@@ -2,10 +2,10 @@ use super::*;
 use crate::{IceServer, RtcConfiguration};
 use anyhow::Result;
 use turn::{
-    auth::{generate_auth_key, AuthHandler},
-    relay::relay_static::RelayAddressGeneratorStatic,
-    server::{config::ConnConfig, config::ServerConfig, Server},
     Error as TurnError,
+    auth::{AuthHandler, generate_auth_key},
+    relay::relay_static::RelayAddressGeneratorStatic,
+    server::{Server, config::ConnConfig, config::ServerConfig},
 };
 // use webrtc_util::vnet::net::Net;
 type TurnResult<T> = std::result::Result<T, TurnError>;
@@ -39,9 +39,11 @@ async fn stun_probe_yields_server_reflexive_candidate() -> Result<()> {
     let gatherer = IceGatherer::new(config);
     gatherer.gather().await?;
     let candidates = gatherer.local_candidates().await;
-    assert!(candidates
-        .iter()
-        .any(|c| matches!(c.typ, IceCandidateType::ServerReflexive)));
+    assert!(
+        candidates
+            .iter()
+            .any(|c| matches!(c.typ, IceCandidateType::ServerReflexive))
+    );
     turn_server.stop().await?;
     Ok(())
 }
@@ -56,9 +58,11 @@ async fn turn_probe_yields_relay_candidate() -> Result<()> {
     let gatherer = IceGatherer::new(config);
     gatherer.gather().await?;
     let candidates = gatherer.local_candidates().await;
-    assert!(candidates
-        .iter()
-        .any(|c| matches!(c.typ, IceCandidateType::Relay)));
+    assert!(
+        candidates
+            .iter()
+            .any(|c| matches!(c.typ, IceCandidateType::Relay))
+    );
     turn_server.stop().await?;
     Ok(())
 }

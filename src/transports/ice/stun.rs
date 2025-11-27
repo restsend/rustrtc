@@ -1,7 +1,8 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use tracing::trace;
 
 const MAGIC_COOKIE: u32 = 0x2112A442;
 const FINGERPRINT_XOR: u32 = 0x5354_554e;
@@ -136,21 +137,25 @@ fn encode_stun_message(
     update_length_field(&mut buffer);
 
     if let Some(key) = integrity_key {
-        // RFC 5389 says length should be up to start of MI.
-        // But let's try including MI size to see if it matches webrtc crate expectation.
-        let len_before_mi = buffer.len() - 20;
-        let len_with_mi = len_before_mi + 24;
-        write_length_field(&mut buffer, len_with_mi);
+        // RFC 5389: The length field in the STUN header MUST contain the length of the message
+        // up to, and including, the MESSAGE-INTEGRITY attribute itself.
+        // MI attribute is 4 bytes header + 20 bytes value = 24 bytes.
+        let len_including_mi = (buffer.len() - 20) + 24;
+        write_length_field(&mut buffer, len_including_mi);
 
-        println!("HMAC key: {:?}", String::from_utf8_lossy(key));
+        trace!("HMAC key: {:?}", String::from_utf8_lossy(key));
         let hmac = hmac_sha1(key, &buffer);
         append_raw_attribute(&mut buffer, 0x0008, &hmac);
         update_length_field(&mut buffer);
     }
 
     if fingerprint {
-        // RFC 5389: Length must reflect size BEFORE Fingerprint
-        update_length_field(&mut buffer);
+        // RFC 5389: The Message Length field in the STUN header MUST contain the length
+        // of the message up to, and including, the FINGERPRINT attribute.
+        // Fingerprint attribute is 4 bytes header + 4 bytes value = 8 bytes.
+        let len_including_fp = (buffer.len() - 20) + 8;
+        write_length_field(&mut buffer, len_including_fp);
+
         let crc = crc32(&buffer) ^ FINGERPRINT_XOR;
         append_raw_attribute(&mut buffer, 0x8028, &crc.to_be_bytes());
     }

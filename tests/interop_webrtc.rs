@@ -1,13 +1,13 @@
 use anyhow::Result;
-use rustrtc::{MediaKind, RtcConfiguration};
 use rustrtc::transports::ice::IceGathererState;
+use rustrtc::{MediaKind, RtcConfiguration};
 use rustrtc::{PeerConnection, TransceiverDirection};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
+use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
-use webrtc::api::APIBuilder;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration as WebrtcConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
@@ -74,8 +74,7 @@ async fn interop_ice_dtls_handshake() -> Result<()> {
     // Convert WebRTC SDP to RustRTC SDP
     // We need to parse the SDP string into rustrtc_core::SessionDescription
     let answer_sdp = answer.sdp;
-    let rust_answer =
-        rustrtc::SessionDescription::parse(rustrtc::SdpType::Answer, &answer_sdp)?;
+    let rust_answer = rustrtc::SessionDescription::parse(rustrtc::SdpType::Answer, &answer_sdp)?;
 
     // 6. RustRTC sets Remote Description
     rust_pc.set_remote_description(rust_answer).await?;
@@ -96,9 +95,9 @@ async fn interop_ice_dtls_handshake() -> Result<()> {
     tokio::spawn(async move {
         loop {
             let _state = rust_pc_clone.signaling_state().await; // This is signaling, we want connection state
-                                                                // But PeerConnection exposes ice_transport state via subscription
-                                                                // Or we can check internal state if exposed.
-                                                                // For now, let's rely on WebRTC side reporting connected, which implies RustRTC side worked.
+            // But PeerConnection exposes ice_transport state via subscription
+            // Or we can check internal state if exposed.
+            // For now, let's rely on WebRTC side reporting connected, which implies RustRTC side worked.
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     });

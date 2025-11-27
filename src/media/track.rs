@@ -1,10 +1,10 @@
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use async_trait::async_trait;
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{Mutex, broadcast, mpsc};
 use tracing::warn;
 
 use crate::{
@@ -366,6 +366,7 @@ mod tests {
             height: 480,
             format: VideoPixelFormat::Rgba,
             rotation_deg: 0,
+            is_last_packet: false,
             data: Bytes::new(),
         };
         let err = source.send_video(video).await.unwrap_err();

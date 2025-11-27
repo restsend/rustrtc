@@ -59,6 +59,7 @@ pub struct VideoFrame {
     pub height: u16,
     pub format: VideoPixelFormat,
     pub rotation_deg: u16,
+    pub is_last_packet: bool,
     pub data: Bytes,
 }
 
@@ -70,6 +71,7 @@ impl Default for VideoFrame {
             height: 0,
             format: VideoPixelFormat::default(),
             rotation_deg: 0,
+            is_last_packet: false,
             data: Bytes::new(),
         }
     }

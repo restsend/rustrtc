@@ -96,7 +96,7 @@ async fn interop_datachannel_test() -> Result<()> {
     }));
 
     // Wait for open
-    let _ = timeout(Duration::from_secs(5), open_rx.recv())
+    let _ = timeout(Duration::from_secs(2), open_rx.recv())
         .await
         .map_err(|_| anyhow::anyhow!("Timeout waiting for DataChannel open"))?;
     println!("WebRTC DataChannel opened");

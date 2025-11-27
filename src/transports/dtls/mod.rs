@@ -6,21 +6,22 @@ pub mod record;
 mod tests;
 
 use aes_gcm::{
-    aead::{Aead, KeyInit, Payload},
     Aes128Gcm, Nonce,
+    aead::{Aead, KeyInit, Payload},
 };
 use anyhow::Result;
 use bytes::{Buf, Bytes, BytesMut};
+use core::fmt;
 use hmac::{Hmac, Mac};
-use p256::ecdsa::signature::Verifier; // Add this
-use p256::ecdsa::{signature::Signer, SigningKey};
+use p256::ecdsa::signature::Verifier;
+use p256::ecdsa::{SigningKey, signature::RandomizedSigner};
 use p256::pkcs8::DecodePrivateKey;
-use p256::{ecdh::EphemeralSecret, elliptic_curve::sec1::ToEncodedPoint, PublicKey};
+use p256::{PublicKey, ecdh::EphemeralSecret, elliptic_curve::sec1::ToEncodedPoint};
 use rand_core::OsRng;
 use rcgen::generate_simple_self_signed;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
 use self::handshake::{
     CertificateMessage, ClientHello, ClientKeyExchange, Finished, HandshakeMessage, HandshakeType,
@@ -28,6 +29,7 @@ use self::handshake::{
 };
 use self::record::{ContentType, DtlsRecord, ProtocolVersion};
 use crate::transports::ice::conn::IceConn;
+use tracing::{debug, trace, warn};
 
 pub fn generate_certificate() -> Result<Certificate> {
     let cert = generate_simple_self_signed(vec!["localhost".to_string()])?;
@@ -48,14 +50,13 @@ pub fn fingerprint(cert: &Certificate) -> String {
         .join(":")
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Certificate {
     pub certificate: Vec<Vec<u8>>,
     pub private_key: String, // PEM encoded key
 }
 
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
+#[derive(Clone)]
 pub struct SessionKeys {
     pub client_write_key: Vec<u8>,
     pub server_write_key: Vec<u8>,
@@ -69,19 +70,31 @@ pub struct SessionKeys {
 pub struct DtlsTransport {
     conn: Arc<IceConn>,
     state: Arc<Mutex<DtlsState>>,
+    state_tx: tokio::sync::watch::Sender<DtlsState>,
+    state_rx: tokio::sync::watch::Receiver<DtlsState>,
     incoming_data_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     outgoing_data_tx: mpsc::Sender<Vec<u8>>,
     // Internal channel to feed the handshake loop from PacketReceiver
     handshake_rx_feeder: mpsc::Sender<Vec<u8>>,
 }
 
-#[derive(Debug)]
-#[allow(dead_code)]
-enum DtlsState {
+#[derive(Clone)]
+pub enum DtlsState {
     New,
     Handshaking,
-    Connected(SessionKeys),
+    Connected(SessionKeys, Option<u16>),
     Failed,
+}
+
+impl fmt::Display for DtlsState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DtlsState::New => write!(f, "New"),
+            DtlsState::Handshaking => write!(f, "Handshaking"),
+            DtlsState::Connected(_, profile) => write!(f, "Connected (SRTP: {:?})", profile),
+            DtlsState::Failed => write!(f, "Failed"),
+        }
+    }
 }
 
 impl DtlsTransport {
@@ -93,10 +106,13 @@ impl DtlsTransport {
         let (incoming_data_tx, incoming_data_rx) = mpsc::channel(100);
         let (outgoing_data_tx, outgoing_data_rx) = mpsc::channel(100);
         let (handshake_rx_feeder, handshake_rx) = mpsc::channel(100);
+        let (state_tx, state_rx) = tokio::sync::watch::channel(DtlsState::New);
 
         let transport = Arc::new(Self {
             conn: conn.clone(),
             state: Arc::new(Mutex::new(DtlsState::New)),
+            state_tx,
+            state_rx,
             incoming_data_rx: Arc::new(Mutex::new(incoming_data_rx)),
             outgoing_data_tx,
             handshake_rx_feeder,
@@ -117,13 +133,18 @@ impl DtlsTransport {
                 )
                 .await
             {
-                eprintln!("DTLS handshake failed: {}", e);
+                warn!("DTLS handshake failed: {}", e);
                 *transport_clone.state.lock().await = DtlsState::Failed;
+                let _ = transport_clone.state_tx.send(DtlsState::Failed);
             }
             // Connected state is set inside handshake now
         });
 
         Ok(transport)
+    }
+
+    pub fn subscribe_state(&self) -> tokio::sync::watch::Receiver<DtlsState> {
+        self.state_rx.clone()
     }
 
     pub async fn send(&self, data: &[u8]) -> Result<()> {
@@ -140,12 +161,839 @@ impl DtlsTransport {
 
     pub async fn export_keying_material(&self, label: &str, len: usize) -> Result<Vec<u8>> {
         let state = self.state.lock().await;
-        if let DtlsState::Connected(keys) = &*state {
+        if let DtlsState::Connected(keys, _) = &*state {
             let seed = [keys.client_random.as_slice(), keys.server_random.as_slice()].concat();
             prf_sha256(&keys.master_secret, label.as_bytes(), &seed, len)
         } else {
             Err(anyhow::anyhow!("DTLS not connected"))
         }
+    }
+
+    async fn handle_retransmit(&self, ctx: &HandshakeContext, is_client: bool) {
+        if let Some(buf) = &ctx.last_flight_buffer {
+            if is_client && ctx.message_seq == 1 {
+                trace!("Retransmitting ClientHello");
+                if let Err(e) = self.conn.send(buf).await {
+                    warn!("Retransmission failed: {}", e);
+                }
+            }
+        }
+    }
+
+    async fn handle_incoming_packet(
+        &self,
+        packet: Vec<u8>,
+        ctx: &mut HandshakeContext,
+        incoming_data_tx: &mpsc::Sender<Vec<u8>>,
+        certificate: &Certificate,
+        is_client: bool,
+    ) -> Result<()> {
+        let mut data = Bytes::from(packet);
+
+        while !data.is_empty() {
+            match DtlsRecord::decode(&mut data) {
+                Ok(None) => break,
+                Ok(Some(record)) => {
+                    let mut payload = record.payload;
+
+                    if record.epoch > 0 {
+                        if let Some(keys) = &ctx.session_keys {
+                            let (key, iv) = if is_client {
+                                (&keys.server_write_key, &keys.server_write_iv)
+                            } else {
+                                (&keys.client_write_key, &keys.client_write_iv)
+                            };
+
+                            // Sequence number for AAD is epoch (16) + seq (48)
+                            let full_seq = ((record.epoch as u64) << 48) | record.sequence_number;
+
+                            match decrypt_record(
+                                record.content_type,
+                                record.version,
+                                full_seq,
+                                &payload,
+                                key,
+                                iv,
+                            ) {
+                                Ok(p) => payload = Bytes::from(p),
+                                Err(e) => {
+                                    warn!("Decryption failed: {}", e);
+                                    debug!(
+                                        "Decryption failed details: seq={} epoch={} type={:?} ver={:?} len={}",
+                                        record.sequence_number,
+                                        record.epoch,
+                                        record.content_type,
+                                        record.version,
+                                        payload.len()
+                                    );
+                                    break;
+                                }
+                            }
+                        } else {
+                            warn!("Received encrypted record but no keys available");
+                            break;
+                        }
+                    }
+
+                    match record.content_type {
+                        ContentType::ChangeCipherSpec => {
+                            trace!("Received ChangeCipherSpec");
+                            // TODO: Switch to encrypted mode
+                        }
+                        ContentType::ApplicationData => {
+                            if let Err(e) = incoming_data_tx.send(payload.to_vec()).await {
+                                warn!("Failed to send incoming data to channel: {}", e);
+                            }
+                        }
+                        ContentType::Handshake => {
+                            let mut body = payload;
+                            while !body.is_empty() {
+                                let msg_buf = body.clone();
+                                match HandshakeMessage::decode(&mut body) {
+                                    Ok(None) => break,
+                                    Ok(Some(msg)) => {
+                                        let consumed = msg_buf.len() - body.len();
+                                        let raw_msg = msg_buf.slice(0..consumed);
+
+                                        debug!(
+                                            "Received handshake message: {:?} seq={} frag_off={} frag_len={}",
+                                            msg.msg_type,
+                                            msg.message_seq,
+                                            msg.fragment_offset,
+                                            msg.fragment_length
+                                        );
+
+                                        if msg.msg_type != HandshakeType::Finished
+                                            && msg.msg_type != HandshakeType::HelloRequest
+                                            && msg.msg_type != HandshakeType::HelloVerifyRequest
+                                        {
+                                            ctx.handshake_messages.extend_from_slice(&raw_msg);
+                                        }
+
+                                        self.handle_handshake_message(
+                                            msg,
+                                            &raw_msg,
+                                            ctx,
+                                            certificate,
+                                            is_client,
+                                        )
+                                        .await?;
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to decode handshake message: {}", e);
+                                        body = Bytes::new();
+                                    }
+                                }
+                            }
+                        }
+                        ContentType::Alert => {
+                            trace!("Received Alert: {:?}", payload);
+                        }
+                        _ => {}
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to decode DTLS record: {}", e);
+                    data = Bytes::new();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_handshake_message(
+        &self,
+        msg: HandshakeMessage,
+        raw_msg: &[u8],
+        ctx: &mut HandshakeContext,
+        certificate: &Certificate,
+        is_client: bool,
+    ) -> Result<()> {
+        match msg.msg_type {
+            HandshakeType::ClientHello => {
+                if !is_client {
+                    debug!("Received ClientHello");
+                    let mut body = msg.body.clone();
+                    match ClientHello::decode(&mut body) {
+                        Ok(client_hello) => {
+                            trace!(
+                                "ClientHello Version: {:?} ({}, {})",
+                                client_hello.version,
+                                client_hello.version.major,
+                                client_hello.version.minor
+                            );
+                            debug!("Client Cipher Suites: {:x?}", client_hello.cipher_suites);
+                            debug!("Client Session ID: {:x?}", client_hello.session_id);
+                            ctx.client_random = Some(client_hello.random.to_bytes());
+
+                            // Send ServerHello
+                            debug!("Sending ServerHello");
+
+                            // Parse ClientHello extensions to trace
+                            let mut srtp_profiles = Vec::new();
+                            let mut ext_buf = Bytes::from(client_hello.extensions.clone());
+                            while ext_buf.len() >= 4 {
+                                let ext_type = ext_buf.get_u16();
+                                let ext_len = ext_buf.get_u16() as usize;
+                                if ext_buf.len() < ext_len {
+                                    break;
+                                }
+                                let _ext_data = ext_buf.split_to(ext_len);
+                                debug!("Client Extension: Type={}", ext_type);
+                                if ext_type == 13 {
+                                    // signature_algorithms
+                                    debug!("  Signature Algorithms: {:?}", _ext_data);
+                                } else if ext_type == 10 {
+                                    // supported_groups
+                                    debug!("  Supported Groups: {:?}", _ext_data);
+                                } else if ext_type == 14 {
+                                    // use_srtp
+                                    debug!("  SRTP Extension: {:?}", _ext_data);
+                                    if _ext_data.len() >= 2 {
+                                        let len = u16::from_be_bytes([_ext_data[0], _ext_data[1]])
+                                            as usize;
+                                        let mut idx = 2;
+                                        while idx < 2 + len && idx + 1 < _ext_data.len() {
+                                            let profile = u16::from_be_bytes([
+                                                _ext_data[idx],
+                                                _ext_data[idx + 1],
+                                            ]);
+                                            srtp_profiles.push(profile);
+                                            idx += 2;
+                                        }
+                                    }
+                                } else if ext_type == 23 {
+                                    // extended_master_secret
+                                    debug!("  Extended Master Secret Extension");
+                                    ctx.ems_negotiated = true;
+                                }
+                            }
+                            debug!("SRTP Profiles: {:?}", srtp_profiles);
+
+                            let random = Random::new();
+                            ctx.server_random = Some(random.to_bytes());
+
+                            let mut extensions = Vec::new();
+                            // Supported Point Formats (uncompressed)
+                            extensions.extend_from_slice(&[0x00, 0x0b]); // Type
+                            extensions.extend_from_slice(&[0x00, 0x02]); // Length
+                            extensions.extend_from_slice(&[0x01]); // List Length
+                            extensions.extend_from_slice(&[0x00]); // uncompressed
+
+                            // Renegotiation Info (empty)
+                            extensions.extend_from_slice(&[0xff, 0x01]); // Type
+                            extensions.extend_from_slice(&[0x00, 0x01]); // Length
+                            extensions.extend_from_slice(&[0x00]); // Body (len 0)
+
+                            // Extended Master Secret
+                            if ctx.ems_negotiated {
+                                extensions.extend_from_slice(&[0x00, 0x17]); // Type 23
+                                extensions.extend_from_slice(&[0x00, 0x00]); // Length 0
+                            }
+
+                            // Use SRTP
+                            if !srtp_profiles.is_empty() {
+                                let selected_profile = srtp_profiles[0];
+                                ctx.srtp_profile = Some(selected_profile);
+                                extensions.extend_from_slice(&[0x00, 0x0e]); // Type 14
+                                extensions.extend_from_slice(&[0x00, 0x05]); // Length
+                                extensions.extend_from_slice(&[0x00, 0x02]); // List Length
+                                extensions.extend_from_slice(&selected_profile.to_be_bytes());
+                                extensions.extend_from_slice(&[0x00]); // MKI Length
+                            }
+
+                            // Generate new Session ID to force full handshake
+                            let mut session_id = vec![0u8; 32];
+                            use rand_core::RngCore;
+                            OsRng.fill_bytes(&mut session_id);
+
+                            let server_hello = ServerHello {
+                                version: ProtocolVersion::DTLS_1_2,
+                                random,
+                                session_id,           // Always new session ID
+                                cipher_suite: 0xC02B, // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+                                compression_method: 0,
+                                extensions,
+                            };
+                            let mut body = BytesMut::new();
+                            server_hello.encode(&mut body);
+
+                            let handshake_msg = HandshakeMessage {
+                                msg_type: HandshakeType::ServerHello,
+                                message_seq: ctx.message_seq,
+                                fragment_offset: 0,
+                                fragment_length: body.len() as u32,
+                                body: body.freeze(),
+                            };
+
+                            let mut buf = BytesMut::new();
+                            handshake_msg.encode(&mut buf);
+                            ctx.handshake_messages.extend_from_slice(&buf);
+
+                            self.send_handshake_message(
+                                handshake_msg,
+                                ctx.epoch,
+                                &mut ctx.sequence_number,
+                                None,
+                                is_client,
+                            )
+                            .await?;
+                            ctx.message_seq += 1;
+
+                            // Send Certificate
+                            let cert_msg = CertificateMessage {
+                                certificates: certificate.certificate.clone(),
+                            };
+
+                            let mut body = BytesMut::new();
+                            cert_msg.encode(&mut body);
+
+                            let handshake_msg = HandshakeMessage {
+                                msg_type: HandshakeType::Certificate,
+                                message_seq: ctx.message_seq,
+                                fragment_offset: 0,
+                                fragment_length: body.len() as u32,
+                                body: body.freeze(),
+                            };
+
+                            let mut buf = BytesMut::new();
+                            handshake_msg.encode(&mut buf);
+                            ctx.handshake_messages.extend_from_slice(&buf);
+
+                            self.send_handshake_message(
+                                handshake_msg,
+                                ctx.epoch,
+                                &mut ctx.sequence_number,
+                                None,
+                                is_client,
+                            )
+                            .await?;
+                            ctx.message_seq += 1;
+
+                            // Send ServerKeyExchange
+                            let mut params = Vec::new();
+                            if let (Some(cr), Some(sr)) = (&ctx.client_random, &ctx.server_random) {
+                                params.extend_from_slice(cr);
+                                params.extend_from_slice(sr);
+                            }
+                            params.push(3); // curve_type: named_curve
+                            params.extend_from_slice(&23u16.to_be_bytes()); // named_curve: secp256r1
+                            params.push(ctx.local_public_key_bytes.len() as u8);
+                            params.extend_from_slice(&ctx.local_public_key_bytes);
+
+                            let signing_key = SigningKey::from_pkcs8_pem(&certificate.private_key)
+                                .map_err(|e| {
+                                    anyhow::anyhow!("Failed to parse private key: {}", e)
+                                })?;
+                            let signature: p256::ecdsa::Signature =
+                                signing_key.sign_with_rng(&mut OsRng, &params);
+                            let signature_bytes = signature.to_der().as_bytes().to_vec();
+                            debug!("Signed params len: {}", params.len());
+                            debug!("Signature len: {}", signature_bytes.len());
+                            debug!("Signature: {:?}", signature_bytes);
+
+                            // Self-verification
+                            let verifying_key = signing_key.verifying_key();
+                            if let Err(e) = verifying_key.verify(&params, &signature) {
+                                warn!("SELF-VERIFICATION FAILED: {}", e);
+                            } else {
+                                debug!("SELF-VERIFICATION SUCCEEDED");
+                            }
+
+                            let server_key_exchange = ServerKeyExchange {
+                                curve_type: 3,   // named_curve
+                                named_curve: 23, // secp256r1
+                                public_key: ctx.local_public_key_bytes.clone(),
+                                signature: signature_bytes,
+                            };
+
+                            let mut body = BytesMut::new();
+                            server_key_exchange.encode(&mut body);
+
+                            let handshake_msg = HandshakeMessage {
+                                msg_type: HandshakeType::ServerKeyExchange,
+                                message_seq: ctx.message_seq,
+                                fragment_offset: 0,
+                                fragment_length: body.len() as u32,
+                                body: body.freeze(),
+                            };
+
+                            let mut buf = BytesMut::new();
+                            handshake_msg.encode(&mut buf);
+                            ctx.handshake_messages.extend_from_slice(&buf);
+
+                            self.send_handshake_message(
+                                handshake_msg,
+                                ctx.epoch,
+                                &mut ctx.sequence_number,
+                                None,
+                                is_client,
+                            )
+                            .await?;
+                            ctx.message_seq += 1;
+
+                            // Send ServerHelloDone
+                            let done_msg = ServerHelloDone {};
+                            let mut body = BytesMut::new();
+                            done_msg.encode(&mut body);
+
+                            let handshake_msg = HandshakeMessage {
+                                msg_type: HandshakeType::ServerHelloDone,
+                                message_seq: ctx.message_seq,
+                                fragment_offset: 0,
+                                fragment_length: body.len() as u32,
+                                body: body.freeze(),
+                            };
+
+                            let mut buf = BytesMut::new();
+                            handshake_msg.encode(&mut buf);
+                            ctx.handshake_messages.extend_from_slice(&buf);
+
+                            self.send_handshake_message(
+                                handshake_msg,
+                                ctx.epoch,
+                                &mut ctx.sequence_number,
+                                None,
+                                is_client,
+                            )
+                            .await?;
+                            ctx.message_seq += 1;
+                        }
+                        Err(e) => {
+                            warn!("Failed to decode ClientHello: {}", e);
+                        }
+                    }
+                }
+            }
+            HandshakeType::ClientKeyExchange => {
+                if !is_client {
+                    if ctx.session_keys.is_some() {
+                        trace!(
+                            "Session keys already derived, skipping ClientKeyExchange processing"
+                        );
+                        return Ok(());
+                    }
+
+                    trace!("Received ClientKeyExchange");
+                    let mut body = msg.body.clone();
+                    if let Ok(client_key_exchange) = ClientKeyExchange::decode(&mut body) {
+                        ctx.peer_public_key = Some(client_key_exchange.public_key);
+
+                        // Compute shared secret
+                        if let Some(peer_key) = &ctx.peer_public_key {
+                            if let Some(secret) = ctx.local_secret.as_ref() {
+                                if let Ok(pk) = PublicKey::from_sec1_bytes(peer_key) {
+                                    let shared_secret = secret.diffie_hellman(&pk);
+                                    trace!("Shared secret computed (Server)");
+
+                                    if let (Some(cr), Some(sr)) =
+                                        (&ctx.client_random, &ctx.server_random)
+                                    {
+                                        let pre_master_secret = shared_secret.raw_secret_bytes();
+                                        let mut seed = Vec::new();
+                                        seed.extend_from_slice(cr);
+                                        seed.extend_from_slice(sr);
+
+                                        if let Ok(master_secret) = if ctx.ems_negotiated {
+                                            let mut hasher = Sha256::new();
+                                            hasher.update(&ctx.handshake_messages);
+                                            let session_hash = hasher.finalize();
+                                            trace!("EMS Session Hash: {:?}", session_hash);
+                                            prf_sha256(
+                                                pre_master_secret,
+                                                b"extended master secret",
+                                                &session_hash,
+                                                48,
+                                            )
+                                        } else {
+                                            prf_sha256(
+                                                pre_master_secret,
+                                                b"master secret",
+                                                &seed,
+                                                48,
+                                            )
+                                        } {
+                                            trace!("Master secret derived: {:?}", master_secret);
+                                            if let Ok(keys) = expand_keys(&master_secret, cr, sr) {
+                                                trace!("Session keys derived (Server)");
+                                                ctx.session_keys = Some(keys);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    warn!("Failed to parse peer public key");
+                                }
+                            } else {
+                                warn!("Local secret not available (already consumed?)");
+                            }
+                        }
+                    } else {
+                        warn!("Failed to decode ClientKeyExchange");
+                    }
+                }
+            }
+            HandshakeType::Finished => {
+                debug!("Received Finished");
+                let mut body = msg.body.clone();
+                if let Ok(finished) = Finished::decode(&mut body) {
+                    if !is_client {
+                        // Verify Client's Finished
+                        if let Some(keys) = &ctx.session_keys {
+                            let expected_verify_data = calculate_verify_data(
+                                &keys.master_secret,
+                                b"client finished",
+                                &ctx.handshake_messages,
+                            )?;
+
+                            if finished.verify_data != expected_verify_data {
+                                warn!(
+                                    "Finished verification failed. Expected {:?}, got {:?}",
+                                    expected_verify_data, finished.verify_data
+                                );
+                                *self.state.lock().await = DtlsState::Failed;
+                                return Err(anyhow::anyhow!("Finished verification failed"));
+                            } else {
+                                trace!("Client Finished verified");
+                            }
+                        }
+
+                        // Add Client's Finished to transcript
+                        ctx.handshake_messages.extend_from_slice(&raw_msg);
+
+                        // Send ChangeCipherSpec
+                        let record = DtlsRecord {
+                            content_type: ContentType::ChangeCipherSpec,
+                            version: ProtocolVersion::DTLS_1_2,
+                            epoch: ctx.epoch,
+                            sequence_number: ctx.sequence_number,
+                            payload: Bytes::from_static(&[1]),
+                        };
+                        // sequence_number increment is not needed as we reset it below
+
+                        let mut buf = BytesMut::new();
+                        record.encode(&mut buf);
+                        self.conn.send(&buf).await?;
+
+                        ctx.epoch += 1;
+                        ctx.sequence_number = 0;
+
+                        // Send Finished
+                        let verify_data = if let Some(keys) = &ctx.session_keys {
+                            calculate_verify_data(
+                                &keys.master_secret,
+                                b"server finished",
+                                &ctx.handshake_messages,
+                            )?
+                        } else {
+                            vec![0u8; 12]
+                        };
+
+                        let finished = Finished { verify_data };
+
+                        let mut body = BytesMut::new();
+                        finished.encode(&mut body);
+
+                        let handshake_msg = HandshakeMessage {
+                            msg_type: HandshakeType::Finished,
+                            message_seq: ctx.message_seq,
+                            fragment_offset: 0,
+                            fragment_length: body.len() as u32,
+                            body: body.freeze(),
+                        };
+
+                        let mut buf = BytesMut::new();
+                        handshake_msg.encode(&mut buf);
+                        ctx.handshake_messages.extend_from_slice(&buf);
+
+                        self.send_handshake_message(
+                            handshake_msg,
+                            ctx.epoch,
+                            &mut ctx.sequence_number,
+                            ctx.session_keys.as_ref(),
+                            is_client,
+                        )
+                        .await?;
+                        // message_seq += 1; // End of handshake
+
+                        if let Some(keys) = &ctx.session_keys {
+                            let state = DtlsState::Connected(keys.clone(), ctx.srtp_profile);
+                            *self.state.lock().await = state.clone();
+                            let _ = self.state_tx.send(state);
+                            // Clear ephemeral secret as handshake is complete
+                            ctx.local_secret = None;
+                        } else {
+                            *self.state.lock().await = DtlsState::Failed;
+                            let _ = self.state_tx.send(DtlsState::Failed);
+                            return Err(anyhow::anyhow!("Session keys not derived"));
+                        }
+                        // return Ok(());
+                    } else {
+                        // Client logic: Verify Finished
+                        if let Some(keys) = &ctx.session_keys {
+                            let expected_verify_data = calculate_verify_data(
+                                &keys.master_secret,
+                                b"server finished",
+                                &ctx.handshake_messages,
+                            )?;
+
+                            if finished.verify_data != expected_verify_data {
+                                warn!(
+                                    "Finished verification failed. Expected {:?}, got {:?}",
+                                    expected_verify_data, finished.verify_data
+                                );
+                                *self.state.lock().await = DtlsState::Failed;
+                                return Err(anyhow::anyhow!("Finished verification failed"));
+                            } else {
+                                debug!("Finished verified");
+                                if let Some(keys) = &ctx.session_keys {
+                                    let state =
+                                        DtlsState::Connected(keys.clone(), ctx.srtp_profile);
+                                    *self.state.lock().await = state.clone();
+                                    let _ = self.state_tx.send(state);
+                                    ctx.local_secret = None;
+                                }
+                                // return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+            HandshakeType::HelloVerifyRequest => {
+                trace!("Received HelloVerifyRequest");
+                let mut body = msg.body.clone();
+                if let Ok(verify_req) = HelloVerifyRequest::decode(&mut body) {
+                    trace!("Resending ClientHello with cookie");
+
+                    // Reset handshake messages
+                    ctx.handshake_messages.clear();
+
+                    // Reuse previous random
+                    let random = if let Some(bytes) = &ctx.client_random {
+                        let gmt = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                        let mut rb = [0u8; 28];
+                        rb.copy_from_slice(&bytes[4..32]);
+                        Random {
+                            gmt_unix_time: gmt,
+                            random_bytes: rb,
+                        }
+                    } else {
+                        Random::new()
+                    };
+                    // client_random is already set, no need to update
+
+                    let mut extensions = Vec::new();
+                    // Supported Elliptic Curves (secp256r1)
+                    extensions.extend_from_slice(&[0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x17]);
+                    // Supported Point Formats (uncompressed)
+                    extensions.extend_from_slice(&[0x00, 0x0b, 0x00, 0x02, 0x01, 0x00]);
+
+                    let client_hello = ClientHello {
+                        version: ProtocolVersion::DTLS_1_2,
+                        random,
+                        session_id: vec![],
+                        cookie: verify_req.cookie,
+                        cipher_suites: vec![0xC02B],
+                        compression_methods: vec![0],
+                        extensions,
+                    };
+
+                    let mut body = BytesMut::new();
+                    client_hello.encode(&mut body);
+
+                    let handshake_msg = HandshakeMessage {
+                        msg_type: HandshakeType::ClientHello,
+                        message_seq: ctx.message_seq,
+                        fragment_offset: 0,
+                        fragment_length: body.len() as u32,
+                        body: body.freeze(),
+                    };
+
+                    let mut buf = BytesMut::new();
+                    handshake_msg.encode(&mut buf);
+                    ctx.handshake_messages.extend_from_slice(&buf);
+
+                    self.send_handshake_message(
+                        handshake_msg,
+                        ctx.epoch,
+                        &mut ctx.sequence_number,
+                        None,
+                        is_client,
+                    )
+                    .await?;
+                    ctx.message_seq += 1;
+                }
+            }
+            HandshakeType::ServerHello => {
+                if is_client {
+                    trace!("Received ServerHello");
+                    let mut body = msg.body.clone();
+                    if let Ok(server_hello) = ServerHello::decode(&mut body) {
+                        ctx.server_random = Some(server_hello.random.to_bytes());
+                        trace!("Server extensions len: {}", server_hello.extensions.len());
+                        if !server_hello.extensions.is_empty() {
+                            trace!("Server extensions: {:?}", server_hello.extensions);
+                            let mut ext_buf = Bytes::from(server_hello.extensions.clone());
+                            while ext_buf.len() >= 4 {
+                                let ext_type = ext_buf.get_u16();
+                                let ext_len = ext_buf.get_u16() as usize;
+                                if ext_buf.len() < ext_len {
+                                    break;
+                                }
+                                let _ext_data = ext_buf.split_to(ext_len);
+                                if ext_type == 23 {
+                                    ctx.ems_negotiated = true;
+                                } else if ext_type == 14 {
+                                    // use_srtp
+                                    if _ext_data.len() >= 5 {
+                                        // Length of list (2 bytes)
+                                        // Profile (2 bytes)
+                                        // MKI (1 byte)
+                                        let profile =
+                                            u16::from_be_bytes([_ext_data[2], _ext_data[3]]);
+                                        ctx.srtp_profile = Some(profile);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            HandshakeType::Certificate => {
+                trace!("Received Certificate");
+            }
+            HandshakeType::ServerKeyExchange => {
+                if is_client {
+                    trace!("Received ServerKeyExchange");
+                    let mut body = msg.body.clone();
+                    if let Ok(server_key_exchange) = ServerKeyExchange::decode(&mut body) {
+                        ctx.peer_public_key = Some(server_key_exchange.public_key);
+                    }
+                }
+            }
+            HandshakeType::ServerHelloDone => {
+                trace!("Received ServerHelloDone");
+
+                // Send ClientKeyExchange
+                let client_key_exchange = ClientKeyExchange {
+                    identity_hint: vec![],
+                    public_key: ctx.local_public_key_bytes.clone(),
+                };
+
+                let mut body = BytesMut::new();
+                client_key_exchange.encode(&mut body);
+
+                let handshake_msg = HandshakeMessage {
+                    msg_type: HandshakeType::ClientKeyExchange,
+                    message_seq: ctx.message_seq,
+                    fragment_offset: 0,
+                    fragment_length: body.len() as u32,
+                    body: body.freeze(),
+                };
+
+                let mut buf = BytesMut::new();
+                handshake_msg.encode(&mut buf);
+                ctx.handshake_messages.extend_from_slice(&buf);
+
+                self.send_handshake_message(
+                    handshake_msg,
+                    ctx.epoch,
+                    &mut ctx.sequence_number,
+                    None,
+                    is_client,
+                )
+                .await?;
+                ctx.message_seq += 1;
+
+                // Compute shared secret
+                if let Some(peer_key) = &ctx.peer_public_key {
+                    if let Some(secret) = ctx.local_secret.as_ref() {
+                        if let Ok(pk) = PublicKey::from_sec1_bytes(peer_key) {
+                            let shared_secret = secret.diffie_hellman(&pk);
+                            trace!("Shared secret computed (Client)");
+
+                            if let (Some(cr), Some(sr)) = (&ctx.client_random, &ctx.server_random) {
+                                let pre_master_secret = shared_secret.raw_secret_bytes();
+                                let mut seed = Vec::new();
+                                seed.extend_from_slice(cr);
+                                seed.extend_from_slice(sr);
+
+                                if let Ok(master_secret) = if ctx.ems_negotiated {
+                                    let mut hasher = Sha256::new();
+                                    hasher.update(&ctx.handshake_messages);
+                                    let session_hash = hasher.finalize();
+                                    prf_sha256(
+                                        pre_master_secret,
+                                        b"extended master secret",
+                                        &session_hash,
+                                        48,
+                                    )
+                                } else {
+                                    prf_sha256(pre_master_secret, b"master secret", &seed, 48)
+                                } {
+                                    trace!("Master secret derived: {:?}", master_secret);
+                                    if let Ok(keys) = expand_keys(&master_secret, cr, sr) {
+                                        trace!("Session keys derived (Client)");
+                                        ctx.session_keys = Some(keys);
+
+                                        // Send ChangeCipherSpec
+                                        let record = DtlsRecord {
+                                            content_type: ContentType::ChangeCipherSpec,
+                                            version: ProtocolVersion::DTLS_1_2,
+                                            epoch: ctx.epoch,
+                                            sequence_number: ctx.sequence_number,
+                                            payload: Bytes::from_static(&[1]),
+                                        };
+
+                                        let mut buf = BytesMut::new();
+                                        record.encode(&mut buf);
+                                        self.conn.send(&buf).await?;
+
+                                        ctx.epoch += 1;
+                                        ctx.sequence_number = 0;
+
+                                        // Send Finished
+                                        let verify_data = calculate_verify_data(
+                                            &master_secret,
+                                            b"client finished",
+                                            &ctx.handshake_messages,
+                                        )?;
+
+                                        let finished = Finished { verify_data };
+
+                                        let mut body = BytesMut::new();
+                                        finished.encode(&mut body);
+
+                                        let handshake_msg = HandshakeMessage {
+                                            msg_type: HandshakeType::Finished,
+                                            message_seq: ctx.message_seq,
+                                            fragment_offset: 0,
+                                            fragment_length: body.len() as u32,
+                                            body: body.freeze(),
+                                        };
+
+                                        let mut buf = BytesMut::new();
+                                        handshake_msg.encode(&mut buf);
+                                        ctx.handshake_messages.extend_from_slice(&buf);
+
+                                        self.send_handshake_message(
+                                            handshake_msg,
+                                            ctx.epoch,
+                                            &mut ctx.sequence_number,
+                                            ctx.session_keys.as_ref(),
+                                            is_client,
+                                        )
+                                        .await?;
+                                        ctx.message_seq += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     async fn handshake(
@@ -157,37 +1005,25 @@ impl DtlsTransport {
         mut handshake_rx: mpsc::Receiver<Vec<u8>>,
     ) -> Result<()> {
         *self.state.lock().await = DtlsState::Handshaking;
+        let _ = self.state_tx.send(DtlsState::Handshaking);
 
-        let mut sequence_number = 0;
-        let mut epoch = 0;
-        let mut message_seq = 0;
+        let mut ctx = HandshakeContext::new();
 
         // Retransmission state
-        let mut last_flight_buffer: Option<Vec<u8>> = None;
         let mut retransmit_interval = tokio::time::interval(std::time::Duration::from_secs(1));
         retransmit_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        // Generate ephemeral key for ECDHE
-        let local_secret = EphemeralSecret::random(&mut OsRng);
-        let local_public = local_secret.public_key();
-        let local_public_key_bytes = local_public.to_encoded_point(false).as_bytes().to_vec();
-
-        // We need to keep local_secret until we have the peer's public key
-        let mut local_secret_opt = Some(local_secret);
-        let mut peer_public_key: Option<Vec<u8>> = None;
-
-        let mut client_random: Option<Vec<u8>> = None;
-        let mut server_random: Option<Vec<u8>> = None;
-        let mut session_keys: Option<SessionKeys> = None;
-        let mut handshake_messages = Vec::new();
-
         if is_client {
             // Send ClientHello
-            println!("Sending ClientHello");
+            debug!("Sending ClientHello");
             let random = Random::new();
-            client_random = Some(random.to_bytes());
+            ctx.client_random = Some(random.to_bytes());
 
             let mut extensions = Vec::new();
+
+            // Extended Master Secret
+            extensions.extend_from_slice(&[0x00, 0x17]); // Type 23
+            extensions.extend_from_slice(&[0x00, 0x00]); // Length 0
 
             // Supported Elliptic Curves (secp256r1)
             extensions.extend_from_slice(&[0x00, 0x0a]); // Type
@@ -216,7 +1052,7 @@ impl DtlsTransport {
 
             let handshake_msg = HandshakeMessage {
                 msg_type: HandshakeType::ClientHello,
-                message_seq,
+                message_seq: ctx.message_seq,
                 fragment_offset: 0,
                 fragment_length: body.len() as u32,
                 body: body.freeze(),
@@ -224,819 +1060,38 @@ impl DtlsTransport {
 
             let mut buf = BytesMut::new();
             handshake_msg.encode(&mut buf);
-            handshake_messages.extend_from_slice(&buf);
+            ctx.handshake_messages.extend_from_slice(&buf);
 
             let buf = self
-                .send_handshake_message(handshake_msg, epoch, &mut sequence_number, None, is_client)
+                .send_handshake_message(
+                    handshake_msg,
+                    ctx.epoch,
+                    &mut ctx.sequence_number,
+                    None,
+                    is_client,
+                )
                 .await?;
-            last_flight_buffer = Some(buf);
-            message_seq += 1;
+            ctx.last_flight_buffer = Some(buf);
+            ctx.message_seq += 1;
         }
 
         loop {
             tokio::select! {
                 _ = retransmit_interval.tick() => {
-                    if let Some(buf) = &last_flight_buffer {
-                        if is_client && message_seq == 1 {
-                            println!("Retransmitting ClientHello");
-                            if let Err(e) = self.conn.send(buf).await {
-                                eprintln!("Retransmission failed: {}", e);
-                            }
-                        }
-                    }
+                    self.handle_retransmit(&ctx, is_client).await;
                 }
                 Some(packet) = handshake_rx.recv() => {
-                            let mut data = Bytes::from(packet);
-
-                            while !data.is_empty() {
-                                match DtlsRecord::decode(&mut data) {
-                                    Ok(None) => break,
-                                    Ok(Some(record)) => {
-                                        let mut payload = record.payload;
-
-                                        if record.epoch > 0 {
-                                            if let Some(keys) = &session_keys {
-                                                let (key, iv) = if is_client {
-                                                    (&keys.server_write_key, &keys.server_write_iv)
-                                                } else {
-                                                    (&keys.client_write_key, &keys.client_write_iv)
-                                                };
-
-                                                // Sequence number for AAD is epoch (16) + seq (48)
-                                                let full_seq = ((record.epoch as u64) << 48) | record.sequence_number;
-
-                                                match decrypt_record(
-                                                    record.content_type,
-                                                    record.version,
-                                                    full_seq,
-                                                    &payload,
-                                                    key,
-                                                    iv
-                                                ) {
-                                                    Ok(p) => payload = Bytes::from(p),
-                                                    Err(e) => {
-                                                        eprintln!("Decryption failed: {}", e);
-                                                        break;
-                                                    }
-                                                }
-                                            } else {
-                                                eprintln!("Received encrypted record but no keys available");
-                                                break;
-                                            }
-                                        }
-
-                                        match record.content_type {
-                                            ContentType::ChangeCipherSpec => {
-                                                println!("Received ChangeCipherSpec");
-                                                // TODO: Switch to encrypted mode
-                                            },
-                                            ContentType::ApplicationData => {
-                                                if let Err(e) = incoming_data_tx.send(payload.to_vec()).await {
-                                                    eprintln!("Failed to send incoming data to channel: {}", e);
-                                                }
-                                            },
-                                            ContentType::Handshake => {
-                                                let mut body = payload;
-                                                while !body.is_empty() {
-                                                    let msg_buf = body.clone();
-                                                    match HandshakeMessage::decode(&mut body) {
-                                                        Ok(None) => break,
-                                                        Ok(Some(msg)) => {
-                                                            let consumed = msg_buf.len() - body.len();
-                                                            let raw_msg = msg_buf.slice(0..consumed);
-
-                                                            println!("Received handshake message: {:?} seq={} frag_off={} frag_len={}",
-                                                                msg.msg_type, msg.message_seq, msg.fragment_offset, msg.fragment_length);
-
-                                                            if msg.msg_type != HandshakeType::Finished
-                                                                && msg.msg_type != HandshakeType::HelloRequest
-                                                                && msg.msg_type != HandshakeType::HelloVerifyRequest
-                                                            {
-                                                                handshake_messages.extend_from_slice(&raw_msg);
-                                                            }
-
-                                                            match msg.msg_type {
-                                                                HandshakeType::ClientHello => {
-                                                                    if !is_client {
-                                                                        println!("Received ClientHello");
-                                                                        let mut body = msg.body.clone();
-                                                                        match ClientHello::decode(&mut body) {
-                                                                            Ok(client_hello) => {
-                                                                            println!("ClientHello Version: {:?} ({}, {})", client_hello.version, client_hello.version.major, client_hello.version.minor);
-                                                                            client_random = Some(
-                                                                                client_hello.random.to_bytes(),
-                                                                            );
-
-                                                                            // Send ServerHello
-                                                                            println!("Sending ServerHello");
-
-                                                                            // Parse ClientHello extensions to debug
-                                                                            let mut srtp_profiles = Vec::new();
-                                                                            let mut ext_buf = Bytes::from(client_hello.extensions.clone());
-                                                                            while ext_buf.len() >= 4 {
-                                                                                let ext_type = ext_buf.get_u16();
-                                                                                let ext_len = ext_buf.get_u16() as usize;
-                                                                                if ext_buf.len() < ext_len {
-                                                                                    break;
-                                                                                }
-                                                                                let _ext_data = ext_buf.split_to(ext_len);
-                                                                                println!("Client Extension: Type={}", ext_type);
-                                                                                if ext_type == 13 { // signature_algorithms
-                                                                                    println!("  Signature Algorithms: {:?}", _ext_data);
-                                                                                } else if ext_type == 10 { // supported_groups
-                                                                                    println!("  Supported Groups: {:?}", _ext_data);
-                                                                                } else if ext_type == 14 { // use_srtp
-                                                                                    println!("  SRTP Extension: {:?}", _ext_data);
-                                                                                    if _ext_data.len() >= 2 {
-                                                                                        let len = u16::from_be_bytes([_ext_data[0], _ext_data[1]]) as usize;
-                                                                                        let mut idx = 2;
-                                                                                        while idx < 2 + len && idx + 1 < _ext_data.len() {
-                                                                                            let profile = u16::from_be_bytes([_ext_data[idx], _ext_data[idx+1]]);
-                                                                                            srtp_profiles.push(profile);
-                                                                                            idx += 2;
-                                                                                        }
-                                                                                    }
-                                                                                }
-                                                                            }
-
-                                                                            let random = Random::new();
-                                                                            server_random = Some(random.to_bytes());
-
-                                            let mut extensions = Vec::new();
-                                            // Supported Point Formats (uncompressed)
-                                            extensions.extend_from_slice(&[0x00, 0x0b]); // Type
-                                            extensions.extend_from_slice(&[0x00, 0x02]); // Length
-                                            extensions.extend_from_slice(&[0x01]); // List Length
-                                            extensions.extend_from_slice(&[0x00]); // uncompressed
-
-                                            // Renegotiation Info (empty)
-                                            extensions.extend_from_slice(&[0xff, 0x01]); // Type
-                                            extensions.extend_from_slice(&[0x00, 0x01]); // Length
-                                            extensions.extend_from_slice(&[0x00]);       // Body (len 0)
-
-                                            // Extended Master Secret (removed to avoid implementing RFC 7627 logic for now)
-                                            // extensions.extend_from_slice(&[0x00, 0x17]); // Type
-                                            // extensions.extend_from_slice(&[0x00, 0x00]); // Length
-
-                                            // Use SRTP
-                                            if !srtp_profiles.is_empty() {
-                                                let selected_profile = srtp_profiles[0];
-                                                extensions.extend_from_slice(&[0x00, 0x0e]); // Type 14
-                                                extensions.extend_from_slice(&[0x00, 0x05]); // Length
-                                                extensions.extend_from_slice(&[0x00, 0x02]); // List Length
-                                                extensions.extend_from_slice(&selected_profile.to_be_bytes());
-                                                extensions.extend_from_slice(&[0x00]); // MKI Length
-                                            }
-
-                                            let server_hello = ServerHello {
-                                                version: ProtocolVersion::DTLS_1_2,
-                                                random,
-                                                session_id: client_hello.session_id,
-                                                cipher_suite: 0xC02B, // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
-                                                compression_method: 0,
-                                                extensions,
-                                            };                                                                            let mut body = BytesMut::new();
-                                                                            server_hello.encode(&mut body);
-
-                                                                            let handshake_msg = HandshakeMessage {
-                                                                                msg_type:
-                                                                                    HandshakeType::ServerHello,
-                                                                                message_seq,
-                                                                                fragment_offset: 0,
-                                                                                fragment_length: body.len() as u32,
-                                                                                body: body.freeze(),
-                                                                            };
-
-                                                                            let mut buf = BytesMut::new();
-                                                                            handshake_msg.encode(&mut buf);
-                                                                            handshake_messages
-                                                                                .extend_from_slice(&buf);
-
-                                                                            self.send_handshake_message(
-                                                                                handshake_msg,
-                                                                                epoch,
-                                                                                &mut sequence_number,
-                                                                                None,
-                                                                                is_client,
-                                                                            )
-                                                                            .await?;
-                                                                            message_seq += 1;
-
-                                                                            // Send Certificate
-                                                                            let cert_msg = CertificateMessage {
-                                                                                certificates: certificate
-                                                                                    .certificate
-                                                                                    .clone(),
-                                                                            };
-
-                                                                            let mut body = BytesMut::new();
-                                                                            cert_msg.encode(&mut body);
-
-                                                                            let handshake_msg = HandshakeMessage {
-                                                                                msg_type:
-                                                                                    HandshakeType::Certificate,
-                                                                                message_seq,
-                                                                                fragment_offset: 0,
-                                                                                fragment_length: body.len() as u32,
-                                                                                body: body.freeze(),
-                                                                            };
-
-                                                                            let mut buf = BytesMut::new();
-                                                                            handshake_msg.encode(&mut buf);
-                                                                            handshake_messages
-                                                                                .extend_from_slice(&buf);
-
-                                                                            self.send_handshake_message(
-                                                                                handshake_msg,
-                                                                                epoch,
-                                                                                &mut sequence_number,
-                                                                                None,
-                                                                                is_client,
-                                                                            )
-                                                                            .await?;
-                                                                            message_seq += 1;
-
-                                                                            // Send ServerKeyExchange
-                                                                            let mut params = Vec::new();
-                                                                            if let (Some(cr), Some(sr)) = (&client_random, &server_random) {
-                                                                                params.extend_from_slice(cr);
-                                                                                params.extend_from_slice(sr);
-                                                                            }
-                                                                            params.push(3); // curve_type: named_curve
-                                                                            params.extend_from_slice(&23u16.to_be_bytes()); // named_curve: secp256r1
-                                                                            params.push(local_public_key_bytes.len() as u8);
-                                                                            params.extend_from_slice(&local_public_key_bytes);
-
-                                                                            let signing_key = SigningKey::from_pkcs8_pem(&certificate.private_key)
-                                                                                .map_err(|e| anyhow::anyhow!("Failed to parse private key: {}", e))?;
-                                                                            let signature: p256::ecdsa::Signature = signing_key.sign(&params);
-                                                                            let signature_bytes = signature.to_der().as_bytes().to_vec();
-
-                                                                            println!("Signed params len: {}", params.len());
-                                                                            println!("Signature len: {}", signature_bytes.len());
-                                                                            println!("Signature: {:?}", signature_bytes);
-
-                                                                            // Self-verification
-                                                                            let verifying_key = signing_key.verifying_key();
-                                                                            if let Err(e) = verifying_key.verify(&params, &signature) {
-                                                                                println!("SELF-VERIFICATION FAILED: {}", e);
-                                                                            } else {
-                                                                                println!("SELF-VERIFICATION SUCCEEDED");
-                                                                            }
-
-                                                                            let server_key_exchange =
-                                                                                ServerKeyExchange {
-                                                                                    curve_type: 3,   // named_curve
-                                                                                    named_curve: 23, // secp256r1
-                                                                                    public_key:
-                                                                                        local_public_key_bytes
-                                                                                            .clone(),
-                                                                                    signature: signature_bytes,
-                                                                                };
-
-                                                                            let mut body = BytesMut::new();
-                                                                            server_key_exchange.encode(&mut body);
-
-                                                                            let handshake_msg = HandshakeMessage {
-                                                                                msg_type:
-                                                                                    HandshakeType::ServerKeyExchange,
-                                                                                message_seq,
-                                                                                fragment_offset: 0,
-                                                                                fragment_length: body.len() as u32,
-                                                                                body: body.freeze(),
-                                                                            };
-
-                                                                            let mut buf = BytesMut::new();
-                                                                            handshake_msg.encode(&mut buf);
-                                                                            handshake_messages
-                                                                                .extend_from_slice(&buf);
-
-                                                                            self.send_handshake_message(
-                                                                                handshake_msg,
-                                                                                epoch,
-                                                                                &mut sequence_number,
-                                                                                None,
-                                                                                is_client,
-                                                                            )
-                                                                            .await?;
-                                                                            message_seq += 1;
-
-                                                                            // Send ServerHelloDone
-                                                                            let done_msg = ServerHelloDone {};
-                                                                            let mut body = BytesMut::new();
-                                                                            done_msg.encode(&mut body);
-
-                                                                            let handshake_msg = HandshakeMessage {
-                                                                                msg_type:
-                                                                                    HandshakeType::ServerHelloDone,
-                                                                                message_seq,
-                                                                                fragment_offset: 0,
-                                                                                fragment_length: body.len() as u32,
-                                                                                body: body.freeze(),
-                                                                            };
-
-                                                                            let mut buf = BytesMut::new();
-                                                                            handshake_msg.encode(&mut buf);
-                                                                            handshake_messages
-                                                                                .extend_from_slice(&buf);
-
-                                                                            self.send_handshake_message(
-                                                                                handshake_msg,
-                                                                                epoch,
-                                                                                &mut sequence_number,
-                                                                                None,
-                                                                                is_client,
-                                                                            )
-                                                                            .await?;
-                                                                            message_seq += 1;
-                                                                            }
-                                                                            Err(e) => {
-                                                                                println!("Failed to decode ClientHello: {}", e);
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                                HandshakeType::ClientKeyExchange => {
-                                                                    if !is_client {
-                                                                        println!("Received ClientKeyExchange");
-                                                                        let mut body = msg.body.clone();
-                                                                        if let Ok(client_key_exchange) =
-                                                                            ClientKeyExchange::decode(&mut body)
-                                                                        {
-                                                                            peer_public_key = Some(
-                                                                                client_key_exchange.public_key,
-                                                                            );
-
-                                                                            // Compute shared secret
-                                                                            if let Some(peer_key) = &peer_public_key
-                                                                            {
-                                                                                if let Some(secret) =
-                                                                                    local_secret_opt.take()
-                                                                                {
-                                                                                    if let Ok(pk) =
-                                                                                        PublicKey::from_sec1_bytes(
-                                                                                            peer_key,
-                                                                                        )
-                                                                                    {
-                                                                                        let shared_secret = secret
-                                                                                            .diffie_hellman(&pk);
-                                                                                        println!("Shared secret computed (Server)");
-
-                                                                                        if let (
-                                                                                            Some(cr),
-                                                                                            Some(sr),
-                                                                                        ) = (
-                                                                                            &client_random,
-                                                                                            &server_random,
-                                                                                        ) {
-                                                                                            let pre_master_secret = shared_secret.raw_secret_bytes();
-                                                                                            let mut seed =
-                                                                                                Vec::new();
-                                                                                            seed.extend_from_slice(
-                                                                                                cr,
-                                                                                            );
-                                                                                            seed.extend_from_slice(
-                                                                                                sr,
-                                                                                            );
-
-                                                                                            if let Ok(
-                                                                                                master_secret,
-                                                                                            ) = prf_sha256(
-                                                                                                pre_master_secret,
-                                                                                                b"master secret",
-                                                                                                &seed,
-                                                                                                48,
-                                                                                            ) {
-                                                                                                println!("Master secret derived: {:?}", master_secret);
-                                                                                                if let Ok(keys) = expand_keys(&master_secret, cr, sr) {
-                                                                                                    println!("Session keys derived (Server)");
-                                                                                                    session_keys = Some(keys);
-                                                                                                }
-                                                                                            }
-                                                                                        }
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                                HandshakeType::Finished => {
-                                                                    println!("Received Finished");
-                                                                    let mut body = msg.body.clone();
-                                                                    if let Ok(finished) =
-                                                                        Finished::decode(&mut body)
-                                                                    {
-                                                                        if !is_client {
-                                                                            // Verify Client's Finished
-                                                                            if let Some(keys) = &session_keys {
-                                                                                let expected_verify_data =
-                                                                                    calculate_verify_data(
-                                                                                        &keys.master_secret,
-                                                                                        b"client finished",
-                                                                                        &handshake_messages,
-                                                                                    )?;
-
-                                                                                if finished.verify_data
-                                                                                    != expected_verify_data
-                                                                                {
-                                                                                    eprintln!("Finished verification failed. Expected {:?}, got {:?}", expected_verify_data, finished.verify_data);
-                                                                                    *self.state.lock().await =
-                                                                                        DtlsState::Failed;
-                                                                                    return Err(anyhow::anyhow!("Finished verification failed"));
-                                                                                } else {
-                                                                                    println!("Client Finished verified");
-                                                                                }
-                                                                            }
-
-                                                                            // Add Client's Finished to transcript
-                                                                            handshake_messages.extend_from_slice(&raw_msg);
-
-                                                                            // Send ChangeCipherSpec
-                                                                            let record = DtlsRecord {
-                                                                                content_type:
-                                                                                    ContentType::ChangeCipherSpec,
-                                                                                version: ProtocolVersion::DTLS_1_2,
-                                                                                epoch,
-                                                                                sequence_number,
-                                                                                payload: Bytes::from_static(&[1]),
-                                                                            };
-                                                                            // sequence_number increment is not needed as we reset it below
-
-                                                                            let mut buf = BytesMut::new();
-                                                                            record.encode(&mut buf);
-                                                                            self.conn.send(&buf).await?;
-
-                                                                            epoch += 1;
-                                                                            sequence_number = 0;
-
-                                                                            // Send Finished
-                                                                            let verify_data =
-                                                                                if let Some(keys) = &session_keys {
-                                                                                    calculate_verify_data(
-                                                                                        &keys.master_secret,
-                                                                                        b"server finished",
-                                                                                        &handshake_messages,
-                                                                                    )?
-                                                                                } else {
-                                                                                    vec![0u8; 12]
-                                                                                };
-
-                                                                            let finished = Finished { verify_data };
-
-                                                                            let mut body = BytesMut::new();
-                                                                            finished.encode(&mut body);
-
-                                                                            let handshake_msg = HandshakeMessage {
-                                                                                msg_type: HandshakeType::Finished,
-                                                                                message_seq,
-                                                                                fragment_offset: 0,
-                                                                                fragment_length: body.len() as u32,
-                                                                                body: body.freeze(),
-                                                                            };
-
-                                                                            let mut buf = BytesMut::new();
-                                                                            handshake_msg.encode(&mut buf);
-                                                                            handshake_messages
-                                                                                .extend_from_slice(&buf);
-
-                                                                            self.send_handshake_message(
-                                                                                handshake_msg,
-                                                                                epoch,
-                                                                                &mut sequence_number,
-                                                                                session_keys.as_ref(),
-                                                                                is_client,
-                                                                            )
-                                                                            .await?;
-                                                                            // message_seq += 1; // End of handshake
-
-                                                                            if let Some(keys) = &session_keys
-                                                                            {
-                                                                                *self.state.lock().await =
-                                                                                    DtlsState::Connected(keys.clone());
-                                                                            } else {
-                                                                                *self.state.lock().await =
-                                                                                    DtlsState::Failed;
-                                                                                return Err(anyhow::anyhow!(
-                                                                                    "Session keys not derived"
-                                                                                ));
-                                                                            }
-                                                                            // return Ok(());
-                                                                        } else {
-                                                                            // Client logic: Verify Finished
-                                                                            if let Some(keys) = &session_keys {
-                                                                                let expected_verify_data =
-                                                                                    calculate_verify_data(
-                                                                                        &keys.master_secret,
-                                                                                        b"server finished",
-                                                                                        &handshake_messages,
-                                                                                    )?;
-
-                                                                                if finished.verify_data
-                                                                                    != expected_verify_data
-                                                                                {
-                                                                                    eprintln!("Finished verification failed. Expected {:?}, got {:?}", expected_verify_data, finished.verify_data);
-                                                                                    *self.state.lock().await =
-                                                                                        DtlsState::Failed;
-                                                                                    return Err(anyhow::anyhow!("Finished verification failed"));
-                                                                                } else {
-                                                                                    println!("Finished verified");
-                                                                                    if let Some(keys) =
-                                                                                        &session_keys
-                                                                                    {
-                                                                                        *self.state.lock().await =
-                                                                                            DtlsState::Connected(
-                                                                                                keys.clone(),
-                                                                                            );
-                                                                                    }
-                                                                                    // return Ok(());
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                                HandshakeType::HelloVerifyRequest => {
-                                                                    println!("Received HelloVerifyRequest");
-                                                                    let mut body = msg.body.clone();
-                                                                    if let Ok(verify_req) =
-                                                                        HelloVerifyRequest::decode(&mut body)
-                                                                    {
-                                                                        println!(
-                                                                            "Resending ClientHello with cookie"
-                                                                        );
-
-                                                                        // Reset handshake messages
-                                                                        handshake_messages.clear();
-
-                                                                        // Reuse previous random
-                                                                        let random =
-                                                                            if let Some(bytes) = &client_random {
-                                                                                let gmt = u32::from_be_bytes([
-                                                                                    bytes[0], bytes[1], bytes[2],
-                                                                                    bytes[3],
-                                                                                ]);
-                                                                                let mut rb = [0u8; 28];
-                                                                                rb.copy_from_slice(&bytes[4..32]);
-                                                                                Random {
-                                                                                    gmt_unix_time: gmt,
-                                                                                    random_bytes: rb,
-                                                                                }
-                                                                            } else {
-                                                                                Random::new()
-                                                                            };
-                                                                        // client_random is already set, no need to update
-
-                                                                        let mut extensions = Vec::new();
-                                                                        // Supported Elliptic Curves (secp256r1)
-                                                                        extensions.extend_from_slice(&[
-                                                                            0x00, 0x0a, 0x00, 0x04, 0x00, 0x02,
-                                                                            0x00, 0x17,
-                                                                        ]);
-                                                                        // Supported Point Formats (uncompressed)
-                                                                        extensions.extend_from_slice(&[
-                                                                            0x00, 0x0b, 0x00, 0x02, 0x01, 0x00,
-                                                                        ]);
-
-                                                                        let client_hello = ClientHello {
-                                                                            version: ProtocolVersion::DTLS_1_2,
-                                                                            random,
-                                                                            session_id: vec![],
-                                                                            cookie: verify_req.cookie,
-                                                                            cipher_suites: vec![0xC02B],
-                                                                            compression_methods: vec![0],
-                                                                            extensions,
-                                                                        };
-
-                                                                        let mut body = BytesMut::new();
-                                                                        client_hello.encode(&mut body);
-
-                                                                        let handshake_msg = HandshakeMessage {
-                                                                            msg_type: HandshakeType::ClientHello,
-                                                                            message_seq,
-                                                                            fragment_offset: 0,
-                                                                            fragment_length: body.len() as u32,
-                                                                            body: body.freeze(),
-                                                                        };
-
-                                                                        let mut buf = BytesMut::new();
-                                                                        handshake_msg.encode(&mut buf);
-                                                                        handshake_messages.extend_from_slice(&buf);
-
-                                                                        self.send_handshake_message(
-                                                                            handshake_msg,
-                                                                            epoch,
-                                                                            &mut sequence_number,
-                                                                            None,
-                                                                            is_client,
-                                                                        )
-                                                                        .await?;
-                                                                        message_seq += 1;
-                                                                    }
-                                                                }
-                                                                HandshakeType::ServerHello => {
-                                                                    if is_client {
-                                                                        println!("Received ServerHello");
-                                                                        let mut body = msg.body.clone();
-                                                                        if let Ok(server_hello) =
-                                                                            ServerHello::decode(&mut body)
-                                                                        {
-                                                                            server_random = Some(
-                                                                                server_hello.random.to_bytes(),
-                                                                            );
-                                                                            println!(
-                                                                                "Server extensions len: {}",
-                                                                                server_hello.extensions.len()
-                                                                            );
-                                                                            if !server_hello.extensions.is_empty() {
-                                                                                println!(
-                                                                                    "Server extensions: {:?}",
-                                                                                    server_hello.extensions
-                                                                                );
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                                HandshakeType::Certificate => {
-                                                                    println!("Received Certificate");
-                                                                }
-                                                                HandshakeType::ServerKeyExchange => {
-                                                                    if is_client {
-                                                                        println!("Received ServerKeyExchange");
-                                                                        let mut body = msg.body.clone();
-                                                                        if let Ok(server_key_exchange) =
-                                                                            ServerKeyExchange::decode(&mut body)
-                                                                        {
-                                                                            peer_public_key = Some(
-                                                                                server_key_exchange.public_key,
-                                                                            );
-                                                                        }
-                                                                    }
-                                                                }
-                                                                HandshakeType::ServerHelloDone => {
-                                                                    println!("Received ServerHelloDone");
-
-                                                                    // Send ClientKeyExchange
-                                                                    let client_key_exchange = ClientKeyExchange {
-                                                                        identity_hint: vec![],
-                                                                        public_key: local_public_key_bytes.clone(),
-                                                                    };
-
-                                                                    let mut body = BytesMut::new();
-                                                                    client_key_exchange.encode(&mut body);
-
-                                                                    let handshake_msg = HandshakeMessage {
-                                                                        msg_type: HandshakeType::ClientKeyExchange,
-                                                                        message_seq,
-                                                                        fragment_offset: 0,
-                                                                        fragment_length: body.len() as u32,
-                                                                        body: body.freeze(),
-                                                                    };
-
-                                                                    let mut buf = BytesMut::new();
-                                                                    handshake_msg.encode(&mut buf);
-                                                                    handshake_messages.extend_from_slice(&buf);
-
-                                                                    self.send_handshake_message(
-                                                                        handshake_msg,
-                                                                        epoch,
-                                                                        &mut sequence_number,
-                                                                        None,
-                                                                        is_client,
-                                                                    )
-                                                                    .await?;
-                                                                    message_seq += 1;
-
-                                                                    // Compute shared secret
-                                                                    if let Some(peer_key) = &peer_public_key {
-                                                                        if let Some(secret) =
-                                                                            local_secret_opt.take()
-                                                                        {
-                                                                            if let Ok(pk) =
-                                                                                PublicKey::from_sec1_bytes(peer_key)
-                                                                            {
-                                                                                let shared_secret =
-                                                                                    secret.diffie_hellman(&pk);
-                                                                                println!("Shared secret computed (Client)");
-
-                                                                                if let (Some(cr), Some(sr)) =
-                                                                                    (&client_random, &server_random)
-                                                                                {
-                                                                                    let pre_master_secret =
-                                                                                        shared_secret
-                                                                                            .raw_secret_bytes();
-                                                                                    let mut seed = Vec::new();
-                                                                                    seed.extend_from_slice(cr);
-                                                                                    seed.extend_from_slice(sr);
-
-                                                                                    if let Ok(master_secret) =
-                                                                                        prf_sha256(
-                                                                                            pre_master_secret,
-                                                                                            b"master secret",
-                                                                                            &seed,
-                                                                                            48,
-                                                                                        )
-                                                                                    {
-                                                                                        println!("Master secret derived: {:?}", master_secret);
-                                                                                        if let Ok(keys) =
-                                                                                            expand_keys(
-                                                                                                &master_secret,
-                                                                                                cr,
-                                                                                                sr,
-                                                                                            )
-                                                                                        {
-                                                                                            println!("Session keys derived (Client)");
-                                                                                            session_keys =
-                                                                                                Some(keys);
-
-                                                                                            // Send ChangeCipherSpec
-                                                                                            let record = DtlsRecord {
-                                                                                                content_type: ContentType::ChangeCipherSpec,
-                                                                                                version: ProtocolVersion::DTLS_1_2,
-                                                                                                epoch,
-                                                                                                sequence_number,
-                                                                                                payload: Bytes::from_static(&[1]),
-                                                                                            };
-
-                                                                                            let mut buf =
-                                                                                                BytesMut::new();
-                                                                                            record.encode(&mut buf);
-                                                                                            self.conn
-                                                                                                .send(&buf)
-                                                                                                .await?;
-
-                                                                                            epoch += 1;
-                                                                                            sequence_number = 0;
-
-                                                                                            // Send Finished
-                                                                                            let verify_data = calculate_verify_data(&master_secret, b"client finished", &handshake_messages)?;
-
-                                                                                            let finished =
-                                                                                                Finished {
-                                                                                                    verify_data,
-                                                                                                };
-
-                                                                                            let mut body =
-                                                                                                BytesMut::new();
-                                                                                            finished
-                                                                                                .encode(&mut body);
-
-                                                                                            let handshake_msg = HandshakeMessage {
-                                                                                                msg_type: HandshakeType::Finished,
-                                                                                                message_seq,
-                                                                                                fragment_offset: 0,
-                                                                                                fragment_length: body.len() as u32,
-                                                                                                body: body.freeze(),
-                                                                                            };
-
-                                                                                            let mut buf =
-                                                                                                BytesMut::new();
-                                                                                            handshake_msg
-                                                                                                .encode(&mut buf);
-                                                                                            handshake_messages
-                                                                                                .extend_from_slice(
-                                                                                                    &buf,
-                                                                                                );
-
-                                                                                            self.send_handshake_message(handshake_msg, epoch, &mut sequence_number, session_keys.as_ref(), is_client).await?;
-                                                                                            message_seq += 1;
-                                                                                        }
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                                _ => {}
-                                                            }
-                                                        }
-                                                        Err(e) => {
-                                                            eprintln!("Failed to decode handshake message: {}", e);
-                                                            body = Bytes::new();
-                                                        }
-                                                    }
-                                                }
-                                    }
-                                    ContentType::Alert => {
-                                        println!("Received Alert: {:?}", payload);
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("Failed to decode DTLS record: {}", e);
-                                data = Bytes::new();
-                            }
-                        }
-                    }
+                    self.handle_incoming_packet(packet, &mut ctx, &incoming_data_tx, &certificate, is_client).await?;
                 }
                 Some(data) = outgoing_data_rx.recv() => {
-                    if let Some(keys) = &session_keys {
+                    if let Some(keys) = &ctx.session_keys {
                         let (key, iv) = if is_client {
                             (&keys.client_write_key, &keys.client_write_iv)
                         } else {
                             (&keys.server_write_key, &keys.server_write_iv)
                         };
 
-                        let full_seq = ((epoch as u64) << 48) | sequence_number;
+                        let full_seq = ((ctx.epoch as u64) << 48) | ctx.sequence_number;
 
                         match encrypt_record(
                             ContentType::ApplicationData,
@@ -1050,22 +1105,22 @@ impl DtlsTransport {
                                 let record = DtlsRecord {
                                     content_type: ContentType::ApplicationData,
                                     version: ProtocolVersion::DTLS_1_2,
-                                    epoch,
-                                    sequence_number,
+                                    epoch: ctx.epoch,
+                                    sequence_number: ctx.sequence_number,
                                     payload: Bytes::from(encrypted),
                                 };
-                                sequence_number += 1;
+                                ctx.sequence_number += 1;
 
                                 let mut buf = BytesMut::new();
                                 record.encode(&mut buf);
                                 if let Err(e) = self.conn.send(&buf).await {
-                                     eprintln!("Failed to send application data: {}", e);
+                                     warn!("Failed to send application data: {}", e);
                                 }
                             },
-                            Err(e) => eprintln!("Failed to encrypt application data: {}", e),
+                            Err(e) => warn!("Failed to encrypt application data: {}", e),
                         }
                     } else {
-                        eprintln!("Cannot send application data: handshake not completed");
+                        warn!("Cannot send application data: handshake not completed");
                     }
                 }
             }
@@ -1084,7 +1139,7 @@ impl DtlsTransport {
         msg.encode(&mut buf);
         let payload = buf.freeze();
 
-        println!(
+        debug!(
             "Sending HandshakeMessage: {:?} len={}",
             msg.msg_type,
             payload.len()
@@ -1124,7 +1179,11 @@ impl DtlsTransport {
 
         let mut buf = BytesMut::new();
         record.encode(&mut buf);
-        self.conn.send(&buf).await?;
+        debug!("Sending DTLS record: len={}", buf.len());
+        if let Err(e) = self.conn.send(&buf).await {
+            warn!("Failed to send DTLS record: {}", e);
+            return Err(e);
+        }
 
         Ok(buf.to_vec())
     }
@@ -1135,6 +1194,8 @@ impl Clone for DtlsTransport {
         Self {
             conn: self.conn.clone(),
             state: self.state.clone(),
+            state_tx: self.state_tx.clone(),
+            state_rx: self.state_rx.clone(),
             incoming_data_rx: self.incoming_data_rx.clone(),
             outgoing_data_tx: self.outgoing_data_tx.clone(),
             handshake_rx_feeder: self.handshake_rx_feeder.clone(),
@@ -1219,7 +1280,7 @@ fn calculate_verify_data(
     let mut hasher = Sha256::new();
     hasher.update(handshake_messages);
     let hash = hasher.finalize();
-    println!(
+    trace!(
         "VerifyData: label={:?} hash={:?}",
         String::from_utf8_lossy(label),
         hash
@@ -1274,7 +1335,7 @@ fn decrypt_record(
     let plaintext_len = ciphertext.len() - 16;
     let aad = make_aad(seq, content_type, version, plaintext_len);
 
-    println!(
+    trace!(
         "Decrypting: seq={} epoch={} seq_num={} type={:?} ver={:?} len={}",
         seq,
         seq >> 48,
@@ -1283,10 +1344,10 @@ fn decrypt_record(
         version,
         plaintext_len
     );
-    println!("Nonce: {:?}", nonce_bytes);
-    println!("AAD: {:?}", aad);
-    println!("Key: {:?}", key);
-    println!("IV: {:?}", iv);
+    trace!("Nonce: {:?}", nonce_bytes);
+    trace!("AAD: {:?}", aad);
+    trace!("Key: {:?}", key);
+    trace!("IV: {:?}", iv);
 
     let decrypted_payload = cipher
         .decrypt(
@@ -1334,4 +1395,45 @@ fn encrypt_record(
     result.extend_from_slice(&encrypted_payload);
 
     Ok(result)
+}
+
+struct HandshakeContext {
+    sequence_number: u64,
+    epoch: u16,
+    message_seq: u16,
+    last_flight_buffer: Option<Vec<u8>>,
+    local_secret: Option<EphemeralSecret>,
+    local_public_key_bytes: Vec<u8>,
+    peer_public_key: Option<Vec<u8>>,
+    client_random: Option<Vec<u8>>,
+    server_random: Option<Vec<u8>>,
+    session_keys: Option<SessionKeys>,
+    handshake_messages: Vec<u8>,
+    ems_negotiated: bool,
+    srtp_profile: Option<u16>,
+}
+
+impl HandshakeContext {
+    fn new() -> Self {
+        // Generate ephemeral key for ECDHE
+        let local_secret = EphemeralSecret::random(&mut OsRng);
+        let local_public = local_secret.public_key();
+        let local_public_key_bytes = local_public.to_encoded_point(false).as_bytes().to_vec();
+
+        Self {
+            sequence_number: 0,
+            epoch: 0,
+            message_seq: 0,
+            last_flight_buffer: None,
+            local_secret: Some(local_secret),
+            local_public_key_bytes,
+            peer_public_key: None,
+            client_random: None,
+            server_random: None,
+            session_keys: None,
+            handshake_messages: Vec::new(),
+            ems_negotiated: false,
+            srtp_profile: None,
+        }
+    }
 }

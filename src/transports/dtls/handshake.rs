@@ -1,6 +1,7 @@
 use super::record::ProtocolVersion;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use tracing::trace;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandshakeType {
@@ -121,8 +122,9 @@ impl Random {
         let since_the_epoch = start.duration_since(UNIX_EPOCH).unwrap();
         let gmt_unix_time = since_the_epoch.as_secs() as u32;
 
-        // TODO: Use a proper random number generator
-        let random_bytes = [0u8; 28];
+        let mut random_bytes = [0u8; 28];
+        use rand_core::{OsRng, RngCore};
+        OsRng.fill_bytes(&mut random_bytes);
 
         Self {
             gmt_unix_time,
@@ -389,7 +391,7 @@ pub struct ServerKeyExchange {
 impl ServerKeyExchange {
     pub fn encode(&self, buf: &mut BytesMut) {
         let start_len = buf.len();
-        println!(
+        trace!(
             "Encoding ServerKeyExchange: curve_type={}, named_curve={}, pubkey_len={}, sig_len={}",
             self.curve_type,
             self.named_curve,
@@ -407,18 +409,12 @@ impl ServerKeyExchange {
         // ECDSA
         buf.put_u8(3);
 
-        // buf.put_u16(self.signature.len() as u16);
-        // buf.put_slice(&self.signature);
         buf.put_u16(self.signature.len() as u16);
         buf.put_slice(&self.signature);
-        // buf.put_u16(0);
-
-        // Dummy byte to debug "failed to fill whole buffer"
-        // buf.put_u8(0);
 
         let end_len = buf.len();
         let encoded = &buf[start_len..end_len];
-        println!("Encoded ServerKeyExchange bytes: {:02X?}", encoded);
+        trace!("Encoded ServerKeyExchange bytes: {:02X?}", encoded);
     }
 
     pub fn decode(buf: &mut Bytes) -> Result<Self> {
@@ -498,7 +494,7 @@ impl ClientKeyExchange {
         if buf.is_empty() {
             bail!("ClientKeyExchange too short");
         }
-        println!("ClientKeyExchange raw body: {:?}", buf);
+        trace!("ClientKeyExchange raw body: {:?}", buf);
         let public_key_len = buf.get_u8() as usize;
         if buf.len() < public_key_len {
             bail!("ClientKeyExchange too short for public key");

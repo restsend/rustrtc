@@ -20,8 +20,16 @@ async fn test_srtp_interop_loopback() -> Result<()> {
     // 2. Create SRTP Sessions
     // Note: In a real scenario, one is sender, one is receiver, or both.
     // SrtpSession handles both protect (send) and unprotect (recv).
-    let mut srtp_a = SrtpSession::new(0x11223344, SrtpProfile::Aes128Sha1_80, km_a)?;
-    let mut srtp_b = SrtpSession::new(0x11223344, SrtpProfile::Aes128Sha1_80, km_b)?;
+    let mut tx_session = SrtpSession::new(
+        SrtpProfile::Aes128Sha1_80,
+        km_a.clone(),
+        km_a,
+    )?;
+    let mut rx_session = SrtpSession::new(
+        SrtpProfile::Aes128Sha1_80,
+        km_b.clone(),
+        km_b,
+    )?;
 
     // 3. Setup UDP Transport
     let socket_a = UdpSocket::bind("127.0.0.1:0").await?;
@@ -40,7 +48,7 @@ async fn test_srtp_interop_loopback() -> Result<()> {
     println!("Original payload: {:02X?}", packet.payload);
 
     // Protect (Encrypt)
-    srtp_a.protect_rtp(&mut packet)?;
+    tx_session.protect_rtp(&mut packet)?;
     println!("Protected payload (encrypted): {:02X?}", packet.payload);
     assert_ne!(packet.payload, payload, "Payload should be encrypted");
 
@@ -54,7 +62,7 @@ async fn test_srtp_interop_loopback() -> Result<()> {
     };
 
     // 7. Unprotect (Decrypt)
-    srtp_b.unprotect_rtp(&mut received)?;
+    rx_session.unprotect_rtp(&mut received)?;
     println!("Decrypted payload: {:02X?}", received.payload);
 
     // 8. Verify

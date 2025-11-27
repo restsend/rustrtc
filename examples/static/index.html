@@ -22,6 +22,11 @@
 <body>
     <h1>RustRTC Echo Demo</h1>
     <div>
+        <label for="backendSelect">Backend:</label>
+        <select id="backendSelect">
+            <option value="rustrtc">RustRTC</option>
+            <option value="webrtc-rs">WebRTC.rs</option>
+        </select>
         <button onclick="start()" id="startBtn">Start Connection</button>
     </div>
     <div style="margin-top: 10px;">
@@ -117,7 +122,11 @@
             };
 
             pc.onicecandidate = (e) => {
-                // We are using non-trickle for simplicity in this demo
+                if (e.candidate) {
+                    log("New ICE candidate: " + e.candidate.candidate);
+                } else {
+                    log("End of candidates.");
+                }
             };
 
             const offer = await pc.createOffer();
@@ -138,22 +147,25 @@
                     pc.addEventListener('icegatheringstatechange', check);
                 }
             });
-            log("Gathering complete. Sending offer...");
-
             // Update local description with gathered candidates
             const offerSdp = pc.localDescription.sdp;
+            log("Sending Offer SDP: " + offerSdp);
+
+            const backend = document.getElementById('backendSelect').value;
+            log("Using backend: " + backend);
 
             const response = await fetch('/offer', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     sdp: offerSdp,
-                    type: pc.localDescription.type
+                    type: pc.localDescription.type,
+                    backend: backend
                 })
             });
 
             const answer = await response.json();
-            log("Received answer");
+            log("Received Answer SDP: " + answer.sdp);
             await pc.setRemoteDescription(new RTCSessionDescription({
                 type: answer.type,
                 sdp: answer.sdp

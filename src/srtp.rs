@@ -4,12 +4,13 @@ use crate::{
 };
 use aes::Aes128;
 use aes_gcm::{
-    aead::{Aead, KeyInit, Payload},
     Aes128Gcm, Nonce,
+    aead::{Aead, KeyInit, Payload},
 };
-use ctr::cipher::{generic_array::GenericArray, KeyIvInit, StreamCipher};
+use ctr::cipher::{KeyIvInit, StreamCipher, generic_array::GenericArray};
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
+use std::collections::HashMap;
 
 type Aes128Ctr = ctr::Ctr128BE<Aes128>;
 type HmacSha1 = Hmac<Sha1>;
@@ -66,27 +67,52 @@ pub enum SrtpDirection {
 }
 
 pub struct SrtpSession {
-    tx: SrtpContext,
-    rx: SrtpContext,
+    profile: SrtpProfile,
+    tx_keying: SrtpKeyingMaterial,
+    rx_keying: SrtpKeyingMaterial,
+    tx_contexts: HashMap<u32, SrtpContext>,
+    rx_contexts: HashMap<u32, SrtpContext>,
 }
 
 impl SrtpSession {
     pub fn new(
-        ssrc: u32,
         profile: SrtpProfile,
-        keying: SrtpKeyingMaterial,
+        tx_keying: SrtpKeyingMaterial,
+        rx_keying: SrtpKeyingMaterial,
     ) -> Result<Self, SrtpError> {
-        let tx = SrtpContext::new(ssrc, profile, keying.clone(), SrtpDirection::Sender)?;
-        let rx = SrtpContext::new(ssrc, profile, keying, SrtpDirection::Receiver)?;
-        Ok(Self { tx, rx })
+        Ok(Self {
+            profile,
+            tx_keying,
+            rx_keying,
+            tx_contexts: HashMap::new(),
+            rx_contexts: HashMap::new(),
+        })
     }
 
     pub fn protect_rtp(&mut self, packet: &mut RtpPacket) -> SrtpResult<()> {
-        self.tx.protect(packet)
+        let ssrc = packet.header.ssrc;
+        let ctx = self.tx_contexts.entry(ssrc).or_insert_with(|| {
+            SrtpContext::new(
+                ssrc,
+                self.profile,
+                self.tx_keying.clone(),
+                SrtpDirection::Sender,
+            ).unwrap()
+        });
+        ctx.protect(packet)
     }
 
     pub fn unprotect_rtp(&mut self, packet: &mut RtpPacket) -> SrtpResult<()> {
-        self.rx.unprotect(packet)
+        let ssrc = packet.header.ssrc;
+        let ctx = self.rx_contexts.entry(ssrc).or_insert_with(|| {
+            SrtpContext::new(
+                ssrc,
+                self.profile,
+                self.rx_keying.clone(),
+                SrtpDirection::Receiver,
+            ).unwrap()
+        });
+        ctx.unprotect(packet)
     }
 }
 
@@ -304,7 +330,7 @@ mod tests {
     #[test]
     fn protect_and_unprotect_roundtrip() {
         let mut session =
-            SrtpSession::new(0xdead_beef, SrtpProfile::Aes128Sha1_80, material()).unwrap();
+            SrtpSession::new(SrtpProfile::Aes128Sha1_80, material(), material()).unwrap();
         let mut packet = sample_packet(1);
         let original = packet.payload.clone();
         session.protect_rtp(&mut packet).unwrap();
@@ -317,7 +343,7 @@ mod tests {
     #[test]
     fn protect_and_unprotect_roundtrip_gcm() {
         let mut session =
-            SrtpSession::new(0xdead_beef, SrtpProfile::AeadAes128Gcm, material()).unwrap();
+            SrtpSession::new(SrtpProfile::AeadAes128Gcm, material(), material()).unwrap();
         let mut packet = sample_packet(1);
         let original = packet.payload.clone();
         session.protect_rtp(&mut packet).unwrap();

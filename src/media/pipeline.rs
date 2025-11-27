@@ -1,18 +1,18 @@
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use async_trait::async_trait;
 use tokio::{
-    sync::{mpsc, Mutex},
+    sync::{Mutex, mpsc},
     task::JoinHandle,
 };
 
 use crate::{
     media::error::{MediaError, MediaResult},
     media::frame::{MediaKind, MediaSample},
-    media::track::{sample_track, MediaStreamTrack, SampleStreamSource, SampleStreamTrack},
+    media::track::{MediaStreamTrack, SampleStreamSource, SampleStreamTrack, sample_track},
 };
 
 #[async_trait]

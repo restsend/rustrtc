@@ -22,7 +22,7 @@ pub use sdp::{
 };
 pub use srtp::{SrtpContext, SrtpDirection, SrtpKeyingMaterial, SrtpProfile, SrtpSession};
 pub use stats::{
-    gather_once, DynProvider, StatsEntry, StatsId, StatsKind, StatsProvider, StatsReport,
+    DynProvider, StatsEntry, StatsId, StatsKind, StatsProvider, StatsReport, gather_once,
 };
 pub use transports::ice::{
     IceCandidate, IceCandidatePair, IceCandidateType, IceGathererState, IceRole, IceTransport,

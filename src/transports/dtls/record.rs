@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,8 +32,14 @@ pub struct ProtocolVersion {
 }
 
 impl ProtocolVersion {
-    pub const DTLS_1_0: Self = Self { major: 254, minor: 255 };
-    pub const DTLS_1_2: Self = Self { major: 254, minor: 253 };
+    pub const DTLS_1_0: Self = Self {
+        major: 254,
+        minor: 255,
+    };
+    pub const DTLS_1_2: Self = Self {
+        major: 254,
+        minor: 253,
+    };
 }
 
 #[derive(Debug, Clone)]
@@ -53,7 +59,7 @@ impl DtlsRecord {
         buf.put_u8(self.version.major);
         buf.put_u8(self.version.minor);
         buf.put_u16(self.epoch);
-        
+
         // 48-bit sequence number
         buf.put_u8((self.sequence_number >> 40) as u8);
         buf.put_u8((self.sequence_number >> 32) as u8);
@@ -75,9 +81,9 @@ impl DtlsRecord {
         let major = buf[1];
         let minor = buf[2];
         let version = ProtocolVersion { major, minor };
-        
+
         let epoch = u16::from_be_bytes([buf[3], buf[4]]);
-        
+
         let mut seq_bytes = [0u8; 8];
         seq_bytes[2..8].copy_from_slice(&buf[5..11]);
         let sequence_number = u64::from_be_bytes(seq_bytes);

@@ -2,7 +2,7 @@ use rustrtc::transports::ice::stun::{StunAttribute, StunMessage};
 use std::net::SocketAddr;
 use webrtc::stun::integrity::MessageIntegrity;
 use webrtc::stun::message::Getter;
-use webrtc::stun::message::{Message, BINDING_REQUEST};
+use webrtc::stun::message::{BINDING_REQUEST, Message};
 use webrtc::stun::xoraddr::XorMappedAddress;
 
 #[test]

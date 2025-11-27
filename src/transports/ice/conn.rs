@@ -6,6 +6,7 @@ use bytes::Bytes;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::{debug, warn};
 
 pub struct IceConn {
     pub socket: IceSocketWrapper,
@@ -49,12 +50,15 @@ impl PacketReceiver for IceConn {
         if current_remote.port() == 0 {
             *self.remote_addr.write().await = addr;
         } else if addr != current_remote {
-            // Drop packets from other addresses
-            println!(
-                "IceConn: Dropping packet from {:?} (expected {:?})",
-                addr, current_remote
+            // Allow updating remote address if it changes (e.g. peer reflexive)
+            // For now, just update it.
+            // In a real implementation, we should validate this against valid candidates or check ICE state.
+            // But since we are in a single connection state, we can assume the peer might have switched candidates.
+            debug!(
+                "IceConn: Remote address changed from {:?} to {:?}",
+                current_remote, addr
             );
-            return;
+            *self.remote_addr.write().await = addr;
         }
 
         if packet.is_empty() {
@@ -62,7 +66,7 @@ impl PacketReceiver for IceConn {
         }
 
         let first_byte = packet[0];
-        println!(
+        debug!(
             "IceConn: Received packet from {:?} len={} first_byte={}",
             addr,
             packet.len(),
@@ -74,7 +78,7 @@ impl PacketReceiver for IceConn {
             if let Some(rx) = &*self.dtls_receiver.read().await {
                 rx.receive(packet, addr).await;
             } else {
-                println!("IceConn: Received DTLS packet but no receiver registered");
+                warn!("IceConn: Received DTLS packet but no receiver registered");
             }
         } else if (128..192).contains(&first_byte) {
             // RTP / RTCP

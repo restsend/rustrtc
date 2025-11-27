@@ -3,6 +3,7 @@ use anyhow::Result;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
+use tracing::{debug, trace, warn};
 
 pub struct SctpTransport {
     dtls_transport: Arc<DtlsTransport>,
@@ -12,6 +13,7 @@ pub struct SctpTransport {
     remote_port: u16,
     verification_tag: Mutex<u32>,
     remote_verification_tag: Mutex<u32>,
+    next_tsn: Mutex<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +35,7 @@ pub struct DataChannel {
     pub id: u16,
     pub label: String,
     pub state: Mutex<DataChannelState>,
+    pub next_ssn: Mutex<u16>,
     tx: mpsc::UnboundedSender<DataChannelEvent>,
     rx: Mutex<mpsc::UnboundedReceiver<DataChannelEvent>>,
 }
@@ -80,6 +83,7 @@ impl SctpTransport {
             remote_port: 5000,
             verification_tag: Mutex::new(0),
             remote_verification_tag: Mutex::new(0),
+            next_tsn: Mutex::new(0),
         });
 
         let t_clone = transport.clone();
@@ -103,11 +107,11 @@ impl SctpTransport {
             match self.dtls_transport.recv().await {
                 Ok(packet) => {
                     if let Err(e) = self.handle_packet(&packet).await {
-                        eprintln!("SCTP handle packet error: {}", e);
+                        warn!("SCTP handle packet error: {}", e);
                     }
                 }
                 Err(e) => {
-                    eprintln!("SCTP loop error: {}", e);
+                    warn!("SCTP loop error: {}", e);
                     break;
                 }
             }
@@ -157,7 +161,7 @@ impl SctpTransport {
                 CT_DATA => self.handle_data(chunk_flags, chunk_value).await?,
                 CT_HEARTBEAT => self.handle_heartbeat(chunk_value).await?,
                 _ => {
-                    println!("Unhandled SCTP chunk type: {}", chunk_type);
+                    debug!("Unhandled SCTP chunk type: {}", chunk_type);
                 }
             }
         }
@@ -165,7 +169,7 @@ impl SctpTransport {
     }
 
     async fn handle_init(&self, _remote_tag: u32, chunk: Bytes) -> Result<()> {
-        println!("Received SCTP INIT");
+        debug!("Received SCTP INIT");
         let mut buf = chunk;
         if buf.remaining() < 16 {
             // Fixed params
@@ -215,7 +219,7 @@ impl SctpTransport {
     }
 
     async fn handle_cookie_echo(&self, _chunk: Bytes) -> Result<()> {
-        println!("Received SCTP COOKIE ECHO");
+        debug!("Received SCTP COOKIE ECHO");
         // Verify cookie (skip for now)
 
         // Send COOKIE ACK
@@ -228,7 +232,7 @@ impl SctpTransport {
         .await?;
 
         *self.state.lock().await = SctpState::Connected;
-        println!("SCTP Connected");
+        debug!("SCTP Connected");
 
         {
             let channels = self.data_channels.lock().await;
@@ -242,7 +246,7 @@ impl SctpTransport {
     }
 
     async fn handle_heartbeat(&self, chunk: Bytes) -> Result<()> {
-        println!("Received SCTP HEARTBEAT");
+        debug!("Received SCTP HEARTBEAT");
         // Send HEARTBEAT ACK with same info
         // ...
 
@@ -257,7 +261,7 @@ impl SctpTransport {
     }
 
     async fn handle_data(&self, _flags: u8, chunk: Bytes) -> Result<()> {
-        println!("Received SCTP DATA");
+        debug!("Received SCTP DATA");
         let mut buf = chunk;
         if buf.remaining() < 12 {
             return Ok(());
@@ -268,7 +272,7 @@ impl SctpTransport {
         let payload_proto = buf.get_u32();
 
         let user_data = buf;
-        println!(
+        trace!(
             "DATA chunk: stream={} seq={} proto={} len={}",
             stream_id,
             stream_seq,
@@ -294,7 +298,7 @@ impl SctpTransport {
         // Dispatch to channel
         // For now, just print
         if let Ok(s) = std::str::from_utf8(&user_data) {
-            println!("Received Data: {}", s);
+            debug!("Received Data: {}", s);
         }
 
         // Store in the correct channel
@@ -347,12 +351,32 @@ impl SctpTransport {
         self.dtls_transport.send(&packet_bytes).await
     }
 
-    pub async fn send_data(&self, _channel_id: u16, data: &[u8]) -> Result<()> {
+    pub async fn send_data(&self, channel_id: u16, data: &[u8]) -> Result<()> {
         // Wrap in DATA chunk
         let mut payload = BytesMut::new();
-        payload.put_u32(0); // TSN (Mock)
-        payload.put_u16(0); // Stream ID
-        payload.put_u16(0); // Stream Seq
+
+        let tsn = {
+            let mut tsn_guard = self.next_tsn.lock().await;
+            let tsn = *tsn_guard;
+            *tsn_guard = tsn.wrapping_add(1);
+            tsn
+        };
+
+        let ssn = {
+            let channels = self.data_channels.lock().await;
+            if let Some(dc) = channels.iter().find(|c| c.id == channel_id) {
+                let mut ssn_guard = dc.next_ssn.lock().await;
+                let ssn = *ssn_guard;
+                *ssn_guard = ssn.wrapping_add(1);
+                ssn
+            } else {
+                0
+            }
+        };
+
+        payload.put_u32(tsn); // TSN
+        payload.put_u16(channel_id); // Stream ID
+        payload.put_u16(ssn); // Stream Seq
         payload.put_u32(51); // PPID: WebRTC String (51) or Binary (53)
         payload.put_slice(data);
 
@@ -368,6 +392,7 @@ impl DataChannel {
             id,
             label,
             state: Mutex::new(DataChannelState::Connecting),
+            next_ssn: Mutex::new(0),
             tx,
             rx: Mutex::new(rx),
         }

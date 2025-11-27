@@ -1,7 +1,7 @@
+use rustrtc::RtcConfiguration;
 use rustrtc::media::frame::{AudioFrame, MediaKind};
 use rustrtc::media::track::sample_track;
 use rustrtc::peer_connection::PeerConnection;
-use rustrtc::RtcConfiguration;
 use std::time::Duration;
 use tokio::time::sleep;
 

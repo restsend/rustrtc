@@ -8,6 +8,7 @@ use dtls::listener::listen;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
+use tracing::{error, info};
 use webrtc_util::conn::Listener;
 
 #[tokio::test]
@@ -25,20 +26,20 @@ async fn test_interop_rustrtc_client_webrtc_server() -> Result<()> {
     let listener = listen("127.0.0.1:0", config).await?;
     let server_addr = listener.addr().await?;
 
-    println!("webrtc-dtls server listening on {}", server_addr);
+    info!("webrtc-dtls server listening on {}", server_addr);
 
     tokio::spawn(async move {
         while let Ok((conn, _)) = listener.accept().await {
-            println!("webrtc-dtls server accepted connection");
+            info!("webrtc-dtls server accepted connection");
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 1024];
                 while let Ok(n) = conn.recv(&mut buf).await {
-                    println!(
+                    info!(
                         "webrtc-dtls server received: {}",
                         String::from_utf8_lossy(&buf[..n])
                     );
                     if let Err(e) = conn.send(&buf[..n]).await {
-                        eprintln!("webrtc-dtls server send error: {}", e);
+                        error!("webrtc-dtls server send error: {}", e);
                         break;
                     }
                 }
@@ -71,7 +72,7 @@ async fn test_interop_rustrtc_client_webrtc_server() -> Result<()> {
                     conn_clone.receive(packet, addr).await;
                 }
                 Err(e) => {
-                    eprintln!("Client socket read error: {}", e);
+                    error!("Client socket read error: {}", e);
                     break;
                 }
             }
@@ -88,26 +89,26 @@ async fn test_interop_rustrtc_client_webrtc_server() -> Result<()> {
     {
         let state = client_dtls.state.lock().await;
         match *state {
-            DtlsState::Connected(_) => println!("rustrtc client connected!"),
-            _ => panic!("rustrtc client failed to connect, state: {:?}", *state),
+            DtlsState::Connected(..) => info!("rustrtc client connected!"),
+            _ => panic!("rustrtc client failed to connect, state: {}", *state),
         }
     }
 
     // Send data
     let msg = b"hello world";
-    println!("rustrtc client sending: {:?}", String::from_utf8_lossy(msg));
+    info!("rustrtc client sending: {:?}", String::from_utf8_lossy(msg));
     client_dtls.send(msg).await?;
 
     // Receive echo
-    println!("rustrtc client waiting for echo...");
+    info!("rustrtc client waiting for echo...");
     let echo = client_dtls.recv().await?;
-    println!(
+    info!(
         "rustrtc client received: {:?}",
         String::from_utf8_lossy(&echo)
     );
 
     assert_eq!(echo, msg);
-    println!("Echo verified!");
+    info!("Echo verified!");
 
     Ok(())
 }

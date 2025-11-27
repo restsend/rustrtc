@@ -5,11 +5,13 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
+use tracing::{debug, warn};
 
-use crate::rtp::{is_rtcp, marshal_rtcp_packets, parse_rtcp_packets, RtcpPacket, RtpPacket};
-use crate::transports::ice::conn::IceConn;
+use crate::rtp::{RtcpPacket, RtpPacket, is_rtcp, marshal_rtcp_packets, parse_rtcp_packets};
+use crate::srtp::SrtpSession;
 use crate::transports::PacketReceiver;
+use crate::transports::ice::conn::IceConn;
 
 #[derive(Debug)]
 pub enum ReceivedPacket {
@@ -32,6 +34,7 @@ pub struct UdpRtpEndpoint {
 pub struct RtpTransport {
     ice_conn: Mutex<Option<Arc<IceConn>>>,
     listeners: Mutex<HashMap<u32, mpsc::Sender<RtpPacket>>>,
+    srtp_session: Mutex<Option<SrtpSession>>,
 }
 
 impl RtpTransport {
@@ -39,7 +42,12 @@ impl RtpTransport {
         Self {
             ice_conn: Mutex::new(Some(ice_conn)),
             listeners: Mutex::new(HashMap::new()),
+            srtp_session: Mutex::new(None),
         }
+    }
+
+    pub async fn start_srtp(&self, session: SrtpSession) {
+        *self.srtp_session.lock().await = Some(session);
     }
 
     pub async fn register_listener(&self, ssrc: u32, sender: mpsc::Sender<RtpPacket>) {
@@ -47,11 +55,21 @@ impl RtpTransport {
     }
 
     pub async fn send_rtp(&self, packet: &RtpPacket) -> Result<()> {
+        let mut packet = packet.clone();
+        {
+            let mut session = self.srtp_session.lock().await;
+            if let Some(s) = &mut *session {
+                s.protect_rtp(&mut packet)
+                    .map_err(|e| anyhow::anyhow!("SRTP protect failed: {:?}", e))?;
+            }
+        }
         let bytes = packet.marshal().context("marshal RTP")?;
         if let Some(conn) = &*self.ice_conn.lock().await {
+            debug!("RtpTransport sending {} bytes via ICE", bytes.len());
             conn.send(&bytes).await.context("send RTP via ICE")?;
             Ok(())
         } else {
+            warn!("ICE connection not set when sending RTP");
             Err(anyhow::anyhow!("ICE connection not set"))
         }
     }
@@ -60,12 +78,33 @@ impl RtpTransport {
 #[async_trait]
 impl PacketReceiver for RtpTransport {
     async fn receive(&self, packet: Bytes, _addr: SocketAddr) {
-        if let Ok(rtp) = RtpPacket::parse(&packet) {
+        if let Ok(mut rtp) = RtpPacket::parse(&packet) {
+            {
+                let mut session = self.srtp_session.lock().await;
+                if let Some(s) = &mut *session {
+                    if let Err(e) = s.unprotect_rtp(&mut rtp) {
+                        debug!("SRTP unprotect failed: {:?}", e);
+                        return;
+                    }
+                }
+            }
+
             let ssrc = rtp.header.ssrc;
             let listeners = self.listeners.lock().await;
             if let Some(sender) = listeners.get(&ssrc) {
+                debug!(
+                    "RtpTransport dispatching RTP packet ssrc={} to listener",
+                    ssrc
+                );
                 let _ = sender.send(rtp).await;
+            } else {
+                debug!(
+                    "RtpTransport received RTP packet ssrc={} but no listener found",
+                    ssrc
+                );
             }
+        } else {
+            debug!("RtpTransport received non-RTP packet len={}", packet.len());
         }
     }
 }
@@ -247,13 +286,13 @@ mod tests {
     async fn srtp_over_udp_roundtrip() -> Result<()> {
         let (a, b) = loopback_pair(true).await?;
         let mut tx_session = SrtpSession::new(
-            0x0102_0304,
             SrtpProfile::Aes128Sha1_80,
+            SrtpKeyingMaterial::new(vec![0u8; 16], vec![0u8; 14]),
             SrtpKeyingMaterial::new(vec![0u8; 16], vec![0u8; 14]),
         )?;
         let mut rx_session = SrtpSession::new(
-            0x0102_0304,
             SrtpProfile::Aes128Sha1_80,
+            SrtpKeyingMaterial::new(vec![0u8; 16], vec![0u8; 14]),
             SrtpKeyingMaterial::new(vec![0u8; 16], vec![0u8; 14]),
         )?;
 
@@ -284,11 +323,13 @@ mod tests {
         stun_packet[6] = 0xA4;
         stun_packet[7] = 0x42;
 
+        let sender = UdpSocket::bind("127.0.0.1:0").await?;
+        let sender_addr = sender.local_addr()?;
+
         let b_socket = UdpSocket::bind("127.0.0.1:0").await?;
         let b_addr = b_socket.local_addr()?;
-        let b = UdpRtpEndpoint::connect(b_socket, None, "127.0.0.1:0".parse()?, None).await?;
+        let b = UdpRtpEndpoint::connect(b_socket, None, sender_addr, None).await?;
 
-        let sender = UdpSocket::bind("127.0.0.1:0").await?;
         sender.send_to(&stun_packet, b_addr).await?;
 
         let received = b.recv().await?;
