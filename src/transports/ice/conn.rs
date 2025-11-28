@@ -11,6 +11,7 @@ use tracing::{debug, warn};
 pub struct IceConn {
     pub socket_rx: watch::Receiver<Option<IceSocketWrapper>>,
     pub remote_addr: RwLock<SocketAddr>,
+    pub remote_rtcp_addr: RwLock<Option<SocketAddr>>,
     pub dtls_receiver: RwLock<Option<Weak<dyn PacketReceiver>>>,
     pub rtp_receiver: RwLock<Option<Weak<dyn PacketReceiver>>>,
 }
@@ -23,9 +24,14 @@ impl IceConn {
         Arc::new(Self {
             socket_rx,
             remote_addr: RwLock::new(remote_addr),
+            remote_rtcp_addr: RwLock::new(None),
             dtls_receiver: RwLock::new(None),
             rtp_receiver: RwLock::new(None),
         })
+    }
+
+    pub async fn set_remote_rtcp_addr(&self, addr: Option<SocketAddr>) {
+        *self.remote_rtcp_addr.write().await = addr;
     }
 
     pub async fn set_dtls_receiver(&self, receiver: Arc<dyn PacketReceiver>) {
@@ -69,6 +75,27 @@ impl IceConn {
             socket.send_to(buf, remote).await
         } else {
             tracing::warn!("IceConn: send failed - no selected socket");
+            Err(anyhow::anyhow!("No selected socket"))
+        }
+    }
+
+    pub async fn send_rtcp(&self, buf: &[u8]) -> Result<usize> {
+        let mut socket_rx = self.socket_rx.clone();
+        let socket_opt = socket_rx.borrow_and_update().clone();
+
+        if let Some(socket) = socket_opt {
+            let remote = if let Some(rtcp_addr) = *self.remote_rtcp_addr.read().await {
+                rtcp_addr
+            } else {
+                *self.remote_addr.read().await
+            };
+
+            if remote.port() == 0 {
+                return Err(anyhow::anyhow!("Remote address not set"));
+            }
+            socket.send_to(buf, remote).await
+        } else {
+            tracing::warn!("IceConn: send_rtcp failed - no selected socket");
             Err(anyhow::anyhow!("No selected socket"))
         }
     }
@@ -121,9 +148,64 @@ impl PacketReceiver for IceConn {
             }
         } else if (128..192).contains(&first_byte) {
             // RTP / RTCP
-            if let Some(rx) = &*self.rtp_receiver.read().await && let Some(strong_rx) = rx.upgrade() {
+            if let Some(rx) = &*self.rtp_receiver.read().await
+                && let Some(strong_rx) = rx.upgrade()
+            {
                 strong_rx.receive(packet, addr).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::UdpSocket;
+    use tokio::sync::watch;
+
+    #[tokio::test]
+    async fn test_ice_conn_send_rtcp_mux() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket_wrapper = IceSocketWrapper::Udp(Arc::new(socket));
+        let (_tx, rx) = watch::channel(Some(socket_wrapper));
+
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+
+        let conn = IceConn::new(rx, receiver_addr);
+
+        // Send RTCP (via send_rtcp) -> should go to receiver_addr (default)
+        conn.send_rtcp(b"hello").await.unwrap();
+
+        let mut buf = [0u8; 1024];
+        let (len, _) = receiver.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..len], b"hello");
+    }
+
+    #[tokio::test]
+    async fn test_ice_conn_send_rtcp_no_mux() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket_wrapper = IceSocketWrapper::Udp(Arc::new(socket));
+        let (_tx, rx) = watch::channel(Some(socket_wrapper));
+
+        let rtp_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rtp_addr = rtp_receiver.local_addr().unwrap();
+
+        let rtcp_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rtcp_addr = rtcp_receiver.local_addr().unwrap();
+
+        let conn = IceConn::new(rx, rtp_addr);
+        conn.set_remote_rtcp_addr(Some(rtcp_addr)).await;
+
+        // Send RTP (via send) -> should go to rtp_addr
+        conn.send(b"rtp").await.unwrap();
+        let mut buf = [0u8; 1024];
+        let (len, _) = rtp_receiver.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..len], b"rtp");
+
+        // Send RTCP (via send_rtcp) -> should go to rtcp_addr
+        conn.send_rtcp(b"rtcp").await.unwrap();
+        let (len, _) = rtcp_receiver.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..len], b"rtcp");
     }
 }

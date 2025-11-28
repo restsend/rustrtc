@@ -24,7 +24,7 @@ async fn main() {
     let pc = PeerConnection::new(config);
 
     // Create a Data Channel
-    let dc = pc.create_data_channel("data").await.unwrap();
+    let dc = pc.create_data_channel("data").unwrap();
 
     // Handle received messages
     let dc_clone = dc.clone();
@@ -46,7 +46,7 @@ You can run the examples provided in the repository.
 
 ### Echo Server
 
-The echo server example demonstrates how to accept a WebRTC connection, receive data on a data channel, and echo it back. It also echoes video tracks.
+The echo server example demonstrates how to accept a WebRTC connection, receive data on a data channel, and echo it back. It also supports video playback if an IVF file is provided.
 
 1. Run the server:
     ```bash
@@ -54,6 +54,15 @@ The echo server example demonstrates how to accept a WebRTC connection, receive 
     ```
 
 2. Open your browser and navigate to `http://127.0.0.1:3000`.
+
+### RTP Example
+
+The RTP example demonstrates how to create a PeerConnection, add an audio track, and send dummy audio frames.
+
+1. Run the example:
+    ```bash
+    cargo run --example rtp_example
+    ```
 
 ## License
 

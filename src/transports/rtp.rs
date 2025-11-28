@@ -27,6 +27,10 @@ impl RtpTransport {
         }
     }
 
+    pub fn ice_conn(&self) -> Arc<IceConn> {
+        self.transport.clone()
+    }
+
     pub fn start_srtp(&self, srtp_session: SrtpSession) {
         let mut session = self.srtp_session.lock().unwrap();
         *session = Some(Arc::new(Mutex::new(srtp_session)));
@@ -85,7 +89,7 @@ impl RtpTransport {
                 raw
             }
         };
-        self.transport.send(&protected).await
+        self.transport.send_rtcp(&protected).await
     }
 }
 

@@ -6,6 +6,7 @@ pub mod rtp;
 pub mod sdp;
 pub mod srtp;
 pub mod stats;
+pub mod stats_collector;
 pub mod transports;
 
 pub use config::{

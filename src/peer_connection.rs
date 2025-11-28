@@ -1,5 +1,7 @@
 use crate::media::track::{MediaStreamTrack, SampleStreamSource, SampleStreamTrack, sample_track};
 use crate::rtp::{FirRequest, FullIntraRequest, PictureLossIndication, RtcpPacket};
+use crate::stats::{StatsReport, gather_once};
+use crate::stats_collector::StatsCollector;
 use crate::transports::dtls::{self, DtlsTransport};
 use crate::transports::ice::{IceCandidate, IceGathererState, IceTransport, conn::IceConn};
 use crate::transports::rtp::RtpTransport;
@@ -46,6 +48,7 @@ struct PeerConnectionInner {
     data_channels: Arc<Mutex<Vec<std::sync::Weak<crate::transports::sctp::DataChannel>>>>,
     dtls_role: watch::Sender<Option<bool>>,
     _dtls_role_rx: watch::Receiver<Option<bool>>,
+    stats_collector: Arc<StatsCollector>,
 }
 
 impl PeerConnection {
@@ -86,6 +89,7 @@ impl PeerConnection {
             data_channels: Arc::new(Mutex::new(Vec::new())),
             dtls_role: dtls_role_tx,
             _dtls_role_rx: dtls_role_rx.clone(),
+            stats_collector: Arc::new(StatsCollector::new()),
         };
         let pc = Self {
             inner: Arc::new(inner),
@@ -292,16 +296,20 @@ impl PeerConnection {
         }
 
         for section in &desc.media_sections {
-            if self.config().transport_mode != TransportMode::WebRtc
-                && let Some(conn) = &section.connection
-            {
-                let parts: Vec<&str> = conn.split_whitespace().collect();
-                if parts.len() >= 3
-                    && parts[0] == "IN"
-                    && parts[1] == "IP4"
-                    && let Ok(ip) = parts[2].parse::<std::net::IpAddr>()
-                {
-                    remote_addr = Some(std::net::SocketAddr::new(ip, section.port));
+            if self.config().transport_mode != TransportMode::WebRtc {
+                let conn_opt = section
+                    .connection
+                    .as_ref()
+                    .or(desc.session.connection.as_ref());
+                if let Some(conn) = conn_opt {
+                    let parts: Vec<&str> = conn.split_whitespace().collect();
+                    if parts.len() >= 3
+                        && parts[0] == "IN"
+                        && parts[1] == "IP4"
+                        && let Ok(ip) = parts[2].parse::<std::net::IpAddr>()
+                    {
+                        remote_addr = Some(std::net::SocketAddr::new(ip, section.port));
+                    }
                 }
             }
 
@@ -468,6 +476,38 @@ impl PeerConnection {
 
         // Create IceConn and register it immediately to avoid dropping packets
         let ice_conn = IceConn::new(socket_rx.clone(), pair.remote.address);
+
+        if self.config().transport_mode != TransportMode::WebRtc {
+            let rtcp_addr = {
+                let remote_desc = self.inner.remote_description.lock().unwrap();
+                if let Some(desc) = &*remote_desc {
+                    // Check if rtcp-mux is enabled in the first media section
+                    // If not, set rtcp_addr = remote_addr port + 1
+                    // Note: This assumes all media sections follow the same mux policy or we only care about the first one for now.
+                    // In a proper implementation, we might need per-transceiver transport or bundle handling.
+                    if let Some(section) = desc.media_sections.first() {
+                        let has_mux = section.attributes.iter().any(|a| a.key == "rtcp-mux");
+                        if !has_mux {
+                            let mut addr = pair.remote.address;
+                            addr.set_port(addr.port() + 1);
+                            Some(addr)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+
+            if let Some(addr) = rtcp_addr {
+                ice_conn.set_remote_rtcp_addr(Some(addr)).await;
+                debug!("RTCP-MUX not detected, setting RTCP address to {}", addr);
+            }
+        }
+
         self.inner
             .ice_transport
             .set_data_receiver(ice_conn.clone())
@@ -607,10 +647,12 @@ impl PeerConnection {
                     let (rtcp_tx, mut rtcp_rx) = mpsc::channel(100);
                     rtp_transport_clone.register_rtcp_listener(rtcp_tx);
                     let inner_weak_rtcp = inner_weak.clone();
+                    let stats_collector = self.inner.stats_collector.clone();
 
                     let rtcp_loop = Box::pin(async move {
                         while let Some(packets) = rtcp_rx.recv().await {
                             for packet in packets {
+                                stats_collector.process_rtcp(&packet);
                                 let Some(inner) = inner_weak_rtcp.upgrade() else {
                                     return;
                                 };
@@ -785,6 +827,10 @@ impl PeerConnection {
         } else {
             Err(RtcError::InvalidState("SCTP not connected".into()))
         }
+    }
+
+    pub async fn get_stats(&self) -> RtcResult<StatsReport> {
+        gather_once(&[self.inner.stats_collector.clone()]).await
     }
 }
 
@@ -1710,6 +1756,80 @@ mod tests {
                     .map(|v| v == expected_port)
                     .unwrap_or(false)
         }));
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_mux_detection() {
+        use crate::{SdpType, SessionDescription, TransportMode};
+        // Setup PC in RTP mode
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+        let pc = PeerConnection::new(config);
+
+        // Create SDP without rtcp-mux
+        let sdp_str = "v=0\r\n\
+                       o=- 123456 0 IN IP4 127.0.0.1\r\n\
+                       s=-\r\n\
+                       t=0 0\r\n\
+                       c=IN IP4 127.0.0.1\r\n\
+                       m=audio 4000 RTP/AVP 111\r\n\
+                       a=rtpmap:111 opus/48000/2\r\n";
+        let desc = SessionDescription::parse(SdpType::Offer, sdp_str).unwrap();
+
+        pc.set_remote_description(desc).await.unwrap();
+
+        // Wait for connection
+        let mut state_rx = pc.subscribe_peer_state();
+        loop {
+            if *state_rx.borrow() == PeerConnectionState::Connected {
+                break;
+            }
+            state_rx.changed().await.unwrap();
+        }
+
+        // Now check IceConn
+        let rtp_transport = pc.inner.rtp_transport.lock().unwrap().clone().unwrap();
+        let ice_conn = rtp_transport.ice_conn();
+        let rtcp_addr = *ice_conn.remote_rtcp_addr.read().await;
+
+        assert!(rtcp_addr.is_some());
+        assert_eq!(rtcp_addr.unwrap().port(), 4001);
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_mux_enabled() {
+        use crate::{SdpType, SessionDescription, TransportMode};
+        // Setup PC in RTP mode
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+        let pc = PeerConnection::new(config);
+
+        // Create SDP WITH rtcp-mux
+        let sdp_str = "v=0\r\n\
+                       o=- 123456 0 IN IP4 127.0.0.1\r\n\
+                       s=-\r\n\
+                       t=0 0\r\n\
+                       c=IN IP4 127.0.0.1\r\n\
+                       m=audio 4000 RTP/AVP 111\r\n\
+                       a=rtcp-mux\r\n\
+                       a=rtpmap:111 opus/48000/2\r\n";
+        let desc = SessionDescription::parse(SdpType::Offer, sdp_str).unwrap();
+
+        pc.set_remote_description(desc).await.unwrap();
+
+        let mut state_rx = pc.subscribe_peer_state();
+        loop {
+            if *state_rx.borrow() == PeerConnectionState::Connected {
+                break;
+            }
+            state_rx.changed().await.unwrap();
+        }
+
+        let rtp_transport = pc.inner.rtp_transport.lock().unwrap().clone().unwrap();
+        let ice_conn = rtp_transport.ice_conn();
+        let rtcp_addr = *ice_conn.remote_rtcp_addr.read().await;
+
+        assert!(rtcp_addr.is_none());
     }
 
     #[tokio::test]
