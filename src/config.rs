@@ -146,7 +146,7 @@ pub struct MediaCapabilities {
 }
 
 /// Primary configuration for a `PeerConnection`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RtcConfiguration {
     pub ice_servers: Vec<IceServer>,
     pub ice_transport_policy: IceTransportPolicy,
@@ -156,6 +156,23 @@ pub struct RtcConfiguration {
     pub transport_mode: TransportMode,
     pub media_capabilities: Option<MediaCapabilities>,
     pub disable_ipv6: bool,
+    pub ssrc_start: u32,
+}
+
+impl Default for RtcConfiguration {
+    fn default() -> Self {
+        Self {
+            ice_servers: Vec::new(),
+            ice_transport_policy: IceTransportPolicy::default(),
+            bundle_policy: BundlePolicy::default(),
+            rtcp_mux_policy: RtcpMuxPolicy::default(),
+            certificates: Vec::new(),
+            transport_mode: TransportMode::default(),
+            media_capabilities: None,
+            disable_ipv6: false,
+            ssrc_start: 10000,
+        }
+    }
 }
 
 pub struct RtcConfigurationBuilder {
@@ -212,6 +229,11 @@ impl RtcConfigurationBuilder {
 
     pub fn disable_ipv6(mut self, disable: bool) -> Self {
         self.inner.disable_ipv6 = disable;
+        self
+    }
+
+    pub fn ssrc_start(mut self, start: u32) -> Self {
+        self.inner.ssrc_start = start;
         self
     }
 

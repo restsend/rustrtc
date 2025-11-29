@@ -1,5 +1,5 @@
 use super::*;
-use crate::{IceServer, RtcConfiguration};
+use crate::{IceServer, IceTransportPolicy, RtcConfiguration};
 use ::turn::{
     auth::{AuthHandler, generate_auth_key},
     relay::relay_static::RelayAddressGeneratorStatic,
@@ -9,6 +9,7 @@ use ::turn::{
     },
 };
 use anyhow::Result;
+use tokio::sync::broadcast;
 // use webrtc_util::vnet::net::Net;
 type TurnResult<T> = std::result::Result<T, ::turn::Error>;
 
@@ -23,7 +24,8 @@ fn parse_turn_uri() {
 
 #[tokio::test]
 async fn builder_starts_gathering() {
-    let transport = IceTransportBuilder::new(RtcConfiguration::default()).build();
+    let (transport, runner) = IceTransportBuilder::new(RtcConfiguration::default()).build();
+    tokio::spawn(runner);
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(matches!(
         transport.gather_state().await,
@@ -38,7 +40,9 @@ async fn stun_probe_yields_server_reflexive_candidate() -> Result<()> {
     config
         .ice_servers
         .push(IceServer::new(vec![turn_server.stun_url()]));
-    let gatherer = IceGatherer::new(config);
+    let (tx, _) = broadcast::channel(100);
+    let (socket_tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let gatherer = IceGatherer::new(config, tx, socket_tx);
     gatherer.gather().await?;
     let candidates = gatherer.local_candidates().await;
     assert!(
@@ -57,7 +61,9 @@ async fn turn_probe_yields_relay_candidate() -> Result<()> {
     config.ice_servers.push(
         IceServer::new(vec![turn_server.turn_url()]).with_credential(TEST_USERNAME, TEST_PASSWORD),
     );
-    let gatherer = IceGatherer::new(config);
+    let (tx, _) = broadcast::channel(100);
+    let (socket_tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let gatherer = IceGatherer::new(config, tx, socket_tx);
     gatherer.gather().await?;
     let candidates = gatherer.local_candidates().await;
     assert!(
@@ -65,6 +71,40 @@ async fn turn_probe_yields_relay_candidate() -> Result<()> {
             .iter()
             .any(|c| matches!(c.typ, IceCandidateType::Relay))
     );
+    turn_server.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn policy_relay_only_gathers_relay_candidates() -> Result<()> {
+    let mut turn_server = TestTurnServer::start().await?;
+    let mut config = RtcConfiguration::default();
+    config.ice_transport_policy = IceTransportPolicy::Relay;
+    config.ice_servers.push(
+        IceServer::new(vec![turn_server.turn_url()]).with_credential(TEST_USERNAME, TEST_PASSWORD),
+    );
+
+    // Add a STUN server too, to verify it is ignored
+    config
+        .ice_servers
+        .push(IceServer::new(vec![turn_server.stun_url()]));
+
+    let (tx, _) = broadcast::channel(100);
+    let (socket_tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let gatherer = IceGatherer::new(config, tx, socket_tx);
+    gatherer.gather().await?;
+    let candidates = gatherer.local_candidates().await;
+
+    assert!(!candidates.is_empty());
+    for c in candidates {
+        assert_eq!(
+            c.typ,
+            IceCandidateType::Relay,
+            "Found non-relay candidate: {:?}",
+            c
+        );
+    }
+
     turn_server.stop().await?;
     Ok(())
 }
@@ -82,6 +122,42 @@ async fn turn_client_can_create_permission() -> Result<()> {
     client.create_permission(peer).await?;
     turn_server.stop().await?;
     Ok(())
+}
+
+#[test]
+fn candidate_pair_priority_calculation() {
+    let local = IceCandidate::host("127.0.0.1:1000".parse().unwrap(), 1);
+    let remote = IceCandidate::host("127.0.0.1:2000".parse().unwrap(), 1);
+    let pair = IceCandidatePair::new(local.clone(), remote.clone());
+
+    // G = local.priority, D = remote.priority
+    // Since both are host/1, priorities should be equal.
+    let p1 = pair.priority(IceRole::Controlling);
+    let p2 = pair.priority(IceRole::Controlled);
+
+    assert_eq!(p1, p2);
+
+    // Test with different priorities
+    let local_relay = IceCandidate::relay("127.0.0.1:1000".parse().unwrap(), 1, "udp");
+    let pair2 = IceCandidatePair::new(local_relay, remote);
+
+    // Relay has lower priority than Host.
+    // Controlling: G (relay) < D (host)
+    // Controlled: D (relay) < G (host)
+
+    let prio_controlling = pair2.priority(IceRole::Controlling);
+    let prio_controlled = pair2.priority(IceRole::Controlled);
+
+    // Formula: 2^32*MIN(G,D) + 2*MAX(G,D) + (G>D?1:0)
+    // Since priorities are different, the MIN term dominates.
+    // In both roles, the set of {G, D} is the same, so MIN(G,D) and MAX(G,D) are same.
+    // The only difference is the tie breaker (G>D?1:0).
+
+    // If G < D (Controlling case here): term is 0.
+    // If G > D (Controlled case here, since G becomes host): term is 1.
+
+    assert!(prio_controlled > prio_controlling);
+    assert_eq!(prio_controlled - prio_controlling, 1);
 }
 
 const TEST_USERNAME: &str = "test";

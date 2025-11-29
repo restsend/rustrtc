@@ -11,13 +11,16 @@ use tokio::time::timeout;
 
 #[tokio::test]
 async fn test_padding_packet_drop() -> Result<()> {
+    println!("Start test");
     let _ = env_logger::builder().is_test(true).try_init();
 
     // 1. Create PC1 (Client)
+    println!("Create PC1");
     let config1 = RtcConfiguration::default();
     let pc1 = PeerConnection::new(config1);
 
     // 2. Create PC2 (Server)
+    println!("Create PC2");
     let config2 = RtcConfiguration::default();
     let pc2 = PeerConnection::new(config2);
 
@@ -37,16 +40,20 @@ async fn test_padding_packet_drop() -> Result<()> {
         clock_rate: 90000,
         channels: 0,
     });
-    *t1.sender.lock().unwrap() = Some(s1.clone());
+    t1.set_sender(Some(s1.clone()));
 
     // 3. Negotiate
     // PC1 Create Offer
+    println!("PC1 Create Offer");
     let _ = pc1.create_offer().await?; // Trigger gathering
+    println!("PC1 Wait Gathering");
     wait_for_gathering(&pc1).await;
+    println!("PC1 Create Offer 2");
     let offer = pc1.create_offer().await?;
     pc1.set_local_description(offer.clone())?;
 
     // PC2 Set Remote Offer
+    println!("PC2 Set Remote Offer");
     pc2.set_remote_description(offer).await?;
 
     // Setup Echo on PC2 (Before Answer)
@@ -65,19 +72,23 @@ async fn test_padding_packet_drop() -> Result<()> {
         clock_rate: 90000,
         channels: 0,
     });
-    *t2.sender.lock().unwrap() = Some(s2);
+    t2.set_sender(Some(s2));
 
     // PC2 Create Answer
+    println!("PC2 Create Answer");
     let _ = pc2.create_answer().await?; // Trigger gathering
+    println!("PC2 Wait Gathering");
     wait_for_gathering(&pc2).await;
+    println!("PC2 Create Answer 2");
     let answer = pc2.create_answer().await?;
     pc2.set_local_description(answer.clone())?;
 
     // PC1 Set Remote Answer
+    println!("PC1 Set Remote Answer");
     pc1.set_remote_description(answer).await?;
 
     // 4. Start Echo Loop on PC2
-    let r2 = t2.receiver.lock().unwrap().clone().unwrap();
+    let r2 = t2.receiver().unwrap();
     let track2 = r2.track();
 
     tokio::spawn(async move {
@@ -93,7 +104,9 @@ async fn test_padding_packet_drop() -> Result<()> {
     });
 
     // 6. Send Packets from PC1
+    println!("PC1 Wait Connection");
     pc1.wait_for_connection().await?;
+    println!("PC2 Wait Connection");
     pc2.wait_for_connection().await?;
 
     // Packet 1: Valid
@@ -154,7 +167,7 @@ async fn test_padding_packet_drop() -> Result<()> {
     println!("Sent P3");
 
     // 7. Verify Reception on PC1
-    let r1 = t1.receiver.lock().unwrap().clone().unwrap();
+    let r1 = t1.receiver().unwrap();
     let track1 = r1.track();
 
     // Expect P1
@@ -168,7 +181,18 @@ async fn test_padding_packet_drop() -> Result<()> {
         panic!("Expected Video sample");
     }
 
-    // Expect P3 (P2 should be dropped)
+    // Expect P2 (Empty - Padding/Keepalive)
+    let s2_recv = timeout(Duration::from_secs(5), track1.recv())
+        .await?
+        .unwrap();
+    if let MediaSample::Video(f) = s2_recv {
+        println!("Received P2: len={}", f.data.len());
+        assert!(f.data.is_empty());
+    } else {
+        panic!("Expected Video sample");
+    }
+
+    // Expect P3
     let s3_recv = timeout(Duration::from_secs(5), track1.recv())
         .await?
         .unwrap();

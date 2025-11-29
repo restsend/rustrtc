@@ -5,6 +5,7 @@ const RTP_VERSION: u8 = 2;
 pub const RTCP_SR: u8 = 200;
 pub const RTCP_RR: u8 = 201;
 pub const RTCP_SDES: u8 = 202;
+pub const RTCP_BYE: u8 = 203;
 pub const RTCP_RTPFB: u8 = 205;
 pub const RTCP_PSFB: u8 = 206;
 
@@ -55,11 +56,13 @@ impl RtpHeader {
         if self.csrcs.len() > 15 {
             return Err(RtpError::InvalidHeader("too many CSRC entries"));
         }
-        if let Some(ext) = &self.extension && ext.data.len() % 4 != 0 {
-                return Err(RtpError::InvalidHeader(
-                    "header extension payload must be 32-bit aligned",
-                ));
-            }
+        if let Some(ext) = &self.extension
+            && ext.data.len() % 4 != 0
+        {
+            return Err(RtpError::InvalidHeader(
+                "header extension payload must be 32-bit aligned",
+            ));
+        }
         Ok(())
     }
 }
@@ -292,10 +295,17 @@ pub struct SourceDescription {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Goodbye {
+    pub sources: Vec<u32>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RtcpPacket {
     SenderReport(SenderReport),
     ReceiverReport(ReceiverReport),
     SourceDescription(SourceDescription),
+    Goodbye(Goodbye),
     PictureLossIndication(PictureLossIndication),
     FullIntraRequest(FullIntraRequest),
     GenericNack(GenericNack),
@@ -334,6 +344,7 @@ pub fn parse_rtcp_packets(raw: &[u8]) -> RtpResult<Vec<RtcpPacket>> {
             RTCP_SR => RtcpPacket::SenderReport(parse_sender_report(fmt, body)?),
             RTCP_RR => RtcpPacket::ReceiverReport(parse_receiver_report(fmt, body)?),
             RTCP_SDES => RtcpPacket::SourceDescription(parse_sdes(fmt, body)?),
+            RTCP_BYE => RtcpPacket::Goodbye(parse_goodbye(fmt, body)?),
             RTCP_RTPFB => parse_rtcp_rtpfb(fmt, body)?,
             RTCP_PSFB => parse_rtcp_psfb(fmt, body)?,
             _ => return Err(RtpError::InvalidRtcp("unsupported RTCP packet type")),
@@ -365,6 +376,12 @@ pub fn marshal_rtcp_packets(packets: &[RtcpPacket]) -> RtpResult<Vec<u8>> {
                 sdes.chunks.len() as u8,
                 RTCP_SDES,
                 build_sdes_body(sdes),
+            ),
+            RtcpPacket::Goodbye(bye) => write_rtcp_packet(
+                &mut out,
+                bye.sources.len() as u8,
+                RTCP_BYE,
+                build_goodbye_body(bye),
             ),
             RtcpPacket::PictureLossIndication(pli) => write_rtcp_packet(
                 &mut out,
@@ -499,6 +516,36 @@ fn parse_sdes(count: u8, body: &[u8]) -> RtpResult<SourceDescription> {
         chunks.push(SdesChunk { ssrc, items });
     }
     Ok(SourceDescription { chunks })
+}
+
+fn parse_goodbye(count: u8, body: &[u8]) -> RtpResult<Goodbye> {
+    let mut sources = Vec::with_capacity(count as usize);
+    let mut offset = 0;
+    for _ in 0..count {
+        if body.len() < offset + 4 {
+            return Err(RtpError::PacketTooShort);
+        }
+        let ssrc = u32::from_be_bytes([
+            body[offset],
+            body[offset + 1],
+            body[offset + 2],
+            body[offset + 3],
+        ]);
+        sources.push(ssrc);
+        offset += 4;
+    }
+
+    let mut reason = None;
+    if offset < body.len() {
+        let len = body[offset] as usize;
+        offset += 1;
+        if body.len() < offset + len {
+            return Err(RtpError::PacketTooShort);
+        }
+        reason = Some(String::from_utf8_lossy(&body[offset..offset + len]).to_string());
+    }
+
+    Ok(Goodbye { sources, reason })
 }
 
 fn parse_report_block(bytes: &[u8]) -> ReportBlock {
@@ -690,6 +737,21 @@ fn build_sdes_body(sdes: &SourceDescription) -> Vec<u8> {
         while body.len() % 4 != 0 {
             body.push(0);
         }
+    }
+    body
+}
+
+fn build_goodbye_body(bye: &Goodbye) -> Vec<u8> {
+    let mut body = Vec::new();
+    for ssrc in &bye.sources {
+        body.extend_from_slice(&ssrc.to_be_bytes());
+    }
+    if let Some(reason) = &bye.reason {
+        let bytes = reason.as_bytes();
+        let len = bytes.len().min(255) as u8;
+        body.push(len);
+        body.extend_from_slice(&bytes[..len as usize]);
+        // Padding to 32-bit boundary is handled by write_rtcp_packet
     }
     body
 }

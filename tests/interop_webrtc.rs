@@ -125,7 +125,7 @@ async fn interop_vp8_echo() -> Result<()> {
     let sender = Arc::new(rustrtc::peer_connection::RtpSender::new(
         track, 12345, // SSRC
     ));
-    *transceiver.sender.lock().unwrap() = Some(sender);
+    transceiver.set_sender(Some(sender));
 
     // 2. Create WebRTC PeerConnection (Answerer)
     let mut m = MediaEngine::default();
@@ -244,7 +244,7 @@ async fn interop_vp8_echo() -> Result<()> {
     });
 
     // 8. Verify Echo on RustRTC
-    let receiver = transceiver.receiver.lock().unwrap().clone().unwrap();
+    let receiver = transceiver.receiver().unwrap();
     let track = receiver.track();
 
     let mut received_count = 0;
@@ -308,7 +308,7 @@ async fn interop_vp8_echo_with_pli() -> Result<()> {
     let sender = Arc::new(rustrtc::peer_connection::RtpSender::new(
         track, 12345, // SSRC
     ));
-    *transceiver.sender.lock().unwrap() = Some(sender);
+    transceiver.set_sender(Some(sender));
 
     // 2. Create WebRTC PeerConnection (Answerer)
     let mut m = MediaEngine::default();
@@ -442,7 +442,7 @@ async fn interop_vp8_echo_with_pli() -> Result<()> {
     });
 
     // 8. Verify Echo on RustRTC
-    let receiver = transceiver.receiver.lock().unwrap().clone().unwrap();
+    let receiver = transceiver.receiver().unwrap();
     let track = receiver.track();
 
     let mut received_count = 0;
@@ -470,6 +470,93 @@ async fn interop_vp8_echo_with_pli() -> Result<()> {
     // Cleanup
     rust_pc.close();
     webrtc_pc.close().await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn interop_ice_close_triggers_pc_close() -> Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    // 1. Create RustRTC PeerConnection (Offerer)
+    let rust_config = RtcConfiguration::default();
+    let rust_pc = PeerConnection::new(rust_config);
+
+    // Add a transceiver to trigger ICE gathering
+    rust_pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+
+    // 2. Create WebRTC PeerConnection (Answerer)
+    let mut m = MediaEngine::default();
+    m.register_default_codecs()?;
+    let mut registry = Registry::new();
+    registry = register_default_interceptors(registry, &mut m)?;
+    let api = APIBuilder::new()
+        .with_media_engine(m)
+        .with_interceptor_registry(registry)
+        .build();
+
+    let webrtc_config = WebrtcConfiguration::default();
+    let webrtc_pc = api.new_peer_connection(webrtc_config).await?;
+
+    // 3. RustRTC creates Offer
+    let _ = rust_pc.create_offer().await?;
+
+    // Wait for gathering to complete
+    loop {
+        if rust_pc.ice_transport().gather_state().await == IceGathererState::Complete {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let offer = rust_pc.create_offer().await?;
+    rust_pc.set_local_description(offer.clone())?;
+
+    let offer_sdp = offer.to_sdp_string();
+    let webrtc_desc = RTCSessionDescription::offer(offer_sdp)?;
+
+    // 4. WebRTC sets Remote Description
+    webrtc_pc.set_remote_description(webrtc_desc).await?;
+
+    // 5. WebRTC creates Answer
+    let answer = webrtc_pc.create_answer(None).await?;
+    let mut gather_complete = webrtc_pc.gathering_complete_promise().await;
+    webrtc_pc.set_local_description(answer.clone()).await?;
+    let _ = gather_complete.recv().await;
+
+    let answer = webrtc_pc.local_description().await.unwrap();
+    let answer_sdp = answer.sdp;
+    let rust_answer = rustrtc::SessionDescription::parse(rustrtc::SdpType::Answer, &answer_sdp)?;
+
+    // 6. RustRTC sets Remote Description
+    rust_pc.set_remote_description(rust_answer).await?;
+
+    // 7. Wait for connection
+    rust_pc.wait_for_connection().await?;
+
+    // 8. Close WebRTC side
+    webrtc_pc.close().await?;
+
+    // 9. Verify RustRTC detects close
+    let mut state_rx = rust_pc.subscribe_peer_state();
+    let timeout_duration = Duration::from_secs(10);
+
+    let check_close = async {
+        loop {
+            let state = *state_rx.borrow_and_update();
+            if state == rustrtc::PeerConnectionState::Closed
+                || state == rustrtc::PeerConnectionState::Failed
+                || state == rustrtc::PeerConnectionState::Disconnected
+            {
+                return Ok(());
+            }
+            if state_rx.changed().await.is_err() {
+                return Err(anyhow::anyhow!("State channel closed"));
+            }
+        }
+    };
+
+    timeout(timeout_duration, check_close).await??;
 
     Ok(())
 }

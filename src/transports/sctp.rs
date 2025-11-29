@@ -25,7 +25,7 @@ pub struct DataChannel {
     pub label: String,
     pub state: Mutex<DataChannelState>,
     pub next_ssn: Mutex<u16>,
-    tx: mpsc::UnboundedSender<DataChannelEvent>,
+    tx: Mutex<Option<mpsc::UnboundedSender<DataChannelEvent>>>,
     rx: TokioMutex<mpsc::UnboundedReceiver<DataChannelEvent>>,
 }
 
@@ -79,13 +79,15 @@ impl SctpTransport {
     pub fn new(
         dtls_transport: Arc<DtlsTransport>,
         data_channels: Arc<Mutex<Vec<Weak<DataChannel>>>>,
-    ) -> Arc<Self> {
+        local_port: u16,
+        remote_port: u16,
+    ) -> (Arc<Self>, impl std::future::Future<Output = ()> + Send + 'static) {
         let inner = Arc::new(SctpInner {
             dtls_transport,
             state: Arc::new(Mutex::new(SctpState::New)),
             data_channels,
-            local_port: 5000,
-            remote_port: 5000,
+            local_port,
+            remote_port,
             verification_tag: Mutex::new(0),
             remote_verification_tag: Mutex::new(0),
             next_tsn: Mutex::new(0),
@@ -100,11 +102,11 @@ impl SctpTransport {
         });
 
         let inner_clone = inner.clone();
-        tokio::spawn(async move {
+        let runner = async move {
             inner_clone.run_loop(close_rx).await;
-        });
+        };
 
-        transport
+        (transport, runner)
     }
 
     pub fn create_data_channel(&self, label: &str, id: u16) -> Arc<DataChannel> {
@@ -151,6 +153,19 @@ impl SctpInner {
         }
 
         *self.state.lock().unwrap() = SctpState::Closed;
+
+        let channels = self.data_channels.lock().unwrap();
+        for weak_dc in channels.iter() {
+            if let Some(dc) = weak_dc.upgrade() {
+                let mut state = dc.state.lock().unwrap();
+                if *state != DataChannelState::Closed {
+                    *state = DataChannelState::Closed;
+                    drop(state);
+                    dc.send_event(DataChannelEvent::Close);
+                    dc.close_channel();
+                }
+            }
+        }
     }
 
     async fn handle_packet(&self, packet: &[u8]) -> Result<()> {
@@ -418,7 +433,7 @@ impl DataChannel {
             label,
             state: Mutex::new(DataChannelState::Connecting),
             next_ssn: Mutex::new(0),
-            tx,
+            tx: Mutex::new(Some(tx)),
             rx: TokioMutex::new(rx),
         }
     }
@@ -429,6 +444,12 @@ impl DataChannel {
     }
 
     pub(crate) fn send_event(&self, event: DataChannelEvent) {
-        let _ = self.tx.send(event);
+        if let Some(tx) = &*self.tx.lock().unwrap() {
+            let _ = tx.send(event);
+        }
+    }
+
+    pub(crate) fn close_channel(&self) {
+        *self.tx.lock().unwrap() = None;
     }
 }

@@ -15,7 +15,8 @@ pub use config::{
 };
 pub use errors::{RtcError, RtcResult, SdpError, SdpResult};
 pub use peer_connection::{
-    PeerConnection, PeerConnectionState, RtpTransceiver, SignalingState, TransceiverDirection,
+    IceConnectionState, IceGatheringState, PeerConnection, PeerConnectionState, RtpTransceiver,
+    SignalingState, TransceiverDirection,
 };
 pub use sdp::{
     AddressType, Attribute, Direction, MediaKind, MediaSection, NetworkType, Origin, SdpType,
@@ -29,3 +30,4 @@ pub use transports::ice::{
     IceCandidate, IceCandidatePair, IceCandidateType, IceGathererState, IceRole, IceTransport,
     IceTransportState,
 };
+pub use transports::sctp::{DataChannelEvent, DataChannelState};

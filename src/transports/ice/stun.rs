@@ -104,6 +104,7 @@ pub struct StunDecoded {
     pub realm: Option<String>,
     pub nonce: Option<String>,
     pub data: Option<Vec<u8>>,
+    pub use_candidate: bool,
 }
 
 fn encode_stun_message(
@@ -309,6 +310,7 @@ fn decode_stun_message(bytes: &[u8]) -> Result<StunDecoded> {
     let mut realm = None;
     let mut nonce = None;
     let mut data = None;
+    let mut use_candidate = false;
     while offset + 4 <= bytes.len() {
         let typ = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
         let len = u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]) as usize;
@@ -352,6 +354,9 @@ fn decode_stun_message(bytes: &[u8]) -> Result<StunDecoded> {
             0x0013 => {
                 data = Some(value.to_vec());
             }
+            0x0025 => {
+                use_candidate = true;
+            }
             _ => {}
         }
         offset += len;
@@ -368,6 +373,7 @@ fn decode_stun_message(bytes: &[u8]) -> Result<StunDecoded> {
         realm,
         nonce,
         data,
+        use_candidate,
     })
 }
 
@@ -448,6 +454,10 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
 
 pub fn random_u64() -> u64 {
     u64::from_be_bytes(random_bytes::<8>())
+}
+
+pub fn random_u32() -> u32 {
+    u32::from_be_bytes(random_bytes::<4>())
 }
 
 fn fill_random_from_urandom(buf: &mut [u8]) -> IoResult<()> {

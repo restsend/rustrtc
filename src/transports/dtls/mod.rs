@@ -56,7 +56,7 @@ pub struct Certificate {
     pub private_key: String, // PEM encoded key
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct SessionKeys {
     pub client_write_key: Vec<u8>,
     pub server_write_key: Vec<u8>,
@@ -82,12 +82,13 @@ pub struct DtlsTransport {
     close_tx: Arc<tokio::sync::Notify>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub enum DtlsState {
     New,
     Handshaking,
     Connected(SessionKeys, Option<u16>),
     Failed,
+    Closed,
 }
 
 impl fmt::Display for DtlsState {
@@ -97,6 +98,7 @@ impl fmt::Display for DtlsState {
             DtlsState::Handshaking => write!(f, "Handshaking"),
             DtlsState::Connected(_, profile) => write!(f, "Connected (SRTP: {:?})", profile),
             DtlsState::Failed => write!(f, "Failed"),
+            DtlsState::Closed => write!(f, "Closed"),
         }
     }
 }
@@ -110,7 +112,7 @@ impl DtlsTransport {
         conn: Arc<IceConn>,
         certificate: Certificate,
         is_client: bool,
-    ) -> Result<Arc<Self>> {
+    ) -> Result<(Arc<Self>, impl std::future::Future<Output = ()> + Send)> {
         let (incoming_data_tx, incoming_data_rx) = mpsc::channel(100);
         let (outgoing_data_tx, outgoing_data_rx) = mpsc::channel(100);
         let (handshake_rx_feeder, handshake_rx) = mpsc::channel(100);
@@ -138,7 +140,7 @@ impl DtlsTransport {
         conn.set_dtls_receiver(transport.clone()).await;
 
         let inner_clone = inner.clone();
-        tokio::spawn(async move {
+        let runner = async move {
             if let Err(e) = inner_clone
                 .handshake(
                     certificate,
@@ -155,13 +157,17 @@ impl DtlsTransport {
                 let _ = inner_clone.state_tx.send(DtlsState::Failed);
             }
             // Connected state is set inside handshake now
-        });
+        };
 
-        Ok(transport)
+        Ok((transport, runner))
     }
 
     pub fn subscribe_state(&self) -> tokio::sync::watch::Receiver<DtlsState> {
         self.inner.state_rx.clone()
+    }
+
+    pub fn close(&self) {
+        self.close_tx.notify_waiters();
     }
 
     pub async fn send(&self, data: &[u8]) -> Result<()> {
@@ -319,6 +325,14 @@ impl DtlsInner {
             }
             ContentType::Alert => {
                 trace!("Received Alert: {:?}", payload);
+                if payload.len() >= 2 {
+                    let description = payload[1];
+                    if description == 0 {
+                        // CloseNotify
+                        *self.state.lock().await = DtlsState::Closed;
+                        let _ = self.state_tx.send(DtlsState::Closed);
+                    }
+                }
             }
             _ => {}
         }
@@ -339,6 +353,34 @@ impl DtlsInner {
                 Ok(Some(msg)) => {
                     let consumed = msg_buf.len() - body.len();
                     let raw_msg = msg_buf.slice(0..consumed);
+
+                    if msg.message_seq < ctx.recv_message_seq {
+                        // Duplicate
+                        // Special case: ClientHello on Server (to trigger retransmit)
+                        if msg.msg_type == HandshakeType::ClientHello && !is_client {
+                            self.handle_handshake_message(
+                                msg,
+                                &raw_msg,
+                                ctx,
+                                certificate,
+                                is_client,
+                            )
+                            .await?;
+                        }
+                        continue;
+                    }
+
+                    if msg.message_seq > ctx.recv_message_seq {
+                        warn!(
+                            "Received out-of-order handshake message: got {}, expected {}",
+                            msg.message_seq, ctx.recv_message_seq
+                        );
+                        // Ignore out-of-order for now
+                        continue;
+                    }
+
+                    // Expected message
+                    ctx.recv_message_seq += 1;
 
                     if msg.msg_type != HandshakeType::Finished
                         && msg.msg_type != HandshakeType::HelloRequest
@@ -406,6 +448,15 @@ impl DtlsInner {
         is_client: bool,
     ) -> Result<()> {
         if is_client {
+            return Ok(());
+        }
+
+        if ctx.server_random.is_some() {
+            if let Some(flight) = &ctx.last_flight_buffer {
+                if let Err(e) = self.conn.send(flight).await {
+                    warn!("Failed to retransmit flight: {}", e);
+                }
+            }
             return Ok(());
         }
 
@@ -513,14 +564,18 @@ impl DtlsInner {
         handshake_msg.encode(&mut buf);
         ctx.handshake_messages.extend_from_slice(&buf);
 
-        self.send_handshake_message(
-            handshake_msg,
-            ctx.epoch,
-            &mut ctx.sequence_number,
-            None,
-            is_client,
-        )
-        .await?;
+        let mut flight_buffer = Vec::new();
+
+        let buf = self
+            .send_handshake_message(
+                handshake_msg,
+                ctx.epoch,
+                &mut ctx.sequence_number,
+                None,
+                is_client,
+            )
+            .await?;
+        flight_buffer.extend_from_slice(&buf);
         ctx.message_seq += 1;
 
         // Send Certificate
@@ -543,14 +598,16 @@ impl DtlsInner {
         handshake_msg.encode(&mut buf);
         ctx.handshake_messages.extend_from_slice(&buf);
 
-        self.send_handshake_message(
-            handshake_msg,
-            ctx.epoch,
-            &mut ctx.sequence_number,
-            None,
-            is_client,
-        )
-        .await?;
+        let buf = self
+            .send_handshake_message(
+                handshake_msg,
+                ctx.epoch,
+                &mut ctx.sequence_number,
+                None,
+                is_client,
+            )
+            .await?;
+        flight_buffer.extend_from_slice(&buf);
         ctx.message_seq += 1;
 
         // Send ServerKeyExchange
@@ -596,14 +653,16 @@ impl DtlsInner {
         handshake_msg.encode(&mut buf);
         ctx.handshake_messages.extend_from_slice(&buf);
 
-        self.send_handshake_message(
-            handshake_msg,
-            ctx.epoch,
-            &mut ctx.sequence_number,
-            None,
-            is_client,
-        )
-        .await?;
+        let buf = self
+            .send_handshake_message(
+                handshake_msg,
+                ctx.epoch,
+                &mut ctx.sequence_number,
+                None,
+                is_client,
+            )
+            .await?;
+        flight_buffer.extend_from_slice(&buf);
         ctx.message_seq += 1;
 
         // Send ServerHelloDone
@@ -623,15 +682,19 @@ impl DtlsInner {
         handshake_msg.encode(&mut buf);
         ctx.handshake_messages.extend_from_slice(&buf);
 
-        self.send_handshake_message(
-            handshake_msg,
-            ctx.epoch,
-            &mut ctx.sequence_number,
-            None,
-            is_client,
-        )
-        .await?;
+        let buf = self
+            .send_handshake_message(
+                handshake_msg,
+                ctx.epoch,
+                &mut ctx.sequence_number,
+                None,
+                is_client,
+            )
+            .await?;
+        flight_buffer.extend_from_slice(&buf);
         ctx.message_seq += 1;
+
+        ctx.last_flight_buffer = Some(flight_buffer);
 
         Ok(())
     }
@@ -1008,6 +1071,10 @@ impl DtlsInner {
         ctx: &mut HandshakeContext,
         is_client: bool,
     ) -> Result<()> {
+        if ctx.session_keys.is_some() {
+            return Ok(());
+        }
+
         // Send ClientKeyExchange
         let client_key_exchange = ClientKeyExchange {
             identity_hint: vec![],
@@ -1229,6 +1296,35 @@ impl DtlsInner {
         loop {
             tokio::select! {
                 _ = close_rx.notified() => {
+                    // Send CloseNotify
+                    if let Some(keys) = &ctx.session_keys {
+                        let alert = vec![1, 0]; // Level: Warning (1), Description: CloseNotify (0)
+                        let (key, iv) = if is_client {
+                            (&keys.client_write_key, &keys.client_write_iv)
+                        } else {
+                            (&keys.server_write_key, &keys.server_write_iv)
+                        };
+                        let full_seq = ((ctx.epoch as u64) << 48) | ctx.sequence_number;
+                        if let Ok(encrypted) = encrypt_record(
+                            ContentType::Alert,
+                            ProtocolVersion::DTLS_1_2,
+                            full_seq,
+                            &alert,
+                            key,
+                            iv
+                        ) {
+                            let record = DtlsRecord {
+                                content_type: ContentType::Alert,
+                                version: ProtocolVersion::DTLS_1_2,
+                                epoch: ctx.epoch,
+                                sequence_number: ctx.sequence_number,
+                                payload: Bytes::from(encrypted),
+                            };
+                            let mut buf = BytesMut::new();
+                            record.encode(&mut buf);
+                            let _ = self.conn.send(&buf).await;
+                        }
+                    }
                     return Ok(());
                 }
                 _ = retransmit_interval.tick() => {
@@ -1522,6 +1618,7 @@ struct HandshakeContext {
     sequence_number: u64,
     epoch: u16,
     message_seq: u16,
+    recv_message_seq: u16,
     last_flight_buffer: Option<Vec<u8>>,
     local_secret: Option<EphemeralSecret>,
     local_public_key_bytes: Vec<u8>,
@@ -1545,6 +1642,7 @@ impl HandshakeContext {
             sequence_number: 0,
             epoch: 0,
             message_seq: 0,
+            recv_message_seq: 0,
             last_flight_buffer: None,
             local_secret: Some(local_secret),
             local_public_key_bytes,

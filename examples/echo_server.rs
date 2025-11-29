@@ -101,6 +101,16 @@ async fn handle_rustrtc_offer(payload: OfferRequest) -> Json<OfferResponse> {
 
     let pc = PeerConnection::new(config);
 
+    let mut ice_state_rx = pc.subscribe_ice_connection_state();
+    tokio::spawn(async move {
+        while let Ok(()) = ice_state_rx.changed().await {
+            let state = *ice_state_rx.borrow();
+            if state == rustrtc::IceConnectionState::Disconnected {
+                info!("ICE connection disconnected");
+            }
+        }
+    });
+
     // Create DataChannel (negotiated id=0)
     if !matches!(payload.mode, Mode::VideoOnly) {
         let dc = pc.create_data_channel("echo").unwrap();
@@ -112,7 +122,7 @@ async fn handle_rustrtc_offer(payload: OfferRequest) -> Json<OfferResponse> {
         tokio::spawn(async move {
             while let Some(event) = dc_clone.recv().await {
                 match event {
-                    rustrtc::transports::sctp::DataChannelEvent::Message(data) => {
+                    rustrtc::DataChannelEvent::Message(data) => {
                         info!("Received message: {:?}", String::from_utf8_lossy(&data));
                         let pc = pc_clone.clone();
                         tokio::spawn(async move {
@@ -124,10 +134,10 @@ async fn handle_rustrtc_offer(payload: OfferRequest) -> Json<OfferResponse> {
                             }
                         });
                     }
-                    rustrtc::transports::sctp::DataChannelEvent::Open => {
+                    rustrtc::DataChannelEvent::Open => {
                         info!("Data channel opened");
                     }
-                    rustrtc::transports::sctp::DataChannelEvent::Close => {
+                    rustrtc::DataChannelEvent::Close => {
                         info!("Data channel closed");
                         break;
                     }
@@ -149,14 +159,7 @@ async fn handle_rustrtc_offer(payload: OfferRequest) -> Json<OfferResponse> {
     let _ = pc.create_answer().await.unwrap();
 
     // Wait for gathering to complete
-    loop {
-        if pc.ice_transport().gather_state().await
-            == rustrtc::transports::ice::IceGathererState::Complete
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    pc.wait_for_gathering_complete().await;
 
     let answer = pc.create_answer().await.unwrap();
     pc.set_local_description(answer.clone()).unwrap();
@@ -176,7 +179,7 @@ async fn start_echo(pc: PeerConnection, vp8_pt: u8) {
 
         transceiver.set_direction(rustrtc::TransceiverDirection::SendRecv);
 
-        let receiver = transceiver.receiver.lock().unwrap().clone();
+        let receiver = transceiver.receiver();
         let Some(receiver) = receiver else {
             warn!("Video transceiver {} missing receiver", transceiver.id());
             continue;
@@ -198,12 +201,19 @@ async fn start_echo(pc: PeerConnection, vp8_pt: u8) {
             channels: 0,
         });
 
-        *transceiver.sender.lock().unwrap() = Some(sender);
+        transceiver.set_sender(Some(sender));
 
         tokio::spawn(async move {
             loop {
                 match incoming_track.recv().await {
                     Ok(sample) => {
+                        let is_empty = match &sample {
+                            MediaSample::Video(f) => f.data.is_empty(),
+                            MediaSample::Audio(f) => f.data.is_empty(),
+                        };
+                        if is_empty {
+                            continue;
+                        }
                         if let Err(err) = sample_source.send(sample).await {
                             warn!("Video echo forwarder stopped: {}", err);
                             break;
@@ -291,6 +301,15 @@ impl MediaSource for IvfSource {
 
 async fn start_video_playback(pc: PeerConnection, vp8_pt: u8) {
     let transceivers = pc.get_transceivers();
+    info!(
+        "start_video_playback: found {} transceivers",
+        transceivers.len()
+    );
+    for (i, t) in transceivers.iter().enumerate() {
+        info!("Transceiver {}: kind={:?} mid={:?}", i, t.kind(), t.mid());
+    }
+
+    let mut video_playing = false;
     for transceiver in transceivers {
         if transceiver.kind() != rustrtc::MediaKind::Video {
             continue;
@@ -299,7 +318,7 @@ async fn start_video_playback(pc: PeerConnection, vp8_pt: u8) {
         transceiver.set_direction(rustrtc::TransceiverDirection::SendRecv);
 
         // Drain incoming track to prevent backpressure blocking the connection
-        if let Some(receiver) = transceiver.receiver.lock().unwrap().clone() {
+        if let Some(receiver) = transceiver.receiver() {
             let incoming_track = receiver.track();
             tokio::spawn(async move {
                 while let Ok(_) = incoming_track.recv().await {
@@ -307,6 +326,12 @@ async fn start_video_playback(pc: PeerConnection, vp8_pt: u8) {
                 }
             });
         }
+
+        if video_playing {
+            info!("Skipping additional video transceiver for playback");
+            continue;
+        }
+        video_playing = true;
 
         let (sample_source, outgoing_track) = media::sample_track(MediaStreamKind::Video, 120);
 
@@ -323,7 +348,7 @@ async fn start_video_playback(pc: PeerConnection, vp8_pt: u8) {
         });
 
         let mut rtcp_rx = sender.subscribe_rtcp();
-        *transceiver.sender.lock().unwrap() = Some(sender);
+        transceiver.set_sender(Some(sender));
 
         let sample_source = sample_source.clone();
         let pc_clone = pc.clone();
@@ -333,6 +358,7 @@ async fn start_video_playback(pc: PeerConnection, vp8_pt: u8) {
                 return;
             }
             info!("Peer connection established, starting video playback");
+            let mut ice_state_rx_loop = pc_clone.subscribe_ice_connection_state();
 
             let last_rtp_timestamp = Arc::new(AtomicU32::new(0));
             let mut rtp_timestamp_offset = 0u32;
@@ -380,7 +406,10 @@ async fn start_video_playback(pc: PeerConnection, vp8_pt: u8) {
 
                 tokio::select! {
                     _ = pump => {
+                        info!("Play done");
                         // Finished naturally
+                        let last = last_rtp_timestamp.load(Ordering::SeqCst);
+                        rtp_timestamp_offset = last.wrapping_add(3000);
                     }
                     result = rtcp_rx.recv() => {
                         if let Ok(rustrtc::rtp::RtcpPacket::PictureLossIndication(_)) = result {
@@ -388,6 +417,18 @@ async fn start_video_playback(pc: PeerConnection, vp8_pt: u8) {
                             let last = last_rtp_timestamp.load(Ordering::SeqCst);
                             rtp_timestamp_offset = last.wrapping_add(3000);
                             // Pump will be dropped and aborted when we loop
+                        }
+                    }
+                    res = ice_state_rx_loop.changed() => {
+                        if res.is_ok() {
+                            let state = *ice_state_rx_loop.borrow();
+                            if state == rustrtc::IceConnectionState::Disconnected || state == rustrtc::IceConnectionState::Failed || state == rustrtc::IceConnectionState::Closed {
+                                info!("Stopping playback due to connection state: {:?}", state);
+                                return;
+                            }
+                            // Ignore other state changes (e.g. Connected -> Completed)
+                        } else {
+                            return;
                         }
                     }
                 }

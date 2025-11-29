@@ -20,7 +20,8 @@ async fn test_dtls_handshake_client_hello() -> Result<()> {
     let cert = generate_certificate()?;
 
     // Start client
-    let _client_dtls = DtlsTransport::new(client_conn, cert.clone(), true).await?;
+    let (_client_dtls, runner) = DtlsTransport::new(client_conn, cert.clone(), true).await?;
+    tokio::spawn(runner);
 
     // Read from server socket to verify ClientHello
     let mut buf = vec![0u8; 2048];
@@ -54,7 +55,8 @@ async fn test_dtls_handshake_server_hello() -> Result<()> {
     let cert = generate_certificate()?;
 
     // Start server
-    let _server_dtls = DtlsTransport::new(server_conn.clone(), cert.clone(), false).await?;
+    let (_server_dtls, runner) = DtlsTransport::new(server_conn.clone(), cert.clone(), false).await?;
+    tokio::spawn(runner);
 
     // Start a loop to feed server_dtls
     let server_socket_clone = server_socket.clone();
@@ -187,8 +189,10 @@ async fn test_dtls_handshake_full_flow() -> Result<()> {
     let cert = generate_certificate()?;
 
     // Start client
-    let _client_dtls = DtlsTransport::new(client_conn.clone(), cert.clone(), true).await?;
-    let _server_dtls = DtlsTransport::new(server_conn.clone(), cert.clone(), false).await?;
+    let (_client_dtls, client_runner) = DtlsTransport::new(client_conn.clone(), cert.clone(), true).await?;
+    tokio::spawn(client_runner);
+    let (_server_dtls, server_runner) = DtlsTransport::new(server_conn.clone(), cert.clone(), false).await?;
+    tokio::spawn(server_runner);
 
     // Start loops to feed DTLS transports
     let client_socket_clone = client_socket.clone();

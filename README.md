@@ -30,7 +30,7 @@ async fn main() {
     let dc_clone = dc.clone();
     tokio::spawn(async move {
         while let Some(event) = dc_clone.recv().await {
-            if let rustrtc::transports::sctp::DataChannelEvent::Message(data) = event {
+            if let rustrtc::DataChannelEvent::Message(data) = event {
                 println!("Received: {:?}", String::from_utf8_lossy(&data));
             }
         }
@@ -38,6 +38,36 @@ async fn main() {
 
     // ... Handle SDP offer/answer exchange ...
 }
+```
+
+## Configuration
+
+`rustrtc` allows customizing the WebRTC session via `RtcConfiguration`:
+
+- **ice_servers**: Configure STUN/TURN servers.
+- **ice_transport_policy**: Control ICE candidate gathering (e.g., `All`, `Relay`).
+- **ssrc_start**: Set the starting SSRC value for local tracks.
+- **media_capabilities**: Configure supported codecs (payload types, names) and SCTP ports.
+
+```rust
+use rustrtc::{PeerConnection, RtcConfiguration, IceServer, IceTransportPolicy, config::MediaCapabilities};
+
+let mut config = RtcConfiguration::default();
+
+// Configure ICE servers
+config.ice_servers.push(IceServer::new(vec!["stun:stun.l.google.com:19302"]));
+
+// Set ICE transport policy (optional)
+config.ice_transport_policy = IceTransportPolicy::All;
+
+config.ssrc_start = 10000;
+
+// Customize media capabilities
+let mut caps = MediaCapabilities::default();
+// ... configure audio/video/application caps ...
+config.media_capabilities = Some(caps);
+
+let pc = PeerConnection::new(config);
 ```
 
 ## Examples

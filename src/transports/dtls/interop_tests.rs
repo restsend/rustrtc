@@ -76,7 +76,8 @@ async fn test_interop_rustrtc_client_webrtc_server() -> Result<()> {
     });
 
     let cert = generate_certificate()?;
-    let client_dtls = DtlsTransport::new(client_conn, cert, true).await?;
+    let (client_dtls, runner) = DtlsTransport::new(client_conn, cert, true).await?;
+    tokio::spawn(runner);
 
     // Wait for handshake
     tokio::time::sleep(Duration::from_secs(2)).await;
