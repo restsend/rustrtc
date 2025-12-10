@@ -30,6 +30,12 @@
         <label><input type="checkbox" id="usePingPong" checked> Enable Ping-Pong Handshake</label>
         <label style="margin-left: 20px;">Chunk Count <input type="text" id="chunkCount" value="256"></label>
         <label style="margin-left: 20px;">Chunk Size <input type="text" id="chunkSize" value="62208"></label>
+        <label style="margin-left: 20px;">Backend:
+            <select id="backend">
+                <option value="rustrtc">rustrtc</option>
+                <option value="webrtc-rs">webrtc-rs</option>
+            </select>
+        </label>
     </div>
     <div id="status">Status: Ready</div>
     <button id="startBtn" onclick="startTest()">Start Test</button>
@@ -140,13 +146,20 @@
 
             const offerSdp = pc.localDescription.sdp;
             const usePingPong = document.getElementById('usePingPong').checked;
+            const backend = document.getElementById('backend').value;
             log('Sending Offer...');
 
             // Send to server
             const response = await fetch('/offer', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ sdp: offerSdp, ping_pong: usePingPong, chunk_count: chunkCount, chunk_size: chunkSize })
+                body: JSON.stringify({
+                    sdp: offerSdp,
+                    ping_pong: usePingPong,
+                    chunk_count: chunkCount,
+                    chunk_size: chunkSize,
+                    backend: backend
+                })
             });
 
             const answerData = await response.json();
