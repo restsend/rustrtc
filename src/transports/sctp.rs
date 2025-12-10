@@ -1211,9 +1211,15 @@ impl SctpInner {
         };
 
         let mut max_payload_size = 1200;
+        let mut ordered = true;
         let (_guard, ssn) = if let Some(dc) = &dc_opt {
             let guard = dc.send_lock.lock().await;
-            let ssn = dc.next_ssn.fetch_add(1, Ordering::SeqCst);
+            ordered = dc.ordered;
+            let ssn = if ordered {
+                dc.next_ssn.fetch_add(1, Ordering::SeqCst)
+            } else {
+                0
+            };
             max_payload_size = dc.max_payload_size;
             (Some(guard), ssn)
         } else {
@@ -1242,7 +1248,11 @@ impl SctpInner {
             }
 
             let tsn = self.next_tsn.fetch_add(1, Ordering::SeqCst);
-            let packet = self.create_packet(channel_id, ppid, data, ssn, 0x03, tsn);
+            let mut flags = 0x03;
+            if !ordered {
+                flags |= 0x04;
+            }
+            let packet = self.create_packet(channel_id, ppid, data, ssn, flags, tsn);
             {
                 let mut queue = self.sent_queue.lock().unwrap();
                 let was_empty = queue.is_empty();
@@ -1298,7 +1308,7 @@ impl SctpInner {
                     break;
                 }
 
-                let flags = if offset == 0 {
+                let mut flags = if offset == 0 {
                     if remaining <= max_payload_size {
                         0x03 // B=1, E=1 (Unfragmented)
                     } else {
@@ -1309,6 +1319,10 @@ impl SctpInner {
                 } else {
                     0x00 // B=0, E=0 (Middle)
                 };
+
+                if !ordered {
+                    flags |= 0x04; // Set U bit
+                }
 
                 let tsn = self.next_tsn.fetch_add(1, Ordering::SeqCst);
                 let chunk_data = &data[offset..offset + chunk_size];
