@@ -429,16 +429,61 @@ impl IceTransport {
         self.start_gathering()?;
         self.start_keepalive();
 
-        // Wait for at least one local candidate
+        // Wait for a suitable local candidate
+        // If remote is not loopback, we prefer a non-loopback local candidate to avoid os error 49 (EADDRNOTAVAIL)
         let mut rx = self.subscribe_candidates();
-        let local = if let Some(first) = self.inner.gatherer.local_candidates().first() {
+        let start = Instant::now();
+        let timeout_dur = Duration::from_secs(2);
+
+        let is_suitable = |c: &IceCandidate| -> bool {
+            if !remote_addr.ip().is_loopback() && c.address.ip().is_loopback() {
+                return false;
+            }
+            true
+        };
+
+        let mut best_local: Option<IceCandidate> = None;
+
+        // 1. Check existing candidates
+        {
+            let candidates = self.inner.gatherer.local_candidates();
+            for c in candidates {
+                if is_suitable(&c) {
+                    best_local = Some(c);
+                    break;
+                }
+            }
+        }
+
+        // 2. If not found, wait for more
+        if best_local.is_none() {
+            loop {
+                let remaining = timeout_dur
+                    .checked_sub(start.elapsed())
+                    .unwrap_or(Duration::ZERO);
+                if remaining.is_zero() {
+                    break;
+                }
+
+                match timeout(remaining, rx.recv()).await {
+                    Ok(Ok(c)) => {
+                        if is_suitable(&c) {
+                            best_local = Some(c);
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        }
+
+        // 3. Fallback to any candidate
+        let local = if let Some(best) = best_local {
+            best
+        } else if let Some(first) = self.inner.gatherer.local_candidates().first() {
             first.clone()
         } else {
-            // Wait for one
-            match timeout(Duration::from_secs(2), rx.recv()).await {
-                Ok(Ok(c)) => c,
-                _ => bail!("No local candidates gathered for direct connection"),
-            }
+            bail!("No local candidates gathered for direct connection");
         };
 
         let remote = IceCandidate::host(remote_addr, 1);

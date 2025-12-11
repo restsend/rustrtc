@@ -196,7 +196,6 @@ impl PeerConnection {
 
             tokio::join!(gathering_loop, dtls_loop, ice_runner);
         });
-
         pc
     }
 
@@ -227,7 +226,7 @@ impl PeerConnection {
         track: Arc<dyn MediaStreamTrack>,
         params: RtpCodecParameters,
     ) -> RtcResult<Arc<RtpSender>> {
-        let stream_id = format!("rustrtc-stream-{}", track.id());
+        let stream_id = format!("{}", track.id());
         self.add_track_with_stream_id(track, stream_id, params)
     }
 
@@ -1654,6 +1653,7 @@ impl PeerConnectionInner {
             .attributes
             .iter()
             .any(|attr| attr.key == "msid-semantic")
+            && self.config.transport_mode == TransportMode::WebRtc
         {
             desc.session
                 .attributes
@@ -1687,7 +1687,7 @@ impl PeerConnectionInner {
             section.direction = direction.into();
 
             if mode == TransportMode::Rtp {
-                section.protocol = "RTP/AVPF".to_string();
+                section.protocol = "RTP/AVP".to_string();
             }
 
             if mode == TransportMode::WebRtc {
@@ -1720,7 +1720,7 @@ impl PeerConnectionInner {
 
             self.populate_media_capabilities(&mut section, transceiver.kind(), sdp_type);
             if let Some(sender) = sender_info {
-                Self::attach_sender_attributes(&mut section, &sender);
+                Self::attach_sender_attributes(&mut section, &sender, &mode);
             }
 
             if self.config.transport_mode == TransportMode::Srtp {
@@ -1768,23 +1768,36 @@ impl PeerConnectionInner {
         Ok(desc)
     }
 
-    fn attach_sender_attributes(section: &mut MediaSection, sender: &Arc<RtpSender>) {
+    fn attach_sender_attributes(
+        section: &mut MediaSection,
+        sender: &Arc<RtpSender>,
+        mode: &TransportMode,
+    ) {
         let ssrc = sender.ssrc();
         let cname = sender.cname();
         let stream_id = sender.stream_id();
         let track_id = sender.track_id();
-        section.attributes.push(Attribute::new(
-            "msid",
-            Some(format!("{} {}", stream_id, track_id)),
-        ));
-        section.attributes.push(Attribute::new(
-            "ssrc",
-            Some(format!("{} cname:{}", ssrc, cname)),
-        ));
-        section.attributes.push(Attribute::new(
-            "ssrc",
-            Some(format!("{} msid:{} {}", ssrc, stream_id, track_id)),
-        ));
+
+        if *mode == TransportMode::WebRtc {
+            section.attributes.push(Attribute::new(
+                "msid",
+                Some(format!("{} {}", stream_id, track_id)),
+            ));
+        }
+
+        if *mode != TransportMode::Rtp {
+            section.attributes.push(Attribute::new(
+                "ssrc",
+                Some(format!("{} cname:{}", ssrc, cname)),
+            ));
+        }
+
+        if *mode == TransportMode::WebRtc {
+            section.attributes.push(Attribute::new(
+                "ssrc",
+                Some(format!("{} msid:{} {}", ssrc, stream_id, track_id)),
+            ));
+        }
     }
 
     fn ensure_mid(&self, transceiver: &Arc<RtpTransceiver>) -> String {
@@ -2687,6 +2700,21 @@ mod tests {
         let attrs = &section.attributes;
         assert!(attrs.iter().any(|attr| attr.key == "ice-ufrag"));
         assert!(attrs.iter().any(|attr| attr.key == "ice-pwd"));
+
+        // Should have msid-semantic
+        assert!(
+            offer
+                .session
+                .attributes
+                .iter()
+                .any(|a| a.key == "msid-semantic")
+        );
+
+        // Should have msid in media section
+        assert!(attrs.iter().any(|a| a.key == "msid"));
+
+        // Should have ssrc in media section
+        assert!(attrs.iter().any(|a| a.key == "ssrc"));
         assert!(attrs.iter().any(|attr| attr.key == "ice-options"));
         assert!(attrs.iter().any(|attr| attr.key == "end-of-candidates"));
         assert!(attrs.iter().filter(|attr| attr.key == "candidate").count() >= 1);
@@ -2927,8 +2955,23 @@ mod tests {
         // Should NOT have DTLS fingerprint
         assert!(!section.attributes.iter().any(|a| a.key == "fingerprint"));
 
-        // Protocol should be RTP/AVPF
-        assert_eq!(section.protocol, "RTP/AVPF");
+        // Should NOT have msid-semantic
+        assert!(
+            !offer
+                .session
+                .attributes
+                .iter()
+                .any(|a| a.key == "msid-semantic")
+        );
+
+        // Should NOT have msid in media section
+        assert!(!section.attributes.iter().any(|a| a.key == "msid"));
+
+        // Should NOT have ssrc in media section
+        assert!(!section.attributes.iter().any(|a| a.key == "ssrc"));
+
+        // Protocol should be RTP/AVP
+        assert_eq!(section.protocol, "RTP/AVP");
     }
 
     #[tokio::test]
