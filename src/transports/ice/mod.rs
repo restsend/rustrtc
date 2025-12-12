@@ -4,8 +4,8 @@ pub mod stun;
 mod tests;
 pub mod turn;
 
-use crate::transports::PacketReceiver;
 use crate::transports::ice::turn::{TurnClient, TurnCredentials};
+use crate::transports::{PacketReceiver, get_local_ip};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -1541,7 +1541,7 @@ impl IceGatherer {
         }
 
         // 2. LAN IP
-        if let Ok(ip) = get_local_ip().await
+        if let Ok(ip) = get_local_ip()
             && !ip.is_loopback()
         {
             match UdpSocket::bind(SocketAddr::new(ip, 0)).await {
@@ -1798,19 +1798,6 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(TABLE[(byte & 0x0f) as usize] as char);
     }
     out
-}
-
-async fn get_local_ip() -> Result<IpAddr> {
-    let fut = async {
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
-        socket.connect("8.8.8.8:80").await?;
-        Ok::<IpAddr, std::io::Error>(socket.local_addr()?.ip())
-    };
-
-    match timeout(Duration::from_millis(200), fut).await {
-        Ok(res) => res.map_err(|e| anyhow!(e)),
-        Err(_) => Err(anyhow!("get_local_ip timed out")),
-    }
 }
 
 #[derive(Debug, Clone)]

@@ -3,6 +3,7 @@ use crate::rtp::{FirRequest, FullIntraRequest, PictureLossIndication, RtcpPacket
 use crate::stats::{StatsReport, gather_once};
 use crate::stats_collector::StatsCollector;
 use crate::transports::dtls::{self, DtlsTransport};
+use crate::transports::get_local_ip;
 use crate::transports::ice::stun::random_u32;
 use crate::transports::ice::{IceCandidate, IceGathererState, IceTransport, conn::IceConn};
 use crate::transports::rtp::RtpTransport;
@@ -14,6 +15,7 @@ use crate::{
 use base64::prelude::*;
 use rand_core::{OsRng, RngCore};
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr};
 use std::{
     sync::{
         Arc, Mutex,
@@ -1749,6 +1751,13 @@ impl PeerConnectionInner {
             desc.media_sections.push(section);
         }
 
+        if mode == TransportMode::Rtp || mode == TransportMode::Srtp {
+            let local_ip = get_local_ip().unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+            if desc.session.connection.is_none() {
+                desc.session.connection = Some(format!("IN IP4 {}", local_ip));
+            }
+        }
+
         if !desc.media_sections.is_empty() {
             let should_bundle = match sdp_type {
                 SdpType::Offer => true,
@@ -1952,6 +1961,9 @@ fn default_origin() -> Origin {
         .as_secs();
     origin.session_id = now;
     origin.session_version = now;
+    if let Ok(ip) = get_local_ip() {
+        origin.unicast_address = ip.to_string();
+    }
     origin
 }
 

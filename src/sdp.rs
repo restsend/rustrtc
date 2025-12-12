@@ -192,10 +192,10 @@ impl Default for SessionSection {
 
 impl SessionSection {
     fn write_lines(&self, out: &mut String) -> fmt::Result {
-        writeln!(out, "v={}", self.version)?;
-        writeln!(
+        write!(out, "v={}\r\n", self.version)?;
+        write!(
             out,
-            "o={} {} {} {} {} {}",
+            "o={} {} {} {} {} {}\r\n",
             self.origin.username,
             self.origin.session_id,
             self.origin.session_version,
@@ -203,11 +203,11 @@ impl SessionSection {
             self.origin.address_type.as_str(),
             self.origin.unicast_address
         )?;
-        writeln!(out, "s={}", self.name)?;
-        writeln!(out, "t={} {}", self.timing.start, self.timing.stop)?;
+        write!(out, "s={}\r\n", self.name)?;
         if let Some(connection) = &self.connection {
-            writeln!(out, "c={}", connection)?;
+            write!(out, "c={}\r\n", connection)?;
         }
+        write!(out, "t={} {}\r\n", self.timing.start, self.timing.stop)?;
         for attr in &self.attributes {
             attr.write_line(out)?;
         }
@@ -324,8 +324,8 @@ impl Attribute {
 
     fn write_line(&self, out: &mut String) -> fmt::Result {
         match &self.value {
-            Some(value) => writeln!(out, "a={}:{}", self.key, value),
-            None => writeln!(out, "a={}", self.key),
+            Some(value) => write!(out, "a={}:{}\r\n", self.key, value),
+            None => write!(out, "a={}\r\n", self.key),
         }
     }
 }
@@ -757,21 +757,24 @@ impl MediaSection {
     }
 
     fn write_lines(&self, out: &mut String) -> fmt::Result {
-        writeln!(
+        write!(
             out,
-            "m={} {} {} {}",
+            "m={} {} {} {}\r\n",
             self.kind.as_str(),
             self.port,
             self.protocol,
             self.formats.join(" ")
         )?;
         if let Some(connection) = &self.connection {
-            writeln!(out, "c={}", connection)?;
+            write!(out, "c={}\r\n", connection)?;
         }
-        if !self.mid.is_empty() {
-            writeln!(out, "a=mid:{}", self.mid)?;
+        // Only write a=mid for WebRTC protocols, not for traditional RTP/AVP
+        if !self.mid.is_empty()
+            && (self.protocol.contains("TLS") || self.protocol.contains("SAVPF"))
+        {
+            write!(out, "a=mid:{}\r\n", self.mid)?;
         }
-        writeln!(out, "a={}", self.direction.as_str())?;
+        write!(out, "a={}\r\n", self.direction.as_str())?;
         for attr in &self.attributes {
             attr.write_line(out)?;
         }
