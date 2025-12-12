@@ -1550,7 +1550,16 @@ impl IceGatherer {
                         let socket = Arc::new(socket);
                         self.sockets.lock().unwrap().push(socket.clone());
                         let _ = self.socket_tx.send(IceSocketWrapper::Udp(socket));
-                        self.push_candidate(IceCandidate::host(addr, 1));
+
+                        if let Some(ext_ip) = &self.config.external_ip
+                            && let Ok(parsed_ip) = ext_ip.parse::<IpAddr>()
+                        {
+                            let mut ext_addr = addr;
+                            ext_addr.set_ip(parsed_ip);
+                            self.push_candidate(IceCandidate::host(ext_addr, 1));
+                        } else {
+                            self.push_candidate(IceCandidate::host(addr, 1));
+                        }
                     }
                 }
                 Err(e) => warn!("Failed to bind LAN socket on {}: {}", ip, e),

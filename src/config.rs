@@ -108,6 +108,52 @@ impl Default for AudioCapability {
     }
 }
 
+impl AudioCapability {
+    pub fn opus() -> Self {
+        Self::default()
+    }
+
+    pub fn pcmu() -> Self {
+        Self {
+            payload_type: 0,
+            codec_name: "PCMU".to_string(),
+            clock_rate: 8000,
+            channels: 1,
+            fmtp: None,
+        }
+    }
+
+    pub fn pcma() -> Self {
+        Self {
+            payload_type: 8,
+            codec_name: "PCMA".to_string(),
+            clock_rate: 8000,
+            channels: 1,
+            fmtp: None,
+        }
+    }
+
+    pub fn g722() -> Self {
+        Self {
+            payload_type: 9,
+            codec_name: "G722".to_string(),
+            clock_rate: 8000,
+            channels: 1,
+            fmtp: None,
+        }
+    }
+
+    pub fn telephone_event() -> Self {
+        Self {
+            payload_type: 101,
+            codec_name: "telephone-event".to_string(),
+            clock_rate: 8000,
+            channels: 1,
+            fmtp: Some("0-16".to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VideoCapability {
     pub payload_type: u8,
@@ -138,11 +184,21 @@ impl Default for ApplicationCapability {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MediaCapabilities {
     pub audio: Vec<AudioCapability>,
     pub video: Vec<VideoCapability>,
     pub application: Option<ApplicationCapability>,
+}
+
+impl Default for MediaCapabilities {
+    fn default() -> Self {
+        Self {
+            audio: vec![AudioCapability::opus(), AudioCapability::pcmu()],
+            video: vec![VideoCapability::default()],
+            application: Some(ApplicationCapability::default()),
+        }
+    }
 }
 
 /// Primary configuration for a `PeerConnection`.
@@ -155,6 +211,7 @@ pub struct RtcConfiguration {
     pub certificates: Vec<CertificateConfig>,
     pub transport_mode: TransportMode,
     pub media_capabilities: Option<MediaCapabilities>,
+    pub external_ip: Option<String>,
     pub disable_ipv6: bool,
     pub ssrc_start: u32,
     pub stun_timeout: std::time::Duration,
@@ -171,6 +228,7 @@ impl Default for RtcConfiguration {
             certificates: Vec::new(),
             transport_mode: TransportMode::default(),
             media_capabilities: None,
+            external_ip: None,
             disable_ipv6: false,
             ssrc_start: 10000,
             stun_timeout: std::time::Duration::from_secs(5),
@@ -228,6 +286,11 @@ impl RtcConfigurationBuilder {
 
     pub fn media_capabilities(mut self, capabilities: MediaCapabilities) -> Self {
         self.inner.media_capabilities = Some(capabilities);
+        self
+    }
+
+    pub fn external_ip(mut self, ip: String) -> Self {
+        self.inner.external_ip = Some(ip);
         self
     }
 
