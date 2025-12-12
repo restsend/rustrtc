@@ -768,10 +768,8 @@ impl MediaSection {
         if let Some(connection) = &self.connection {
             write!(out, "c={}\r\n", connection)?;
         }
-        // Only write a=mid for WebRTC protocols, not for traditional RTP/AVP
-        if !self.mid.is_empty()
-            && (self.protocol.contains("TLS") || self.protocol.contains("SAVPF"))
-        {
+        // Always write a=mid if it is present, as it is required for BUNDLE
+        if !self.mid.is_empty() {
             write!(out, "a=mid:{}\r\n", self.mid)?;
         }
         write!(out, "a={}\r\n", self.direction.as_str())?;

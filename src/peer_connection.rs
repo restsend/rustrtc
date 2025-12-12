@@ -181,8 +181,6 @@ impl PeerConnection {
         let ice_transport_gathering = ice_transport.clone();
         let ice_gathering_state_tx = pc.inner.ice_gathering_state.clone();
         let inner_weak_gathering = inner_weak.clone();
-        let need_run_dtls_loop = pc.inner.config.transport_mode == TransportMode::WebRtc;
-
         tokio::spawn(async move {
             let gathering_loop = run_gathering_loop(
                 ice_transport_gathering,
@@ -190,17 +188,12 @@ impl PeerConnection {
                 inner_weak_gathering,
             );
 
-            let dtls_loop = async {
-                if need_run_dtls_loop {
-                    run_ice_dtls_loop(
-                        ice_transport,
-                        ice_connection_state_tx,
-                        dtls_role_rx,
-                        inner_weak,
-                    )
-                    .await
-                }
-            };
+            let dtls_loop = run_ice_dtls_loop(
+                ice_transport,
+                ice_connection_state_tx,
+                dtls_role_rx,
+                inner_weak,
+            );
 
             tokio::join!(gathering_loop, dtls_loop, ice_runner);
         });
@@ -1447,6 +1440,20 @@ async fn run_ice_dtls_loop(
         match ice_state {
             crate::transports::ice::IceTransportState::Connected
             | crate::transports::ice::IceTransportState::Completed => {
+                // For RTP/SRTP mode, we don't need DTLS role to start
+                let transport_mode = if let Some(inner) = inner_weak.upgrade() {
+                    inner.config.transport_mode.clone()
+                } else {
+                    return;
+                };
+
+                if transport_mode != TransportMode::WebRtc {
+                    if !handle_connected_state_no_dtls(&inner_weak, &mut ice_state_rx).await {
+                        return;
+                    }
+                    continue;
+                }
+
                 if !handle_connected_state(
                     &inner_weak,
                     &ice_connection_state_tx,
@@ -1478,6 +1485,43 @@ async fn run_ice_dtls_loop(
             return;
         }
     }
+}
+
+async fn handle_connected_state_no_dtls(
+    inner_weak: &std::sync::Weak<PeerConnectionInner>,
+    ice_state_rx: &mut watch::Receiver<crate::transports::ice::IceTransportState>,
+) -> bool {
+    if let Some(inner) = inner_weak.upgrade() {
+        let pc_temp = PeerConnection {
+            inner: inner.clone(),
+        };
+        // For RTP/SRTP, we pass false as is_client, but it doesn't matter as start_dtls handles it
+        match pc_temp.start_dtls(false).await {
+            Err(e) => {
+                warn!("Transport start failed: {}", e);
+                let _ = inner.peer_state.send(PeerConnectionState::Failed);
+                return false;
+            }
+            Ok(mut rtcp_loop) => {
+                let _ = inner.peer_state.send(PeerConnectionState::Connected);
+                loop {
+                    tokio::select! {
+                        _ = &mut rtcp_loop => {
+                            break;
+                        }
+                        res = ice_state_rx.changed() => {
+                            if res.is_err() { return false; }
+                            let new_state = *ice_state_rx.borrow();
+                            if is_ice_disconnected(new_state) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 async fn handle_connected_state(
