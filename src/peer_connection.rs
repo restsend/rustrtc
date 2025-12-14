@@ -1831,6 +1831,8 @@ impl PeerConnectionInner {
                 _ => false,
             };
 
+            let should_bundle = should_bundle && desc.media_sections.len() > 1;
+
             if should_bundle {
                 let mids: Vec<String> = desc.media_sections.iter().map(|m| m.mid.clone()).collect();
                 let value = format!("BUNDLE {}", mids.join(" "));
