@@ -12,14 +12,14 @@ use tracing::{debug, info, trace, warn};
 
 // RTO Constants (RFC 4960)
 const RTO_INITIAL: f64 = 1.0;
-const RTO_MIN: f64 = 0.2;
+const RTO_MIN: f64 = 0.1; // Lower RTO_MIN for faster recovery in high-speed networks
 const RTO_MAX: f64 = 60.0;
 const RTO_ALPHA: f64 = 0.125;
 const RTO_BETA: f64 = 0.25;
 
 // Flow Control Constants
-const CWND_INITIAL: usize = 1200 * 10; // Start with 10 MTUs (RFC 6928) for better stability
-const MAX_BURST: usize = 4; // RFC 4960 Section 7.2.4
+const CWND_INITIAL: usize = 1200 * 200; // Start with 200 MTUs for better performance
+const MAX_BURST: usize = 20; // RFC 4960 Section 7.2.4
 
 #[derive(Debug, Clone)]
 struct ChunkRecord {
@@ -43,8 +43,8 @@ pub enum SctpState {
 // SCTP Constants
 const SCTP_COMMON_HEADER_SIZE: usize = 12;
 const CHUNK_HEADER_SIZE: usize = 4;
-const MAX_SCTP_PACKET_SIZE: usize = 1200;
-const DEFAULT_MAX_PAYLOAD_SIZE: usize = 1172; // 1200 - 12 (common) - 16 (data header)
+const MAX_SCTP_PACKET_SIZE: usize = 1400; // Increased for better throughput
+const DEFAULT_MAX_PAYLOAD_SIZE: usize = 1372; // 1400 - 12 (common) - 16 (data header)
 const LOCAL_RWND_BYTES: usize = 16 * 1024 * 1024;
 const DUP_THRESH: u8 = 3;
 
@@ -377,7 +377,7 @@ impl SctpTransport {
             peer_rwnd: AtomicU32::new(1024 * 1024), // Default 1MB until we hear otherwise
             timer_notify: Arc::new(Notify::new()),
             flow_control_notify: Arc::new(Notify::new()),
-            ack_delay_ms: AtomicU32::new(200),
+            ack_delay_ms: AtomicU32::new(50),
             ack_scheduled: AtomicBool::new(false),
             last_gap_sig: AtomicU32::new(0),
             dups_buffer: Mutex::new(Vec::new()),
@@ -436,14 +436,14 @@ impl Drop for SctpTransport {
 impl SctpInner {
     fn compute_ack_delay_ms(&self, has_gap: bool) -> u32 {
         if !has_gap {
-            return 200;
+            return 50;
         }
         let srtt = self.rto_state.lock().unwrap().srtt;
         if srtt == 0.0 {
-            return 50;
+            return 20;
         }
         let ms = (srtt * 1000.0 * 0.25).round() as u32;
-        ms.clamp(20, 200)
+        ms.clamp(10, 50)
     }
 
     fn gap_signature(&self, cumulative_tsn_ack: u32) -> u32 {
@@ -651,25 +651,24 @@ impl SctpInner {
                 return Ok(());
             }
 
+            // Collect channel info once to avoid locking in the loop
+            let channel_info: std::collections::HashMap<u16, Option<u16>> = {
+                let channels = self.data_channels.lock().unwrap();
+                channels
+                    .iter()
+                    .filter_map(|weak_dc| weak_dc.upgrade().map(|dc| (dc.id, dc.max_retransmits)))
+                    .collect()
+            };
+
             for (tsn, record) in sent_queue.iter_mut() {
                 let expiry = record.sent_time + Duration::from_secs_f64(rto);
                 if now >= expiry {
                     // Check for abandonment
                     let mut abandoned = false;
-                    let dc_opt = {
-                        let channels = self.data_channels.lock().unwrap();
-                        channels.iter().find_map(|weak_dc| {
-                            weak_dc.upgrade().filter(|dc| dc.id == record.stream_id)
-                        })
-                    };
-
-                    if let Some(dc) = dc_opt {
-                        if let Some(max_rexmit) = dc.max_retransmits {
-                            if record.transmit_count >= max_rexmit as u32 {
-                                abandoned = true;
-                            }
+                    if let Some(Some(max_rexmit)) = channel_info.get(&record.stream_id) {
+                        if record.transmit_count >= *max_rexmit as u32 {
+                            abandoned = true;
                         }
-                        // Max life time check could also be here
                     }
 
                     if abandoned {
@@ -704,7 +703,7 @@ impl SctpInner {
 
             // Reduce ssthresh and cwnd (RFC 4960 / Modern TCP)
             let cwnd = self.cwnd.load(Ordering::SeqCst);
-            let new_ssthresh = (cwnd / 2).max(1200 * 32); // Higher minimum ssthresh
+            let new_ssthresh = (cwnd / 2).max(MAX_SCTP_PACKET_SIZE * 32); // Higher minimum ssthresh
             self.ssthresh.store(new_ssthresh, Ordering::SeqCst);
             self.cwnd.store(CWND_INITIAL, Ordering::SeqCst); // Reset to Initial Window for faster recovery
             self.partial_bytes_acked.store(0, Ordering::SeqCst);
@@ -1055,7 +1054,9 @@ impl SctpInner {
                 } else if cwnd < ssthresh {
                     // Slow Start: cwnd += bytes_acked (only for cumulative ack advancement)
                     if outcome.bytes_acked_by_cum_tsn > 0 {
-                        let increase = outcome.bytes_acked_by_cum_tsn.min(MAX_BURST * 1200);
+                        let increase = outcome
+                            .bytes_acked_by_cum_tsn
+                            .min(MAX_BURST * MAX_SCTP_PACKET_SIZE);
                         self.cwnd.fetch_add(increase, Ordering::SeqCst);
                     }
                 } else {
@@ -1067,7 +1068,7 @@ impl SctpInner {
                         let total_pba = pba + outcome.bytes_acked_by_cum_tsn;
                         if total_pba >= cwnd {
                             self.partial_bytes_acked.fetch_sub(cwnd, Ordering::SeqCst);
-                            self.cwnd.fetch_add(1200, Ordering::SeqCst);
+                            self.cwnd.fetch_add(MAX_SCTP_PACKET_SIZE, Ordering::SeqCst);
                         }
                     }
                 }
@@ -1089,7 +1090,7 @@ impl SctpInner {
                 if !in_fast_recovery {
                     // Enter Fast Recovery
                     let cwnd = self.cwnd.load(Ordering::SeqCst);
-                    let new_ssthresh = (cwnd / 2).max(1200 * 4);
+                    let new_ssthresh = (cwnd / 2).max(MAX_SCTP_PACKET_SIZE * 32);
                     self.ssthresh.store(new_ssthresh, Ordering::SeqCst);
                     self.cwnd.store(new_ssthresh, Ordering::SeqCst);
                     self.partial_bytes_acked.store(0, Ordering::SeqCst);
@@ -1424,25 +1425,44 @@ impl SctpInner {
         }
 
         // Process packets in order
-        loop {
-            let next_tsn = self
-                .cumulative_tsn_ack
-                .load(Ordering::SeqCst)
-                .wrapping_add(1);
+        let mut to_process = Vec::new();
+        {
+            let mut received_queue = self.received_queue.lock().unwrap();
+            loop {
+                let next_tsn = self
+                    .cumulative_tsn_ack
+                    .load(Ordering::SeqCst)
+                    .wrapping_add(1 + to_process.len() as u32);
 
-            let packet_entry = {
-                let mut received_queue = self.received_queue.lock().unwrap();
-                received_queue.remove(&next_tsn)
+                if let Some(entry) = received_queue.remove(&next_tsn) {
+                    to_process.push(entry);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        if !to_process.is_empty() {
+            // Collect channel info once to avoid repeated locking
+            let channel_map: std::collections::HashMap<u16, Arc<DataChannel>> = {
+                let channels = self.data_channels.lock().unwrap();
+                channels
+                    .iter()
+                    .filter_map(|w| w.upgrade().map(|dc| (dc.id, dc)))
+                    .collect()
             };
 
-            if let Some((p_flags, p_chunk)) = packet_entry {
-                // Process this packet
+            for (p_flags, p_chunk) in to_process {
                 let chunk_len = p_chunk.len();
-                self.process_data_payload(p_flags, p_chunk).await?;
+                let next_tsn = self
+                    .cumulative_tsn_ack
+                    .load(Ordering::SeqCst)
+                    .wrapping_add(1);
+
+                self.process_data_payload(p_flags, p_chunk, &channel_map)
+                    .await?;
                 self.cumulative_tsn_ack.store(next_tsn, Ordering::SeqCst);
                 self.used_rwnd.fetch_sub(chunk_len, Ordering::Relaxed);
-            } else {
-                break;
             }
         }
 
@@ -1520,7 +1540,12 @@ impl SctpInner {
         Ok(())
     }
 
-    async fn process_data_payload(&self, flags: u8, chunk: Bytes) -> Result<()> {
+    async fn process_data_payload(
+        &self,
+        flags: u8,
+        chunk: Bytes,
+        channel_map: &std::collections::HashMap<u16, Arc<DataChannel>>,
+    ) -> Result<()> {
         let mut buf = chunk;
         // Skip TSN (4 bytes)
         buf.advance(4);
@@ -1536,14 +1561,7 @@ impl SctpInner {
             return Ok(());
         }
 
-        let found_dc = {
-            let channels = self.data_channels.lock().unwrap();
-            channels
-                .iter()
-                .find_map(|weak_dc| weak_dc.upgrade().filter(|dc| dc.id == stream_id))
-        };
-
-        if let Some(dc) = found_dc {
+        if let Some(dc) = channel_map.get(&stream_id) {
             // Handle fragmentation
             // B bit: 0x02, E bit: 0x01
             let b_bit = (flags & 0x02) != 0;

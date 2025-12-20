@@ -596,18 +596,9 @@ async fn run_rustrtc(count: usize) -> (f64, u64, u64) {
             let start_send = Instant::now();
             let duration = Duration::from_secs(10);
             while start_send.elapsed() < duration {
-                let remaining = duration.saturating_sub(start_send.elapsed());
-                if remaining.is_zero() {
+                if let Err(_) = pc1.send_data(dc1.id, &data).await {
                     break;
                 }
-
-                match tokio::time::timeout(remaining, pc1.send_data(dc1.id, &data)).await {
-                    Ok(Ok(_)) => {}
-                    _ => break, // Timeout or Send Error
-                }
-
-                // Small delay to avoid overwhelming buffer if any
-                tokio::task::yield_now().await;
             }
 
             // Close connections

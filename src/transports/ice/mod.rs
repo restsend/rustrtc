@@ -1812,25 +1812,29 @@ pub enum IceSocketWrapper {
 
 impl IceSocketWrapper {
     pub async fn send_to(&self, data: &[u8], addr: SocketAddr) -> Result<usize> {
-        match self {
-            IceSocketWrapper::Udp(s) => match s.send_to(data, addr).await {
-                Ok(len) => Ok(len),
-                Err(e) => {
-                    if let Some(code) = e.raw_os_error() {
-                        if code == 55 {
-                            return Ok(0);
+        loop {
+            match self {
+                IceSocketWrapper::Udp(s) => match s.send_to(data, addr).await {
+                    Ok(len) => return Ok(len),
+                    Err(e) => {
+                        if let Some(code) = e.raw_os_error() {
+                            if code == 55 {
+                                // ENOBUFS on macOS, wait a bit and retry
+                                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                                continue;
+                            }
                         }
+                        return Err(e.into());
                     }
-                    Err(e.into())
+                },
+                IceSocketWrapper::Turn(c, _) => {
+                    if let Some(channel) = c.get_channel(addr).await {
+                        c.send_channel_data(channel, data).await?;
+                    } else {
+                        c.send_indication(addr, data).await?;
+                    }
+                    return Ok(data.len());
                 }
-            },
-            IceSocketWrapper::Turn(c, _) => {
-                if let Some(channel) = c.get_channel(addr).await {
-                    c.send_channel_data(channel, data).await?;
-                } else {
-                    c.send_indication(addr, data).await?;
-                }
-                Ok(data.len())
             }
         }
     }
