@@ -214,6 +214,24 @@
                 log("Could not get camera/mic: " + e);
             }
 
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    const ip = event.candidate.candidate.split(' ')[4] || 'unknown';
+                    log(`Sending ICE candidate: ${ip}`);
+                    fetch('/candidate', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            userId: userIdEl.value,
+                            roomId: roomIdEl.value,
+                            candidate: event.candidate.candidate
+                        })
+                    }).catch(e => console.warn('Failed to send ICE candidate:', e));
+                } else {
+                    log('ICE gathering complete');
+                }
+            };
+
             // Setup Data Channel
             dc = pc.createDataChannel("chat");
             setupDataChannel(dc);
@@ -259,21 +277,6 @@
         async function negotiate() {
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
-
-            // Wait for ICE gathering to complete for simplicity
-            await new Promise(resolve => {
-                if (pc.iceGatheringState === 'complete') {
-                    resolve();
-                } else {
-                    const checkState = () => {
-                        if (pc.iceGatheringState === 'complete') {
-                            pc.removeEventListener('icegatheringstatechange', checkState);
-                            resolve();
-                        }
-                    };
-                    pc.addEventListener('icegatheringstatechange', checkState);
-                }
-            });
 
             const payload = {
                 userId: userIdEl.value,

@@ -746,7 +746,9 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
 
     if !success {
         let state = *inner.state.borrow();
-        if state != IceTransportState::Connected {
+        let has_selected_pair = inner.selected_pair.lock().unwrap().is_some();
+        // Only set Failed if we're not already connected AND we don't have a working pair
+        if state != IceTransportState::Connected && !has_selected_pair {
             let _ = inner.state.send(IceTransportState::Failed);
         }
     }
@@ -855,7 +857,9 @@ async fn handle_stun_request(
                             debug!("Failed to send STUN Response to {}: {}", addr, e);
                         }
                         _ => {
-                            if io_err.raw_os_error() == Some(65) {
+                            if io_err.raw_os_error() == Some(65)
+                                || io_err.raw_os_error() == Some(49)
+                            {
                                 debug!("Failed to send STUN Response to {}: {}", addr, e);
                             } else {
                                 warn!("Failed to send STUN Response to {}: {}", addr, e);
@@ -1116,14 +1120,14 @@ async fn perform_binding_check(
                 match e.kind() {
                     std::io::ErrorKind::HostUnreachable
                     | std::io::ErrorKind::NetworkUnreachable => {
-                        debug!("socket.send_to failed: {}", e);
+                        debug!("socket.send_to {} failed: {}", remote.address, e);
                     }
                     _ => {
                         // Also check raw OS error for cases not covered by ErrorKind
-                        if e.raw_os_error() == Some(65) {
-                            debug!("socket.send_to failed: {}", e);
+                        if e.raw_os_error() == Some(65) || e.raw_os_error() == Some(49) {
+                            debug!("socket.send_to {} failed: {}", remote.address, e);
                         } else {
-                            warn!("socket.send_to failed: {}", e);
+                            warn!("socket.send_to {} failed: {}", remote.address, e);
                         }
                     }
                 }
@@ -1298,7 +1302,12 @@ impl IceCandidate {
         let port = parts[start_idx + 5].parse::<u16>()?;
         let typ_str = parts[start_idx + 7];
 
-        let address = format!("{}:{}", ip_str, port).parse()?;
+        // IPv6 addresses need brackets when combined with port
+        let address = if ip_str.contains(':') {
+            format!("[{}]:{}", ip_str, port).parse()?
+        } else {
+            format!("{}:{}", ip_str, port).parse()?
+        };
 
         let typ = match typ_str {
             "host" => IceCandidateType::Host,

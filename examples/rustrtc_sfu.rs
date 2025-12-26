@@ -42,6 +42,7 @@ async fn main() {
     let app = Router::new()
         .route("/", get(index))
         .route("/session", post(session))
+        .route("/candidate", post(add_candidate))
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 8081));
@@ -78,6 +79,15 @@ struct SessionResponse {
     #[serde(rename = "type")]
     type_: String,
     sdp: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct CandidateRequest {
+    #[serde(rename = "userId")]
+    user_id: String,
+    #[serde(rename = "roomId")]
+    room_id: String,
+    candidate: String,
 }
 
 // Global state
@@ -212,11 +222,15 @@ async fn session(
         return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    pc.wait_for_gathering_complete().await;
-
     let answer = pc
         .local_description()
         .expect("Local description should be set");
+
+    info!(
+        "Returning answer with {} candidates for user {}",
+        answer.to_sdp_string().matches("a=candidate:").count(),
+        req.user_id
+    );
 
     let response = SessionResponse {
         type_: answer.sdp_type.as_str().to_string(),
@@ -224,6 +238,60 @@ async fn session(
     };
 
     Json(response).into_response()
+}
+
+/// ICE Lite: Receive ICE candidate from client
+async fn add_candidate(
+    State(state): State<AppState>,
+    Json(req): Json<CandidateRequest>,
+) -> impl IntoResponse {
+    // Skip empty candidates (end-of-candidates signal)
+    if req.candidate.is_empty() {
+        return axum::http::StatusCode::OK.into_response();
+    }
+
+    info!(
+        "Received ICE candidate from user={} room={}: {}",
+        req.user_id,
+        req.room_id,
+        req.candidate.split(' ').nth(4).unwrap_or(&req.candidate)
+    );
+
+    // Find the room and peer
+    let rooms = state.rooms.read().await;
+    let room = match rooms.get(&req.room_id) {
+        Some(r) => r.clone(),
+        None => {
+            warn!("Room not found: {}", req.room_id);
+            return axum::http::StatusCode::NOT_FOUND.into_response();
+        }
+    };
+    drop(rooms);
+
+    let peers = room.peers.read().await;
+    let peer = match peers.get(&req.user_id) {
+        Some(p) => p.clone(),
+        None => {
+            warn!("Peer not found: {}", req.user_id);
+            return axum::http::StatusCode::NOT_FOUND.into_response();
+        }
+    };
+    drop(peers);
+
+    // Parse and add the ICE candidate
+    match rustrtc::transports::ice::IceCandidate::from_sdp(&req.candidate) {
+        Ok(candidate) => {
+            if let Err(e) = peer.pc.add_ice_candidate(candidate) {
+                warn!("Failed to add ICE candidate: {}", e);
+                return axum::http::StatusCode::BAD_REQUEST.into_response();
+            }
+            axum::http::StatusCode::OK.into_response()
+        }
+        Err(e) => {
+            warn!("Failed to parse ICE candidate '{}': {}", req.candidate, e);
+            axum::http::StatusCode::BAD_REQUEST.into_response()
+        }
+    }
 }
 
 async fn setup_new_peer(peer: Arc<Peer>, room: Arc<Room>) {
