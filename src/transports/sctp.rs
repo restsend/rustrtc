@@ -43,7 +43,6 @@ const SCTP_COMMON_HEADER_SIZE: usize = 12;
 const CHUNK_HEADER_SIZE: usize = 4;
 const MAX_SCTP_PACKET_SIZE: usize = 1200;
 const DEFAULT_MAX_PAYLOAD_SIZE: usize = 1172; // 1200 - 12 (common) - 16 (data header)
-const LOCAL_RWND_BYTES: usize = 16 * 1024 * 1024;
 const DUP_THRESH: u8 = 3;
 
 // Chunk Types
@@ -158,6 +157,7 @@ struct SctpInner {
     // Reconfig State
     reconfig_request_sn: AtomicU32,
     peer_reconfig_request_sn: AtomicU32,
+    local_rwnd: usize,
 
     // Fast Recovery
     fast_recovery_exit_tsn: AtomicU32,
@@ -398,6 +398,7 @@ impl SctpTransport {
             last_immediate_sack: Mutex::new(None),
             reconfig_request_sn: AtomicU32::new(0),
             peer_reconfig_request_sn: AtomicU32::new(u32::MAX), // Initial value to allow 0
+            local_rwnd: config.sctp_receive_window,
             fast_recovery_exit_tsn: AtomicU32::new(0),
             max_association_retransmits: config.sctp_max_association_retransmits,
             association_error_count: AtomicU32::new(0),
@@ -946,7 +947,7 @@ impl SctpInner {
         // Initiate Tag
         init_ack_params.put_u32(local_tag);
         // a_rwnd
-        init_ack_params.put_u32(LOCAL_RWND_BYTES as u32);
+        init_ack_params.put_u32(self.local_rwnd as u32);
         // Outbound streams
         init_ack_params.put_u16(10);
         // Inbound streams
@@ -1779,10 +1780,7 @@ impl SctpInner {
 
     fn advertised_rwnd(&self) -> u32 {
         let used = self.used_rwnd.load(Ordering::Relaxed);
-        LOCAL_RWND_BYTES
-            .saturating_sub(used)
-            .try_into()
-            .unwrap_or(0)
+        self.local_rwnd.saturating_sub(used).try_into().unwrap_or(0)
     }
 
     async fn send_sack(&self, cumulative_tsn_ack: u32) -> Result<()> {
@@ -2077,11 +2075,9 @@ impl SctpInner {
                         fast_retransmit: false,
                     };
                     queue.insert(*tsn, record);
+                    self.flight_size.fetch_add(chunk.len(), Ordering::SeqCst);
                 }
 
-                self.flight_size.fetch_add(batch_len, Ordering::SeqCst);
-
-                // Only notify timer if the queue was empty (head changed)
                 if was_empty {
                     self.timer_notify.notify_one();
                     let mut cached = self.cached_rto_timeout.lock().unwrap();
@@ -2089,16 +2085,13 @@ impl SctpInner {
                 }
             }
 
-            // 4. Bundle and send
-            let mut to_send = Vec::new();
-            for (_, chunk) in chunks {
-                to_send.push(chunk);
-            }
-            self.transmit_chunks(to_send).await?;
+            let chunks_to_send: Vec<Bytes> = chunks.into_iter().map(|(_, c)| c).collect();
+            self.transmit_chunks(chunks_to_send).await?;
         }
 
         Ok(())
     }
+
     fn create_data_chunk(
         &self,
         channel_id: u16,

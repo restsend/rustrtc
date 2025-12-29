@@ -233,6 +233,7 @@ pub struct RtcConfiguration {
     pub sctp_rto_min: std::time::Duration,
     pub sctp_rto_max: std::time::Duration,
     pub sctp_max_association_retransmits: u32,
+    pub sctp_receive_window: usize,
     pub dtls_buffer_size: usize,
 }
 
@@ -255,7 +256,8 @@ impl Default for RtcConfiguration {
             sctp_rto_initial: std::time::Duration::from_secs(1),
             sctp_rto_min: std::time::Duration::from_millis(200),
             sctp_rto_max: std::time::Duration::from_secs(60),
-            sctp_max_association_retransmits: 20,
+            sctp_max_association_retransmits: 10,
+            sctp_receive_window: 192 * 1024,
             dtls_buffer_size: 100,
         }
     }

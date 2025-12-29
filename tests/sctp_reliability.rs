@@ -1,9 +1,6 @@
 use anyhow::Result;
 use rustrtc::{DataChannelEvent, PeerConnection, RtcConfiguration};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
 
 #[tokio::test]
 async fn test_sctp_reliability_under_loss() -> Result<()> {
@@ -73,7 +70,8 @@ async fn test_sctp_reliability_under_loss() -> Result<()> {
     let mut received = false;
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(10) {
-        if let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(100), dc2.recv()).await {
+        if let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(100), dc2.recv()).await
+        {
             match event {
                 DataChannelEvent::Message(msg) => {
                     assert_eq!(msg.as_ref(), data);
