@@ -55,6 +55,38 @@ pub fn fingerprint(cert: &Certificate) -> String {
         .join(":")
 }
 
+pub fn get_client_hello_extensions() -> Vec<u8> {
+    let mut extensions = Vec::new();
+
+    // Extended Master Secret (Type 23)
+    extensions.extend_from_slice(&[0x00, 0x17, 0x00, 0x00]);
+
+    // Use SRTP (Type 14)
+    extensions.extend_from_slice(&[0x00, 0x0e, 0x00, 0x05, 0x00, 0x02, 0x00, 0x01, 0x00]);
+
+    // Supported Elliptic Curves (Type 10) - secp256r1
+    extensions.extend_from_slice(&[0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x17]);
+
+    // Supported Point Formats (Type 11) - uncompressed
+    extensions.extend_from_slice(&[0x00, 0x0b, 0x00, 0x02, 0x01, 0x00]);
+
+    // Signature Algorithms (Type 13)
+    // ecdsa_secp256r1_sha256 (0x0403), rsa_pkcs1_sha256 (0x0401), ecdsa_secp384r1_sha384 (0x0503), rsa_pkcs1_sha384 (0x0501)
+    extensions.extend_from_slice(&[
+        0x00, 0x0d, 0x00, 0x0a, 0x00, 0x08, 0x04, 0x03, 0x04, 0x01, 0x05, 0x03, 0x05, 0x01,
+    ]);
+
+    extensions
+}
+
+pub fn get_client_hello_cipher_suites() -> Vec<u16> {
+    vec![
+        0xC02B, // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+        0xC02F, // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+        0x009C, // TLS_RSA_WITH_AES_128_GCM_SHA256
+    ]
+}
+
 #[derive(Clone)]
 pub struct Certificate {
     pub certificate: Vec<Vec<u8>>,
@@ -1173,18 +1205,14 @@ impl DtlsInner {
             };
             // client_random is already set, no need to update
 
-            let mut extensions = Vec::new();
-            // Supported Elliptic Curves (secp256r1)
-            extensions.extend_from_slice(&[0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x17]);
-            // Supported Point Formats (uncompressed)
-            extensions.extend_from_slice(&[0x00, 0x0b, 0x00, 0x02, 0x01, 0x00]);
+            let extensions = get_client_hello_extensions();
 
             let client_hello = ClientHello {
                 version: ProtocolVersion::DTLS_1_2,
                 random,
                 session_id: vec![],
                 cookie: verify_req.cookie,
-                cipher_suites: vec![0xC02B],
+                cipher_suites: get_client_hello_cipher_suites(),
                 compression_methods: vec![0],
                 extensions,
             };
@@ -1458,39 +1486,15 @@ impl DtlsInner {
             let random = Random::new();
             ctx.client_random = Some(random.to_bytes());
 
-            let mut extensions = Vec::new();
-
-            // Extended Master Secret
-            extensions.extend_from_slice(&[0x00, 17]); // Type 23
-            extensions.extend_from_slice(&[0x00, 0x00]); // Length 0
-
-            // Use SRTP
-            extensions.extend_from_slice(&[0x00, 0x0e]); // Type 14
-            extensions.extend_from_slice(&[0x00, 0x07]); // Length 7
-            extensions.extend_from_slice(&[0x00, 0x04]); // Profiles Length 4
-            extensions.extend_from_slice(&[0x00, 0x07]); // Profile: AEAD_AES_128_GCM
-            extensions.extend_from_slice(&[0x00, 0x01]); // Profile: AES_CM_128_HMAC_SHA1_80
-            extensions.extend_from_slice(&[0x00]); // MKI Length 0
-
-            // Supported Elliptic Curves (secp256r1)
-            extensions.extend_from_slice(&[0x00, 0x0a]); // Type
-            extensions.extend_from_slice(&[0x00, 0x04]); // Length
-            extensions.extend_from_slice(&[0x00, 0x02]); // List Length
-            extensions.extend_from_slice(&[0x00, 0x17]); // secp256r1
-
-            // Supported Point Formats (uncompressed)
-            extensions.extend_from_slice(&[0x00, 0x0b]); // Type
-            extensions.extend_from_slice(&[0x00, 0x02]); // Length
-            extensions.extend_from_slice(&[0x01]); // List Length
-            extensions.extend_from_slice(&[0x00]); // uncompressed
+            let extensions = get_client_hello_extensions();
 
             let client_hello = ClientHello {
                 version: ProtocolVersion::DTLS_1_2,
                 random,
                 session_id: vec![],
                 cookie: vec![],
-                cipher_suites: vec![0xC02B], // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
-                compression_methods: vec![0], // Null
+                cipher_suites: get_client_hello_cipher_suites(), // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+                compression_methods: vec![0],                    // Null
                 extensions,
             };
 
