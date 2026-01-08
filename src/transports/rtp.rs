@@ -16,6 +16,7 @@ pub struct RtpTransport {
     listeners: Mutex<HashMap<u32, mpsc::Sender<RtpPacket>>>,
     rtcp_listener: Mutex<Option<mpsc::Sender<Vec<RtcpPacket>>>>,
     rid_listeners: Mutex<HashMap<String, mpsc::Sender<RtpPacket>>>,
+    provisional_listener: Mutex<Option<mpsc::Sender<RtpPacket>>>,
     rid_extension_id: Mutex<Option<u8>>,
     abs_send_time_extension_id: Mutex<Option<u8>>,
     srtp_required: bool,
@@ -29,6 +30,7 @@ impl RtpTransport {
             listeners: Mutex::new(HashMap::new()),
             rtcp_listener: Mutex::new(None),
             rid_listeners: Mutex::new(HashMap::new()),
+            provisional_listener: Mutex::new(None),
             rid_extension_id: Mutex::new(None),
             abs_send_time_extension_id: Mutex::new(None),
             srtp_required,
@@ -57,6 +59,11 @@ impl RtpTransport {
     pub fn register_rid_listener(&self, rid: String, tx: mpsc::Sender<RtpPacket>) {
         let mut listeners = self.rid_listeners.lock().unwrap();
         listeners.insert(rid, tx);
+    }
+
+    pub fn register_provisional_listener(&self, tx: mpsc::Sender<RtpPacket>) {
+        let mut listener = self.provisional_listener.lock().unwrap();
+        *listener = Some(tx);
     }
 
     pub fn set_rid_extension_id(&self, id: u8) {
@@ -271,6 +278,17 @@ impl PacketReceiver for RtpTransport {
                         listener = listeners.get(&ssrc).cloned();
                     }
 
+                    // Fallback to provisional listener (and bind SSRC)
+                    if listener.is_none() {
+                        let mut provisional = self.provisional_listener.lock().unwrap();
+                        if let Some(tx) = provisional.take() {
+                            tracing::info!("RTP binding provisional listener to SSRC: {}", ssrc);
+                            let mut listeners = self.listeners.lock().unwrap();
+                            listeners.insert(ssrc, tx.clone());
+                            listener = Some(tx);
+                        }
+                    }
+
                     if let Some(tx) = listener {
                         if tx.send(rtp_packet).await.is_err() {
                             // Only remove SSRC listener if we used it?
@@ -297,5 +315,77 @@ impl PacketReceiver for RtpTransport {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transports::ice::conn::IceConn;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn test_provisional_listener_binding() {
+        use crate::transports::ice::IceSocketWrapper;
+        use bytes::Bytes;
+        use tokio::sync::watch;
+
+        // Setup RtpTransport with a mock/dummy IceConn
+        let (_ice_tx, ice_rx) = watch::channel(None::<IceSocketWrapper>);
+        let ice_conn = IceConn::new(ice_rx, "127.0.0.1:1234".parse().unwrap());
+        let transport = RtpTransport::new(ice_conn, false);
+
+        // Register a provisional listener
+        let (tx, mut rx) = mpsc::channel(10);
+        transport.register_provisional_listener(tx);
+
+        // Simulate receiving an RTP packet with unknown SSRC
+        let ssrc = 12345u32;
+        let header = crate::rtp::RtpHeader::new(0, 1, 0, ssrc);
+
+        let rtp_packet = crate::rtp::RtpPacket::new(header, vec![0u8; 160]);
+
+        // Inject the packet via the receive logic
+        let bytes = rtp_packet.marshal().unwrap();
+        transport
+            .receive(Bytes::from(bytes), "127.0.0.1:5000".parse().unwrap())
+            .await;
+
+        // 1. Verify listener received the packet
+        let received = rx
+            .recv()
+            .await
+            .expect("Packet should be received by provisional listener");
+        assert_eq!(received.header.ssrc, ssrc);
+
+        // 2. Verify SSRC is now bound
+        assert!(
+            transport.has_listener(ssrc),
+            "SSRC should be bound in listeners map"
+        );
+
+        // 3. Verify provisional listener is consumed (None)
+        {
+            let prov = transport.provisional_listener.lock().unwrap();
+            assert!(
+                prov.is_none(),
+                "Provisional listener should be consumed after binding"
+            );
+        }
+
+        // 4. Send another packet with same SSRC, it should go to the same listener via the bound map
+        let header2 = crate::rtp::RtpHeader::new(0, 2, 80, ssrc);
+        let rtp_packet2 = crate::rtp::RtpPacket::new(header2, vec![1u8; 160]);
+        let bytes2 = rtp_packet2.marshal().unwrap();
+        transport
+            .receive(Bytes::from(bytes2), "127.0.0.1:5000".parse().unwrap())
+            .await;
+
+        let received2 = rx
+            .recv()
+            .await
+            .expect("Second packet should be received via bound SSRC");
+        assert_eq!(received2.header.ssrc, ssrc);
+        assert_eq!(received2.payload[0], 1);
     }
 }

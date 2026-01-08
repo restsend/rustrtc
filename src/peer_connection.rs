@@ -3189,6 +3189,7 @@ impl RtpReceiver {
         let (tx, rx) = mpsc::channel(2000);
         let ssrc = *self.ssrc.lock().unwrap();
         transport.register_listener_sync(ssrc, tx.clone());
+        transport.register_provisional_listener(tx.clone());
         *self.packet_tx.lock().unwrap() = Some(tx);
 
         initial_tracks.push(ReceiverCommand::AddTrack {
@@ -3289,6 +3290,18 @@ impl RtpReceiver {
                                             let mut s = simulcast_ssrc.lock().unwrap();
                                             if s.is_none() {
                                                 *s = Some(packet.header.ssrc);
+                                            }
+                                        } else {
+                                            // Main track: Update SSRC if it matched via provisional listener
+                                            if let Some(this) = weak_self.upgrade() {
+                                                let mut s = this.ssrc.lock().unwrap();
+                                                if *s != packet.header.ssrc {
+                                                    debug!(
+                                                        "RTP main track SSRC changed from {} to {}",
+                                                        *s, packet.header.ssrc
+                                                    );
+                                                    *s = packet.header.ssrc;
+                                                }
                                             }
                                         }
 
