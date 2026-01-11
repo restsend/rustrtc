@@ -127,20 +127,15 @@ impl PacketReceiver for IceConn {
         if current_remote.port() == 0 {
             *self.remote_addr.write().unwrap() = addr;
         } else if addr != current_remote {
-            // Only allow updating remote address for DTLS packets (20-63).
-            if (20..64).contains(&first_byte) {
-                debug!(
-                    "IceConn: Remote address changed from {:?} to {:?} (DTLS)",
-                    current_remote, addr
-                );
-                *self.remote_addr.write().unwrap() = addr;
-            } else {
-                tracing::trace!(
-                    "IceConn: Received packet from new address {:?} but ignoring address change (byte={})",
-                    addr,
-                    first_byte
-                );
-            }
+            // Note: We no longer automatically switch the remote address just by receiving
+            // a packet from a new source (e.g. DTLS). This prevents "path flapping"
+            // that can confuse the transport Layer. The remote address should only
+            // be updated via the ICE nomination process.
+            tracing::trace!(
+                "IceConn: Received packet from new address {:?} (byte={}) - ignoring address change",
+                addr,
+                first_byte
+            );
         }
 
         if (20..64).contains(&first_byte) {

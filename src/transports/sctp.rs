@@ -601,6 +601,15 @@ impl SctpInner {
         let heartbeat_interval = Duration::from_secs(30);
 
         loop {
+            // Check if state was changed to Closed by timeout handler
+            {
+                let state = self.state.lock().unwrap();
+                if *state == SctpState::Closed {
+                    debug!("SctpTransport run_loop exiting (state is Closed)");
+                    break;
+                }
+            }
+
             let now = Instant::now();
 
             // 1. Calculate RTO Timeout
@@ -847,11 +856,24 @@ impl SctpInner {
         }
 
         if !to_retransmit.is_empty() {
+            // Increment association error count (RFC 4960 Section 8.1)
+            let error_count = self.association_error_count.fetch_add(1, Ordering::SeqCst) + 1;
+            if error_count >= self.max_association_retransmits
+                && self.max_association_retransmits > 0
+            {
+                warn!(
+                    "SCTP Association RTO limit reached ({}), closing",
+                    self.max_association_retransmits
+                );
+                self.set_state(SctpState::Closed);
+                return Ok(());
+            }
+
             // Backoff RTO once per timer tick
             {
                 let mut rto_state = self.rto_state.lock().unwrap();
                 rto_state.backoff();
-                warn!(
+                info!(
                     "SCTP RTO Timeout! Backoff RTO to {}s, retransmitting {} head chunks. Flight size reset.",
                     rto_state.rto,
                     to_retransmit.len()
@@ -974,7 +996,7 @@ impl SctpInner {
     fn set_state(&self, new_state: SctpState) {
         let mut state = self.state.lock().unwrap();
         if *state != new_state {
-            info!("SCTP state transition: {:?} -> {:?}", *state, new_state);
+            debug!("SCTP state transition: {:?} -> {:?}", *state, new_state);
             *state = new_state;
         }
     }
@@ -1370,7 +1392,7 @@ impl SctpInner {
                     self.fast_recovery_exit_tsn
                         .store(highest_tsn, Ordering::SeqCst);
 
-                    warn!(
+                    debug!(
                         "Entering Fast Recovery! New ssthresh/cwnd: {}, exit_tsn: {}, retransmitting {} chunks",
                         new_ssthresh,
                         highest_tsn,
@@ -1380,7 +1402,7 @@ impl SctpInner {
 
                 let chunks: Vec<Bytes> = outcome.retransmit.into_iter().map(|(_, d)| d).collect();
                 if let Err(e) = self.transmit_chunks(chunks).await {
-                    warn!("Failed to retransmit fast recovery chunks: {}", e);
+                    info!("Failed to retransmit fast recovery chunks: {}", e);
                 }
             }
 
@@ -2719,10 +2741,7 @@ mod tests {
         }
 
         sctp.inner.handle_timeout().await.unwrap();
-        assert_eq!(
-            sctp.inner.state.lock().unwrap().clone(),
-            SctpState::Connecting
-        );
+        assert_eq!(sctp.inner.state.lock().unwrap().clone(), SctpState::Closed);
     }
 
     #[tokio::test]
