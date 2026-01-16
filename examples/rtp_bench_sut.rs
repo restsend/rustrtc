@@ -1,6 +1,5 @@
-use async_trait::async_trait;
 use axum::{Router, extract::Json, response::IntoResponse, routing::post};
-use rustrtc::rtp::{RtcpPacket, RtpPacket};
+use rustrtc::media::MediaStreamTrack;
 use rustrtc::{PeerConnection, RtcConfiguration, SdpType, SessionDescription, TransportMode};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -17,23 +16,6 @@ struct OfferRequest {
 struct OfferResponse {
     sdp: String,
 }
-
-struct ForwarderInterceptor {
-    echo_addr: SocketAddr,
-    forward_socket: Arc<UdpSocket>,
-}
-
-#[async_trait]
-impl rustrtc::peer_connection::RtpReceiverInterceptor for ForwarderInterceptor {
-    async fn on_packet_received(&self, packet: &RtpPacket) -> Option<RtcpPacket> {
-        if let Ok(buf) = packet.marshal() {
-            let _ = self.forward_socket.send_to(&buf, self.echo_addr).await;
-        }
-        None
-    }
-}
-
-use rustrtc::media::MediaStreamTrack;
 
 async fn start_forwarding(pc: PeerConnection, pt: u8, echo_addr: SocketAddr) {
     let transceivers = pc.get_transceivers();

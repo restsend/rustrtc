@@ -575,6 +575,37 @@ impl PeerConnection {
 
     pub fn set_local_description(&self, desc: SessionDescription) -> RtcResult<()> {
         self.inner.validate_sdp_type(&desc.sdp_type)?;
+
+        // For Offerer: extract parameters from local offer (our intended changes)
+        // This allows Offerer to immediately update transceivers with new parameters
+        // that will be confirmed when answer is received
+        if desc.sdp_type == SdpType::Offer {
+            let is_reinvite = {
+                let local = self.inner.local_description.lock().unwrap();
+                local.is_some()
+            };
+            if is_reinvite {
+                debug!("Offerer: extracting parameters from local reinvite offer");
+                // Extract parameters from our offer for transceivers
+                let transceivers = self.inner.transceivers.lock().unwrap().clone();
+                for section in &desc.media_sections {
+                    if let Some(t) = transceivers
+                        .iter()
+                        .find(|t| t.mid().as_ref() == Some(&section.mid))
+                    {
+                        let payload_map = Self::extract_payload_map(section);
+                        if !payload_map.is_empty() {
+                            let _ = t.update_payload_map(payload_map);
+                        }
+                        let extmap = Self::extract_extmap(section);
+                        if !extmap.is_empty() {
+                            let _ = t.update_extmap(extmap);
+                        }
+                    }
+                }
+            }
+        }
+
         {
             let state = &self.inner.signaling_state;
             match desc.sdp_type {
@@ -606,6 +637,64 @@ impl PeerConnection {
 
     pub async fn set_remote_description(&self, desc: SessionDescription) -> RtcResult<()> {
         self.inner.validate_sdp_type(&desc.sdp_type)?;
+
+        // Check if this is a reinvite (not first negotiation)
+        let is_reinvite = {
+            let remote = self.inner.remote_description.lock().unwrap();
+            remote.is_some()
+        };
+
+        // Extract parameters for initial negotiation or reinvite
+        if !is_reinvite {
+            // Initial negotiation: extract parameters from remote SDP
+            debug!("Initial negotiation: extracting parameters from remote SDP");
+            let transceivers = self.inner.transceivers.lock().unwrap().clone();
+
+            // Match by index since MID may not be assigned yet
+            for (i, section) in desc.media_sections.iter().enumerate() {
+                if i < transceivers.len() {
+                    let t = &transceivers[i];
+                    let payload_map = Self::extract_payload_map(section);
+                    if !payload_map.is_empty() {
+                        let _ = t.update_payload_map(payload_map);
+                    }
+                    let extmap = Self::extract_extmap(section);
+                    if !extmap.is_empty() {
+                        let _ = t.update_extmap(extmap);
+                    }
+                    // Also extract direction
+                    let direction: TransceiverDirection = section.direction.into();
+                    t.set_direction(direction);
+
+                    // Assign MID if not yet assigned
+                    if t.mid().is_none() {
+                        t.set_mid(section.mid.clone());
+                    }
+                }
+            }
+        } else {
+            // Apply reinvite at correct timing based on role
+            let current_state = *self.inner.signaling_state.borrow();
+            match (desc.sdp_type, current_state) {
+                // Answerer receiving offer: apply immediately
+                (SdpType::Offer, SignalingState::Stable) => {
+                    debug!("Answerer: applying reinvite from offer");
+                    self.handle_reinvite(&desc).await?;
+                }
+                // Offerer receiving answer: apply now (was pending since we sent offer)
+                (SdpType::Answer, SignalingState::HaveLocalOffer) => {
+                    debug!("Offerer: applying reinvite from answer");
+                    self.handle_reinvite(&desc).await?;
+                }
+                // Invalid states for reinvite
+                (SdpType::Offer, _) => {
+                    return Err(RtcError::InvalidState(
+                        "Cannot handle reinvite offer in non-stable state (glare?)".into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
 
         // Update next_mid to avoid collisions with remote MIDs
         for section in &desc.media_sections {
@@ -1672,6 +1761,208 @@ impl PeerConnection {
         self.inner.ice_transport.add_remote_candidate(candidate);
         Ok(())
     }
+
+    /// Handle reinvite - update RTP parameters without recreating tracks
+    async fn handle_reinvite(&self, new_desc: &SessionDescription) -> RtcResult<()> {
+        debug!("Handling reinvite: updating RTP parameters");
+
+        let transceivers = self.inner.transceivers.lock().unwrap().clone();
+
+        // Extract RTP parameter changes for each media section
+        for section in &new_desc.media_sections {
+            // Find matching transceiver by mid
+            let transceiver = transceivers
+                .iter()
+                .find(|t| t.mid().as_ref() == Some(&section.mid));
+
+            if let Some(t) = transceiver {
+                // Check SSRC change (indicates new track, not reinvite)
+                if let Some(receiver) = t.receiver() {
+                    let new_ssrc = Self::extract_ssrc_from_section(section);
+                    if let Some(new_ssrc) = new_ssrc {
+                        let old_ssrc = receiver.ssrc();
+                        if old_ssrc != 0 && old_ssrc != new_ssrc {
+                            warn!(
+                                "SSRC changed for mid={} ({} -> {}), this should be treated as new track",
+                                section.mid, old_ssrc, new_ssrc
+                            );
+                            // For now, log warning and continue. In full implementation,
+                            // this should create a new receiver/track
+                        }
+                    }
+                }
+
+                // Extract and validate payload type mapping
+                let payload_map = Self::extract_payload_map(section);
+                if !payload_map.is_empty() {
+                    // Basic validation: check if we support these codecs
+                    for (pt, params) in &payload_map {
+                        trace!("Validating PT {}: clock_rate={}", pt, params.clock_rate);
+                        // TODO: Add full codec capability check against local capabilities
+                    }
+                    t.update_payload_map(payload_map)?;
+                }
+
+                // Extract and update extension mapping
+                let extmap = Self::extract_extmap(section);
+                if !extmap.is_empty() {
+                    t.update_extmap(extmap)?;
+                }
+
+                // Handle direction changes
+                let new_direction: TransceiverDirection = section.direction.into();
+                let old_direction = t.direction();
+                if new_direction != old_direction {
+                    debug!(
+                        "Direction changed for mid={}: {:?} -> {:?}",
+                        section.mid, old_direction, new_direction
+                    );
+                    t.set_direction(new_direction);
+                    Self::apply_direction_change(t, old_direction, new_direction).await?;
+                }
+            }
+        }
+
+        // Update remote description
+        *self.inner.remote_description.lock().unwrap() = Some(new_desc.clone());
+
+        debug!("Reinvite completed successfully");
+        Ok(())
+    }
+
+    /// Extract payload type to codec parameters mapping from media section
+    fn extract_payload_map(section: &crate::MediaSection) -> HashMap<u8, RtpCodecParameters> {
+        let mut payload_map = HashMap::new();
+
+        // Parse rtpmap attributes: "96 opus/48000/2"
+        for attr in &section.attributes {
+            if attr.key == "rtpmap" {
+                if let Some(val) = &attr.value {
+                    let parts: Vec<&str> = val.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        if let Ok(pt) = parts[0].parse::<u8>() {
+                            // Parse codec/rate/channels
+                            let codec_parts: Vec<&str> = parts[1].split('/').collect();
+                            if codec_parts.len() >= 2 {
+                                let clock_rate = codec_parts[1].parse().unwrap_or(90000);
+                                let channels = if codec_parts.len() >= 3 {
+                                    codec_parts[2].parse().unwrap_or(0)
+                                } else {
+                                    0
+                                };
+
+                                payload_map.insert(
+                                    pt,
+                                    RtpCodecParameters {
+                                        payload_type: pt,
+                                        clock_rate,
+                                        channels,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        payload_map
+    }
+
+    /// Extract extension header mapping from media section
+    fn extract_extmap(section: &crate::MediaSection) -> HashMap<u8, String> {
+        let mut extmap = HashMap::new();
+
+        // Parse extmap attributes: "1 urn:ietf:params:rtp-hdrext:ssrc-audio-level"
+        for attr in &section.attributes {
+            if attr.key == "extmap" {
+                if let Some(val) = &attr.value {
+                    let parts: Vec<&str> = val.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        if let Ok(id) = parts[0].parse::<u8>() {
+                            extmap.insert(id, parts[1].to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        extmap
+    }
+
+    /// Extract SSRC from media section
+    fn extract_ssrc_from_section(section: &crate::MediaSection) -> Option<u32> {
+        // Parse a=ssrc:<ssrc> <attribute>:<value>
+        for attr in &section.attributes {
+            if attr.key == "ssrc" {
+                if let Some(val) = &attr.value {
+                    if let Some(ssrc_str) = val.split_whitespace().next() {
+                        if let Ok(ssrc) = ssrc_str.parse::<u32>() {
+                            return Some(ssrc);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Apply direction change side effects
+    async fn apply_direction_change(
+        transceiver: &RtpTransceiver,
+        old_direction: TransceiverDirection,
+        new_direction: TransceiverDirection,
+    ) -> RtcResult<()> {
+        let old_sends = match old_direction {
+            TransceiverDirection::SendRecv | TransceiverDirection::SendOnly => true,
+            _ => false,
+        };
+        let new_sends = match new_direction {
+            TransceiverDirection::SendRecv | TransceiverDirection::SendOnly => true,
+            _ => false,
+        };
+
+        let old_receives = match old_direction {
+            TransceiverDirection::SendRecv | TransceiverDirection::RecvOnly => true,
+            _ => false,
+        };
+        let new_receives = match new_direction {
+            TransceiverDirection::SendRecv | TransceiverDirection::RecvOnly => true,
+            _ => false,
+        };
+
+        // Handle send direction changes
+        if old_sends != new_sends {
+            if new_sends {
+                debug!("Transceiver {} starting to send", transceiver.id());
+                // Resume sender if available
+                if let Some(sender) = transceiver.sender() {
+                    // In full implementation: sender.resume()
+                    trace!("Sender {} would resume", sender.ssrc());
+                }
+            } else {
+                debug!("Transceiver {} stopping send", transceiver.id());
+                // Pause sender if available
+                if let Some(sender) = transceiver.sender() {
+                    // In full implementation: sender.pause()
+                    trace!("Sender {} would pause", sender.ssrc());
+                }
+            }
+        }
+
+        // Handle receive direction changes
+        if old_receives != new_receives {
+            if new_receives {
+                debug!("Transceiver {} starting to receive", transceiver.id());
+                // In full implementation: activate receiver
+            } else {
+                debug!("Transceiver {} stopping receive", transceiver.id());
+                // In full implementation: deactivate receiver or discard packets
+            }
+        }
+
+        Ok(())
+    }
 }
 
 async fn run_gathering_loop(
@@ -2578,9 +2869,20 @@ impl From<TransceiverDirection> for Direction {
     }
 }
 
+impl From<Direction> for TransceiverDirection {
+    fn from(value: Direction) -> Self {
+        match value {
+            Direction::SendRecv => TransceiverDirection::SendRecv,
+            Direction::SendOnly => TransceiverDirection::SendOnly,
+            Direction::RecvOnly => TransceiverDirection::RecvOnly,
+            Direction::Inactive => TransceiverDirection::Inactive,
+        }
+    }
+}
+
 static TRANSCEIVER_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RtpCodecParameters {
     pub payload_type: u8,
     pub clock_rate: u32,
@@ -2608,6 +2910,8 @@ pub struct RtpTransceiver {
     sender_ssrc: Mutex<Option<u32>>,
     sender_stream_id: Mutex<Option<String>>,
     sender_track_id: Mutex<Option<String>>,
+    payload_map: Arc<std::sync::RwLock<HashMap<u8, RtpCodecParameters>>>,
+    extmap: Arc<std::sync::RwLock<HashMap<u8, String>>>,
 }
 
 impl RtpTransceiver {
@@ -2623,7 +2927,15 @@ impl RtpTransceiver {
             sender_ssrc: Mutex::new(None),
             sender_stream_id: Mutex::new(None),
             sender_track_id: Mutex::new(None),
+            payload_map: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            extmap: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Create transceiver for testing purposes
+    #[doc(hidden)]
+    pub fn new_for_test(kind: MediaKind, direction: TransceiverDirection) -> Self {
+        Self::new(kind, direction)
     }
 
     pub fn id(&self) -> u64 {
@@ -2697,6 +3009,71 @@ impl RtpTransceiver {
 
     pub fn set_receiver(&self, receiver: Option<Arc<RtpReceiver>>) {
         *self.receiver.lock().unwrap() = receiver;
+    }
+
+    /// Update payload type mapping for reinvite scenarios
+    pub fn update_payload_map(&self, new_map: HashMap<u8, RtpCodecParameters>) -> RtcResult<()> {
+        let mut payload_map = self.payload_map.write().unwrap();
+
+        // Log changes for debugging
+        for (pt, codec) in &new_map {
+            if !payload_map.contains_key(pt) || payload_map.get(pt) != Some(codec) {
+                trace!(
+                    "Payload type {} remapped: clock_rate={}, channels={}",
+                    pt, codec.clock_rate, codec.channels
+                );
+            }
+        }
+
+        *payload_map = new_map;
+        Ok(())
+    }
+
+    /// Update RTP header extension mapping for reinvite scenarios
+    pub fn update_extmap(&self, new_extmap: HashMap<u8, String>) -> RtcResult<()> {
+        let mut extmap = self.extmap.write().unwrap();
+
+        // Log changes
+        for (id, uri) in &new_extmap {
+            if !extmap.contains_key(id) || extmap.get(id) != Some(uri) {
+                trace!("Extmap ID {} remapped to {}", id, uri);
+            }
+        }
+
+        *extmap = new_extmap;
+
+        // Update transport extension IDs if available
+        if let Some(weak_transport) = self.rtp_transport.lock().unwrap().as_ref() {
+            if let Some(transport) = weak_transport.upgrade() {
+                if let Some(id) = extmap
+                    .iter()
+                    .find(|(_, uri)| uri.as_str() == crate::sdp::ABS_SEND_TIME_URI)
+                    .map(|(id, _)| *id)
+                {
+                    transport.set_abs_send_time_extension_id(id);
+                }
+
+                if let Some(id) = extmap
+                    .iter()
+                    .find(|(_, uri)| uri.contains("rtp-stream-id"))
+                    .map(|(id, _)| *id)
+                {
+                    transport.set_rid_extension_id(id);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get current payload type mapping (for testing/debugging)
+    pub fn get_payload_map(&self) -> HashMap<u8, RtpCodecParameters> {
+        self.payload_map.read().unwrap().clone()
+    }
+
+    /// Get current extmap (for testing/debugging)
+    pub fn get_extmap(&self) -> HashMap<u8, String> {
+        self.extmap.read().unwrap().clone()
     }
 }
 

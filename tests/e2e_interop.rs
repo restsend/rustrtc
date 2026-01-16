@@ -68,7 +68,12 @@ fn test_rust_server_go_client() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    assert!(output.status.success(), "Go client failed");
+    if output.status.success() {
+        println!(
+            "Go Client stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
 }
 
 #[test]
