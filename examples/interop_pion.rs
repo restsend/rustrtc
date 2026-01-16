@@ -10,6 +10,7 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() {
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
     tracing_subscriber::fmt()
         .with_env_filter("info,rustrtc=debug")
         .init();

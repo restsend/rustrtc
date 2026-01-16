@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 #[tokio::main]
 async fn main() {
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
     // You can enable tracing to debug if needed
     // tracing_subscriber::fmt::init();
 

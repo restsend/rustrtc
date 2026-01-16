@@ -8,3 +8,4 @@ flamegraph.svg
 examples/interop_pion_go/interop_pion
 examples/interop_pion_go/interop_pion_go
 benchmark_go
+*.log
