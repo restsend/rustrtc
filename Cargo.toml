@@ -31,7 +31,10 @@ ctr = "0.9"
 hmac = "0.12"
 sha1 = "0.10"
 sha2 = "0.10"
-rcgen = "0.14.6"
+rcgen = { version = "0.14.6", default-features = false, features = [
+    "aws_lc_rs",
+    "pem",
+] }
 md5 = { package = "md-5", version = "0.10" }
 p256 = { version = "0.13.2", features = ["ecdh", "std", "ecdsa", "pkcs8"] }
 aes-gcm = { version = "0.10.3", features = ["std"] }
@@ -55,7 +58,7 @@ env_logger = "0.11.8"
 dtls = "0.13.0"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 indicatif = "0.18.3"
-rustls = { version = "0.23.36", features = ["ring"] }
+rustls = { version = "0.23.36" }
 
 [features]
 default = []
