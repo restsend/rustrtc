@@ -251,6 +251,7 @@ pub struct RtcConfiguration {
     pub dtls_buffer_size: usize,
     pub rtp_start_port: Option<u16>,
     pub rtp_end_port: Option<u16>,
+    pub enable_latching: bool,
 }
 
 impl Default for RtcConfiguration {
@@ -278,6 +279,7 @@ impl Default for RtcConfiguration {
             dtls_buffer_size: 2048,
             rtp_start_port: None,
             rtp_end_port: None,
+            enable_latching: true,
         }
     }
 }
@@ -297,6 +299,11 @@ impl RtcConfigurationBuilder {
         Self {
             inner: RtcConfiguration::default(),
         }
+    }
+
+    pub fn enable_latching(mut self, enable: bool) -> Self {
+        self.inner.enable_latching = enable;
+        self
     }
 
     pub fn ice_server(mut self, server: IceServer) -> Self {

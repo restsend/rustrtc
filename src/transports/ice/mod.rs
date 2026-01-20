@@ -829,6 +829,33 @@ async fn handle_packet(
         match StunMessage::decode(packet) {
             Ok(msg) => {
                 if msg.class == StunClass::Request {
+                    // Start of Latching Logic for RTP mode
+                    if inner.config.transport_mode == crate::TransportMode::Rtp
+                        && inner.config.enable_latching
+                    {
+                        let mut update = false;
+                        {
+                            let selected_pair = inner.selected_pair.lock().unwrap();
+                            if let Some(pair) = selected_pair.as_ref() {
+                                if pair.remote.address != addr {
+                                    debug!(
+                                        "RTP Latching: Switching remote address from {} to {} based on STUN Binding Request",
+                                        pair.remote.address, addr
+                                    );
+                                    update = true;
+                                }
+                            }
+                        }
+
+                        if update {
+                            let mut pair = inner.selected_pair.lock().unwrap().clone().unwrap();
+                            pair.remote.address = addr;
+
+                            *inner.selected_pair.lock().unwrap() = Some(pair.clone());
+                            // This send should trigger the pair_monitor in PeerConnection via watcher
+                            let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
+                        }
+                    }
                     handle_stun_request(&sender, &msg, addr, inner).await;
                 } else if msg.class == StunClass::SuccessResponse {
                     let mut map = inner.pending_transactions.lock().unwrap();

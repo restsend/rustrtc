@@ -441,7 +441,11 @@ impl PeerConnection {
 
         let transceiver = Arc::new(RtpTransceiver::new(kind, direction));
         if direction.sends() {
-            let ssrc = self.inner.ssrc_generator.fetch_add(1, Ordering::Relaxed);
+            let rand_val = random_u32();
+            let ssrc = self
+                .inner
+                .ssrc_generator
+                .fetch_add(1 + rand_val, Ordering::Relaxed);
             *transceiver.sender_ssrc.lock().unwrap() = Some(ssrc);
             *transceiver.sender_stream_id.lock().unwrap() = Some("default".to_string());
             *transceiver.sender_track_id.lock().unwrap() =
@@ -589,18 +593,48 @@ impl PeerConnection {
                 // Extract parameters from our offer for transceivers
                 let transceivers = self.inner.transceivers.lock().unwrap().clone();
                 for section in &desc.media_sections {
-                    if let Some(t) = transceivers
+                    let mut matched_transceiver = transceivers
                         .iter()
                         .find(|t| t.mid().as_ref() == Some(&section.mid))
-                    {
+                        .map(|t| t.clone());
+
+                    // If not found by MID, try to match with mid-less transceiver (e.g. manual SDP)
+                    if matched_transceiver.is_none() {
+                        if let Some(t) = transceivers
+                            .iter()
+                            .find(|t| t.mid().is_none() && t.kind() == section.kind)
+                        {
+                            t.set_mid(section.mid.clone());
+                            matched_transceiver = Some(t.clone());
+                        }
+                    }
+
+                    if let Some(t) = matched_transceiver {
                         let payload_map = Self::extract_payload_map(section);
                         if !payload_map.is_empty() {
                             let _ = t.update_payload_map(payload_map);
                         }
                         let extmap = Self::extract_extmap(section);
-                        if !extmap.is_empty() {
-                            let _ = t.update_extmap(extmap);
-                        }
+                        let _ = t.update_extmap(extmap);
+                    }
+                }
+            } else {
+                // Initial offer: ensure MIDs are assigned if we match unassigned transceivers
+                // This covers manual SDP creation (skipped create_offer)
+                let transceivers = self.inner.transceivers.lock().unwrap().clone();
+                for section in &desc.media_sections {
+                    if transceivers
+                        .iter()
+                        .any(|t| t.mid().as_ref() == Some(&section.mid))
+                    {
+                        continue;
+                    }
+                    // Assign to first matching unassigned transceiver
+                    if let Some(t) = transceivers
+                        .iter()
+                        .find(|t| t.mid().is_none() && t.kind() == section.kind)
+                    {
+                        t.set_mid(section.mid.clone());
                     }
                 }
             }
@@ -659,9 +693,7 @@ impl PeerConnection {
                         let _ = t.update_payload_map(payload_map);
                     }
                     let extmap = Self::extract_extmap(section);
-                    if !extmap.is_empty() {
-                        let _ = t.update_extmap(extmap);
-                    }
+                    let _ = t.update_extmap(extmap);
                     // Also extract direction
                     let direction: TransceiverDirection = section.direction.into();
                     t.set_direction(direction);
@@ -933,13 +965,13 @@ impl PeerConnection {
 
                 if let Some(id) = rid_ext_id {
                     if let Some(transport) = self.inner.rtp_transport.lock().unwrap().as_ref() {
-                        transport.set_rid_extension_id(id);
+                        transport.set_rid_extension_id(Some(id));
                     }
                 }
 
                 if let Some(id) = abs_send_time_ext_id {
                     if let Some(transport) = self.inner.rtp_transport.lock().unwrap().as_ref() {
-                        transport.set_abs_send_time_extension_id(id);
+                        transport.set_abs_send_time_extension_id(Some(id));
                     }
                 }
 
@@ -1168,7 +1200,14 @@ impl PeerConnection {
                 Arc::downgrade(&self.inner),
                 self.inner.stats_collector.clone(),
             );
-            return Ok(Box::pin(rtcp_loop) as Pin<Box<dyn Future<Output = ()> + Send>>);
+            let pair_monitor = Self::create_pair_monitor(pair_rx.clone(), ice_conn_monitor.clone());
+            let combined_loop = async move {
+                tokio::select! {
+                    _ = rtcp_loop => {},
+                    _ = pair_monitor => {},
+                }
+            };
+            return Ok(Box::pin(combined_loop) as Pin<Box<dyn Future<Output = ()> + Send>>);
         }
 
         if self.config().transport_mode == TransportMode::Rtp {
@@ -1201,7 +1240,14 @@ impl PeerConnection {
                     }
                 }
             }
-            return Ok(Box::pin(rtcp_loop) as Pin<Box<dyn Future<Output = ()> + Send>>);
+            let pair_monitor = Self::create_pair_monitor(pair_rx.clone(), ice_conn_monitor.clone());
+            let combined_loop = async move {
+                tokio::select! {
+                    _ = rtcp_loop => {},
+                    _ = pair_monitor => {},
+                }
+            };
+            return Ok(Box::pin(combined_loop) as Pin<Box<dyn Future<Output = ()> + Send>>);
         }
 
         let (dtls, incoming_data_rx, dtls_runner) = DtlsTransport::new(
@@ -1550,20 +1596,25 @@ impl PeerConnection {
             if let Some(pair) = pair_rx.borrow().clone() {
                 if let Ok(mut addr) = ice_conn_monitor.remote_addr.write() {
                     trace!(
-                        "PeerConnection: pair_monitor initial update: {}",
-                        pair.remote.address
+                        "PeerConnection: pair_monitor initial update: {} -> {}",
+                        *addr, pair.remote.address
                     );
                     *addr = pair.remote.address;
                 }
             }
             while pair_rx.changed().await.is_ok() {
                 if let Some(pair) = pair_rx.borrow().clone() {
-                    if let Ok(mut addr) = ice_conn_monitor.remote_addr.write() {
+                    let old_addr = if let Ok(addr) = ice_conn_monitor.remote_addr.read() {
+                        *addr
+                    } else {
+                        "0.0.0.0:0".parse().unwrap()
+                    };
+                    if let Ok(mut addr_guard) = ice_conn_monitor.remote_addr.write() {
                         trace!(
-                            "PeerConnection: pair_monitor update: {}",
-                            pair.remote.address
+                            "PeerConnection: pair_monitor update: {} -> {}",
+                            old_addr, pair.remote.address
                         );
-                        *addr = pair.remote.address;
+                        *addr_guard = pair.remote.address;
                     }
                 }
             }
@@ -1800,9 +1851,7 @@ impl PeerConnection {
 
                 // Extract and update extension mapping
                 let extmap = Self::extract_extmap(section);
-                if !extmap.is_empty() {
-                    t.update_extmap(extmap)?;
-                }
+                t.update_extmap(extmap)?;
 
                 // Handle direction changes
                 let new_direction: TransceiverDirection = section.direction.into();
@@ -2636,7 +2685,7 @@ impl PeerConnectionInner {
         if kind == MediaKind::Video {
             let (mut rid_id, mut repaired_rid_id) = self.get_remote_video_extmap_ids(&section.mid);
 
-            if sdp_type == SdpType::Offer {
+            if sdp_type == SdpType::Offer && self.config.transport_mode != TransportMode::Rtp {
                 // If not found in remote (new transceiver), use defaults
                 if rid_id.is_none() {
                     rid_id = Some("1".to_string());
@@ -2652,7 +2701,10 @@ impl PeerConnectionInner {
         // Add abs-send-time extmap
         let mut abs_send_time_id =
             self.get_remote_extmap_id(&section.mid, crate::sdp::ABS_SEND_TIME_URI);
-        if sdp_type == SdpType::Offer && abs_send_time_id.is_none() {
+        if sdp_type == SdpType::Offer
+            && abs_send_time_id.is_none()
+            && self.config.transport_mode != TransportMode::Rtp
+        {
             abs_send_time_id = Some("3".to_string()); // Default ID for abs-send-time
         }
         if let Some(id) = abs_send_time_id {
@@ -3040,21 +3092,17 @@ impl RtpTransceiver {
         // Update transport extension IDs if available
         if let Some(weak_transport) = self.rtp_transport.lock().unwrap().as_ref() {
             if let Some(transport) = weak_transport.upgrade() {
-                if let Some(id) = extmap
+                let id = extmap
                     .iter()
                     .find(|(_, uri)| uri.as_str() == crate::sdp::ABS_SEND_TIME_URI)
-                    .map(|(id, _)| *id)
-                {
-                    transport.set_abs_send_time_extension_id(id);
-                }
+                    .map(|(id, _)| *id);
+                transport.set_abs_send_time_extension_id(id);
 
-                if let Some(id) = extmap
+                let id = extmap
                     .iter()
                     .find(|(_, uri)| uri.contains("rtp-stream-id"))
-                    .map(|(id, _)| *id)
-                {
-                    transport.set_rid_extension_id(id);
-                }
+                    .map(|(id, _)| *id);
+                transport.set_rid_extension_id(id);
             }
         }
 
@@ -3325,6 +3373,20 @@ impl RtpSender {
 
                                 for interceptor in &interceptors {
                                     interceptor.on_packet_sent(&packet).await;
+                                }
+
+                                if packet.header.payload_type == 8 {
+                                    if packet.header.sequence_number % 50 == 0 || packet.header.marker {
+                                        tracing::info!("RTP_TRACE ssrc={} seq={} ts={} offset={} len={} m={} x={}",
+                                            packet.header.ssrc,
+                                            packet.header.sequence_number,
+                                            packet.header.timestamp,
+                                            timestamp_offset,
+                                            packet.payload.len(),
+                                            packet.header.marker,
+                                            packet.header.extension.is_some()
+                                        );
+                                    }
                                 }
 
                                 if let Err(e) = transport.send_rtp(&packet).await {

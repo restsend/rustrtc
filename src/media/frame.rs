@@ -26,6 +26,7 @@ pub struct AudioFrame {
     pub data: Bytes,
     pub sequence_number: Option<u16>,
     pub payload_type: Option<u8>,
+    pub marker: bool,
 }
 
 impl Default for AudioFrame {
@@ -36,6 +37,7 @@ impl Default for AudioFrame {
             data: Bytes::new(),
             sequence_number: None,
             payload_type: None,
+            marker: false,
         }
     }
 }
@@ -96,7 +98,7 @@ impl MediaSample {
         let (payload, marker, rtp_timestamp, csrcs, frame_seq, frame_pt, extension) = match self {
             MediaSample::Audio(f) => (
                 f.data,
-                false,
+                f.marker,
                 f.rtp_timestamp,
                 Vec::new(),
                 f.sequence_number,
@@ -138,6 +140,7 @@ impl MediaSample {
                 data,
                 sequence_number: Some(packet.header.sequence_number),
                 payload_type: Some(packet.header.payload_type),
+                marker: packet.header.marker,
             }),
             MediaKind::Video => MediaSample::Video(VideoFrame {
                 rtp_timestamp: packet.header.timestamp,

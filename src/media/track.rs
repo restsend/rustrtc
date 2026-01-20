@@ -558,6 +558,7 @@ mod tests {
             data: Bytes::from_static(&[1u8; 4]),
             sequence_number: None,
             payload_type: None,
+            marker: false,
         };
         source.send_audio(frame.clone()).await.unwrap();
 

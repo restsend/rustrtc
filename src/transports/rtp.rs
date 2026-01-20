@@ -66,12 +66,12 @@ impl RtpTransport {
         *listener = Some(tx);
     }
 
-    pub fn set_rid_extension_id(&self, id: u8) {
-        *self.rid_extension_id.lock().unwrap() = Some(id);
+    pub fn set_rid_extension_id(&self, id: Option<u8>) {
+        *self.rid_extension_id.lock().unwrap() = id;
     }
 
-    pub fn set_abs_send_time_extension_id(&self, id: u8) {
-        *self.abs_send_time_extension_id.lock().unwrap() = Some(id);
+    pub fn set_abs_send_time_extension_id(&self, id: Option<u8>) {
+        *self.abs_send_time_extension_id.lock().unwrap() = id;
     }
 
     pub fn register_rtcp_listener(&self, tx: mpsc::Sender<Vec<RtcpPacket>>) {
