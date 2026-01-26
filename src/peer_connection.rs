@@ -3330,10 +3330,12 @@ impl RtpSender {
             let mut sequence_number = next_seq.load(Ordering::SeqCst);
             let mut last_source_ts: Option<u32> = None;
             let mut timestamp_offset = random_u32(); // Start with random offset
+            let notified = stop_rx.notified();
+            tokio::pin!(notified);
 
             loop {
                 tokio::select! {
-                    _ = stop_rx.notified() => break,
+                    _ = &mut notified => break,
                     rtcp = rtcp_rx.recv() => {
                         match rtcp {
                             Ok(packet) => {
