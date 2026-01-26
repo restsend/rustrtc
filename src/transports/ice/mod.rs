@@ -129,6 +129,7 @@ struct IceTransportRunner {
     socket_rx: mpsc::UnboundedReceiver<IceSocketWrapper>,
     candidate_rx: broadcast::Receiver<IceCandidate>,
     cmd_rx: mpsc::UnboundedReceiver<IceCommand>,
+    state_rx: watch::Receiver<IceTransportState>,
 }
 
 impl IceTransportRunner {
@@ -142,6 +143,14 @@ impl IceTransportRunner {
 
         loop {
             tokio::select! {
+                res = self.state_rx.changed() => {
+                    if res.is_err() {
+                        break;
+                    }
+                    if *self.state_rx.borrow() == IceTransportState::Closed {
+                        break;
+                    }
+                }
                 Some(socket) = self.socket_rx.recv() => {
                     match socket {
                         IceSocketWrapper::Udp(s) => {
@@ -344,6 +353,7 @@ impl IceTransport {
         let (socket_tx, socket_rx) = tokio::sync::mpsc::unbounded_channel();
         let gatherer = IceGatherer::new(config.clone(), candidate_tx.clone(), socket_tx);
         let (state_tx, state_rx) = watch::channel(IceTransportState::New);
+        let runner_state_rx = state_tx.subscribe();
         let (gathering_state_tx, _) = watch::channel(IceGathererState::New);
         let (selected_socket_tx, selected_socket_rx) = watch::channel(None);
         let (selected_pair_tx, selected_pair_rx) = watch::channel(None);
@@ -381,6 +391,7 @@ impl IceTransport {
             socket_rx,
             candidate_rx: candidate_tx.subscribe(),
             cmd_rx,
+            state_rx: runner_state_rx,
         };
 
         (Self { inner }, runner.run())
@@ -537,6 +548,11 @@ impl IceTransport {
 
     pub fn stop(&self) {
         let _ = self.inner.state.send(IceTransportState::Closed);
+        let _ = self.inner.selected_socket.send(None);
+        let _ = self.inner.selected_pair_notifier.send(None);
+        *self.inner.selected_pair.lock().unwrap() = None;
+        self.inner.gatherer.sockets.lock().unwrap().clear();
+        self.inner.gatherer.turn_clients.lock().unwrap().clear();
     }
 
     pub fn set_role(&self, role: IceRole) {
