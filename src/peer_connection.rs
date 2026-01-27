@@ -408,7 +408,8 @@ impl PeerConnection {
             .map(|list| list.len())
             .unwrap_or(0);
         let ssrc = 2000 + index as u32;
-        let mut builder = RtpReceiverBuilder::new(kind, ssrc);
+        let mut builder =
+            RtpReceiverBuilder::new(kind, ssrc).interceptor(self.inner.stats_collector.clone());
 
         let nack_enabled = if let Some(caps) = &self.inner.config.media_capabilities {
             match kind {
@@ -486,7 +487,8 @@ impl PeerConnection {
 
         let mut builder = RtpSenderBuilder::new(track, ssrc)
             .stream_id(stream_id)
-            .params(params);
+            .params(params)
+            .interceptor(self.inner.stats_collector.clone());
 
         let nack_enabled = if let Some(caps) = &self.inner.config.media_capabilities {
             match kind {
@@ -1002,7 +1004,8 @@ impl PeerConnection {
 
                     let receiver_ssrc = ssrc.unwrap_or_else(|| 2000 + transceivers.len() as u32);
 
-                    let mut builder = RtpReceiverBuilder::new(kind, receiver_ssrc);
+                    let mut builder = RtpReceiverBuilder::new(kind, receiver_ssrc)
+                        .interceptor(self.inner.stats_collector.clone());
 
                     let nack_enabled = if let Some(caps) = &self.inner.config.media_capabilities {
                         match kind {
@@ -1043,7 +1046,11 @@ impl PeerConnection {
                     {
                         let transport_guard = self.inner.rtp_transport.lock().unwrap();
                         if let Some(transport) = &*transport_guard {
-                            receiver.set_transport(transport.clone(), None, None);
+                            receiver.set_transport(
+                                transport.clone(),
+                                Some(self.inner.event_tx.clone()),
+                                Some(t.clone()),
+                            );
                         } else {
                             debug!(
                                 "No existing transport to attach to new receiver mid={}",
@@ -1449,7 +1456,11 @@ impl PeerConnection {
             }
 
             if let Some(receiver) = &receiver_arc {
-                receiver.set_transport(rtp_transport.clone(), None, None);
+                receiver.set_transport(
+                    rtp_transport.clone(),
+                    Some(self.inner.event_tx.clone()),
+                    Some(t.clone()),
+                );
                 if let Some(sender) = &sender_arc {
                     receiver.set_feedback_ssrc(sender.ssrc());
                 }
@@ -1521,7 +1532,11 @@ impl PeerConnection {
                         }
 
                         if let Some(receiver) = &receiver_arc {
-                            receiver.set_transport(rtp_transport.clone(), None, None);
+                            receiver.set_transport(
+                                rtp_transport.clone(),
+                                Some(self.inner.event_tx.clone()),
+                                Some(t.clone()),
+                            );
                             if let Some(sender) = &sender_arc {
                                 receiver.set_feedback_ssrc(sender.ssrc());
                             }

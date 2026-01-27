@@ -54,6 +54,21 @@ impl StatsEntry {
     }
 }
 
+impl std::fmt::Display for StatsEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{:?}/{}]", self.kind, self.id.0)?;
+        for (k, v) in &self.values {
+            // Attempt to display strings without quotes for cleaner logs, fallback to standard display
+            if let Some(s) = v.as_str() {
+                write!(f, " {}={}", k, s)?;
+            } else {
+                write!(f, " {}={}", k, v)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatsReport {
     pub collected_at: SystemTime,
@@ -72,6 +87,16 @@ impl StatsReport {
         self.entries.append(&mut other.entries);
         self.collected_at = self.collected_at.max(other.collected_at);
         self
+    }
+}
+
+impl std::fmt::Display for StatsReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "StatsReport(len={})", self.entries.len())?;
+        for entry in &self.entries {
+            write!(f, " {}", entry)?;
+        }
+        Ok(())
     }
 }
 

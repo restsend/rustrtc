@@ -28,17 +28,60 @@ async fn test_rtp_latching() -> Result<()> {
         }
     }
 
-    if ips.len() < 2 {
+    let ipv4_ips: Vec<_> = ips.into_iter().collect();
+    if ipv4_ips.len() < 2 {
         println!(
             "Skipping test_rtp_latching: Need at least 2 distinct local IPv4s, found {:?}",
-            ips
+            ipv4_ips
         );
         return Ok(());
     }
 
-    let ips: Vec<_> = ips.into_iter().collect();
-    let ip1 = ips[0];
-    let ip2 = ips[1];
+    // Try to find a pair of IPs that can talk to each other
+    let mut selected_pair = None;
+    for i in 0..ipv4_ips.len() {
+        for j in 0..ipv4_ips.len() {
+            if i == j {
+                continue;
+            }
+            let ip_a = ipv4_ips[i];
+            let ip_b = ipv4_ips[j];
+
+            // Verify connectivity from B to A
+            let socket_a = UdpSocket::bind(SocketAddr::new(ip_a, 0)).await?;
+            let socket_b = UdpSocket::bind(SocketAddr::new(ip_b, 0)).await?;
+            let addr_a = socket_a.local_addr()?;
+
+            socket_b.send_to(b"PING", addr_a).await?;
+
+            let mut buf = [0u8; 10];
+            if let Ok(Ok((_, src_b))) =
+                tokio::time::timeout(Duration::from_millis(100), socket_a.recv_from(&mut buf)).await
+            {
+                // Verify return path A -> B
+                socket_a.send_to(b"PONG", src_b).await?;
+                if let Ok(Ok(_)) =
+                    tokio::time::timeout(Duration::from_millis(100), socket_b.recv_from(&mut buf))
+                        .await
+                {
+                    selected_pair = Some((ip_a, ip_b));
+                    break;
+                }
+            }
+        }
+        if selected_pair.is_some() {
+            break;
+        }
+    }
+
+    let (ip1, ip2) = if let Some(pair) = selected_pair {
+        pair
+    } else {
+        println!("Skipping test_rtp_latching: No two local IPs can reach each other via UDP.");
+        return Ok(());
+    };
+
+    println!("Selected IPs: IP1={}, IP2={}", ip1, ip2);
 
     // 1. Setup PeerConnection (PC) with RTP Mode & Latching
     let mut config = RtcConfiguration::default();

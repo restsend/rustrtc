@@ -1,6 +1,7 @@
 use crate::errors::{RtpError, RtpResult};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
+use tracing::debug;
 
 const RTP_VERSION: u8 = 2;
 pub const RTCP_SR: u8 = 200;
@@ -479,16 +480,19 @@ pub fn parse_rtcp_packets(raw: &[u8]) -> RtpResult<Vec<RtcpPacket>> {
             body_end -= pad;
         }
         let body = &raw[offset + 4..body_end];
-        let packet = match packet_type {
-            RTCP_SR => RtcpPacket::SenderReport(parse_sender_report(fmt, body)?),
-            RTCP_RR => RtcpPacket::ReceiverReport(parse_receiver_report(fmt, body)?),
-            RTCP_SDES => RtcpPacket::SourceDescription(parse_sdes(fmt, body)?),
-            RTCP_BYE => RtcpPacket::Goodbye(parse_goodbye(fmt, body)?),
-            RTCP_RTPFB => parse_rtcp_rtpfb(fmt, body)?,
-            RTCP_PSFB => parse_rtcp_psfb(fmt, body)?,
-            _ => return Err(RtpError::InvalidRtcp("unsupported RTCP packet type")),
-        };
-        packets.push(packet);
+        match packet_type {
+            RTCP_SR => packets.push(RtcpPacket::SenderReport(parse_sender_report(fmt, body)?)),
+            RTCP_RR => packets.push(RtcpPacket::ReceiverReport(parse_receiver_report(
+                fmt, body,
+            )?)),
+            RTCP_SDES => packets.push(RtcpPacket::SourceDescription(parse_sdes(fmt, body)?)),
+            RTCP_BYE => packets.push(RtcpPacket::Goodbye(parse_goodbye(fmt, body)?)),
+            RTCP_RTPFB => packets.push(parse_rtcp_rtpfb(fmt, body)?),
+            RTCP_PSFB => packets.push(parse_rtcp_psfb(fmt, body)?),
+            _ => {
+                debug!("unsupported RTCP packet type: {}", packet_type);
+            }
+        }
         offset += packet_len;
     }
     Ok(packets)

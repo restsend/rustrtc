@@ -1076,12 +1076,15 @@ impl SctpInner {
             let available_window = effective_window - current_flight;
             let mut chunks_to_send = Vec::new();
             let mut total_size = 0;
+            let mut modified_tsns = Vec::new();
+            let mut window_blocked = false;
 
             // Collect chunks that fit in available window
-            for record in sent_queue.values_mut() {
+            for (tsn, record) in sent_queue.iter_mut() {
                 if !record.acked && !record.in_flight && !record.abandoned {
                     let len = record.payload.len();
                     if total_size + len > available_window {
+                        window_blocked = true;
                         break; // Would exceed window
                     }
 
@@ -1095,6 +1098,7 @@ impl SctpInner {
                     record.fast_retransmit = false;
                     total_size += len;
                     chunks_to_send.push(record.payload.clone());
+                    modified_tsns.push(*tsn);
 
                     if chunks_to_send.len() >= 32 {
                         break;
@@ -1102,16 +1106,51 @@ impl SctpInner {
                 }
             }
 
+            // Zero Window Probing: If logic prevents sending but window is zero (or too small) and flight is zero,
+            // strict flow control would deadlock. We must send 1 packet as probe.
+            let mut is_probe = false;
+            if chunks_to_send.is_empty() && current_flight == 0 && window_blocked {
+                for (tsn, record) in sent_queue.iter_mut() {
+                    if !record.acked && !record.in_flight && !record.abandoned {
+                        record.in_flight = true;
+                        record.transmit_count += 1;
+                        if record.transmit_count > 1 {
+                            record.sent_time = now;
+                        }
+                        record.fast_retransmit = false;
+
+                        let len = record.payload.len();
+                        total_size += len;
+                        chunks_to_send.push(record.payload.clone());
+                        modified_tsns.push(*tsn);
+                        is_probe = true;
+                        break; // Only 1 probe packet
+                    }
+                }
+            }
+
             if total_size > 0 {
                 let new_flight = current_flight + total_size;
-                if new_flight > effective_window {
+                // Re-check effective_window because rwnd/cwnd might have changed (atomics)
+                let cwnd = self.cwnd.load(Ordering::SeqCst);
+                let rwnd = self.peer_rwnd.load(Ordering::SeqCst) as usize;
+                let effective_window = cwnd.min(rwnd);
+
+                // If probing, we intentionally exceed window (0).
+                // Otherwise calculate strict overflow logic.
+                if !is_probe && new_flight > effective_window {
                     debug!(
                         "drain_retransmissions: would exceed window (flight={} + {} > {}), skipping",
                         current_flight, total_size, effective_window
                     );
-                    for record in sent_queue.values_mut() {
-                        if record.in_flight && record.sent_time == now {
-                            record.in_flight = false;
+                    for tsn in modified_tsns {
+                        if let Some(record) = sent_queue.get_mut(&tsn) {
+                            if record.in_flight {
+                                record.in_flight = false;
+                                if record.transmit_count > 0 {
+                                    record.transmit_count -= 1;
+                                }
+                            }
                         }
                     }
                     return Ok(());
