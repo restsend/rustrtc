@@ -1290,19 +1290,38 @@ impl PeerConnection {
             5000
         };
 
+        let sctp_needed = {
+            let remote = self.inner.remote_description.lock().unwrap();
+            if let Some(desc) = &*remote {
+                desc.media_sections
+                    .iter()
+                    .any(|m| m.kind == MediaKind::Application)
+            } else {
+                false
+            }
+        };
+
         let (dc_tx, mut dc_rx) = mpsc::unbounded_channel();
 
-        let (sctp, sctp_runner) = SctpTransport::new(
-            dtls.clone(),
-            incoming_data_rx,
-            self.inner.data_channels.clone(),
-            sctp_port,
-            sctp_port,
-            Some(dc_tx),
-            is_client,
-            self.config(),
-        );
-        *self.inner.sctp_transport.lock().unwrap() = Some(sctp);
+        let mut sctp_runner: Pin<Box<dyn Future<Output = ()> + Send>>;
+
+        if sctp_needed {
+            let (sctp, runner) = SctpTransport::new(
+                dtls.clone(),
+                incoming_data_rx,
+                self.inner.data_channels.clone(),
+                sctp_port,
+                sctp_port,
+                Some(dc_tx),
+                is_client,
+                self.config(),
+            );
+            *self.inner.sctp_transport.lock().unwrap() = Some(sctp);
+            sctp_runner = Box::pin(runner);
+        } else {
+            drop(incoming_data_rx);
+            sctp_runner = Box::pin(std::future::pending());
+        }
 
         *self.inner.dtls_transport.lock().unwrap() = Some(dtls.clone());
 
@@ -1312,7 +1331,6 @@ impl PeerConnection {
         let stats_collector = self.inner.stats_collector.clone();
 
         let mut dtls_runner: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(dtls_runner);
-        let mut sctp_runner: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(sctp_runner);
 
         let inner_weak_dc = inner_weak.clone();
         let dc_listener = async move {
@@ -1324,7 +1342,11 @@ impl PeerConnection {
                 }
             }
         };
-        let mut dc_listener: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(dc_listener);
+        let mut dc_listener: Pin<Box<dyn Future<Output = ()> + Send>> = if sctp_needed {
+            Box::pin(dc_listener)
+        } else {
+            Box::pin(std::future::pending())
+        };
 
         let mut state_rx = dtls_clone.subscribe_state();
         loop {
