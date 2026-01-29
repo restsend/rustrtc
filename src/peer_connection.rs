@@ -1049,7 +1049,7 @@ impl PeerConnection {
                             receiver.set_transport(
                                 transport.clone(),
                                 Some(self.inner.event_tx.clone()),
-                                Some(t.clone()),
+                                Some(Arc::downgrade(&t)),
                             );
                         } else {
                             debug!(
@@ -1203,7 +1203,7 @@ impl PeerConnection {
                     receiver.set_transport(
                         rtp_transport.clone(),
                         Some(self.inner.event_tx.clone()),
-                        Some(t.clone()),
+                        Some(Arc::downgrade(&t)),
                     );
                 }
             }
@@ -1481,7 +1481,7 @@ impl PeerConnection {
                 receiver.set_transport(
                     rtp_transport.clone(),
                     Some(self.inner.event_tx.clone()),
-                    Some(t.clone()),
+                    Some(Arc::downgrade(&t)),
                 );
                 if let Some(sender) = &sender_arc {
                     receiver.set_feedback_ssrc(sender.ssrc());
@@ -1557,7 +1557,7 @@ impl PeerConnection {
                             receiver.set_transport(
                                 rtp_transport.clone(),
                                 Some(self.inner.event_tx.clone()),
-                                Some(t.clone()),
+                                Some(Arc::downgrade(&t)),
                             );
                             if let Some(sender) = &sender_arc {
                                 receiver.set_feedback_ssrc(sender.ssrc());
@@ -3519,7 +3519,7 @@ pub struct RtpReceiver {
     runner_tx: Mutex<Option<mpsc::UnboundedSender<ReceiverCommand>>>,
     interceptors: Vec<Arc<dyn RtpReceiverInterceptor>>,
     track_ready_event_tx: Mutex<Option<mpsc::UnboundedSender<PeerConnectionEvent>>>,
-    track_ready_transceiver: Mutex<Option<Arc<RtpTransceiver>>>,
+    track_ready_transceiver: Mutex<Option<Weak<RtpTransceiver>>>,
     track_event_sent: AtomicBool,
 }
 
@@ -3742,7 +3742,7 @@ impl RtpReceiver {
         self: &Arc<Self>,
         transport: Arc<RtpTransport>,
         event_tx: Option<mpsc::UnboundedSender<PeerConnectionEvent>>,
-        transceiver: Option<Arc<RtpTransceiver>>,
+        transceiver: Option<Weak<RtpTransceiver>>,
     ) {
         *self.transport.lock().unwrap() = Some(transport.clone());
         *self.track_ready_event_tx.lock().unwrap() = event_tx;
@@ -3882,7 +3882,8 @@ impl RtpReceiver {
                                                         // Use swap to atomically check and set the flag
                                                         if !this.track_event_sent.swap(true, Ordering::SeqCst) {
                                                             if let Some(ref event_tx) = *this.track_ready_event_tx.lock().unwrap() {
-                                                                if let Some(ref transceiver) = *this.track_ready_transceiver.lock().unwrap() {
+                                                                let transceiver = this.track_ready_transceiver.lock().unwrap();
+                                                                if let Some(transceiver) = transceiver.as_ref().and_then(|t| t.upgrade()) {
                                                                     let _ = event_tx.send(PeerConnectionEvent::Track(transceiver.clone()));
                                                                     debug!("RTP mode: Sent Track event after SSRC latching complete");
                                                                 }
