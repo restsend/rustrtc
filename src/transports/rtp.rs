@@ -296,14 +296,11 @@ impl PacketReceiver for RtpTransport {
                         listener = listeners.get(&ssrc).cloned();
                     }
 
-                    // Fallback to Payload Type listener
-                    let mut found_via_pt = false;
                     let pt = rtp_packet.header.payload_type;
                     if listener.is_none() {
                         let pt_listeners = self.pt_listeners.lock().unwrap();
                         if let Some(pt_tx) = pt_listeners.get(&pt) {
                             listener = Some(pt_tx.clone());
-                            found_via_pt = true;
                         }
                     }
 
