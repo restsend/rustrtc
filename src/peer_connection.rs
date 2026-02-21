@@ -2241,7 +2241,7 @@ async fn run_gathering_loop(
             }
             res = ice_state_rx.changed() => {
                 if res.is_err() { break; }
-                if *ice_state_rx.borrow() == crate::transports::ice::IceTransportState::Closed {
+                if matches!(*ice_state_rx.borrow(), crate::transports::ice::IceTransportState::Closed | crate::transports::ice::IceTransportState::Failed) {
                     break;
                 }
             }

@@ -147,7 +147,7 @@ impl IceTransportRunner {
                     if res.is_err() {
                         break;
                     }
-                    if *self.state_rx.borrow() == IceTransportState::Closed {
+                    if matches!(*self.state_rx.borrow(), IceTransportState::Closed | IceTransportState::Failed) {
                         break;
                     }
                 }
@@ -237,8 +237,8 @@ impl IceTransportRunner {
                     }
                 }
                 res = state_rx.changed() => {
-                    if res.is_err() || *state_rx.borrow() == IceTransportState::Closed {
-                        debug!("Read loop stopping (IceTransport Closed)");
+                    if res.is_err() || matches!(*state_rx.borrow(), IceTransportState::Closed | IceTransportState::Failed) {
+                        debug!("Read loop stopping (IceTransport Closed or Failed)");
                         break;
                     }
                 }
@@ -275,8 +275,8 @@ impl IceTransportRunner {
                     }
                 }
                 res = state_rx.changed() => {
-                    if res.is_err() || *state_rx.borrow() == IceTransportState::Closed {
-                        debug!("TURN Read loop stopping (IceTransport Closed)");
+                    if res.is_err() || matches!(*state_rx.borrow(), IceTransportState::Closed | IceTransportState::Failed) {
+                        debug!("TURN Read loop stopping (IceTransport Closed or Failed)");
                         break;
                     }
                 }
