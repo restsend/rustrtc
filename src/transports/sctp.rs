@@ -1119,15 +1119,12 @@ impl SctpInner {
             new_rto
         );
 
-        let peer_rwnd = self.peer_rwnd.load(Ordering::SeqCst);
-        if peer_rwnd > 0 {
-            let count = self.association_error_count.fetch_add(1, Ordering::SeqCst) + 1;
-            if count >= self.max_association_retransmits && self.max_association_retransmits > 0 {
-                debug!("SCTP Association failed (RTO count {})", count);
-                self.set_state(SctpState::Closed);
-                return Ok(());
-            }
-        }
+        // Note: Unlike T1/T2 timers, T3 timeout should NOT close the connection based on
+        // association_error_count. Per RFC 4960 and aiortc implementation, we just:
+        // 1. Mark chunks for retransmit (or abandon if max retransmits exceeded)
+        // 2. Collapse the congestion window
+        // The connection is only closed when ALL chunks are abandoned, or via heartbeat timeout.
+        // This is critical for TURN relay scenarios where SACK packets may be lost.
 
         const MAX_PER_TSN_T3_RETRANSMITS: u32 = 8;
 
@@ -3466,7 +3463,6 @@ mod tests {
 
         let config = RtcConfiguration::default();
         let mut config = config;
-        config.sctp_max_association_retransmits = 2;
         config.sctp_rto_initial = Duration::from_secs(1);
         config.sctp_rto_min = Duration::from_secs(1);
 
@@ -3490,7 +3486,7 @@ mod tests {
         // Set state to Connecting
         *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
 
-        // Add a chunk to sent queue
+        // Add a chunk to sent queue with transmit_count already at 8 (the limit)
         {
             let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
             sent_queue.insert(
@@ -3498,7 +3494,7 @@ mod tests {
                 ChunkRecord {
                     payload: Bytes::from_static(b"test"),
                     sent_time: Instant::now() - Duration::from_secs(10),
-                    transmit_count: 1,
+                    transmit_count: 8, // At the MAX_PER_TSN_T3_RETRANSMITS limit
                     missing_reports: 0,
                     abandoned: false,
                     fast_retransmit: false,
@@ -3515,42 +3511,23 @@ mod tests {
             );
         }
 
-        // First timeout: error_count becomes 1, transmit_count becomes 2
+        // Trigger timeout - should abandon the chunk since it's at the limit
         sctp.inner.handle_timeout().await.unwrap();
-        let state_after_first = sctp.inner.state.lock().unwrap().clone();
-        let error_count_after_first = sctp.inner.association_error_count.load(Ordering::SeqCst);
 
-        // State should still be Connecting after first timeout
-        assert_eq!(state_after_first, SctpState::Connecting);
-        assert_eq!(error_count_after_first, 1);
-
-        sctp.inner.transmit().await.unwrap();
-
-        // Check transmit_count was incremented
+        // Check that the chunk is now abandoned
         {
             let sent_queue = sctp.inner.sent_queue.lock().unwrap();
             let record = sent_queue.get(&100).unwrap();
-            assert_eq!(record.transmit_count, 2);
+            assert!(record.abandoned, "Chunk should be abandoned after reaching max retransmits");
         }
 
-        // Manually set sent_time back to old time to trigger another timeout
-        {
-            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
-            let record = sent_queue.get_mut(&100).unwrap();
-            record.sent_time = Instant::now() - Duration::from_secs(10);
-        }
+        // Connection should NOT be closed - aiortc behavior is to keep connection alive
+        let state_after = sctp.inner.state.lock().unwrap().clone();
+        assert_eq!(state_after, SctpState::Connecting, "Connection should remain open");
 
-        // Reset the T3 fire guard so the second timeout can fire in the test
-        *sctp.inner.last_t3_fire_time.lock().unwrap() = None;
-
-        // Second timeout: error_count becomes 2, transmit_count becomes 3
-        sctp.inner.handle_timeout().await.unwrap();
-
-        // With max_association_retransmits=2, error_count reaching 2 should trigger close
-        let final_state = sctp.inner.state.lock().unwrap().clone();
-        let final_error_count = sctp.inner.association_error_count.load(Ordering::SeqCst);
-        assert_eq!(final_error_count, 2);
-        assert_eq!(final_state, SctpState::Closed);
+        // Error count should NOT be incremented for T3 timeout
+        let error_count = sctp.inner.association_error_count.load(Ordering::SeqCst);
+        assert_eq!(error_count, 0, "Error count should not increase on T3 timeout");
     }
 
     #[tokio::test]
@@ -4008,7 +3985,8 @@ mod tests {
         }
     }
 
-    /// Test showing that cumulative TSN advancement DOES reset error count
+    /// Test showing that T3 timeout does NOT increment error count (aiortc behavior)
+    /// and that cumulative TSN advancement resets error count
     #[tokio::test]
     async fn test_cumulative_ack_resets_error_count() {
         let (socket_tx, _) = tokio::sync::watch::channel(None);
@@ -4065,10 +4043,13 @@ mod tests {
             );
         }
 
-        // Trigger timeout to increment error count
+        // Manually set error count to simulate previous heartbeat failures
+        sctp.inner.association_error_count.store(5, Ordering::SeqCst);
+
+        // Trigger timeout - should NOT increment error count (aiortc behavior)
         sctp.inner.handle_timeout().await.unwrap();
         let error_count = sctp.inner.association_error_count.load(Ordering::SeqCst);
-        assert_eq!(error_count, 1, "Error count should be 1 after timeout");
+        assert_eq!(error_count, 5, "Error count should NOT change after T3 timeout");
 
         // Simulate SACK that advances cumulative TSN (acknowledges TSN 100)
         let sack = build_sack_packet(100, 1024 * 1024, vec![], vec![]);
@@ -6195,5 +6176,782 @@ mod tests {
         let msgs = stream.enqueue(0, Bytes::from("c"));
         assert_eq!(msgs.len(), 1);
         assert_eq!(stream.next_ssn, 1);
+    }
+
+    /// Test: Verify SACK is correctly generated with gap blocks when packets arrive out of order
+    /// This simulates the scenario where a packet is lost and subsequent packets are received
+    #[tokio::test]
+    async fn test_sack_generation_with_out_of_order_packets() {
+        println!("\n=== Testing SACK generation with out-of-order packets ===");
+
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
+
+        let config = RtcConfiguration::default();
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+
+        let (sctp, runner) = SctpTransport::new(
+            dtls,
+            incoming_rx,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &config,
+        );
+
+        tokio::spawn(runner);
+
+        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        sctp.inner
+            .remote_verification_tag
+            .store(12345, Ordering::SeqCst);
+        sctp.inner.cumulative_tsn_ack.store(99, Ordering::SeqCst);
+
+        // Simulate receiving packets out of order: TSN 101, 102, 103 arrive, but 100 is missing
+        // This should result in a SACK with cum_ack=99 and gap blocks for 101-103
+
+        // Create DATA chunk for TSN 101
+        let create_data_chunk = |tsn: u32| -> Bytes {
+            let mut buf = BytesMut::new();
+            buf.put_u32(tsn); // TSN
+            buf.put_u16(0); // Stream ID
+            buf.put_u16(0); // SSN
+            buf.put_u32(51); // PPID (binary)
+            buf.put_slice(b"test data");
+            buf.freeze()
+        };
+
+        // Receive TSN 101 (out of order)
+        let chunk_101 = create_data_chunk(101);
+        sctp.inner.handle_data(0x03, chunk_101.clone()).await.unwrap();
+
+        // Check cumulative_tsn_ack should still be 99
+        let cum_ack = sctp.inner.cumulative_tsn_ack.load(Ordering::SeqCst);
+        assert_eq!(cum_ack, 99, "cumulative_tsn_ack should still be 99 after receiving out-of-order TSN 101");
+
+        // Check received_queue should contain TSN 101
+        {
+            let received = sctp.inner.received_queue.lock().unwrap();
+            assert!(received.contains_key(&101), "TSN 101 should be in received_queue");
+        }
+
+        // sack_needed should be set
+        assert!(sctp.inner.sack_needed.load(Ordering::Relaxed), "sack_needed should be set");
+
+        // Generate SACK and verify gap blocks
+        let sack_chunk = sctp.inner.create_sack_chunk();
+
+        // Parse SACK chunk
+        let mut sack_buf = sack_chunk.clone();
+        sack_buf.advance(4); // Skip chunk header (type, flags, length)
+        let sack_cum_ack = sack_buf.get_u32();
+        let _a_rwnd = sack_buf.get_u32();
+        let num_gap_blocks = sack_buf.get_u16();
+        let _num_dups = sack_buf.get_u16();
+
+        println!("SACK: cum_ack={}, num_gap_blocks={}", sack_cum_ack, num_gap_blocks);
+
+        assert_eq!(sack_cum_ack, 99, "SACK cumulative_tsn_ack should be 99");
+
+        // Should have gap block for TSN 101 (offset 2 from cum_ack=99)
+        if num_gap_blocks > 0 {
+            let start = sack_buf.get_u16();
+            let end = sack_buf.get_u16();
+            println!("Gap block: start={}, end={}", start, end);
+            assert_eq!(start, 2, "Gap block start should be 2 (TSN 101 = 99 + 2)");
+            assert_eq!(end, 2, "Gap block end should be 2");
+        }
+
+        // Now receive TSN 100 (fills the gap)
+        let chunk_100 = create_data_chunk(100);
+        sctp.inner.handle_data(0x03, chunk_100.clone()).await.unwrap();
+
+        // Check cumulative_tsn_ack should now be 101
+        let cum_ack_after = sctp.inner.cumulative_tsn_ack.load(Ordering::SeqCst);
+        println!("After receiving TSN 100: cumulative_tsn_ack = {}", cum_ack_after);
+        assert_eq!(cum_ack_after, 101, "cumulative_tsn_ack should advance to 101 after gap is filled");
+
+        // Generate new SACK and verify no gap blocks
+        let sack_chunk2 = sctp.inner.create_sack_chunk();
+        let mut sack_buf2 = sack_chunk2.clone();
+        sack_buf2.advance(4); // Skip chunk header
+        let sack_cum_ack2 = sack_buf2.get_u32();
+        let _a_rwnd2 = sack_buf2.get_u32();
+        let num_gap_blocks2 = sack_buf2.get_u16();
+
+        println!("SACK after gap filled: cum_ack={}, num_gap_blocks={}", sack_cum_ack2, num_gap_blocks2);
+        assert_eq!(sack_cum_ack2, 101, "SACK cumulative_tsn_ack should be 101");
+        assert_eq!(num_gap_blocks2, 0, "No gap blocks after all packets received in order");
+
+        println!("✅ SACK generation with out-of-order packets works correctly!");
+    }
+
+    /// Test: Simulate the exact scenario from the bug report
+    /// A TSN is retransmitted multiple times but the peer never receives it
+    /// This tests that the connection correctly handles repeated retransmissions
+    #[tokio::test]
+    async fn test_repeated_retransmission_without_sack() {
+        println!("\n=== Testing repeated retransmission without SACK ===");
+
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
+
+        let mut config = RtcConfiguration::default();
+        config.sctp_max_association_retransmits = 10; // Set a reasonable limit
+
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+
+        let (sctp, runner) = SctpTransport::new(
+            dtls,
+            incoming_rx,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &config,
+        );
+
+        tokio::spawn(runner);
+
+        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        sctp.inner
+            .remote_verification_tag
+            .store(12345, Ordering::SeqCst);
+        sctp.inner.rto_state.lock().unwrap().rto = 0.4; // Start with 400ms RTO like in the bug
+
+        // Add a packet that needs retransmission
+        {
+            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            sent_queue.insert(
+                1000,
+                ChunkRecord {
+                    payload: Bytes::from_static(b"test data that will be retransmitted"),
+                    sent_time: Instant::now() - Duration::from_secs(1), // Already timed out
+                    transmit_count: 1,
+                    missing_reports: 0,
+                    abandoned: false,
+                    fast_retransmit: false,
+                    fast_retransmit_time: None,
+                    needs_retransmit: false,
+                    in_flight: true,
+                    acked: false,
+                    stream_id: 0,
+                    ssn: 0,
+                    flags: 0x03,
+                    max_retransmits: None,
+                    expiry: None,
+                },
+            );
+        }
+
+        // Simulate 5 T3 timeouts (like in the bug report)
+        // We need to ensure sent_time is old enough relative to RTO
+        for i in 1..=5 {
+            println!("--- Retransmission attempt {} ---", i);
+
+            let current_rto = sctp.inner.rto_state.lock().unwrap().rto;
+
+            // Reset sent_time to be older than current RTO to trigger timeout
+            {
+                let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+                if let Some(record) = sent_queue.get_mut(&1000) {
+                    // Make sent_time at least RTO + 1 second in the past
+                    record.sent_time = Instant::now() - Duration::from_secs_f64(current_rto + 1.0);
+                }
+            }
+
+            // Clear the rate limiting guard to simulate RTO timeout
+            *sctp.inner.last_t3_fire_time.lock().unwrap() = None;
+
+            // Trigger timeout
+            sctp.inner.handle_timeout().await.unwrap();
+
+            // Check state
+            let state = sctp.inner.state.lock().unwrap().clone();
+            let error_count = sctp.inner.association_error_count.load(Ordering::SeqCst);
+            let rto = sctp.inner.rto_state.lock().unwrap().rto;
+
+            println!(
+                "After timeout {}: state={:?}, error_count={}, rto={:.3}s",
+                i, state, error_count, rto
+            );
+
+            // Check transmit_count
+            {
+                let sent_queue = sctp.inner.sent_queue.lock().unwrap();
+                if let Some(record) = sent_queue.get(&1000) {
+                    println!("TSN 1000 transmit_count: {}", record.transmit_count);
+                    assert_eq!(
+                        record.transmit_count,
+                        1 + i as u32,
+                        "transmit_count should be {} after {} retransmissions",
+                        1 + i,
+                        i
+                    );
+                }
+            }
+
+            if state == SctpState::Closed {
+                println!("Connection closed after {} retransmissions", i);
+                break;
+            }
+        }
+
+        // Verify connection state after 5 retransmissions
+        let final_state = sctp.inner.state.lock().unwrap().clone();
+        let final_error_count = sctp.inner.association_error_count.load(Ordering::SeqCst);
+
+        println!("\n=== Final State ===");
+        println!("State: {:?}", final_state);
+        println!("Error count: {}", final_error_count);
+
+        // Connection should still be alive (error_count 5 < max 10)
+        assert_ne!(
+            final_state,
+            SctpState::Closed,
+            "Connection should NOT be closed after only 5 retransmissions (max is 10)"
+        );
+        assert!(
+            final_error_count < config.sctp_max_association_retransmits,
+            "Error count {} should be less than max {}",
+            final_error_count,
+            config.sctp_max_association_retransmits
+        );
+
+        println!("✅ Repeated retransmission handled correctly!");
+    }
+
+    /// Test: Verify that when a retransmitted packet arrives at the receiver,
+    /// the cumulative_tsn_ack is correctly updated and SACK is generated
+    #[tokio::test]
+    async fn test_retransmitted_packet_updates_cumulative_ack() {
+        println!("\n=== Testing retransmitted packet updates cumulative_ack ===");
+
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
+
+        let config = RtcConfiguration::default();
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+
+        let (sctp, runner) = SctpTransport::new(
+            dtls,
+            incoming_rx,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &config,
+        );
+
+        tokio::spawn(runner);
+
+        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        sctp.inner
+            .remote_verification_tag
+            .store(12345, Ordering::SeqCst);
+        sctp.inner.cumulative_tsn_ack.store(99, Ordering::SeqCst);
+
+        // Create DATA chunk
+        let create_data_chunk = |tsn: u32| -> Bytes {
+            let mut buf = BytesMut::new();
+            buf.put_u32(tsn); // TSN
+            buf.put_u16(0); // Stream ID
+            buf.put_u16(0); // SSN
+            buf.put_u32(51); // PPID (binary)
+            buf.put_slice(b"test data");
+            buf.freeze()
+        };
+
+        // Receive TSN 100 for the first time
+        let chunk_100 = create_data_chunk(100);
+        sctp.inner.handle_data(0x03, chunk_100.clone()).await.unwrap();
+        let cum_ack_1 = sctp.inner.cumulative_tsn_ack.load(Ordering::SeqCst);
+        println!("After first TSN 100: cumulative_tsn_ack = {}", cum_ack_1);
+        assert_eq!(cum_ack_1, 100, "cumulative_tsn_ack should be 100");
+
+        // Receive TSN 100 again (simulating retransmission/duplicate)
+        sctp.inner.handle_data(0x03, chunk_100.clone()).await.unwrap();
+        let cum_ack_2 = sctp.inner.cumulative_tsn_ack.load(Ordering::SeqCst);
+        println!("After duplicate TSN 100: cumulative_tsn_ack = {}", cum_ack_2);
+        assert_eq!(cum_ack_2, 100, "cumulative_tsn_ack should still be 100 after duplicate");
+
+        // Verify duplicate was recorded
+        {
+            let dups = sctp.inner.dups_buffer.lock().unwrap();
+            assert!(dups.contains(&100), "TSN 100 should be in duplicates buffer");
+        }
+
+        // sack_needed should be set for duplicate
+        assert!(sctp.inner.sack_needed.load(Ordering::Relaxed), "sack_needed should be set for duplicate");
+
+        println!("✅ Retransmitted packet handling works correctly!");
+    }
+
+    /// Test: Simulate the exact scenario from the bug report where
+    /// a connection with long idle time experiences repeated timeouts
+    #[tokio::test]
+    async fn test_long_idle_connection_timeout() {
+        println!("\n=== Testing long idle connection timeout scenario ===");
+        println!("This simulates: connection works fine, then goes idle, then single packet fails repeatedly");
+
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
+
+        let mut config = RtcConfiguration::default();
+        config.sctp_max_association_retransmits = 5; // Low limit to test protection
+
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+
+        let (sctp, runner) = SctpTransport::new(
+            dtls,
+            incoming_rx,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &config,
+        );
+
+        tokio::spawn(runner);
+
+        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        sctp.inner.remote_verification_tag.store(12345, Ordering::SeqCst);
+
+        // Phase 1: Normal operation - send some packets and receive SACKs
+        println!("\n--- Phase 1: Normal operation ---");
+        {
+            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            for tsn in 100..110 {
+                sent_queue.insert(
+                    tsn,
+                    ChunkRecord {
+                        payload: Bytes::from_static(b"data"),
+                        sent_time: Instant::now() - Duration::from_millis(50),
+                        transmit_count: 1,
+                        missing_reports: 0,
+                        abandoned: false,
+                        fast_retransmit: false,
+                        fast_retransmit_time: None,
+                        needs_retransmit: false,
+                        in_flight: true,
+                        acked: false,
+                        stream_id: 0,
+                        ssn: 0,
+                        flags: 0x03,
+                        max_retransmits: None,
+                        expiry: None,
+                    },
+                );
+            }
+        }
+
+        // Simulate receiving SACK for all packets
+        let sack = build_sack_packet(109, 1024 * 1024, vec![], vec![]);
+        sctp.inner.handle_sack(sack).await.unwrap();
+
+        let queue_len = sctp.inner.sent_queue.lock().unwrap().len();
+        println!("After SACK: sent_queue len = {} (should be 0)", queue_len);
+        assert_eq!(queue_len, 0, "All packets should be acknowledged");
+
+        // Phase 2: Idle period - no activity
+        println!("\n--- Phase 2: Idle period (simulated) ---");
+        // In real scenario, nothing happens for a long time
+
+        // Phase 3: Send a new packet that will be "lost"
+        println!("\n--- Phase 3: Send packet that gets lost ---");
+        {
+            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            sent_queue.insert(
+                200,
+                ChunkRecord {
+                    payload: Bytes::from_static(b"important data"),
+                    sent_time: Instant::now() - Duration::from_secs(2), // Already timed out
+                    transmit_count: 1,
+                    missing_reports: 0,
+                    abandoned: false,
+                    fast_retransmit: false,
+                    fast_retransmit_time: None,
+                    needs_retransmit: false,
+                    in_flight: true,
+                    acked: false,
+                    stream_id: 0,
+                    ssn: 0,
+                    flags: 0x03,
+                    max_retransmits: None,
+                    expiry: None,
+                },
+            );
+        }
+
+        // Phase 4: Repeated timeouts without SACK (simulating network loss)
+        println!("\n--- Phase 4: Repeated timeouts without SACK ---");
+        let mut last_error_count = 0;
+        for i in 1..=5 {
+            let current_rto = sctp.inner.rto_state.lock().unwrap().rto;
+
+            // Make sent_time old enough
+            {
+                let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+                if let Some(record) = sent_queue.get_mut(&200) {
+                    record.sent_time = Instant::now() - Duration::from_secs_f64(current_rto + 1.0);
+                }
+            }
+
+            // Clear rate limit guard
+            *sctp.inner.last_t3_fire_time.lock().unwrap() = None;
+
+            sctp.inner.handle_timeout().await.unwrap();
+
+            let error_count = sctp.inner.association_error_count.load(Ordering::SeqCst);
+            let state = sctp.inner.state.lock().unwrap().clone();
+            let rto = sctp.inner.rto_state.lock().unwrap().rto;
+
+            println!(
+                "Timeout {}: error_count={} (was {}), rto={:.3}s, state={:?}",
+                i, error_count, last_error_count, rto, state
+            );
+
+            // Error count should NOT increase on T3 timeout (aiortc behavior)
+            assert_eq!(
+                error_count, 0,
+                "Error count should NOT increase on T3 timeout"
+            );
+
+            // Connection should stay open
+            assert_eq!(state, SctpState::Connecting, "Connection should stay open");
+        }
+
+        // Check final state - connection should still be open
+        let final_state = sctp.inner.state.lock().unwrap().clone();
+        let final_error_count = sctp.inner.association_error_count.load(Ordering::SeqCst);
+
+        println!("\n=== Final State ===");
+        println!("State: {:?}", final_state);
+        println!("Error count: {} / {}", final_error_count, config.sctp_max_association_retransmits);
+
+        // Connection should remain open - aiortc behavior
+        assert_eq!(final_state, SctpState::Connecting, "Connection should remain open after T3 timeouts");
+        assert_eq!(final_error_count, 0, "Error count should be 0 (not incremented by T3)");
+
+        println!("✅ Connection survived T3 timeouts without error count increment (aiortc behavior)");
+    }
+
+    /// Test: Verify that when receiver has out-of-order packets and sender retransmits,
+    /// the receiver correctly updates cumulative_tsn_ack and sends proper SACK
+    /// This tests the scenario where a packet is lost, subsequent packets arrive,
+    /// then the lost packet is retransmitted and should fill the gap
+    #[tokio::test]
+    async fn test_gap_filling_on_retransmit() {
+        println!("\n=== Testing gap filling on retransmit ===");
+        println!("Scenario: TSN 100 lost, 101-102 received, 100 retransmitted");
+
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
+
+        let config = RtcConfiguration::default();
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+
+        let (sctp, runner) = SctpTransport::new(
+            dtls,
+            incoming_rx,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &config,
+        );
+
+        tokio::spawn(runner);
+
+        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        sctp.inner.remote_verification_tag.store(12345, Ordering::SeqCst);
+        sctp.inner.cumulative_tsn_ack.store(99, Ordering::SeqCst);
+
+        let create_data_chunk = |tsn: u32| -> Bytes {
+            let mut buf = BytesMut::new();
+            buf.put_u32(tsn);
+            buf.put_u16(0);
+            buf.put_u16(0);
+            buf.put_u32(51);
+            buf.put_slice(b"test data");
+            buf.freeze()
+        };
+
+        // Step 1: Receive TSN 101 (out of order, TSN 100 missing)
+        println!("\nStep 1: Receive TSN 101 (out of order)");
+        let chunk_101 = create_data_chunk(101);
+        sctp.inner.handle_data(0x03, chunk_101).await.unwrap();
+
+        let cum_ack = sctp.inner.cumulative_tsn_ack.load(Ordering::SeqCst);
+        println!("  cumulative_tsn_ack = {} (should be 99)", cum_ack);
+        assert_eq!(cum_ack, 99, "cumulative_tsn_ack should still be 99");
+
+        // Verify received_queue has TSN 101
+        {
+            let received = sctp.inner.received_queue.lock().unwrap();
+            assert!(received.contains_key(&101), "TSN 101 should be in received_queue");
+            println!("  received_queue contains: {:?}", received.keys().collect::<Vec<_>>());
+        }
+
+        // Step 2: Receive TSN 102 (also out of order)
+        println!("\nStep 2: Receive TSN 102 (also out of order)");
+        let chunk_102 = create_data_chunk(102);
+        sctp.inner.handle_data(0x03, chunk_102).await.unwrap();
+
+        let cum_ack = sctp.inner.cumulative_tsn_ack.load(Ordering::SeqCst);
+        println!("  cumulative_tsn_ack = {} (should still be 99)", cum_ack);
+        assert_eq!(cum_ack, 99, "cumulative_tsn_ack should still be 99");
+
+        // Step 3: Generate SACK and verify gap blocks
+        println!("\nStep 3: Generate SACK with gap blocks");
+        let sack_chunk = sctp.inner.create_sack_chunk();
+        let mut sack_buf = sack_chunk.clone();
+        sack_buf.advance(4);
+        let sack_cum_ack = sack_buf.get_u32();
+        let _a_rwnd = sack_buf.get_u32();
+        let num_gap_blocks = sack_buf.get_u16();
+        let _num_dups = sack_buf.get_u16();
+
+        println!("  SACK: cum_ack={}, num_gap_blocks={}", sack_cum_ack, num_gap_blocks);
+        assert_eq!(sack_cum_ack, 99, "SACK cum_ack should be 99");
+        assert!(num_gap_blocks > 0, "Should have gap blocks for TSN 101-102");
+
+        // Print gap blocks
+        for _ in 0..num_gap_blocks {
+            let start = sack_buf.get_u16();
+            let end = sack_buf.get_u16();
+            println!("  Gap block: start={}, end={} (TSN {} to {})",
+                start, end, 99 + start as u32, 99 + end as u32);
+        }
+
+        // Step 4: Receive retransmitted TSN 100 (fills the gap)
+        println!("\nStep 4: Receive retransmitted TSN 100 (fills the gap)");
+        let chunk_100 = create_data_chunk(100);
+        sctp.inner.handle_data(0x03, chunk_100).await.unwrap();
+
+        let cum_ack = sctp.inner.cumulative_tsn_ack.load(Ordering::SeqCst);
+        println!("  cumulative_tsn_ack = {} (should be 102)", cum_ack);
+        assert_eq!(cum_ack, 102, "cumulative_tsn_ack should advance to 102");
+
+        // Verify received_queue is now empty
+        {
+            let received = sctp.inner.received_queue.lock().unwrap();
+            println!("  received_queue now contains: {:?}", received.keys().collect::<Vec<_>>());
+            assert!(received.is_empty(), "received_queue should be empty after gap filled");
+        }
+
+        // Step 5: Generate new SACK and verify no gap blocks
+        println!("\nStep 5: Generate SACK after gap filled");
+        let sack_chunk2 = sctp.inner.create_sack_chunk();
+        let mut sack_buf2 = sack_chunk2.clone();
+        sack_buf2.advance(4);
+        let sack_cum_ack2 = sack_buf2.get_u32();
+        let _a_rwnd2 = sack_buf2.get_u32();
+        let num_gap_blocks2 = sack_buf2.get_u16();
+
+        println!("  SACK: cum_ack={}, num_gap_blocks={}", sack_cum_ack2, num_gap_blocks2);
+        assert_eq!(sack_cum_ack2, 102, "SACK cum_ack should be 102");
+        assert_eq!(num_gap_blocks2, 0, "No gap blocks after gap filled");
+
+        println!("\n✅ Gap filling on retransmit works correctly!");
+    }
+
+    /// Test: Simulate the scenario where SACK is generated but never "sent"
+    /// This tests the interaction between sack_needed flag and transmit()
+    #[tokio::test]
+    async fn test_sack_needed_flag_interaction() {
+        println!("\n=== Testing sack_needed flag interaction ===");
+        println!("Scenario: Multiple packets received, verify sack_needed behavior");
+
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
+
+        let config = RtcConfiguration::default();
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+
+        let (sctp, runner) = SctpTransport::new(
+            dtls,
+            incoming_rx,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &config,
+        );
+
+        tokio::spawn(runner);
+
+        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        sctp.inner.remote_verification_tag.store(12345, Ordering::SeqCst);
+        sctp.inner.cumulative_tsn_ack.store(99, Ordering::SeqCst);
+
+        let create_data_chunk = |tsn: u32| -> Bytes {
+            let mut buf = BytesMut::new();
+            buf.put_u32(tsn);
+            buf.put_u16(0);
+            buf.put_u16(0);
+            buf.put_u32(51);
+            buf.put_slice(b"test data");
+            buf.freeze()
+        };
+
+        // Receive packet, this sets sack_needed
+        println!("\n1. Receive TSN 100");
+        let chunk_100 = create_data_chunk(100);
+        sctp.inner.handle_data(0x03, chunk_100).await.unwrap();
+        assert!(sctp.inner.sack_needed.load(Ordering::Relaxed), "sack_needed should be true after receive");
+        println!("  sack_needed = true");
+
+        // transmit() should clear sack_needed and generate SACK
+        println!("\n2. Call transmit()");
+        sctp.inner.transmit().await.unwrap();
+        assert!(!sctp.inner.sack_needed.load(Ordering::Relaxed), "sack_needed should be false after transmit");
+        println!("  sack_needed = false (cleared by transmit)");
+
+        // Receive another packet
+        println!("\n3. Receive TSN 101");
+        let chunk_101 = create_data_chunk(101);
+        sctp.inner.handle_data(0x03, chunk_101).await.unwrap();
+        assert!(sctp.inner.sack_needed.load(Ordering::Relaxed), "sack_needed should be true again after receive");
+        println!("  sack_needed = true");
+
+        // Verify cumulative_tsn_ack is correct
+        let cum_ack = sctp.inner.cumulative_tsn_ack.load(Ordering::SeqCst);
+        println!("  cumulative_tsn_ack = {} (should be 101)", cum_ack);
+        assert_eq!(cum_ack, 101, "cumulative_tsn_ack should be 101");
+
+        println!("\n✅ sack_needed flag interaction works correctly!");
+    }
+
+    /// Test: Verify that error count is correctly reduced when gap ACKs are received
+    #[tokio::test]
+    async fn test_error_count_reduction_on_gap_ack() {
+        println!("\n=== Testing error count reduction on gap ACK ===");
+        println!("Scenario: Error count increases, then gap ACK reduces it");
+
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
+
+        let mut config = RtcConfiguration::default();
+        config.sctp_max_association_retransmits = 10;
+
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+
+        let (sctp, runner) = SctpTransport::new(
+            dtls,
+            incoming_rx,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &config,
+        );
+
+        tokio::spawn(runner);
+
+        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        sctp.inner.remote_verification_tag.store(12345, Ordering::SeqCst);
+
+        // Add unacked packets to sent_queue
+        // TSN 100 is unacked (lost), TSN 101-104 are in flight but not acked yet
+        {
+            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            for tsn in 100..105 {
+                sent_queue.insert(
+                    tsn,
+                    ChunkRecord {
+                        payload: Bytes::from(vec![0u8; 1000]), // Make payload larger for more bytes_acked
+                        sent_time: Instant::now() - Duration::from_millis(50),
+                        transmit_count: 1,
+                        missing_reports: 0,
+                        abandoned: false,
+                        fast_retransmit: false,
+                        fast_retransmit_time: None,
+                        needs_retransmit: false,
+                        in_flight: true,
+                        acked: false, // None are acked yet
+                        stream_id: 0,
+                        ssn: 0,
+                        flags: 0x03,
+                        max_retransmits: None,
+                        expiry: None,
+                    },
+                );
+            }
+        }
+
+        // Set error count to 5
+        sctp.inner.association_error_count.store(5, Ordering::SeqCst);
+        println!("Initial error_count = 5");
+
+        // Simulate SACK with cum_ack=99 and gap block for 101-104
+        // This should:
+        // 1. Mark TSN 101-104 as acked via gap
+        // 2. Reduce error count because peer is alive
+        let sack = build_sack_packet(99, 1024 * 1024, vec![(2, 5)], vec![]);
+        sctp.inner.handle_sack(sack).await.unwrap();
+
+        let error_count = sctp.inner.association_error_count.load(Ordering::SeqCst);
+        println!("After SACK with gap blocks: error_count = {}", error_count);
+
+        // Verify TSN 101-104 are now acked
+        {
+            let sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            for tsn in 101..105 {
+                if let Some(record) = sent_queue.get(&tsn) {
+                    println!("  TSN {}: acked={}", tsn, record.acked);
+                    assert!(record.acked, "TSN {} should be acked via gap", tsn);
+                }
+            }
+        }
+
+        // Error count should be reduced because bytes were acked via gaps
+        // Note: The reduction logic requires bytes_acked_by_gap > 0
+        assert!(error_count < 5, "Error count should be reduced after gap ACK (was 5, now {})", error_count);
+
+        println!("✅ Error count reduction on gap ACK works correctly!");
     }
 }
