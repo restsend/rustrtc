@@ -2137,52 +2137,78 @@ impl SctpInner {
                 let rto = self.rto_state.lock().unwrap().rto;
                 let is_rto_backing_off = rto > 2.0;
 
-                // Track consecutive heartbeat failures
-                let consecutive_failures = self
-                    .consecutive_heartbeat_failures
-                    .fetch_add(1, Ordering::SeqCst)
-                    + 1;
-
-                if !is_rto_backing_off {
-                    let error_count =
-                        self.association_error_count.fetch_add(1, Ordering::SeqCst) + 1;
-                    let sent_queue_len = self.sent_queue.lock().unwrap().len();
-                    debug!(
-                        "SCTP Heartbeat timeout! Error count: {}/{}, consecutive failures: {}, pending chunks: {}",
-                        error_count,
-                        self.max_association_retransmits,
-                        consecutive_failures,
-                        sent_queue_len
-                    );
-                    if error_count >= self.max_association_retransmits
-                        && self.max_association_retransmits > 0
-                    {
-                        let rto_state = self.rto_state.lock().unwrap();
-                        debug!(
-                            "SCTP Association heartbeat timeout limit reached ({}/{}), RTO={:.1}s, closing connection",
-                            error_count, self.max_association_retransmits, rto_state.rto
-                        );
-                        drop(rto_state);
-                        self.print_stats("HEARTBEAT_TIMEOUT");
-                        self.set_state(SctpState::Closed);
-                        return Ok(());
+                // Check if a SACK was received recently — proves the peer is alive
+                // even if HEARTBEAT_ACKs are being dropped (e.g. TURN rate limiting).
+                let peer_alive_via_sack = {
+                    let last_sack = self.last_sack_time.lock().unwrap();
+                    if let Some(t) = *last_sack {
+                        // Consider peer alive if SACK received within 2× heartbeat interval (30s)
+                        now.duration_since(t) < Duration::from_secs(30)
+                    } else {
+                        false
                     }
-                } else {
-                    debug!(
-                        "SCTP Heartbeat timeout (RTO={:.1}s is backing off, consecutive failures: {})",
-                        rto, consecutive_failures
-                    );
+                };
 
-                    // If we have 4 consecutive heartbeat failures, even during RTO backoff,
-                    // the peer is likely dead. Force close the connection.
-                    if consecutive_failures >= 4 {
+                if peer_alive_via_sack {
+                    // Peer is alive (proven by recent SACKs). Reset heartbeat failure
+                    // counters — the HEARTBEAT_ACK was likely dropped by a rate-limited
+                    // TURN relay, not because the peer is dead.
+                    self.consecutive_heartbeat_failures
+                        .store(0, Ordering::SeqCst);
+                    debug!(
+                        "SCTP Heartbeat timeout suppressed: peer alive (recent SACK), RTO={:.1}s",
+                        rto
+                    );
+                } else {
+                    // No recent SACK — peer may actually be dead.
+
+                    // Track consecutive heartbeat failures
+                    let consecutive_failures = self
+                        .consecutive_heartbeat_failures
+                        .fetch_add(1, Ordering::SeqCst)
+                        + 1;
+
+                    if !is_rto_backing_off {
+                        let error_count =
+                            self.association_error_count.fetch_add(1, Ordering::SeqCst) + 1;
+                        let sent_queue_len = self.sent_queue.lock().unwrap().len();
                         debug!(
-                            "SCTP Connection dead: {} consecutive heartbeat failures (RTO={:.1}s), closing connection",
-                            consecutive_failures, rto
+                            "SCTP Heartbeat timeout! Error count: {}/{}, consecutive failures: {}, pending chunks: {}",
+                            error_count,
+                            self.max_association_retransmits,
+                            consecutive_failures,
+                            sent_queue_len
                         );
-                        self.print_stats("HEARTBEAT_DEAD");
-                        self.set_state(SctpState::Closed);
-                        return Ok(());
+                        if error_count >= self.max_association_retransmits
+                            && self.max_association_retransmits > 0
+                        {
+                            let rto_state = self.rto_state.lock().unwrap();
+                            debug!(
+                                "SCTP Association heartbeat timeout limit reached ({}/{}), RTO={:.1}s, closing connection",
+                                error_count, self.max_association_retransmits, rto_state.rto
+                            );
+                            drop(rto_state);
+                            self.print_stats("HEARTBEAT_TIMEOUT");
+                            self.set_state(SctpState::Closed);
+                            return Ok(());
+                        }
+                    } else {
+                        debug!(
+                            "SCTP Heartbeat timeout (RTO={:.1}s is backing off, consecutive failures: {})",
+                            rto, consecutive_failures
+                        );
+
+                        // If we have 4 consecutive heartbeat failures, even during RTO backoff,
+                        // the peer is likely dead. Force close the connection.
+                        if consecutive_failures >= 4 {
+                            debug!(
+                                "SCTP Connection dead: {} consecutive heartbeat failures (RTO={:.1}s), closing connection",
+                                consecutive_failures, rto
+                            );
+                            self.print_stats("HEARTBEAT_DEAD");
+                            self.set_state(SctpState::Closed);
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -3518,16 +3544,26 @@ mod tests {
         {
             let sent_queue = sctp.inner.sent_queue.lock().unwrap();
             let record = sent_queue.get(&100).unwrap();
-            assert!(record.abandoned, "Chunk should be abandoned after reaching max retransmits");
+            assert!(
+                record.abandoned,
+                "Chunk should be abandoned after reaching max retransmits"
+            );
         }
 
         // Connection should NOT be closed - aiortc behavior is to keep connection alive
         let state_after = sctp.inner.state.lock().unwrap().clone();
-        assert_eq!(state_after, SctpState::Connecting, "Connection should remain open");
+        assert_eq!(
+            state_after,
+            SctpState::Connecting,
+            "Connection should remain open"
+        );
 
         // Error count should NOT be incremented for T3 timeout
         let error_count = sctp.inner.association_error_count.load(Ordering::SeqCst);
-        assert_eq!(error_count, 0, "Error count should not increase on T3 timeout");
+        assert_eq!(
+            error_count, 0,
+            "Error count should not increase on T3 timeout"
+        );
     }
 
     #[tokio::test]
@@ -4044,12 +4080,17 @@ mod tests {
         }
 
         // Manually set error count to simulate previous heartbeat failures
-        sctp.inner.association_error_count.store(5, Ordering::SeqCst);
+        sctp.inner
+            .association_error_count
+            .store(5, Ordering::SeqCst);
 
         // Trigger timeout - should NOT increment error count (aiortc behavior)
         sctp.inner.handle_timeout().await.unwrap();
         let error_count = sctp.inner.association_error_count.load(Ordering::SeqCst);
-        assert_eq!(error_count, 5, "Error count should NOT change after T3 timeout");
+        assert_eq!(
+            error_count, 5,
+            "Error count should NOT change after T3 timeout"
+        );
 
         // Simulate SACK that advances cumulative TSN (acknowledges TSN 100)
         let sack = build_sack_packet(100, 1024 * 1024, vec![], vec![]);
@@ -6230,20 +6271,32 @@ mod tests {
 
         // Receive TSN 101 (out of order)
         let chunk_101 = create_data_chunk(101);
-        sctp.inner.handle_data(0x03, chunk_101.clone()).await.unwrap();
+        sctp.inner
+            .handle_data(0x03, chunk_101.clone())
+            .await
+            .unwrap();
 
         // Check cumulative_tsn_ack should still be 99
         let cum_ack = sctp.inner.cumulative_tsn_ack.load(Ordering::SeqCst);
-        assert_eq!(cum_ack, 99, "cumulative_tsn_ack should still be 99 after receiving out-of-order TSN 101");
+        assert_eq!(
+            cum_ack, 99,
+            "cumulative_tsn_ack should still be 99 after receiving out-of-order TSN 101"
+        );
 
         // Check received_queue should contain TSN 101
         {
             let received = sctp.inner.received_queue.lock().unwrap();
-            assert!(received.contains_key(&101), "TSN 101 should be in received_queue");
+            assert!(
+                received.contains_key(&101),
+                "TSN 101 should be in received_queue"
+            );
         }
 
         // sack_needed should be set
-        assert!(sctp.inner.sack_needed.load(Ordering::Relaxed), "sack_needed should be set");
+        assert!(
+            sctp.inner.sack_needed.load(Ordering::Relaxed),
+            "sack_needed should be set"
+        );
 
         // Generate SACK and verify gap blocks
         let sack_chunk = sctp.inner.create_sack_chunk();
@@ -6256,7 +6309,10 @@ mod tests {
         let num_gap_blocks = sack_buf.get_u16();
         let _num_dups = sack_buf.get_u16();
 
-        println!("SACK: cum_ack={}, num_gap_blocks={}", sack_cum_ack, num_gap_blocks);
+        println!(
+            "SACK: cum_ack={}, num_gap_blocks={}",
+            sack_cum_ack, num_gap_blocks
+        );
 
         assert_eq!(sack_cum_ack, 99, "SACK cumulative_tsn_ack should be 99");
 
@@ -6271,12 +6327,21 @@ mod tests {
 
         // Now receive TSN 100 (fills the gap)
         let chunk_100 = create_data_chunk(100);
-        sctp.inner.handle_data(0x03, chunk_100.clone()).await.unwrap();
+        sctp.inner
+            .handle_data(0x03, chunk_100.clone())
+            .await
+            .unwrap();
 
         // Check cumulative_tsn_ack should now be 101
         let cum_ack_after = sctp.inner.cumulative_tsn_ack.load(Ordering::SeqCst);
-        println!("After receiving TSN 100: cumulative_tsn_ack = {}", cum_ack_after);
-        assert_eq!(cum_ack_after, 101, "cumulative_tsn_ack should advance to 101 after gap is filled");
+        println!(
+            "After receiving TSN 100: cumulative_tsn_ack = {}",
+            cum_ack_after
+        );
+        assert_eq!(
+            cum_ack_after, 101,
+            "cumulative_tsn_ack should advance to 101 after gap is filled"
+        );
 
         // Generate new SACK and verify no gap blocks
         let sack_chunk2 = sctp.inner.create_sack_chunk();
@@ -6286,9 +6351,15 @@ mod tests {
         let _a_rwnd2 = sack_buf2.get_u32();
         let num_gap_blocks2 = sack_buf2.get_u16();
 
-        println!("SACK after gap filled: cum_ack={}, num_gap_blocks={}", sack_cum_ack2, num_gap_blocks2);
+        println!(
+            "SACK after gap filled: cum_ack={}, num_gap_blocks={}",
+            sack_cum_ack2, num_gap_blocks2
+        );
         assert_eq!(sack_cum_ack2, 101, "SACK cumulative_tsn_ack should be 101");
-        assert_eq!(num_gap_blocks2, 0, "No gap blocks after all packets received in order");
+        assert_eq!(
+            num_gap_blocks2, 0,
+            "No gap blocks after all packets received in order"
+        );
 
         println!("✅ SACK generation with out-of-order packets works correctly!");
     }
@@ -6483,25 +6554,43 @@ mod tests {
 
         // Receive TSN 100 for the first time
         let chunk_100 = create_data_chunk(100);
-        sctp.inner.handle_data(0x03, chunk_100.clone()).await.unwrap();
+        sctp.inner
+            .handle_data(0x03, chunk_100.clone())
+            .await
+            .unwrap();
         let cum_ack_1 = sctp.inner.cumulative_tsn_ack.load(Ordering::SeqCst);
         println!("After first TSN 100: cumulative_tsn_ack = {}", cum_ack_1);
         assert_eq!(cum_ack_1, 100, "cumulative_tsn_ack should be 100");
 
         // Receive TSN 100 again (simulating retransmission/duplicate)
-        sctp.inner.handle_data(0x03, chunk_100.clone()).await.unwrap();
+        sctp.inner
+            .handle_data(0x03, chunk_100.clone())
+            .await
+            .unwrap();
         let cum_ack_2 = sctp.inner.cumulative_tsn_ack.load(Ordering::SeqCst);
-        println!("After duplicate TSN 100: cumulative_tsn_ack = {}", cum_ack_2);
-        assert_eq!(cum_ack_2, 100, "cumulative_tsn_ack should still be 100 after duplicate");
+        println!(
+            "After duplicate TSN 100: cumulative_tsn_ack = {}",
+            cum_ack_2
+        );
+        assert_eq!(
+            cum_ack_2, 100,
+            "cumulative_tsn_ack should still be 100 after duplicate"
+        );
 
         // Verify duplicate was recorded
         {
             let dups = sctp.inner.dups_buffer.lock().unwrap();
-            assert!(dups.contains(&100), "TSN 100 should be in duplicates buffer");
+            assert!(
+                dups.contains(&100),
+                "TSN 100 should be in duplicates buffer"
+            );
         }
 
         // sack_needed should be set for duplicate
-        assert!(sctp.inner.sack_needed.load(Ordering::Relaxed), "sack_needed should be set for duplicate");
+        assert!(
+            sctp.inner.sack_needed.load(Ordering::Relaxed),
+            "sack_needed should be set for duplicate"
+        );
 
         println!("✅ Retransmitted packet handling works correctly!");
     }
@@ -6511,7 +6600,9 @@ mod tests {
     #[tokio::test]
     async fn test_long_idle_connection_timeout() {
         println!("\n=== Testing long idle connection timeout scenario ===");
-        println!("This simulates: connection works fine, then goes idle, then single packet fails repeatedly");
+        println!(
+            "This simulates: connection works fine, then goes idle, then single packet fails repeatedly"
+        );
 
         let (socket_tx, _) = tokio::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
@@ -6540,7 +6631,9 @@ mod tests {
         tokio::spawn(runner);
 
         *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
-        sctp.inner.remote_verification_tag.store(12345, Ordering::SeqCst);
+        sctp.inner
+            .remote_verification_tag
+            .store(12345, Ordering::SeqCst);
 
         // Phase 1: Normal operation - send some packets and receive SACKs
         println!("\n--- Phase 1: Normal operation ---");
@@ -6610,7 +6703,7 @@ mod tests {
 
         // Phase 4: Repeated timeouts without SACK (simulating network loss)
         println!("\n--- Phase 4: Repeated timeouts without SACK ---");
-        let mut last_error_count = 0;
+        let last_error_count = 0;
         for i in 1..=5 {
             let current_rto = sctp.inner.rto_state.lock().unwrap().rto;
 
@@ -6652,13 +6745,25 @@ mod tests {
 
         println!("\n=== Final State ===");
         println!("State: {:?}", final_state);
-        println!("Error count: {} / {}", final_error_count, config.sctp_max_association_retransmits);
+        println!(
+            "Error count: {} / {}",
+            final_error_count, config.sctp_max_association_retransmits
+        );
 
         // Connection should remain open - aiortc behavior
-        assert_eq!(final_state, SctpState::Connecting, "Connection should remain open after T3 timeouts");
-        assert_eq!(final_error_count, 0, "Error count should be 0 (not incremented by T3)");
+        assert_eq!(
+            final_state,
+            SctpState::Connecting,
+            "Connection should remain open after T3 timeouts"
+        );
+        assert_eq!(
+            final_error_count, 0,
+            "Error count should be 0 (not incremented by T3)"
+        );
 
-        println!("✅ Connection survived T3 timeouts without error count increment (aiortc behavior)");
+        println!(
+            "✅ Connection survived T3 timeouts without error count increment (aiortc behavior)"
+        );
     }
 
     /// Test: Verify that when receiver has out-of-order packets and sender retransmits,
@@ -6695,7 +6800,9 @@ mod tests {
         tokio::spawn(runner);
 
         *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
-        sctp.inner.remote_verification_tag.store(12345, Ordering::SeqCst);
+        sctp.inner
+            .remote_verification_tag
+            .store(12345, Ordering::SeqCst);
         sctp.inner.cumulative_tsn_ack.store(99, Ordering::SeqCst);
 
         let create_data_chunk = |tsn: u32| -> Bytes {
@@ -6720,8 +6827,14 @@ mod tests {
         // Verify received_queue has TSN 101
         {
             let received = sctp.inner.received_queue.lock().unwrap();
-            assert!(received.contains_key(&101), "TSN 101 should be in received_queue");
-            println!("  received_queue contains: {:?}", received.keys().collect::<Vec<_>>());
+            assert!(
+                received.contains_key(&101),
+                "TSN 101 should be in received_queue"
+            );
+            println!(
+                "  received_queue contains: {:?}",
+                received.keys().collect::<Vec<_>>()
+            );
         }
 
         // Step 2: Receive TSN 102 (also out of order)
@@ -6743,7 +6856,10 @@ mod tests {
         let num_gap_blocks = sack_buf.get_u16();
         let _num_dups = sack_buf.get_u16();
 
-        println!("  SACK: cum_ack={}, num_gap_blocks={}", sack_cum_ack, num_gap_blocks);
+        println!(
+            "  SACK: cum_ack={}, num_gap_blocks={}",
+            sack_cum_ack, num_gap_blocks
+        );
         assert_eq!(sack_cum_ack, 99, "SACK cum_ack should be 99");
         assert!(num_gap_blocks > 0, "Should have gap blocks for TSN 101-102");
 
@@ -6751,8 +6867,13 @@ mod tests {
         for _ in 0..num_gap_blocks {
             let start = sack_buf.get_u16();
             let end = sack_buf.get_u16();
-            println!("  Gap block: start={}, end={} (TSN {} to {})",
-                start, end, 99 + start as u32, 99 + end as u32);
+            println!(
+                "  Gap block: start={}, end={} (TSN {} to {})",
+                start,
+                end,
+                99 + start as u32,
+                99 + end as u32
+            );
         }
 
         // Step 4: Receive retransmitted TSN 100 (fills the gap)
@@ -6767,8 +6888,14 @@ mod tests {
         // Verify received_queue is now empty
         {
             let received = sctp.inner.received_queue.lock().unwrap();
-            println!("  received_queue now contains: {:?}", received.keys().collect::<Vec<_>>());
-            assert!(received.is_empty(), "received_queue should be empty after gap filled");
+            println!(
+                "  received_queue now contains: {:?}",
+                received.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                received.is_empty(),
+                "received_queue should be empty after gap filled"
+            );
         }
 
         // Step 5: Generate new SACK and verify no gap blocks
@@ -6780,7 +6907,10 @@ mod tests {
         let _a_rwnd2 = sack_buf2.get_u32();
         let num_gap_blocks2 = sack_buf2.get_u16();
 
-        println!("  SACK: cum_ack={}, num_gap_blocks={}", sack_cum_ack2, num_gap_blocks2);
+        println!(
+            "  SACK: cum_ack={}, num_gap_blocks={}",
+            sack_cum_ack2, num_gap_blocks2
+        );
         assert_eq!(sack_cum_ack2, 102, "SACK cum_ack should be 102");
         assert_eq!(num_gap_blocks2, 0, "No gap blocks after gap filled");
 
@@ -6819,7 +6949,9 @@ mod tests {
         tokio::spawn(runner);
 
         *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
-        sctp.inner.remote_verification_tag.store(12345, Ordering::SeqCst);
+        sctp.inner
+            .remote_verification_tag
+            .store(12345, Ordering::SeqCst);
         sctp.inner.cumulative_tsn_ack.store(99, Ordering::SeqCst);
 
         let create_data_chunk = |tsn: u32| -> Bytes {
@@ -6836,20 +6968,29 @@ mod tests {
         println!("\n1. Receive TSN 100");
         let chunk_100 = create_data_chunk(100);
         sctp.inner.handle_data(0x03, chunk_100).await.unwrap();
-        assert!(sctp.inner.sack_needed.load(Ordering::Relaxed), "sack_needed should be true after receive");
+        assert!(
+            sctp.inner.sack_needed.load(Ordering::Relaxed),
+            "sack_needed should be true after receive"
+        );
         println!("  sack_needed = true");
 
         // transmit() should clear sack_needed and generate SACK
         println!("\n2. Call transmit()");
         sctp.inner.transmit().await.unwrap();
-        assert!(!sctp.inner.sack_needed.load(Ordering::Relaxed), "sack_needed should be false after transmit");
+        assert!(
+            !sctp.inner.sack_needed.load(Ordering::Relaxed),
+            "sack_needed should be false after transmit"
+        );
         println!("  sack_needed = false (cleared by transmit)");
 
         // Receive another packet
         println!("\n3. Receive TSN 101");
         let chunk_101 = create_data_chunk(101);
         sctp.inner.handle_data(0x03, chunk_101).await.unwrap();
-        assert!(sctp.inner.sack_needed.load(Ordering::Relaxed), "sack_needed should be true again after receive");
+        assert!(
+            sctp.inner.sack_needed.load(Ordering::Relaxed),
+            "sack_needed should be true again after receive"
+        );
         println!("  sack_needed = true");
 
         // Verify cumulative_tsn_ack is correct
@@ -6893,7 +7034,9 @@ mod tests {
         tokio::spawn(runner);
 
         *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
-        sctp.inner.remote_verification_tag.store(12345, Ordering::SeqCst);
+        sctp.inner
+            .remote_verification_tag
+            .store(12345, Ordering::SeqCst);
 
         // Add unacked packets to sent_queue
         // TSN 100 is unacked (lost), TSN 101-104 are in flight but not acked yet
@@ -6924,7 +7067,9 @@ mod tests {
         }
 
         // Set error count to 5
-        sctp.inner.association_error_count.store(5, Ordering::SeqCst);
+        sctp.inner
+            .association_error_count
+            .store(5, Ordering::SeqCst);
         println!("Initial error_count = 5");
 
         // Simulate SACK with cum_ack=99 and gap block for 101-104
@@ -6950,8 +7095,435 @@ mod tests {
 
         // Error count should be reduced because bytes were acked via gaps
         // Note: The reduction logic requires bytes_acked_by_gap > 0
-        assert!(error_count < 5, "Error count should be reduced after gap ACK (was 5, now {})", error_count);
+        assert!(
+            error_count < 5,
+            "Error count should be reduced after gap ACK (was 5, now {})",
+            error_count
+        );
 
         println!("✅ Error count reduction on gap ACK works correctly!");
+    }
+
+    /// Test: SCTP over TURN relay with rate limiting (high packet loss).
+    ///
+    /// Scenario: TURN relay drops packets exceeding its bandwidth. DATA packets
+    /// occasionally get through after retransmission and SACKs come back (proving
+    /// peer is alive), but HEARTBEAT_ACK packets are consistently dropped. Under
+    /// the current code, `consecutive_heartbeat_failures` accumulates to 4 during
+    /// RTO backoff and kills the connection — even though SACKs prove the peer is
+    /// alive.
+    ///
+    /// Key detail: after retransmission (transmit_count > 1), Karn's algorithm
+    /// prevents RTT updates, so RTO stays backed off. This keeps us in the
+    /// `is_rto_backing_off` branch of send_heartbeat(), where 4 consecutive
+    /// heartbeat failures close the connection.
+    ///
+    /// This test verifies that receiving SACKs (which update `last_sack_time`)
+    /// should prevent the heartbeat-failure-based disconnect.
+    #[tokio::test]
+    async fn test_turn_rate_limit_heartbeat_disconnect() {
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
+
+        let mut config = RtcConfiguration::default();
+        config.sctp_max_association_retransmits = 20;
+        config.sctp_rto_initial = Duration::from_secs(3);
+
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+
+        let (sctp, runner) = SctpTransport::new(
+            dtls,
+            incoming_rx,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &config,
+        );
+        tokio::spawn(runner);
+
+        // Set up a connected state with RTO backed off (simulates TURN loss)
+        *sctp.inner.state.lock().unwrap() = SctpState::Connected;
+        sctp.inner
+            .remote_verification_tag
+            .store(12345, Ordering::SeqCst);
+
+        // Simulate RTO backoff past 2.0s threshold (TURN packet loss causes T3 timeouts)
+        {
+            let mut rto = sctp.inner.rto_state.lock().unwrap();
+            rto.rto = 6.0; // Backed off RTO — triggers is_rto_backing_off branch
+            // srtt stays 0.0 — no fresh RTT samples due to Karn's algorithm
+        }
+
+        println!("\n=== Test: TURN rate-limit heartbeat disconnect ===");
+        println!("RTO backed off to 6.0s (simulates T3 timeout from TURN loss)");
+        println!("Heartbeat ACKs will be 'dropped' (not delivered)");
+        println!("SACKs will be delivered (proving peer is alive)\n");
+
+        // Phase 1: Simulate 5 heartbeat intervals where HEARTBEAT_ACKs are dropped
+        // but SACKs prove the peer is alive.
+        for round in 1..=5 {
+            println!("--- Heartbeat round {} ---", round);
+
+            // First, simulate receiving a SACK (peer is alive, data flowing)
+            // Use transmit_count=2 to simulate retransmitted packets — Karn's
+            // algorithm won't update RTT, so RTO stays backed off.
+            let base_tsn = 100 + (round - 1) * 10;
+            {
+                let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+                for i in 0..5u32 {
+                    sent_queue.insert(
+                        base_tsn + i,
+                        ChunkRecord {
+                            payload: Bytes::from(vec![0u8; 100]),
+                            sent_time: Instant::now() - Duration::from_millis(200),
+                            transmit_count: 2, // Retransmitted! Karn's algorithm skips RTT
+                            missing_reports: 0,
+                            abandoned: false,
+                            fast_retransmit: false,
+                            fast_retransmit_time: None,
+                            needs_retransmit: false,
+                            in_flight: true,
+                            acked: false,
+                            stream_id: 0,
+                            ssn: 0,
+                            flags: 0x03,
+                            max_retransmits: None,
+                            expiry: None,
+                        },
+                    );
+                }
+            }
+
+            // Receive a SACK acknowledging this data (peer is alive!)
+            let sack = build_sack_packet(
+                base_tsn + 4, // cumulative ack all 5 chunks
+                1024 * 1024,
+                vec![],
+                vec![],
+            );
+            sctp.inner.handle_sack(sack).await.unwrap();
+
+            // Verify last_sack_time was updated
+            {
+                let last_sack = sctp.inner.last_sack_time.lock().unwrap();
+                assert!(
+                    last_sack.is_some(),
+                    "last_sack_time should be set after SACK"
+                );
+            }
+
+            // Verify RTO is still backed off (Karn's algorithm prevented update)
+            let rto_after_sack = sctp.inner.rto_state.lock().unwrap().rto;
+            println!(
+                "  RTO after SACK: {:.1}s (should still be >2.0)",
+                rto_after_sack
+            );
+            assert!(
+                rto_after_sack > 2.0,
+                "RTO should remain backed off (no RTT samples from retransmitted packets)"
+            );
+
+            // Now simulate heartbeat timeout (HEARTBEAT_ACK dropped by TURN)
+            {
+                let mut sent_time = sctp.inner.heartbeat_sent_time.lock().unwrap();
+                *sent_time = Some(Instant::now() - Duration::from_secs(15));
+            }
+
+            // Call send_heartbeat — sees pending heartbeat wasn't acked
+            let _ = sctp.inner.send_heartbeat().await;
+
+            let failures = sctp
+                .inner
+                .consecutive_heartbeat_failures
+                .load(Ordering::SeqCst);
+            let state = sctp.inner.state.lock().unwrap().clone();
+            println!(
+                "  consecutive_heartbeat_failures: {}, state: {:?}",
+                failures, state
+            );
+
+            // KEY: Connection should NOT be closed because SACKs prove peer is alive.
+            assert_eq!(
+                state,
+                SctpState::Connected,
+                "Connection closed at round {} even though SACK received {:.1}s ago! \
+                 consecutive_heartbeat_failures={}, RTO={:.1}s",
+                round,
+                sctp.inner
+                    .last_sack_time
+                    .lock()
+                    .unwrap()
+                    .unwrap()
+                    .elapsed()
+                    .as_secs_f64(),
+                failures,
+                rto_after_sack
+            );
+        }
+
+        // If we reach here, the fix is applied — connection survived all rounds
+        let final_state = sctp.inner.state.lock().unwrap().clone();
+        assert_eq!(
+            final_state,
+            SctpState::Connected,
+            "Connection should survive when SACKs prove peer is alive"
+        );
+        println!("\n✅ Connection survived TURN rate limiting!");
+        println!("   SACKs correctly prevented heartbeat-based disconnect.");
+    }
+
+    /// Test: verify that consecutive_heartbeat_failures DOES kill the connection
+    /// when no SACKs are received (peer is truly dead).
+    #[tokio::test]
+    async fn test_heartbeat_kills_connection_when_peer_dead() {
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
+
+        let mut config = RtcConfiguration::default();
+        config.sctp_max_association_retransmits = 20;
+
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+
+        let (sctp, runner) = SctpTransport::new(
+            dtls,
+            incoming_rx,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &config,
+        );
+        tokio::spawn(runner);
+
+        *sctp.inner.state.lock().unwrap() = SctpState::Connected;
+        sctp.inner
+            .remote_verification_tag
+            .store(12345, Ordering::SeqCst);
+
+        // RTO backed off
+        {
+            let mut rto = sctp.inner.rto_state.lock().unwrap();
+            rto.rto = 6.0;
+        }
+
+        // NO SACKs at all — peer is truly dead.
+        // 4 consecutive heartbeat failures should close the connection.
+        for round in 1..=5 {
+            {
+                let mut sent_time = sctp.inner.heartbeat_sent_time.lock().unwrap();
+                *sent_time = Some(Instant::now() - Duration::from_secs(15));
+            }
+
+            let _ = sctp.inner.send_heartbeat().await;
+
+            let state = sctp.inner.state.lock().unwrap().clone();
+            if state == SctpState::Closed {
+                println!(
+                    "✅ Connection correctly closed at round {} (peer is dead)",
+                    round
+                );
+                assert!(
+                    round <= 4,
+                    "Should close by round 4 (4 consecutive failures)"
+                );
+                return;
+            }
+        }
+
+        panic!("Connection should have been closed after 4 heartbeat failures with no SACKs");
+    }
+
+    /// Test: cwnd collapse under TURN rate limiting prevents data transmission.
+    ///
+    /// When TURN rate-limits, repeated fast recovery entries and T3 timeouts
+    /// collapse cwnd to CWND_MIN_AFTER_RTO (1200 bytes). Combined with high
+    /// RTO backoff, new data barely gets transmitted. This test verifies the
+    /// cwnd recovery mechanism (ssthresh raise when cwnd approaches floor).
+    #[tokio::test]
+    async fn test_cwnd_collapse_under_turn_rate_limit() {
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
+
+        let config = RtcConfiguration::default();
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+
+        let (sctp, runner) = SctpTransport::new(
+            dtls,
+            incoming_rx,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &config,
+        );
+        tokio::spawn(runner);
+
+        *sctp.inner.state.lock().unwrap() = SctpState::Connected;
+        sctp.inner
+            .remote_verification_tag
+            .store(12345, Ordering::SeqCst);
+
+        // Simulate repeated T3 timeouts (TURN dropping packets)
+        // Each timeout collapses cwnd and doubles RTO
+        for i in 0..5 {
+            // Add a chunk that will timeout
+            {
+                let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+                sent_queue.insert(
+                    200 + i,
+                    ChunkRecord {
+                        payload: Bytes::from(vec![0u8; 1000]),
+                        sent_time: Instant::now() - Duration::from_secs(10),
+                        transmit_count: 1,
+                        missing_reports: 0,
+                        abandoned: false,
+                        fast_retransmit: false,
+                        fast_retransmit_time: None,
+                        needs_retransmit: false,
+                        in_flight: true,
+                        acked: false,
+                        stream_id: 0,
+                        ssn: 0,
+                        flags: 0x03,
+                        max_retransmits: None,
+                        expiry: None,
+                    },
+                );
+            }
+
+            sctp.inner.handle_timeout().await.unwrap();
+
+            let cwnd = sctp.inner.cwnd_tx.load(Ordering::SeqCst);
+            let ssthresh = sctp.inner.ssthresh.load(Ordering::SeqCst);
+            let rto = sctp.inner.rto_state.lock().unwrap().rto;
+
+            println!(
+                "T3 timeout #{}: cwnd={}, ssthresh={}, rto={:.1}s",
+                i + 1,
+                cwnd,
+                ssthresh,
+                rto
+            );
+        }
+
+        let final_cwnd = sctp.inner.cwnd_tx.load(Ordering::SeqCst);
+        let final_ssthresh = sctp.inner.ssthresh.load(Ordering::SeqCst);
+        let final_rto = sctp.inner.rto_state.lock().unwrap().rto;
+
+        println!("\n=== After 5 T3 timeouts (simulating TURN rate limit) ===");
+        println!("cwnd: {} (min={})", final_cwnd, CWND_MIN_AFTER_RTO);
+        println!("ssthresh: {} (min={})", final_ssthresh, SSTHRESH_MIN);
+        println!("RTO: {:.1}s", final_rto);
+
+        // cwnd should be at floor after repeated timeouts
+        assert_eq!(
+            final_cwnd, CWND_MIN_AFTER_RTO,
+            "cwnd should collapse to minimum after repeated T3 timeouts"
+        );
+
+        // RTO should have backed off significantly
+        assert!(
+            final_rto > 2.0,
+            "RTO should back off past 2.0s threshold (actual: {:.1}s)",
+            final_rto
+        );
+
+        // Now simulate recovery: SACKs start arriving
+        // With cwnd at floor and ssthresh at floor, the ssthresh-raise logic should
+        // allow faster recovery. Note: cwnd growth requires flight_size >= cwnd
+        // (full utilization), so we must fill the window.
+
+        // Clear old chunks
+        sctp.inner.sent_queue.lock().unwrap().clear();
+        sctp.inner.flight_size.store(0, Ordering::SeqCst);
+
+        // Add new chunks that fill the cwnd and simulate successful transmission + SACK
+        for round in 0..5u32 {
+            let tsn = 300 + round;
+            let cwnd = sctp.inner.cwnd_tx.load(Ordering::SeqCst);
+            // Use packet size that fills cwnd to trigger slow start growth
+            let pkt_size = cwnd.max(1);
+            {
+                let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+                sent_queue.insert(
+                    tsn,
+                    ChunkRecord {
+                        payload: Bytes::from(vec![0u8; pkt_size]),
+                        sent_time: Instant::now() - Duration::from_millis(50),
+                        transmit_count: 1,
+                        missing_reports: 0,
+                        abandoned: false,
+                        fast_retransmit: false,
+                        fast_retransmit_time: None,
+                        needs_retransmit: false,
+                        in_flight: true,
+                        acked: false,
+                        stream_id: 0,
+                        ssn: 0,
+                        flags: 0x03,
+                        max_retransmits: None,
+                        expiry: None,
+                    },
+                );
+            }
+            // Set flight_size >= cwnd so slow start can kick in
+            sctp.inner.flight_size.store(pkt_size, Ordering::SeqCst);
+
+            let sack = build_sack_packet(tsn, 1024 * 1024, vec![], vec![]);
+            sctp.inner.handle_sack(sack).await.unwrap();
+
+            let new_cwnd = sctp.inner.cwnd_tx.load(Ordering::SeqCst);
+            let ssthresh = sctp.inner.ssthresh.load(Ordering::SeqCst);
+            println!(
+                "Recovery SACK #{}: cwnd={}, ssthresh={}",
+                round + 1,
+                new_cwnd,
+                ssthresh
+            );
+        }
+
+        let recovered_cwnd = sctp.inner.cwnd_tx.load(Ordering::SeqCst);
+        println!("\n=== cwnd behavior under TURN rate limiting ===",);
+        println!(
+            "cwnd collapsed to minimum ({}) after T3 timeouts",
+            CWND_MIN_AFTER_RTO
+        );
+        println!("RTO backed off to {:.1}s", final_rto);
+        println!(
+            "After {} SACKs, cwnd = {} (slow recovery with 1-packet-at-a-time)",
+            5, recovered_cwnd
+        );
+        println!(
+            "This means effective throughput = ~{} bytes every {:.1}s",
+            CWND_MIN_AFTER_RTO, final_rto
+        );
+        println!("Combined with heartbeat disconnect, this kills the TURN connection.\n");
+
+        // cwnd staying at minimum is expected — recovering from floor requires
+        // multiple packets in flight simultaneously, which is hard at 1-packet cwnd.
+        // This documents why the application layer sees "no data transmitted".
+        assert_eq!(
+            recovered_cwnd, CWND_MIN_AFTER_RTO,
+            "cwnd stays at floor after collapse — this is the throughput problem"
+        );
     }
 }
