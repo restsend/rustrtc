@@ -26,7 +26,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{broadcast, mpsc, watch};
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -3775,6 +3775,23 @@ impl RtpSender {
     }
 
     pub fn set_transport(&self, transport: Arc<RtpTransport>) {
+        {
+            let track_id = self.track_id.clone();
+            let ssrc = self.ssrc;
+            let current_transport = self.transport.lock().unwrap();
+            if let Some(existing) = current_transport.as_ref() {
+                if Arc::ptr_eq(existing, &transport) {
+                    info!(
+                        "ignored same transport track_id={}, ssrc={}, transport_ptr={:p}",
+                        track_id,
+                        ssrc,
+                        Arc::as_ptr(&transport)
+                    );
+                    return;
+                }
+            }
+        }
+
         *self.transport.lock().unwrap() = Some(transport.clone());
         let track = self.track.clone();
         let ssrc = self.ssrc;

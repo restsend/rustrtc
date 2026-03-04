@@ -8,8 +8,8 @@ use tokio::time::timeout;
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
-use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
+use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration as WebrtcConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
@@ -80,7 +80,8 @@ async fn multichannel_stress_test() -> Result<()> {
                     let open_count_clone = open_count_clone.clone();
                     let webrtc_ready_tx_clone = webrtc_ready_tx_clone.clone();
                     Box::pin(async move {
-                        let count = open_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        let count =
+                            open_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                         if count == NUM_CHANNELS {
                             let _ = webrtc_ready_tx_clone.send(true);
                         }
@@ -228,7 +229,10 @@ async fn multichannel_stress_test() -> Result<()> {
                     println!("Channel {} sent packet {}/{}", idx, i, CHUNK_COUNT);
                 }
             }
-            println!("Channel {} finished sending all {} packets", idx, CHUNK_COUNT);
+            println!(
+                "Channel {} finished sending all {} packets",
+                idx, CHUNK_COUNT
+            );
             Ok(())
         });
 
