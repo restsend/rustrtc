@@ -528,28 +528,61 @@ impl DtlsInner {
                     let raw_msg = msg_buf.slice(0..consumed);
 
                     if msg.message_seq < ctx.recv_message_seq {
-                        // Duplicate
-                        // Special case: ClientHello on Server (to trigger retransmit)
-                        if msg.msg_type == HandshakeType::ClientHello && !is_client {
-                            self.handle_handshake_message(
-                                msg,
-                                &raw_msg,
-                                ctx,
-                                certificate,
-                                is_client,
-                            )
-                            .await?;
+                        // If we just processed a HelloVerifyRequest, the server may
+                        // restart its message_seq at a value lower than what we expect
+                        // (RFC 6347 §4.2.1 says restart at 0, but recv_message_seq may
+                        // already be at 1 from the HVR). Sync to the server's counter.
+                        if ctx.post_hvr && is_client {
+                            debug!(
+                                "post-HVR: syncing recv_message_seq from {} to {} (server restart)",
+                                ctx.recv_message_seq, msg.message_seq
+                            );
+                            ctx.recv_message_seq = msg.message_seq;
+                            ctx.post_hvr = false;
+                            // Fall through to process this message normally
+                        } else {
+                            // Duplicate
+                            // Special case: ClientHello on Server (to trigger retransmit)
+                            if msg.msg_type == HandshakeType::ClientHello && !is_client {
+                                self.handle_handshake_message(
+                                    msg,
+                                    &raw_msg,
+                                    ctx,
+                                    certificate,
+                                    is_client,
+                                )
+                                .await?;
+                            }
+                            continue;
                         }
-                        continue;
                     }
 
                     if msg.message_seq > ctx.recv_message_seq {
-                        debug!(
-                            "Received out-of-order handshake message: got {}, expected {}",
-                            msg.message_seq, ctx.recv_message_seq
-                        );
-                        // Ignore out-of-order for now
-                        continue;
+                        // If we just processed a HelloVerifyRequest, the server may
+                        // restart its message_seq at a value different from what we
+                        // expect (RFC 6347 says 0, but some implementations use 1).
+                        // Sync our counter to the server's actual starting point.
+                        if ctx.post_hvr && is_client {
+                            debug!(
+                                "post-HVR: syncing recv_message_seq from {} to {} (server restart)",
+                                ctx.recv_message_seq, msg.message_seq
+                            );
+                            ctx.recv_message_seq = msg.message_seq;
+                            ctx.post_hvr = false;
+                        } else {
+                            debug!(
+                                "Received out-of-order handshake message: got {}, expected {}",
+                                msg.message_seq, ctx.recv_message_seq
+                            );
+                            // Ignore out-of-order for now
+                            continue;
+                        }
+                    }
+
+                    // Clear post_hvr once we've accepted the first post-HVR message
+                    // (handles the case where msg_seq == recv_message_seq exactly)
+                    if ctx.post_hvr {
+                        ctx.post_hvr = false;
                     }
 
                     // Expected message - handle fragmentation
@@ -1254,6 +1287,12 @@ impl DtlsInner {
                 .await?;
             ctx.last_flight_buffer = Some(buf);
             ctx.message_seq += 1;
+            // After sending a new ClientHello in response to HelloVerifyRequest,
+            // the server will restart its own handshake message_seq counter.
+            // Different implementations restart from different values (0 per RFC 6347
+            // §4.2.1, or 1 continuing from the HVR), so we sync dynamically on the
+            // first message we receive from the server after this point.
+            ctx.post_hvr = true;
         }
         Ok(())
     }
@@ -1541,6 +1580,7 @@ impl DtlsInner {
                     is_client,
                 )
                 .await?;
+            trace!("ClientHello sent ({} bytes)", buf.len());
             ctx.last_flight_buffer = Some(buf);
             ctx.message_seq += 1;
         }
@@ -1896,6 +1936,11 @@ struct HandshakeContext {
     epoch: u16,
     message_seq: u16,
     recv_message_seq: u16,
+    /// Set after processing a HelloVerifyRequest so that the next server
+    /// message is accepted at whatever message_seq the server chooses.
+    /// RFC 6347 §4.2.1 says the server should restart at 0, but some
+    /// implementations (e.g. webrtc-dtls) continue from the HVR seq + 1.
+    post_hvr: bool,
     last_flight_buffer: Option<Vec<u8>>,
     incomplete_handshake: BytesMut,
     incomplete_msg_seq: u16,
@@ -1923,6 +1968,7 @@ impl HandshakeContext {
             epoch: 0,
             message_seq: 0,
             recv_message_seq: 0,
+            post_hvr: false,
             last_flight_buffer: None,
             incomplete_handshake: BytesMut::new(),
             incomplete_msg_seq: 0,

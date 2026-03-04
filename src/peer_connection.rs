@@ -2342,6 +2342,8 @@ async fn run_ice_dtls_loop(
     inner_weak: std::sync::Weak<PeerConnectionInner>,
 ) {
     let mut ice_state_rx = ice_transport.subscribe_state();
+    // Subscribe once; the channel starts as None and transitions to Some(_) exactly once.
+    let mut nomination_complete_rx = ice_transport.subscribe_nomination_complete();
     loop {
         let ice_state = *ice_state_rx.borrow_and_update();
 
@@ -2360,6 +2362,51 @@ async fn run_ice_dtls_loop(
         match ice_state {
             crate::transports::ice::IceTransportState::Connected
             | crate::transports::ice::IceTransportState::Completed => {
+                // Wait for ICE nomination to complete before starting DTLS.
+                // This prevents a race where DTLS and the USE-CANDIDATE binding check
+                // compete for the same UDP socket, causing spurious nomination timeouts.
+                let nomination_timeout = if let Some(inner) = inner_weak.upgrade() {
+                    inner.config.nomination_timeout
+                } else {
+                    return;
+                };
+
+                // If nomination is already done (value is Some), this resolves immediately.
+                if nomination_complete_rx.borrow().is_none() {
+                    let wait_result = tokio::select! {
+                        // Wait for nomination to complete (success or failure).
+                        changed = nomination_complete_rx.changed() => {
+                            changed.ok().and_then(|_| *nomination_complete_rx.borrow())
+                        }
+                        // Guard: abort if ICE transitions away from connected/completed.
+                        _ = async {
+                            loop {
+                                if ice_state_rx.changed().await.is_err() {
+                                    break;
+                                }
+                                let s = *ice_state_rx.borrow();
+                                if !matches!(
+                                    s,
+                                    crate::transports::ice::IceTransportState::Connected
+                                    | crate::transports::ice::IceTransportState::Completed
+                                ) {
+                                    break;
+                                }
+                            }
+                        } => None,
+                        // Safety timeout: if nomination takes longer than configured, proceed anyway.
+                        _ = tokio::time::sleep(nomination_timeout) => None,
+                    };
+
+                    // Log the outcome but always proceed — a nomination failure doesn't
+                    // mean the path is unusable; DTLS may still succeed.
+                    match wait_result {
+                        Some(true) => debug!("ICE nomination completed successfully, starting DTLS"),
+                        Some(false) => debug!("ICE nomination failed, proceeding to DTLS anyway"),
+                        None => debug!("ICE nomination wait timed-out or ICE changed state, proceeding to DTLS"),
+                    }
+                }
+
                 // For RTP/SRTP mode, we don't need DTLS role to start
                 let transport_mode = if let Some(inner) = inner_weak.upgrade() {
                     inner.config.transport_mode.clone()

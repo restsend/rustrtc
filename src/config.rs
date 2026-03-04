@@ -272,6 +272,10 @@ pub struct RtcConfiguration {
     pub disable_ipv6: bool,
     pub ssrc_start: u32,
     pub stun_timeout: std::time::Duration,
+    /// Timeout for the ICE nomination binding check (USE-CANDIDATE).
+    /// This should be larger than `stun_timeout` to allow more retransmissions
+    /// and reduce the probability of nomination failures under packet loss.
+    pub nomination_timeout: std::time::Duration,
     pub ice_connection_timeout: std::time::Duration,
     pub sctp_rto_initial: std::time::Duration,
     pub sctp_rto_min: std::time::Duration,
@@ -303,6 +307,7 @@ impl Default for RtcConfiguration {
             disable_ipv6: false,
             ssrc_start: 10000,
             stun_timeout: std::time::Duration::from_secs(5),
+            nomination_timeout: std::time::Duration::from_secs(10),
             ice_connection_timeout: std::time::Duration::from_secs(30),
             sctp_rto_initial: std::time::Duration::from_secs(3),
             sctp_rto_min: std::time::Duration::from_secs(1),
@@ -403,6 +408,11 @@ impl RtcConfigurationBuilder {
 
     pub fn stun_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.inner.stun_timeout = timeout;
+        self
+    }
+
+    pub fn nomination_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.inner.nomination_timeout = timeout;
         self
     }
 

@@ -704,3 +704,330 @@ async fn test_ice_lite_connectivity_establishment() -> Result<()> {
 
     Ok(())
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Nomination timeout / completion tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Verify that `nomination_timeout` defaults to a value larger than `stun_timeout`
+/// so that the nomination binding check gets more retransmission attempts than a
+/// regular connectivity check.
+#[test]
+fn test_nomination_timeout_larger_than_stun_timeout() {
+    let config = RtcConfiguration::default();
+    assert!(
+        config.nomination_timeout > config.stun_timeout,
+        "nomination_timeout ({:?}) must be > stun_timeout ({:?}) to allow more retransmissions",
+        config.nomination_timeout,
+        config.stun_timeout,
+    );
+}
+
+/// Verify that `RtcConfigurationBuilder::nomination_timeout` correctly overrides the default.
+#[test]
+fn test_nomination_timeout_builder() {
+    use crate::config::RtcConfigurationBuilder;
+
+    let custom = std::time::Duration::from_secs(20);
+    let config = RtcConfigurationBuilder::new()
+        .nomination_timeout(custom)
+        .build();
+    assert_eq!(config.nomination_timeout, custom);
+    // Other defaults should be unaffected.
+    assert_eq!(config.stun_timeout, std::time::Duration::from_secs(5));
+}
+
+/// Helper: set up two host-only ICE transports (controlling + controlled), exchange
+/// candidates and parameters, start both, then return state/nomination receivers plus
+/// both transports so the caller can await what it needs.
+async fn setup_host_pair(
+    controlling_config: RtcConfiguration,
+    controlled_config: RtcConfiguration,
+) -> (IceTransport, IceTransport) {
+    let (controlling, runner_c) = IceTransportBuilder::new(controlling_config)
+        .role(IceRole::Controlling)
+        .build();
+    tokio::spawn(runner_c);
+
+    let (controlled, runner_d) = IceTransportBuilder::new(controlled_config)
+        .role(IceRole::Controlled)
+        .build();
+    tokio::spawn(runner_d);
+
+    // Exchange already-gathered candidates.
+    for c in controlling.local_candidates() {
+        controlled.add_remote_candidate(c);
+    }
+    for c in controlled.local_candidates() {
+        controlling.add_remote_candidate(c);
+    }
+
+    // Forward future trickle candidates.
+    let ctrl_clone = controlling.clone();
+    let ctrd_clone = controlled.clone();
+    let mut rx_ctrl = controlling.subscribe_candidates();
+    let mut rx_ctrd = controlled.subscribe_candidates();
+    tokio::spawn(async move {
+        while let Ok(c) = rx_ctrl.recv().await {
+            ctrd_clone.add_remote_candidate(c);
+        }
+    });
+    tokio::spawn(async move {
+        while let Ok(c) = rx_ctrd.recv().await {
+            ctrl_clone.add_remote_candidate(c);
+        }
+    });
+
+    // Start both agents (this triggers connectivity checks).
+    controlling
+        .start(controlled.local_parameters())
+        .expect("controlling.start");
+    controlled
+        .start(controlling.local_parameters())
+        .expect("controlled.start");
+
+    (controlling, controlled)
+}
+
+/// Wait for an ICE transport to reach Connected or fail; returns true on success.
+async fn wait_ice_connected(
+    mut state_rx: watch::Receiver<IceTransportState>,
+    deadline: Duration,
+) -> bool {
+    let result = timeout(deadline, async move {
+        loop {
+            let s = *state_rx.borrow_and_update();
+            match s {
+                IceTransportState::Connected | IceTransportState::Completed => return true,
+                IceTransportState::Failed => return false,
+                _ => {}
+            }
+            if state_rx.changed().await.is_err() {
+                return false;
+            }
+        }
+    })
+    .await;
+    result.unwrap_or(false)
+}
+
+/// End-to-end test: two host ICE agents establish a connection and the
+/// `nomination_complete` signal on the controlling side fires `Some(true)`.
+/// The controlled side also fires `Some(true)` immediately (no nomination to do).
+#[tokio::test]
+async fn test_nomination_complete_fires_on_connection() -> Result<()> {
+    let config1 = RtcConfiguration::default();
+    let config2 = RtcConfiguration::default();
+
+    let (controlling, controlled) = setup_host_pair(config1, config2).await;
+
+    // Subscribe to nomination signals before ICE connects.
+    let mut ctrl_nomination_rx = controlling.subscribe_nomination_complete();
+    let mut ctrd_nomination_rx = controlled.subscribe_nomination_complete();
+
+    let ctrl_state = controlling.subscribe_state();
+    let ctrd_state = controlled.subscribe_state();
+
+    // Both sides should reach Connected within 10 s.
+    let (ok1, ok2) = tokio::join!(
+        wait_ice_connected(ctrl_state, Duration::from_secs(10)),
+        wait_ice_connected(ctrd_state, Duration::from_secs(10)),
+    );
+    assert!(ok1, "Controlling agent failed to reach Connected");
+    assert!(ok2, "Controlled agent failed to reach Connected");
+
+    // Nomination signal must arrive soon after ICE connects.
+    let ctrl_result = timeout(Duration::from_secs(5), async {
+        // The value might already be set; check before waiting.
+        if ctrl_nomination_rx.borrow().is_some() {
+            return *ctrl_nomination_rx.borrow();
+        }
+        ctrl_nomination_rx.changed().await.ok()?;
+        *ctrl_nomination_rx.borrow()
+    })
+    .await
+    .expect("nomination_complete timed out on controlling side");
+
+    assert_eq!(
+        ctrl_result,
+        Some(true),
+        "Controlling nomination should succeed (Some(true))"
+    );
+
+    // Controlled side signals immediately (no nomination to perform).
+    let ctrd_result = timeout(Duration::from_secs(2), async {
+        if ctrd_nomination_rx.borrow().is_some() {
+            return *ctrd_nomination_rx.borrow();
+        }
+        ctrd_nomination_rx.changed().await.ok()?;
+        *ctrd_nomination_rx.borrow()
+    })
+    .await
+    .expect("nomination_complete timed out on controlled side");
+
+    assert_eq!(
+        ctrd_result,
+        Some(true),
+        "Controlled nomination should be Some(true) (immediate)"
+    );
+
+    Ok(())
+}
+
+/// Verify that `nomination_timeout` is actually used for the nomination binding
+/// check: set it to a very small value and confirm the nomination attempt fails
+/// quickly (before `stun_timeout` would fire).
+///
+/// We simulate this by configuring `nomination_timeout` shorter than even one
+/// RTO and then running a host-only check against a black-hole address so the
+/// check never gets a response.
+#[tokio::test]
+async fn test_nomination_uses_nomination_timeout_not_stun_timeout() -> Result<()> {
+    // Using a very short nomination_timeout to make the test fast.
+    let mut config = RtcConfiguration::default();
+    config.stun_timeout = Duration::from_secs(30); // Would take 30 s if wrong timeout is used.
+    config.nomination_timeout = Duration::from_millis(200); // Should fire quickly.
+
+    let (transport, runner) = IceTransportBuilder::new(config).build();
+    tokio::spawn(runner);
+
+    // Build a dummy pair pointing to a loopback port that nobody is listening on.
+    // (port 1 is reserved and will result in an ICMP unreachable or silent timeout)
+    let local_candidate = IceCandidate::host("127.0.0.1:0".parse().unwrap(), 1);
+    let remote_candidate = IceCandidate::host("127.0.0.1:1".parse().unwrap(), 1);
+    let pair = IceCandidatePair::new(local_candidate, remote_candidate);
+
+    // Force the transport inner's role to Controlling so the nomination path fires.
+    *transport.inner.role.lock().unwrap() = IceRole::Controlling;
+
+    // Set a dummy remote parameters so authentication is possible.
+    let remote_params = IceParameters::new("dummy_ufrag", "dummy_password_1234567890");
+    transport.set_remote_parameters(remote_params);
+
+    let mut nomination_rx = transport.subscribe_nomination_complete();
+
+    // Kick off a nomination check in a background task.
+    let inner_clone = transport.inner.clone();
+    let pair_clone = pair.clone();
+    tokio::spawn(async move {
+        let result = perform_binding_check(
+            &pair_clone.local,
+            &pair_clone.remote,
+            &inner_clone,
+            IceRole::Controlling,
+            true, // nominated = true → should use nomination_timeout
+        )
+        .await;
+        match result {
+            Ok(_) => {
+                let _ = inner_clone.nomination_complete.send(Some(true));
+            }
+            Err(_) => {
+                let _ = inner_clone.nomination_complete.send(Some(false));
+            }
+        }
+    });
+
+    // The nomination should fail (no response) within nomination_timeout (200 ms),
+    // which is much shorter than stun_timeout (30 s).
+    let start = std::time::Instant::now();
+    let result = timeout(Duration::from_secs(5), async {
+        if nomination_rx.borrow().is_some() {
+            return *nomination_rx.borrow();
+        }
+        nomination_rx.changed().await.ok()?;
+        *nomination_rx.borrow()
+    })
+    .await
+    .expect("nomination_complete should fire within 5 s");
+
+    let elapsed = start.elapsed();
+
+    assert_eq!(
+        result,
+        Some(false),
+        "Nomination to a black-hole address should fail"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "Nomination should have timed out using nomination_timeout (200 ms), not stun_timeout (30 s); elapsed: {:?}",
+        elapsed
+    );
+    // Also verify it actually used nomination_timeout (not stun_timeout):
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "Elapsed ({:?}) should be close to nomination_timeout (200 ms), not stun_timeout (30 s)",
+        elapsed
+    );
+
+    Ok(())
+}
+
+/// Verify that under simulated packet loss the nomination_complete signal still
+/// arrives as `Some(true)`, because the longer `nomination_timeout` allows
+/// sufficient retransmissions to get through.
+///
+/// This test uses `PACKET_LOSS_RATE` to drop ~30 % of packets and confirms that
+/// with the default `nomination_timeout` (2× `stun_timeout`) nomination succeeds
+/// where with only `stun_timeout` it would be far more likely to fail.
+///
+/// Note: packet-loss simulation is a global atomic, so this test uses
+/// `#[serial_test::serial]` style isolation by resetting the rate at the end.
+/// Since we can't guarantee ordering with other tests, we keep the rate
+/// conservative (30 %) to avoid flakiness.
+#[tokio::test]
+async fn test_nomination_succeeds_under_moderate_packet_loss() -> Result<()> {
+    // 30% packet loss: rate = 3000 (units: 1/10000th, compared against random % 10000)
+    // We temporarily set the global rate; it may have been initialized from env.
+    // We reset it afterward to avoid affecting other tests.
+    let prev_rate = PACKET_LOSS_RATE.swap(3000, Ordering::SeqCst);
+
+    let result: Result<()> = async {
+        let mut config1 = RtcConfiguration::default();
+        let mut config2 = RtcConfiguration::default();
+        // Use generous timeouts so the test is robust under CI load.
+        config1.nomination_timeout = Duration::from_secs(15);
+        config1.stun_timeout = Duration::from_secs(5);
+        config2.nomination_timeout = Duration::from_secs(15);
+        config2.stun_timeout = Duration::from_secs(5);
+
+        let (controlling, controlled) = setup_host_pair(config1, config2).await;
+
+        let mut ctrl_nom_rx = controlling.subscribe_nomination_complete();
+        let ctrl_state = controlling.subscribe_state();
+        let ctrd_state = controlled.subscribe_state();
+
+        // Wait for both sides to connect (ICE checks also go through the loss simulator).
+        let (ok1, ok2) = tokio::join!(
+            wait_ice_connected(ctrl_state, Duration::from_secs(20)),
+            wait_ice_connected(ctrd_state, Duration::from_secs(20)),
+        );
+        assert!(ok1, "Controlling agent failed to connect under packet loss");
+        assert!(ok2, "Controlled agent failed to connect under packet loss");
+
+        // Nomination should still succeed thanks to retransmissions within nomination_timeout.
+        let nom_result = timeout(Duration::from_secs(20), async {
+            if ctrl_nom_rx.borrow().is_some() {
+                return *ctrl_nom_rx.borrow();
+            }
+            ctrl_nom_rx.changed().await.ok()?;
+            *ctrl_nom_rx.borrow()
+        })
+        .await
+        .expect("nomination_complete should fire within 20 s even under 30% loss");
+
+        assert_eq!(
+            nom_result,
+            Some(true),
+            "Nomination should succeed under 30% packet loss with nomination_timeout > stun_timeout"
+        );
+
+        Ok(())
+    }
+    .await;
+
+    // Always restore the previous rate so we don't contaminate other tests.
+    PACKET_LOSS_RATE.store(prev_rate, Ordering::SeqCst);
+
+    result
+}

@@ -98,6 +98,11 @@ struct IceTransportInner {
     candidate_tx: broadcast::Sender<IceCandidate>,
     cmd_tx: mpsc::UnboundedSender<IceCommand>,
     checking_pairs: Mutex<std::collections::HashSet<(SocketAddr, SocketAddr)>>,
+    /// Signals when the controlling-side nomination is complete.
+    /// `true` = nomination succeeded, `false` = nomination failed (but ICE is still connected).
+    /// Controlled side immediately sends `true` (no nomination to do).
+    nomination_complete: watch::Sender<Option<bool>>,
+    _nomination_complete_rx: watch::Receiver<Option<bool>>,
 }
 
 impl std::fmt::Debug for IceTransportInner {
@@ -120,6 +125,7 @@ impl std::fmt::Debug for IceTransportInner {
             .field("selected_pair_notifier", &self.selected_pair_notifier)
             .field("candidate_tx", &self.candidate_tx)
             .field("cmd_tx", &self.cmd_tx)
+            .field("nomination_complete", &self.nomination_complete)
             .finish()
     }
 }
@@ -529,6 +535,7 @@ impl IceTransport {
         let (selected_socket_tx, selected_socket_rx) = watch::channel(None);
         let (selected_pair_tx, selected_pair_rx) = watch::channel(None);
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (nomination_complete_tx, nomination_complete_rx) = watch::channel(None);
 
         let inner = IceTransportInner {
             state: state_tx,
@@ -554,6 +561,8 @@ impl IceTransport {
             candidate_tx: candidate_tx.clone(),
             cmd_tx,
             checking_pairs: Mutex::new(std::collections::HashSet::new()),
+            nomination_complete: nomination_complete_tx,
+            _nomination_complete_rx: nomination_complete_rx,
         };
         let inner = Arc::new(inner);
 
@@ -592,6 +601,12 @@ impl IceTransport {
         self.inner.selected_pair_notifier.subscribe()
     }
 
+    /// Subscribe to the nomination-complete signal.
+    /// Yields `Some(true)` when nomination succeeds, `Some(false)` when it fails.
+    /// The controlled side yields `Some(true)` immediately (it has no nomination to perform).
+    pub fn subscribe_nomination_complete(&self) -> watch::Receiver<Option<bool>> {
+        self.inner.nomination_complete.subscribe()
+    }
     pub fn gather_state(&self) -> IceGathererState {
         self.inner.gatherer.state()
     }
@@ -1123,18 +1138,31 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
                 let inner_clone = inner.clone();
                 let pair_clone = pair.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = perform_binding_check(
+                    let result = perform_binding_check(
                         &pair_clone.local,
                         &pair_clone.remote,
                         &inner_clone,
                         role,
                         true,
                     )
-                    .await
-                    {
-                        debug!("Failed to send nomination: {}", e);
+                    .await;
+                    match &result {
+                        Ok(_) => {
+                            debug!(
+                                "Nomination succeeded: {} -> {}",
+                                pair_clone.local.address, pair_clone.remote.address
+                            );
+                            let _ = inner_clone.nomination_complete.send(Some(true));
+                        }
+                        Err(e) => {
+                            debug!("Failed to send nomination: {}", e);
+                            let _ = inner_clone.nomination_complete.send(Some(false));
+                        }
                     }
                 });
+            } else {
+                // Controlled side: no nomination to perform, signal immediately.
+                let _ = inner.nomination_complete.send(Some(true));
             }
 
             break;
@@ -1370,6 +1398,9 @@ async fn handle_stun_request(
                     let _ = inner.selected_socket.send(Some(socket));
                 }
                 let _ = inner.state.send(IceTransportState::Connected);
+                // Controlled side: nomination is decided by the controlling agent;
+                // once we receive USE-CANDIDATE, our "nomination" is complete.
+                let _ = inner.nomination_complete.send(Some(true));
             } else {
                 debug!(
                     "Received UseCandidate but could not find pair for {} -> {}",
@@ -1536,7 +1567,11 @@ async fn perform_binding_check(
 
     let start = Instant::now();
     let mut rto = Duration::from_millis(500);
-    let max_timeout = inner.config.stun_timeout;
+    let max_timeout = if nominated {
+        inner.config.nomination_timeout
+    } else {
+        inner.config.stun_timeout
+    };
 
     loop {
         if let Some(client) = &turn_client {
