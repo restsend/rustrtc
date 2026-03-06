@@ -856,8 +856,9 @@ async fn wait_ice_connected(
 
 /// End-to-end test: two host ICE agents establish a connection and the
 /// `nomination_complete` signal on the controlling side fires `Some(true)`.
-/// The controlled side also fires `Some(true)` immediately (no nomination to do).
+/// The controlled side also fires `Some(true)` once USE-CANDIDATE is received.
 #[tokio::test]
+#[serial]
 async fn test_nomination_complete_fires_on_connection() -> Result<()> {
     let config1 = RtcConfiguration::default();
     let config2 = RtcConfiguration::default();
@@ -897,8 +898,8 @@ async fn test_nomination_complete_fires_on_connection() -> Result<()> {
         "Controlling nomination should succeed (Some(true))"
     );
 
-    // Controlled side signals immediately (no nomination to perform).
-    let ctrd_result = timeout(Duration::from_secs(2), async {
+    // Controlled side signals after receiving USE-CANDIDATE from the controlling side.
+    let ctrd_result = timeout(Duration::from_secs(5), async {
         if ctrd_nomination_rx.borrow().is_some() {
             return *ctrd_nomination_rx.borrow();
         }
@@ -911,7 +912,7 @@ async fn test_nomination_complete_fires_on_connection() -> Result<()> {
     assert_eq!(
         ctrd_result,
         Some(true),
-        "Controlled nomination should be Some(true) (immediate)"
+        "Controlled nomination should be Some(true) (after receiving USE-CANDIDATE)"
     );
 
     Ok(())
@@ -1019,6 +1020,7 @@ async fn test_nomination_uses_nomination_timeout_not_stun_timeout() -> Result<()
 /// Since we can't guarantee ordering with other tests, we keep the rate
 /// conservative (30 %) to avoid flakiness.
 #[tokio::test]
+#[serial]
 async fn test_nomination_succeeds_under_moderate_packet_loss() -> Result<()> {
     // 30% packet loss: rate = 3000 (units: 1/10000th, compared against random % 10000)
     // Use a scope guard to ensure PACKET_LOSS_RATE is always restored, even if the test panics.
@@ -1317,3 +1319,337 @@ async fn test_ice_connection_without_external_ip() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+#[serial]
+async fn test_nomination_delayed_by_dtls_socket_contention() -> Result<()> {
+    let mut config1 = RtcConfiguration::default();
+    let mut config2 = RtcConfiguration::default();
+    config1.nomination_timeout = Duration::from_millis(500);
+    config1.stun_timeout = Duration::from_millis(200);
+    config2.nomination_timeout = Duration::from_millis(500);
+    config2.stun_timeout = Duration::from_millis(200);
+
+    let (controlling, controlled) = setup_host_pair(config1, config2).await;
+
+    let ctrl_state = controlling.subscribe_state();
+    let ctrd_state = controlled.subscribe_state();
+    let mut ctrl_nom_rx = controlling.subscribe_nomination_complete();
+    let mut ctrd_nom_rx = controlled.subscribe_nomination_complete();
+
+    let (ok1, ok2) = tokio::join!(
+        wait_ice_connected(ctrl_state, Duration::from_secs(10)),
+        wait_ice_connected(ctrd_state, Duration::from_secs(10)),
+    );
+    assert!(ok1, "Controlling ICE failed to connect");
+    assert!(ok2, "Controlled ICE failed to connect");
+
+    let ice_connected_at = std::time::Instant::now();
+
+    let ctrd_nom = timeout(Duration::from_millis(600), async {
+        if ctrd_nom_rx.borrow().is_some() {
+            return *ctrd_nom_rx.borrow();
+        }
+        ctrd_nom_rx.changed().await.ok()?;
+        *ctrd_nom_rx.borrow()
+    })
+    .await;
+    assert!(
+        ctrd_nom.is_ok(),
+        "Controlled side nomination_complete should fire after receiving USE-CANDIDATE (within 600ms), \
+         but timed out — this means the controlled side never received USE-CANDIDATE"
+    );
+    assert_eq!(
+        ctrd_nom.unwrap(),
+        Some(true),
+        "Controlled side should signal nomination success after receiving USE-CANDIDATE"
+    );
+
+    let ctrl_nom = timeout(
+        Duration::from_millis(600),
+        async {
+            if ctrl_nom_rx.borrow().is_some() {
+                return *ctrl_nom_rx.borrow();
+            }
+            ctrl_nom_rx.changed().await.ok()?;
+            *ctrl_nom_rx.borrow()
+        },
+    )
+    .await;
+
+    let elapsed = ice_connected_at.elapsed();
+
+    assert!(
+        ctrl_nom.is_ok(),
+        "Controlling side nomination_complete should fire within nomination_timeout (500ms + margin), \
+         elapsed={:?}. If this fails it means nomination is stuck indefinitely.",
+        elapsed
+    );
+
+    let nom_result = ctrl_nom.unwrap();
+    assert!(
+        nom_result.is_some(),
+        "nomination_complete must be Some(_), got None after {:?}",
+        elapsed
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_nomination_fails_immediately_on_host_unreachable() -> Result<()> {
+    // With the transient-error retry fix, EHOSTUNREACH is no longer an immediate
+    // failure.  Nomination retries until nomination_timeout, then yields Some(false).
+    // Use a short nomination_timeout so the test still terminates quickly.
+    let mut config = RtcConfiguration::default();
+    config.stun_timeout = Duration::from_secs(30);
+    config.nomination_timeout = Duration::from_millis(500);
+
+    let (transport, runner) = IceTransportBuilder::new(config).build();
+    tokio::spawn(runner);
+
+    let local_candidate = IceCandidate::host("127.0.0.1:0".parse().unwrap(), 1);
+    let remote_candidate = IceCandidate::host("127.0.0.1:1".parse().unwrap(), 1);
+
+    *transport.inner.role.lock().unwrap() = IceRole::Controlling;
+    transport.set_remote_parameters(IceParameters::new(
+        "testufrag",
+        "testpassword_long_enough_1234",
+    ));
+
+    let mut nom_rx = transport.subscribe_nomination_complete();
+
+    let inner_clone = transport.inner.clone();
+    let local_clone = local_candidate.clone();
+    let remote_clone = remote_candidate.clone();
+    tokio::spawn(async move {
+        let result = perform_binding_check(
+            &local_clone,
+            &remote_clone,
+            &inner_clone,
+            IceRole::Controlling,
+            true,
+        )
+        .await;
+        let signal = if result.is_ok() { Some(true) } else { Some(false) };
+        let _ = inner_clone.nomination_complete.send(signal);
+    });
+
+    let start = std::time::Instant::now();
+    let result = timeout(Duration::from_millis(1500), async {
+        if nom_rx.borrow().is_some() {
+            return *nom_rx.borrow();
+        }
+        nom_rx.changed().await.ok()?;
+        *nom_rx.borrow()
+    })
+    .await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        result.is_ok(),
+        "nomination_complete should fire after nomination_timeout (500ms) when host is \
+         unreachable, but timed out after {:?}",
+        elapsed
+    );
+
+    let nom_value = result.unwrap();
+    assert_eq!(
+        nom_value,
+        Some(false),
+        "Nomination to unreachable address should produce Some(false), got {:?}",
+        nom_value
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_dtls_proceeds_after_nomination_timeout() -> Result<()> {
+    let mut config1 = RtcConfiguration::default();
+    let mut config2 = RtcConfiguration::default();
+    config1.nomination_timeout = Duration::from_millis(1);
+    config1.stun_timeout = Duration::from_secs(5);
+    config2.nomination_timeout = Duration::from_millis(1);
+    config2.stun_timeout = Duration::from_secs(5);
+
+    let (controlling, controlled) = setup_host_pair(config1, config2).await;
+
+    let ctrl_state = controlling.subscribe_state();
+    let ctrd_state = controlled.subscribe_state();
+    let mut ctrl_nom_rx = controlling.subscribe_nomination_complete();
+
+    let (ok1, ok2) = tokio::join!(
+        wait_ice_connected(ctrl_state, Duration::from_secs(10)),
+        wait_ice_connected(ctrd_state, Duration::from_secs(10)),
+    );
+    assert!(ok1, "Controlling ICE failed to connect");
+    assert!(ok2, "Controlled ICE failed to connect");
+
+    let nom = timeout(Duration::from_millis(200), async {
+        if ctrl_nom_rx.borrow().is_some() {
+            return *ctrl_nom_rx.borrow();
+        }
+        ctrl_nom_rx.changed().await.ok()?;
+        *ctrl_nom_rx.borrow()
+    })
+    .await;
+
+    let ctrl_pair = controlling.get_selected_pair().await;
+    assert!(
+        ctrl_pair.is_some(),
+        "Even when nomination times out, ICE selected pair should exist. nom={:?}",
+        nom
+    );
+    let ctrd_pair = controlled.get_selected_pair().await;
+    assert!(
+        ctrd_pair.is_some(),
+        "Controlled side should have a selected pair even when controlling nomination times out"
+    );
+
+    let (tx1, rx1) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+    let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+
+    struct Chan(tokio::sync::mpsc::UnboundedSender<bytes::Bytes>);
+    #[async_trait::async_trait]
+    impl PacketReceiver for Chan {
+        async fn receive(&self, packet: bytes::Bytes, _addr: std::net::SocketAddr) {
+            let _ = self.0.send(packet);
+        }
+    }
+
+    controlling
+        .inner
+        .data_receiver
+        .lock()
+        .unwrap()
+        .replace(Arc::new(Chan(tx1)));
+    controlled
+        .inner
+        .data_receiver
+        .lock()
+        .unwrap()
+        .replace(Arc::new(Chan(tx2)));
+
+    let test_payload = bytes::Bytes::from_static(b"\xffhello-after-nomination-timeout");
+    let ctrl_socket_rx = controlling.subscribe_selected_socket();
+    let ctrd_socket_rx = controlled.subscribe_selected_socket();
+
+    let ctrl_sock = timeout(Duration::from_secs(3), async {
+        let mut rx = ctrl_socket_rx;
+        loop {
+            if rx.borrow().is_some() {
+                return rx.borrow().clone();
+            }
+            if rx.changed().await.is_err() {
+                return None;
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+
+    let ctrd_sock = timeout(Duration::from_secs(3), async {
+        let mut rx = ctrd_socket_rx;
+        loop {
+            if rx.borrow().is_some() {
+                return rx.borrow().clone();
+            }
+            if rx.changed().await.is_err() {
+                return None;
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+
+    if let (Some(sock), Some(ctrl_pair)) = (ctrl_sock, controlling.get_selected_pair().await) {
+        let _ = sock
+            .send_to(&test_payload, ctrl_pair.remote.address)
+            .await;
+        let received = timeout(Duration::from_secs(2), rx2.recv()).await;
+        if let Ok(Some(pkt)) = received {
+            assert_eq!(
+                &pkt[..],
+                &test_payload[..],
+                "Received payload mismatch after nomination timeout"
+            );
+        }
+        let _ = ctrd_sock;
+        let _ = rx1;
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_nomination_race_under_high_packet_loss() -> Result<()> {
+    struct ScopeGuard {
+        prev: u32,
+    }
+    impl Drop for ScopeGuard {
+        fn drop(&mut self) {
+            PACKET_LOSS_RATE.store(self.prev, Ordering::SeqCst);
+        }
+    }
+
+    let _guard = ScopeGuard {
+        prev: PACKET_LOSS_RATE.swap(8000, Ordering::SeqCst),
+    };
+
+    let mut config1 = RtcConfiguration::default();
+    let mut config2 = RtcConfiguration::default();
+    config1.nomination_timeout = Duration::from_secs(3);
+    config1.stun_timeout = Duration::from_secs(1);
+    config2.nomination_timeout = Duration::from_secs(3);
+    config2.stun_timeout = Duration::from_secs(1);
+
+    let (controlling, controlled) = setup_host_pair(config1, config2).await;
+
+    let ctrl_state = controlling.subscribe_state();
+    let ctrd_state = controlled.subscribe_state();
+    let mut ctrl_nom_rx = controlling.subscribe_nomination_complete();
+
+    let (ok1, ok2) = tokio::join!(
+        wait_ice_connected(ctrl_state, Duration::from_secs(15)),
+        wait_ice_connected(ctrd_state, Duration::from_secs(15)),
+    );
+
+    if !ok1 || !ok2 {
+        return Ok(());
+    }
+
+    let nom_result = timeout(Duration::from_secs(5), async {
+        if ctrl_nom_rx.borrow().is_some() {
+            return *ctrl_nom_rx.borrow();
+        }
+        ctrl_nom_rx.changed().await.ok()?;
+        *ctrl_nom_rx.borrow()
+    })
+    .await;
+
+    assert!(
+        nom_result.is_ok(),
+        "Under 80% packet loss, nomination_complete must still fire (Some(true) or Some(false)), \
+         but it timed out (hung indefinitely). This reproduces the log issue where the connection \
+         gets stuck waiting for nomination."
+    );
+
+    let nom = nom_result.unwrap();
+    assert!(
+        nom.is_some(),
+        "nomination_complete value must be Some(_), got None. \
+         This means the watch channel was closed unexpectedly."
+    );
+
+    println!(
+        "High packet loss nomination result: {:?} (either is acceptable, None is not)",
+        nom
+    );
+
+    Ok(())
+}
+

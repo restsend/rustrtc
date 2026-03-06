@@ -1161,8 +1161,12 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
                     }
                 });
             } else {
-                // Controlled side: no nomination to perform, signal immediately.
-                let _ = inner.nomination_complete.send(Some(true));
+                // Controlled side: nomination_complete is signalled when we
+                // receive USE-CANDIDATE from the controlling agent (see the
+                // handle_stun_binding_request path below).  Do NOT signal here —
+                // firing early causes DTLS to start before the controlling side
+                // has finished its nomination binding check, creating a timing
+                // gap that can exceed `nomination_timeout` (10 s in production).
             }
 
             break;
@@ -1403,9 +1407,14 @@ async fn handle_stun_request(
                 let _ = inner.nomination_complete.send(Some(true));
             } else {
                 debug!(
-                    "Received UseCandidate but could not find pair for {} -> {}",
+                    "Received UseCandidate but could not find pair for {} -> {}; \
+                     signalling nomination_complete=Some(true) as fallback",
                     local_addr, addr
                 );
+                // Fallback: USE-CANDIDATE arrived before ICE checks completed
+                // (pair not yet in remote_candidates).  Signal nomination complete
+                // so peer_connection is not stuck waiting forever.
+                let _ = inner.nomination_complete.send(Some(true));
             }
         }
     }
@@ -1434,6 +1443,7 @@ async fn perform_binding_check(
     if remote.transport != "udp" {
         bail!("only UDP connectivity checks are supported");
     }
+
     let local_params = inner.local_parameters.lock().unwrap().clone();
     let remote_params = match inner.remote_parameters.lock().unwrap().clone() {
         Some(p) => p,
@@ -1587,21 +1597,19 @@ async fn perform_binding_check(
             }
         } else if let Some(socket) = &socket {
             if let Err(e) = socket.send_to(&bytes, remote.address).await {
-                match e.kind() {
-                    std::io::ErrorKind::HostUnreachable
-                    | std::io::ErrorKind::NetworkUnreachable => {
-                        debug!("socket.send_to {} failed: {}", remote.address, e);
-                    }
-                    _ => {
-                        // Also check raw OS error for cases not covered by ErrorKind
-                        if e.raw_os_error() == Some(65) || e.raw_os_error() == Some(49) {
-                            debug!("socket.send_to {} failed: {}", remote.address, e);
-                        } else {
-                            debug!("socket.send_to {} failed: {}", remote.address, e);
-                        }
-                    }
+                let is_fatal = matches!(
+                    e.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::NotConnected
+                );
+                if is_fatal {
+                    debug!("socket.send_to {} fatal error, aborting nomination: {}", remote.address, e);
+                    return Err(e.into());
                 }
-                return Err(e.into());
+                // Transient error (e.g., EHOSTUNREACH / os error 65 during route setup).
+                // Treat as a dropped send — wait for next RTO and retry.
+                debug!("socket.send_to {} transient error, will retry: {}", remote.address, e);
             }
         }
 
