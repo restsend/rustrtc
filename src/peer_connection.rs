@@ -1253,22 +1253,7 @@ impl PeerConnection {
             let rtcp_addr = {
                 let remote_desc = self.inner.remote_description.lock().unwrap();
                 if let Some(desc) = &*remote_desc {
-                    // Check if rtcp-mux is enabled in the first media section
-                    // If not, set rtcp_addr = remote_addr port + 1
-                    // Note: This assumes all media sections follow the same mux policy or we only care about the first one for now.
-                    // In a proper implementation, we might need per-transceiver transport or bundle handling.
-                    if let Some(section) = desc.media_sections.first() {
-                        let has_mux = section.attributes.iter().any(|a| a.key == "rtcp-mux");
-                        if !has_mux {
-                            let mut addr = pair.remote.address;
-                            addr.set_port(addr.port() + 1);
-                            Some(addr)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
+                    Self::remote_rtcp_addr_from_sdp(desc, pair.remote.address)
                 } else {
                     None
                 }
@@ -1680,6 +1665,43 @@ impl PeerConnection {
                 dtls.get_state()
             );
         }
+    }
+
+    fn remote_rtcp_addr_from_sdp(
+        desc: &SessionDescription,
+        remote_rtp_addr: std::net::SocketAddr,
+    ) -> Option<std::net::SocketAddr> {
+        let section = desc.media_sections.first()?;
+        if section.attributes.iter().any(|attr| attr.key == "rtcp-mux") {
+            return None;
+        }
+
+        if let Some(explicit_rtcp) = section
+            .attributes
+            .iter()
+            .find(|attr| attr.key == "rtcp")
+            .and_then(|attr| Self::parse_rtcp_attribute(attr, remote_rtp_addr.ip()))
+        {
+            return Some(explicit_rtcp);
+        }
+
+        let mut addr = remote_rtp_addr;
+        addr.set_port(addr.port() + 1);
+        Some(addr)
+    }
+
+    fn parse_rtcp_attribute(
+        attr: &Attribute,
+        fallback_ip: IpAddr,
+    ) -> Option<std::net::SocketAddr> {
+        let value = attr.value.as_deref()?;
+        let mut parts = value.split_whitespace();
+        let port = parts.next()?.parse::<u16>().ok()?;
+        let ip = match (parts.next(), parts.next(), parts.next()) {
+            (Some("IN"), Some("IP4" | "IP6"), Some(host)) => host.parse().ok()?,
+            _ => fallback_ip,
+        };
+        Some(std::net::SocketAddr::new(ip, port))
     }
 
     fn create_rtcp_loop(
@@ -5597,6 +5619,51 @@ a=mid:0
             rtcp_addr.unwrap().port(),
             8001,
             "RTCP port should be RTP port + 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn rtp_mode_rtcp_explicit_port_answerer() {
+        use crate::TransportMode;
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+        let pc = PeerConnection::new(config);
+
+        let remote_sdp = "v=0\r\n\
+                          o=- 1 1 IN IP4 10.0.0.1\r\n\
+                          s=-\r\n\
+                          t=0 0\r\n\
+                          c=IN IP4 10.0.0.1\r\n\
+                          m=audio 8000 RTP/AVP 0\r\n\
+                          a=rtcp:9000\r\n\
+                          a=rtpmap:0 PCMU/8000\r\n\
+                          a=sendrecv\r\n";
+        let desc = SessionDescription::parse(SdpType::Offer, remote_sdp).unwrap();
+        pc.set_remote_description(desc).await.unwrap();
+
+        let mut state_rx = pc.subscribe_peer_state();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if *state_rx.borrow() == PeerConnectionState::Connected {
+                    return;
+                }
+                let _ = state_rx.changed().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let rtp_transport = pc.inner.rtp_transport.lock().unwrap().clone().unwrap();
+        let ice_conn = rtp_transport.ice_conn();
+        let rtcp_addr = *ice_conn.remote_rtcp_addr.read().unwrap();
+        assert!(
+            rtcp_addr.is_some(),
+            "Explicit a=rtcp must produce a separate RTCP addr"
+        );
+        assert_eq!(
+            rtcp_addr.unwrap().port(),
+            9000,
+            "RTCP port should honor explicit a=rtcp"
         );
     }
 
