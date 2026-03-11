@@ -4,6 +4,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 use tokio::sync::watch;
 use tracing::debug;
@@ -14,20 +15,23 @@ pub struct IceConn {
     pub remote_rtcp_addr: RwLock<Option<SocketAddr>>,
     pub dtls_receiver: RwLock<Option<Weak<dyn PacketReceiver>>>,
     pub rtp_receiver: RwLock<Option<Weak<dyn PacketReceiver>>>,
+    pub latch_on_rtp: AtomicBool,
 }
 
 impl IceConn {
-    pub fn new(
-        socket_rx: watch::Receiver<Option<IceSocketWrapper>>,
-        remote_addr: SocketAddr,
-    ) -> Arc<Self> {
+    pub fn new(socket_rx: watch::Receiver<Option<IceSocketWrapper>>, remote_addr: SocketAddr) -> Arc<Self> {
         Arc::new(Self {
             socket_rx,
             remote_addr: RwLock::new(remote_addr),
             remote_rtcp_addr: RwLock::new(None),
             dtls_receiver: RwLock::new(None),
             rtp_receiver: RwLock::new(None),
+            latch_on_rtp: AtomicBool::new(false),
         })
+    }
+
+    pub fn enable_latch_on_rtp(&self) {
+        self.latch_on_rtp.store(true, Ordering::Relaxed);
     }
 
     pub fn set_remote_rtcp_addr(&self, addr: Option<SocketAddr>) {
@@ -157,6 +161,14 @@ impl PacketReceiver for IceConn {
             }
         } else if (128..192).contains(&first_byte) {
             // RTP / RTCP
+            if self.latch_on_rtp.load(Ordering::Relaxed) && addr != current_remote {
+                *self.remote_addr.write().unwrap() = addr;
+                let current_rtcp = *self.remote_rtcp_addr.read().unwrap();
+                if let Some(mut rtcp_addr) = current_rtcp {
+                    rtcp_addr.set_ip(addr.ip());
+                    *self.remote_rtcp_addr.write().unwrap() = Some(rtcp_addr);
+                }
+            }
             let receiver = {
                 let rx_lock = self.rtp_receiver.read().unwrap();
                 if let Some(rx) = &*rx_lock {
@@ -181,6 +193,8 @@ impl PacketReceiver for IceConn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use std::net::{IpAddr, Ipv4Addr};
     use tokio::net::UdpSocket;
     use tokio::sync::watch;
 
@@ -228,5 +242,27 @@ mod tests {
         conn.send_rtcp(b"rtcp").await.unwrap();
         let (len, _) = rtcp_receiver.recv_from(&mut buf).await.unwrap();
         assert_eq!(&buf[..len], b"rtcp");
+    }
+
+    struct NoopReceiver;
+
+    #[async_trait]
+    impl PacketReceiver for NoopReceiver {
+        async fn receive(&self, _packet: Bytes, _addr: SocketAddr) {}
+    }
+
+    #[tokio::test]
+    async fn test_ice_conn_latches_remote_addr_on_rtp() {
+        let (_tx, rx) = watch::channel(None);
+        let initial_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4000);
+        let latched_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
+        let conn = IceConn::new(rx, initial_addr);
+        conn.enable_latch_on_rtp();
+        conn.set_rtp_receiver(Arc::new(NoopReceiver));
+
+        conn.receive(Bytes::from_static(&[0x80, 0x00, 0x00, 0x00]), latched_addr)
+            .await;
+
+        assert_eq!(*conn.remote_addr.read().unwrap(), latched_addr);
     }
 }
