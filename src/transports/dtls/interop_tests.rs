@@ -87,7 +87,7 @@ async fn test_interop_rustrtc_client_webrtc_server() -> Result<()> {
 
     let cert = generate_certificate()?;
     let (client_dtls, mut incoming_rx, runner) =
-        DtlsTransport::new(client_conn, cert, true, 1500).await?;
+        DtlsTransport::new(client_conn, cert, true, 1500, None).await?;
     tokio::spawn(runner);
 
     // Wait for handshake
@@ -148,9 +148,7 @@ async fn test_interop_rustrtc_client_openssl_server() -> Result<()> {
     info!("OpenSSL version: {}", openssl_version.trim());
 
     // Check if s_server supports -dtls1_2
-    let help_output = Command::new("openssl")
-        .args(["s_server", "-help"])
-        .output();
+    let help_output = Command::new("openssl").args(["s_server", "-help"]).output();
     if let Ok(output) = help_output {
         let help_text = String::from_utf8_lossy(&output.stderr);
         if !help_text.contains("dtls1_2") {
@@ -244,7 +242,7 @@ async fn test_interop_rustrtc_client_openssl_server() -> Result<()> {
 
     let cert = generate_certificate()?;
     let (client_dtls, _incoming_rx, runner) =
-        DtlsTransport::new(client_conn, cert, true, 1500).await?;
+        DtlsTransport::new(client_conn, cert, true, 1500, None).await?;
     tokio::spawn(runner);
 
     // Poll for handshake completion

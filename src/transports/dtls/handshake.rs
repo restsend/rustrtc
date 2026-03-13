@@ -458,6 +458,39 @@ impl CertificateMessage {
             buf.put_slice(cert);
         }
     }
+    pub fn decode(buf: &mut Bytes) -> Result<Self> {
+        if buf.len() < 3 {
+            bail!("Certificate message too short");
+        }
+
+        let total_len = u32::from_be_bytes([0, buf[0], buf[1], buf[2]]) as usize;
+        buf.advance(3);
+
+        if buf.len() < total_len {
+            bail!("Certificate message shorter than declared length");
+        }
+
+        let mut certs_buf = buf.split_to(total_len);
+        let mut certificates = Vec::new();
+
+        while !certs_buf.is_empty() {
+            if certs_buf.len() < 3 {
+                bail!("Certificate entry missing length");
+            }
+
+            let cert_len =
+                u32::from_be_bytes([0, certs_buf[0], certs_buf[1], certs_buf[2]]) as usize;
+            certs_buf.advance(3);
+
+            if certs_buf.len() < cert_len {
+                bail!("Certificate entry shorter than declared length");
+            }
+
+            certificates.push(certs_buf.split_to(cert_len).to_vec());
+        }
+
+        Ok(Self { certificates })
+    }
 }
 
 #[derive(Debug, Clone)]

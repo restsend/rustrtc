@@ -109,9 +109,12 @@ async fn bench_dtls() {
     let cert1 = rustrtc::transports::dtls::generate_certificate().unwrap();
     let cert2 = rustrtc::transports::dtls::generate_certificate().unwrap();
 
-    let (dtls1, _rx_data1, runner1) = DtlsTransport::new(conn1, cert1, true, 2000).await.unwrap();
-    let (dtls2, mut rx_data2, runner2) =
-        DtlsTransport::new(conn2, cert2, false, 2000).await.unwrap();
+    let (dtls1, _rx_data1, runner1) = DtlsTransport::new(conn1, cert1, true, 2000, None)
+        .await
+        .unwrap();
+    let (dtls2, mut rx_data2, runner2) = DtlsTransport::new(conn2, cert2, false, 2000, None)
+        .await
+        .unwrap();
 
     tokio::spawn(runner1);
     tokio::spawn(runner2);

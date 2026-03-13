@@ -167,6 +167,107 @@ impl SessionDescription {
         }
         out
     }
+    pub fn dtls_fingerprint(&self) -> SdpResult<Option<SdpFingerprint>> {
+        let mut fingerprint = None;
+
+        for attr in &self.session.attributes {
+            collect_dtls_fingerprint(attr, &mut fingerprint)?;
+        }
+
+        for section in &self.media_sections {
+            for attr in &section.attributes {
+                collect_dtls_fingerprint(attr, &mut fingerprint)?;
+            }
+        }
+
+        Ok(fingerprint)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdpFingerprint {
+    pub algorithm: String,
+    pub value: String,
+}
+
+impl SdpFingerprint {
+    pub fn parse(value: &str) -> SdpResult<Self> {
+        let mut parts = value.split_whitespace();
+        let algorithm = parts
+            .next()
+            .ok_or_else(|| SdpError::Parse("fingerprint missing algorithm".into()))?;
+        let value = parts
+            .next()
+            .ok_or_else(|| SdpError::Parse("fingerprint missing value".into()))?;
+
+        if parts.next().is_some() {
+            return Err(SdpError::Parse(
+                "fingerprint has unexpected trailing data".into(),
+            ));
+        }
+
+        Ok(Self {
+            algorithm: algorithm.to_ascii_lowercase(),
+            value: normalize_fingerprint_value(value)?,
+        })
+    }
+}
+
+fn collect_dtls_fingerprint(
+    attr: &Attribute,
+    current: &mut Option<SdpFingerprint>,
+) -> SdpResult<()> {
+    if attr.key != "fingerprint" {
+        return Ok(());
+    }
+
+    let value = attr
+        .value
+        .as_deref()
+        .ok_or_else(|| SdpError::Parse("fingerprint attribute missing value".into()))?;
+    let parsed = SdpFingerprint::parse(value)?;
+
+    if let Some(existing) = current {
+        if existing != &parsed {
+            return Err(SdpError::Parse(
+                "conflicting DTLS fingerprint attributes in SDP".into(),
+            ));
+        }
+    } else {
+        *current = Some(parsed);
+    }
+
+    Ok(())
+}
+
+fn normalize_fingerprint_value(value: &str) -> SdpResult<String> {
+    let normalized = value
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace() && *c != ':')
+        .collect::<String>()
+        .to_ascii_uppercase();
+
+    if normalized.is_empty() || normalized.len() % 2 != 0 {
+        return Err(SdpError::Parse("fingerprint hex length is invalid".into()));
+    }
+
+    if !normalized.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(SdpError::Parse(
+            "fingerprint contains non-hex characters".into(),
+        ));
+    }
+
+    let mut formatted = String::with_capacity(normalized.len() + normalized.len() / 2);
+    for (index, chunk) in normalized.as_bytes().chunks(2).enumerate() {
+        if index > 0 {
+            formatted.push(':');
+        }
+        formatted.push(chunk[0] as char);
+        formatted.push(chunk[1] as char);
+    }
+
+    Ok(formatted)
+}
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

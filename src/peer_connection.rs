@@ -287,6 +287,7 @@ struct PeerConnectionInner {
     ice_transport: IceTransport,
     certificate: Arc<dtls::Certificate>,
     dtls_fingerprint: String,
+    remote_dtls_fingerprint: Mutex<Option<String>>,
     dtls_transport: Mutex<Option<Arc<DtlsTransport>>>,
     rtp_transport: Mutex<Option<Arc<RtpTransport>>>,
     sctp_transport: Mutex<Option<Arc<SctpTransport>>>,
@@ -369,6 +370,7 @@ impl PeerConnection {
             ice_transport,
             certificate,
             dtls_fingerprint,
+            remote_dtls_fingerprint: Mutex::new(None),
             dtls_transport: Mutex::new(None),
             rtp_transport: Mutex::new(None),
             sctp_transport: Mutex::new(None),
@@ -714,6 +716,28 @@ impl PeerConnection {
 
     pub async fn set_remote_description(&self, desc: SessionDescription) -> RtcResult<()> {
         self.inner.validate_sdp_type(&desc.sdp_type)?;
+        let remote_dtls_fingerprint = if self.config().transport_mode == TransportMode::WebRtc {
+            match desc.dtls_fingerprint() {
+                Ok(Some(fingerprint)) if fingerprint.algorithm == "sha-256" => {
+                    Some(fingerprint.value)
+                }
+                Ok(Some(fingerprint)) => {
+                    return Err(RtcError::InvalidConfiguration(format!(
+                        "unsupported DTLS fingerprint algorithm: {}",
+                        fingerprint.algorithm
+                    )));
+                }
+                Ok(None) => None,
+                Err(err) => {
+                    return Err(RtcError::InvalidConfiguration(format!(
+                        "invalid DTLS fingerprint in remote SDP: {}",
+                        err
+                    )));
+                }
+            }
+        } else {
+            None
+        };
 
         // Check if this is a reinvite (not first negotiation)
         let is_reinvite = {
@@ -810,6 +834,20 @@ impl PeerConnection {
                     let _ = self.inner.dtls_role.send(Some(r));
                 }
             }
+        }
+
+        {
+            // Cache the remote fingerprint before ICE/DTLS starts so the handshake can bind
+            // the SDP identity to the certificate actually presented on the wire.
+            let dtls_started = self.inner.dtls_transport.lock().unwrap().is_some();
+            let mut stored = self.inner.remote_dtls_fingerprint.lock().unwrap();
+            if dtls_started && *stored != remote_dtls_fingerprint {
+                return Err(RtcError::InvalidState(
+                    "changing remote DTLS fingerprint after transport start is not supported"
+                        .into(),
+                ));
+            }
+            *stored = remote_dtls_fingerprint;
         }
 
         // Start ICE
@@ -1362,11 +1400,13 @@ impl PeerConnection {
             return Ok(Box::pin(combined_loop) as Pin<Box<dyn Future<Output = ()> + Send>>);
         }
 
+        let remote_dtls_fingerprint = self.inner.remote_dtls_fingerprint.lock().unwrap().clone();
         let (dtls, incoming_data_rx, dtls_runner) = DtlsTransport::new(
             ice_conn,
             self.inner.certificate.as_ref().clone(),
             is_client,
             self.config().dtls_buffer_size,
+            remote_dtls_fingerprint,
         )
         .await
         .map_err(|e| RtcError::Internal(format!("DTLS failed: {}", e)))?;
@@ -1694,10 +1734,7 @@ impl PeerConnection {
         Some(addr)
     }
 
-    fn parse_rtcp_attribute(
-        attr: &Attribute,
-        fallback_ip: IpAddr,
-    ) -> Option<std::net::SocketAddr> {
+    fn parse_rtcp_attribute(attr: &Attribute, fallback_ip: IpAddr) -> Option<std::net::SocketAddr> {
         let value = attr.value.as_deref()?;
         let mut parts = value.split_whitespace();
         let port = parts.next()?.parse::<u16>().ok()?;
@@ -4075,12 +4112,9 @@ impl RtpSender {
         octet_count: u32,
         now: SystemTime,
     ) -> SenderReport {
-        let duration = now
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
+        let duration = now.duration_since(UNIX_EPOCH).unwrap_or_default();
         let ntp_seconds = duration.as_secs().saturating_add(2_208_988_800);
-        let ntp_fraction =
-            (duration.subsec_nanos() as u64 * (1u64 << 32) / 1_000_000_000) as u32;
+        let ntp_fraction = (duration.subsec_nanos() as u64 * (1u64 << 32) / 1_000_000_000) as u32;
 
         SenderReport {
             sender_ssrc,

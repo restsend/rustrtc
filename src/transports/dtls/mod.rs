@@ -687,6 +687,44 @@ impl DtlsInner {
         Ok(())
     }
 
+    async fn handle_certificate(
+        &self,
+        msg: HandshakeMessage,
+        ctx: &mut HandshakeContext,
+    ) -> Result<()> {
+        let mut body = msg.body.clone();
+        let certificate = CertificateMessage::decode(&mut body)?;
+        let Some(leaf_certificate) = certificate.certificates.first() else {
+            *self.state.lock().unwrap() = DtlsState::Failed;
+            let _ = self.state_tx.send(DtlsState::Failed);
+            return Err(anyhow::anyhow!(
+                "DTLS certificate message did not contain a leaf certificate"
+            ));
+        };
+
+        // Compare the certificate hash to SDP before accepting any key material from it.
+        let actual_fingerprint = fingerprint_from_der(leaf_certificate);
+        if let Some(expected_fingerprint) = &ctx.expected_remote_fingerprint
+            && &actual_fingerprint != expected_fingerprint
+        {
+            *self.state.lock().unwrap() = DtlsState::Failed;
+            let _ = self.state_tx.send(DtlsState::Failed);
+            return Err(anyhow::anyhow!(
+                "DTLS fingerprint mismatch: expected {}, got {}",
+                expected_fingerprint,
+                actual_fingerprint
+            ));
+        }
+
+        if let Err(e) = certificate_public_key(leaf_certificate) {
+            *self.state.lock().unwrap() = DtlsState::Failed;
+            let _ = self.state_tx.send(DtlsState::Failed);
+            return Err(e);
+        }
+        ctx.peer_certificate = Some(leaf_certificate.clone());
+
+        Ok(())
+    }
     async fn handle_client_hello(
         &self,
         msg: HandshakeMessage,
@@ -1355,6 +1393,33 @@ impl DtlsInner {
         if is_client {
             let mut body = msg.body.clone();
             if let Ok(server_key_exchange) = ServerKeyExchange::decode(&mut body) {
+                let Some(peer_certificate) = ctx.peer_certificate.as_deref() else {
+                    *self.state.lock().unwrap() = DtlsState::Failed;
+                    let _ = self.state_tx.send(DtlsState::Failed);
+                    return Err(anyhow::anyhow!(
+                        "Received ServerKeyExchange before a verifiable DTLS certificate"
+                    ));
+                };
+                let (Some(client_random), Some(server_random)) =
+                    (&ctx.client_random, &ctx.server_random)
+                else {
+                    *self.state.lock().unwrap() = DtlsState::Failed;
+                    let _ = self.state_tx.send(DtlsState::Failed);
+                    return Err(anyhow::anyhow!(
+                        "Missing DTLS random values for ServerKeyExchange verification"
+                    ));
+                };
+
+                if let Err(e) = verify_server_key_exchange_signature(
+                    peer_certificate,
+                    client_random,
+                    server_random,
+                    &server_key_exchange,
+                ) {
+                    *self.state.lock().unwrap() = DtlsState::Failed;
+                    let _ = self.state_tx.send(DtlsState::Failed);
+                    return Err(e);
+                }
                 ctx.peer_public_key = Some(server_key_exchange.public_key);
             }
         }
