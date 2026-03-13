@@ -3935,7 +3935,12 @@ impl RtpSender {
             let mut sequence_number = next_seq.load(Ordering::SeqCst);
             let mut last_source_ts: Option<u32> = None;
             let mut timestamp_offset = random_u32(); // Start with random offset
-            let mut rtcp_interval = tokio::time::interval(std::time::Duration::from_secs(3));
+            // Delay the first SR so the initial RTP burst is not immediately followed by RTCP
+            // on the same 5-tuple, which can confuse consumers that are expecting RTP first.
+            let mut rtcp_interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(3),
+                std::time::Duration::from_secs(3),
+            );
             rtcp_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let notified = stop_rx.notified();
             tokio::pin!(notified);
