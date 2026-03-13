@@ -313,6 +313,56 @@ async fn test_dtls_handshake_fails_on_fingerprint_mismatch() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn test_dtls_fragment_reassembly_rejects_oversized_message() -> Result<()> {
+    let client_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let server_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+
+    let client_addr = client_socket.local_addr()?;
+    let server_addr = server_socket.local_addr()?;
+
+    let (server_socket_tx, _) = watch::channel(Some(IceSocketWrapper::Udp(server_socket.clone())));
+    let server_conn = IceConn::new(server_socket_tx.subscribe(), client_addr);
+
+    let cert = generate_certificate()?;
+    let (server_dtls, _server_rx, runner) =
+        DtlsTransport::new(server_conn.clone(), cert, false, 64, None).await?;
+    tokio::spawn(runner);
+    spawn_socket_pump(server_socket, server_conn);
+
+    for (sequence_number, fragment_offset) in [(0, 0u32), (1, 48u32)] {
+        let fragment_body = Bytes::from(vec![0u8; 48]);
+        let handshake_msg = HandshakeMessage {
+            msg_type: HandshakeType::ClientHello,
+            total_length: 96,
+            message_seq: 0,
+            fragment_offset,
+            fragment_length: 48,
+            body: fragment_body,
+        };
+
+        let mut handshake_buf = BytesMut::new();
+        handshake_msg.encode(&mut handshake_buf);
+        let record = DtlsRecord {
+            content_type: ContentType::Handshake,
+            version: ProtocolVersion::DTLS_1_2,
+            epoch: 0,
+            sequence_number,
+            payload: handshake_buf.freeze(),
+        };
+
+        let mut record_buf = BytesMut::new();
+        record.encode(&mut record_buf);
+        client_socket.send_to(&record_buf, server_addr).await?;
+    }
+
+    assert!(matches!(
+        wait_for_terminal_state(&server_dtls).await?,
+        DtlsState::Failed
+    ));
+    Ok(())
+}
+
 #[test]
 fn test_verify_server_key_exchange_signature_rejects_tampering() -> Result<()> {
     let certificate = generate_certificate()?;

@@ -175,6 +175,7 @@ struct DtlsInner {
     write_epoch: AtomicU16,
     is_client: bool,
     expected_remote_fingerprint: Option<String>,
+    handshake_reassembly_limit: usize,
 }
 
 pub struct DtlsTransport {
@@ -225,7 +226,7 @@ impl DtlsTransport {
         conn: Arc<IceConn>,
         certificate: Certificate,
         is_client: bool,
-        _buffer_size: usize,
+        buffer_size: usize,
         expected_remote_fingerprint: Option<String>,
     ) -> Result<(
         Arc<Self>,
@@ -246,6 +247,7 @@ impl DtlsTransport {
             write_epoch: AtomicU16::new(0),
             is_client,
             expected_remote_fingerprint,
+            handshake_reassembly_limit: buffer_size.max(1),
         });
 
         let close_tx = Arc::new(tokio::sync::Notify::new());
@@ -390,6 +392,11 @@ impl Drop for DtlsTransport {
 }
 
 impl DtlsInner {
+    fn mark_failed(&self) {
+        *self.state.lock().unwrap() = DtlsState::Failed;
+        let _ = self.state_tx.send(DtlsState::Failed);
+    }
+
     async fn handle_retransmit(&self, ctx: &HandshakeContext, _is_client: bool) {
         if *self.state.lock().unwrap() != DtlsState::Handshaking {
             return;
@@ -585,6 +592,16 @@ impl DtlsInner {
                 Ok(Some(msg)) => {
                     let consumed = msg_buf.len() - body.len();
                     let raw_msg = msg_buf.slice(0..consumed);
+                    let fragment_end = msg
+                        .fragment_offset
+                        .checked_add(msg.fragment_length)
+                        .ok_or_else(|| anyhow::anyhow!("DTLS fragment range overflow"))?;
+                    if fragment_end > msg.total_length {
+                        self.mark_failed();
+                        return Err(anyhow::anyhow!(
+                            "DTLS fragment range exceeds declared message length"
+                        ));
+                    }
 
                     if msg.message_seq < ctx.recv_message_seq {
                         // If we just processed a HelloVerifyRequest, the server may
@@ -648,10 +665,30 @@ impl DtlsInner {
                     let (processing_msg, processing_raw) = if msg.total_length
                         != msg.fragment_length
                     {
+                        if msg.total_length as usize > self.handshake_reassembly_limit {
+                            self.mark_failed();
+                            return Err(anyhow::anyhow!(
+                                "DTLS handshake message exceeds reassembly limit: {} > {}",
+                                msg.total_length,
+                                self.handshake_reassembly_limit
+                            ));
+                        }
+
                         if ctx.incomplete_msg_seq != msg.message_seq || msg.fragment_offset == 0 {
                             // New message or first fragment, reset buffer
                             ctx.incomplete_handshake.clear();
                             ctx.incomplete_msg_seq = msg.message_seq;
+                        }
+
+                        if ctx.incomplete_handshake.len() + msg.body.len()
+                            > self.handshake_reassembly_limit
+                        {
+                            self.mark_failed();
+                            return Err(anyhow::anyhow!(
+                                "DTLS handshake reassembly buffer exceeded limit: {} > {}",
+                                ctx.incomplete_handshake.len() + msg.body.len(),
+                                self.handshake_reassembly_limit
+                            ));
                         }
 
                         ctx.incomplete_handshake.extend_from_slice(&msg.body[..]);
