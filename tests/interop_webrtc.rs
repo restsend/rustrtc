@@ -7,10 +7,32 @@ use tokio::time::timeout;
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
+use webrtc::api::setting_engine::SettingEngine;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration as WebrtcConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+
+fn build_webrtc_api() -> Result<webrtc::api::API> {
+    let mut m = MediaEngine::default();
+    m.register_default_codecs()?;
+
+    let mut registry = Registry::new();
+    registry = register_default_interceptors(registry, &mut m)?;
+
+    let mut setting_engine = SettingEngine::default();
+    // These same-host interop tests are sensitive to transient IPv6/link-local
+    // interfaces on the developer machine. Constrain the webrtc-rs side to
+    // stable IPv4 candidates and allow loopback for local self-connectivity.
+    setting_engine.set_ip_filter(Box::new(|ip| ip.is_ipv4()));
+    setting_engine.set_include_loopback_candidate(true);
+
+    Ok(APIBuilder::new()
+        .with_setting_engine(setting_engine)
+        .with_media_engine(m)
+        .with_interceptor_registry(registry)
+        .build())
+}
 
 #[tokio::test]
 async fn interop_ice_dtls_handshake() -> Result<()> {
@@ -25,14 +47,7 @@ async fn interop_ice_dtls_handshake() -> Result<()> {
     rust_pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
 
     // 2. Create WebRTC PeerConnection (Answerer)
-    let mut m = MediaEngine::default();
-    m.register_default_codecs()?;
-    let mut registry = Registry::new();
-    registry = register_default_interceptors(registry, &mut m)?;
-    let api = APIBuilder::new()
-        .with_media_engine(m)
-        .with_interceptor_registry(registry)
-        .build();
+    let api = build_webrtc_api()?;
 
     let webrtc_config = WebrtcConfiguration::default();
     let webrtc_pc = api.new_peer_connection(webrtc_config).await?;
@@ -132,14 +147,7 @@ async fn interop_vp8_echo() -> Result<()> {
     transceiver.set_sender(Some(sender));
 
     // 2. Create WebRTC PeerConnection (Answerer)
-    let mut m = MediaEngine::default();
-    m.register_default_codecs()?;
-    let mut registry = Registry::new();
-    registry = register_default_interceptors(registry, &mut m)?;
-    let api = APIBuilder::new()
-        .with_media_engine(m)
-        .with_interceptor_registry(registry)
-        .build();
+    let api = build_webrtc_api()?;
 
     let webrtc_config = WebrtcConfiguration::default();
     let webrtc_pc = api.new_peer_connection(webrtc_config).await?;
@@ -319,14 +327,7 @@ async fn interop_vp8_echo_with_pli() -> Result<()> {
     transceiver.set_sender(Some(sender));
 
     // 2. Create WebRTC PeerConnection (Answerer)
-    let mut m = MediaEngine::default();
-    m.register_default_codecs()?;
-    let mut registry = Registry::new();
-    registry = register_default_interceptors(registry, &mut m)?;
-    let api = APIBuilder::new()
-        .with_media_engine(m)
-        .with_interceptor_registry(registry)
-        .build();
+    let api = build_webrtc_api()?;
 
     let webrtc_config = WebrtcConfiguration::default();
     let webrtc_pc = Arc::new(api.new_peer_connection(webrtc_config).await?);
@@ -489,14 +490,7 @@ async fn interop_ice_close_triggers_pc_close() -> Result<()> {
     rust_pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
 
     // 2. Create WebRTC PeerConnection (Answerer)
-    let mut m = MediaEngine::default();
-    m.register_default_codecs()?;
-    let mut registry = Registry::new();
-    registry = register_default_interceptors(registry, &mut m)?;
-    let api = APIBuilder::new()
-        .with_media_engine(m)
-        .with_interceptor_registry(registry)
-        .build();
+    let api = build_webrtc_api()?;
 
     let webrtc_config = WebrtcConfiguration::default();
     let webrtc_pc = api.new_peer_connection(webrtc_config).await?;

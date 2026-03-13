@@ -49,14 +49,9 @@ async fn handle_offer(Json(payload): Json<OfferRequest>) -> impl IntoResponse {
     info!("Received offer");
 
     let mut config = RtcConfiguration::default();
-    // Enable VP8
     let mut caps = rustrtc::config::MediaCapabilities::default();
-    caps.video = vec![rustrtc::config::VideoCapability {
-        payload_type: 96,
-        codec_name: "VP8".to_string(),
-        clock_rate: 90000,
-        rtcp_fbs: vec!["nack".to_string(), "pli".to_string()],
-    }];
+    // Keep the example aligned with the runtime's default VP8 negotiation model.
+    caps.video = vec![rustrtc::config::VideoCapability::default()];
     config.media_capabilities = Some(caps);
 
     let pc = PeerConnection::new(config);
@@ -120,12 +115,8 @@ async fn handle_offer(Json(payload): Json<OfferRequest>) -> impl IntoResponse {
 async fn run_client(addr_str: &str) {
     let mut config = RtcConfiguration::default();
     let mut caps = rustrtc::config::MediaCapabilities::default();
-    caps.video = vec![rustrtc::config::VideoCapability {
-        payload_type: 96,
-        codec_name: "VP8".to_string(),
-        clock_rate: 90000,
-        rtcp_fbs: vec!["nack".to_string(), "pli".to_string()],
-    }];
+    // Keep the example aligned with the runtime's default VP8 negotiation model.
+    caps.video = vec![rustrtc::config::VideoCapability::default()];
     config.media_capabilities = Some(caps);
 
     let pc = PeerConnection::new(config);
@@ -174,11 +165,7 @@ async fn run_client(addr_str: &str) {
     let (source, track, _) = rustrtc::media::sample_track(rustrtc::media::MediaKind::Video, 96);
     let sender = rustrtc::peer_connection::RtpSender::builder(track, 12345)
         .stream_id("stream".to_string())
-        .params(rustrtc::RtpCodecParameters {
-            payload_type: 96,
-            clock_rate: 90000,
-            channels: 0,
-        })
+        .params(rustrtc::RtpCodecParameters::default())
         .build();
 
     let transceiver = pc.add_transceiver(

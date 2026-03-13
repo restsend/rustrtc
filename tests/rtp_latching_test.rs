@@ -181,15 +181,14 @@ async fn test_rtp_latching() -> Result<()> {
     };
     println!("Remote 2 (Migrated) at {}", addr2);
 
-    // Retrieve PC's listening address
-    // We assume the first media section's port is binding
-    let local_desc = pc.local_description().unwrap();
-    let pc_port = local_desc.media_sections[0].port;
-    if pc_port == 0 {
-        panic!("PC port is 0, gathering failed?");
-    }
-    // Since PC is bound to 0.0.0.0, it should be reachable on all local IPs
-    let pc_addr: SocketAddr = SocketAddr::new(ip1, pc_port);
+    // Send the latching STUN probe to the currently selected local candidate
+    // instead of assuming a specific interface address from the test harness.
+    let selected_pair = pc
+        .ice_transport()
+        .get_selected_pair()
+        .await
+        .expect("selected ICE pair should exist after RTP mode connects");
+    let pc_addr = selected_pair.local.address;
     println!("PC listening at {}", pc_addr);
 
     // Send STUN Binding Request from socket2 to PC to trigger latching
@@ -199,6 +198,21 @@ async fn test_rtp_latching() -> Result<()> {
 
     println!("Sending STUN Binding Request from {} to {}", addr2, pc_addr);
     socket2.send_to(&req_bytes, pc_addr).await?;
+
+    let wait_for_latch = async {
+        loop {
+            if let Some(pair) = pc.ice_transport().get_selected_pair().await
+                && pair.remote.address == addr2
+            {
+                return Ok::<(), anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+
+    tokio::time::timeout(Duration::from_secs(2), wait_for_latch)
+        .await
+        .expect("timed out waiting for ICE latching update")?;
 
     // 6. Verify PC sends to addr2
     println!("Waiting for packets on addr2...");

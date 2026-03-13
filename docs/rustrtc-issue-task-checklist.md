@@ -52,6 +52,10 @@
 用途:
 - 验证跨栈语义而不是只测内部函数
 
+说明:
+- 同机 `webrtc-rs` 回归优先使用稳定的 `IPv4 + loopback` 候选，避免开发机临时网卡、`link-local IPv6` 和接口作用域差异导致测试抖动
+- 若要验证真实 `IPv6` host candidate 行为，应单独放入专门的 `network/ipv6-*` 任务和测试入口，不与主回归路径混跑
+
 ### L3: 专门测试客户端
 
 适用场景:
@@ -500,7 +504,49 @@ Follow-up:
 - 不支持时有清晰自动验证
 - 支持时有完整 TCP 建连回归
 
-### ISSUE-11 `media/default-video-path-alignment`
+### ISSUE-11 `network/ipv6-host-candidate-validation`
+
+目标:
+- 将“同机回归稳定性”与“真实 IPv6 host candidate 支持验证”分离
+
+任务:
+1. 明确 `tests/interop_webrtc.rs` 这类同机主回归默认只跑 `IPv4 + loopback`
+2. 新增专门的 IPv6 测试入口，覆盖全局 IPv6 地址和 `link-local` 地址的行为差异
+3. 对 `link-local` candidate 的接口作用域、可达性和失败模式做显式约束
+4. 若当前暂不支持可路由 IPv6 host candidate，需要在文档和日志中明确声明
+
+自动测试方案:
+- 扩展:
+  - `tests/interop_webrtc.rs`
+    - 保持主路径稳定回归，只使用 `IPv4 + loopback`
+- 新增:
+  - `tests/interop_webrtc_ipv6.rs`
+    - `global_ipv6_host_candidate_connects_when_available`
+    - `link_local_ipv6_candidate_is_scope_aware`
+    - `unsupported_ipv6_mode_fails_with_clear_reason`
+  - `tests/ice_ipv6_candidate_filtering.rs`
+    - `same_host_regression_ignores_transient_link_local_interfaces`
+    - `ipv6_candidate_logging_is_explicit`
+
+专门客户端需求:
+- 建议新增 `tests/clients/ipv6_peer/`
+- 功能:
+  - 枚举本机可用 IPv6 接口并区分 `global` / `link-local`
+  - 构造带接口作用域的 candidate 或验证被明确拒绝
+- 说明:
+  - 浏览器或 `webrtc-rs` 默认 gather 结果会受开发机网络环境影响，不适合直接充当全部 IPv6 语义验证器
+
+建议命令:
+- `cargo test --test interop_webrtc`
+- `cargo test --test interop_webrtc_ipv6`
+- `cargo test --test ice_ipv6_candidate_filtering`
+
+完成门禁:
+- 主回归路径不再被临时 IPv6/link-local 候选干扰
+- 若支持 IPv6，则有单独自动测试验证可达性和接口作用域
+- 若暂不支持 IPv6 host candidate，则有清晰失败语义和自动测试覆盖
+
+### ISSUE-12 `media/default-video-path-alignment`
 
 目标:
 - 对齐默认视频 codec 收发链路
@@ -529,7 +575,7 @@ Follow-up:
 完成门禁:
 - 默认视频能力不再出现“协商成功但媒体解不开”的假成功
 
-### ISSUE-12 `cc/remb-twcc-closure`
+### ISSUE-13 `cc/remb-twcc-closure`
 
 目标:
 - 让 REMB/TWCC 从报文层实现推进到控制闭环
@@ -562,7 +608,7 @@ Follow-up:
 完成门禁:
 - 反馈到控制行为形成可测闭环
 
-### ISSUE-13 `media/vp9-support`
+### ISSUE-14 `media/vp9-support`
 
 目标:
 - 增加 VP9 协商和收发链路
@@ -596,7 +642,7 @@ Follow-up:
 完成门禁:
 - `VP9 only` 和 `VP8 + VP9 fallback` 可自动验证
 
-### ISSUE-14 `media/h265-support`
+### ISSUE-15 `media/h265-support`
 
 目标:
 - 增加 H.265 显式启用、协商、收发和回退
@@ -634,7 +680,7 @@ Follow-up:
 - 显式启用才广告 H.265
 - `H264 + H.265 fallback` 可自动验证
 
-### ISSUE-15 `stats/transport-and-datachannel`
+### ISSUE-16 `stats/transport-and-datachannel`
 
 目标:
 - 让 stats 类型与实际产出一致
@@ -665,7 +711,7 @@ Follow-up:
 完成门禁:
 - `StatsKind` 暴露的关键类型均有真实产出
 
-### ISSUE-16 `ops/security-observability`
+### ISSUE-17 `ops/security-observability`
 
 目标:
 - 为安全和异常路径增加可观测性
@@ -693,7 +739,7 @@ Follow-up:
 完成门禁:
 - 关键异常路径都能被自动触发并观测到
 
-### ISSUE-17 `docs/implementation-scope-sync`
+### ISSUE-18 `docs/implementation-scope-sync`
 
 目标:
 - 保持文档、配置和测试事实一致
@@ -759,8 +805,8 @@ Follow-up:
 - 精确发送 REMB/TWCC/PLI/FIR/NACK 反馈
 
 覆盖任务:
-- ISSUE-12
-- ISSUE-15
+- ISSUE-13
+- ISSUE-16
 
 建议实现:
 - Rust
@@ -773,9 +819,9 @@ Follow-up:
 
 覆盖任务:
 - ISSUE-05
-- ISSUE-11
-- ISSUE-13
+- ISSUE-12
 - ISSUE-14
+- ISSUE-15
 
 建议实现:
 - Go
@@ -791,11 +837,25 @@ Follow-up:
 - ISSUE-04
 - ISSUE-07
 - ISSUE-09
-- ISSUE-15
+- ISSUE-16
 
 建议实现:
 - Rust
 - 直接复用当前 `tests/interop_*.rs` 里的公共逻辑
+
+### 4.6 `tests/clients/ipv6_peer/`
+
+用途:
+- 验证 `IPv6` host candidate 的 gather、作用域和可达性
+- 将同机主回归稳定性和 `IPv6` 语义测试拆开
+
+覆盖任务:
+- ISSUE-11
+
+建议实现:
+- Rust
+- 优先复用仓内 ICE candidate 结构，显式枚举 `global` 与 `link-local` 接口
+- 对 `link-local` 地址带接口作用域或明确拒绝，避免隐式依赖操作系统默认行为
 
 ## 5. 建议的 CI 分组
 
@@ -808,7 +868,7 @@ Follow-up:
 
 - ISSUE-02
 - ISSUE-03
-- ISSUE-16
+- ISSUE-17
 
 ### CI-3 `signaling-and-datachannel`
 
@@ -820,22 +880,23 @@ Follow-up:
 
 - ISSUE-09
 - ISSUE-10
+- ISSUE-11
 
 ### CI-5 `media-core`
 
 - ISSUE-05
-- ISSUE-11
 - ISSUE-12
+- ISSUE-13
 
 ### CI-6 `media-extended`
 
-- ISSUE-13
 - ISSUE-14
+- ISSUE-15
 
 ### CI-7 `stats-and-docs`
 
-- ISSUE-15
-- ISSUE-17
+- ISSUE-16
+- ISSUE-18
 
 说明:
 - `media-extended` 可先作为非阻断 job，等 VP9/H.265 落地后转为阻断
@@ -857,11 +918,12 @@ Follow-up:
 10. ISSUE-10
 11. ISSUE-11
 12. ISSUE-12
-13. ISSUE-15
-14. ISSUE-16
+13. ISSUE-16
+14. ISSUE-17
 15. ISSUE-13
 16. ISSUE-14
-17. ISSUE-17
+17. ISSUE-15
+18. ISSUE-18
 
 说明:
 - `stats` 和 `observability` 可以在媒体扩展前完成
