@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use headless_chrome::{Browser, LaunchOptionsBuilder, Tab};
 use rustrtc::config::{ApplicationCapability, MediaCapabilities};
-use rustrtc::transports::datachannel::{DataChannel, DataChannelEvent};
+use rustrtc::transports::datachannel::{DataChannel, DataChannelConfig, DataChannelEvent};
 use rustrtc::{
     AudioCapability, MediaSection, PeerConnection, PeerConnectionEvent, RtcConfiguration,
     RtcConfigurationBuilder, SdpType, SessionDescription,
@@ -33,6 +33,18 @@ struct BrowserPeerState {
     signaling_state: String,
     #[serde(rename = "connectionState")]
     connection_state: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct BrowserDataChannelInfo {
+    label: String,
+    ordered: bool,
+    #[serde(rename = "maxRetransmits")]
+    max_retransmits: Option<u16>,
+    #[serde(rename = "maxPacketLifeTime")]
+    max_packet_life_time: Option<u16>,
+    #[serde(rename = "readyState")]
+    ready_state: String,
 }
 
 struct BrowserPeer {
@@ -99,12 +111,20 @@ impl BrowserPeer {
                     pc,
                     dc: null,
                     messages: [],
+                    remoteDc: null,
+                    remoteMessages: [],
                 }};
                 pc.onconnectionstatechange = () => {{
                     state.lastConnectionState = pc.connectionState;
                 }};
                 pc.onsignalingstatechange = () => {{
                     state.lastSignalingState = pc.signalingState;
+                }};
+                pc.ondatachannel = (event) => {{
+                    state.remoteDc = event.channel;
+                    event.channel.onmessage = (messageEvent) => {{
+                        state.remoteMessages.push(String(messageEvent.data));
+                    }};
                 }};
                 {audio_setup}
                 {data_channel_setup}
@@ -149,6 +169,53 @@ impl BrowserPeer {
         assert_eq!(desc.signaling_state, "have-local-offer");
         SessionDescription::parse(SdpType::Offer, &desc.sdp)
             .context("failed to parse browser offer SDP")
+    }
+
+    fn create_answer(&self) -> Result<SessionDescription> {
+        let desc: BrowserDescription = self.eval_json(
+            r#"(async () => {
+                const pc = window.__rustrtc.pc;
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                if (pc.iceGatheringState !== "complete") {
+                    await new Promise((resolve) => {
+                        const onState = () => {
+                            if (pc.iceGatheringState === "complete") {
+                                pc.removeEventListener("icegatheringstatechange", onState);
+                                resolve();
+                            }
+                        };
+                        pc.addEventListener("icegatheringstatechange", onState);
+                        setTimeout(() => {
+                            pc.removeEventListener("icegatheringstatechange", onState);
+                            resolve();
+                        }, 5000);
+                    });
+                }
+                return {
+                    type: pc.localDescription.type,
+                    sdp: pc.localDescription.sdp,
+                    signalingState: pc.signalingState,
+                };
+            })()"#,
+        )?;
+        if desc.kind != "answer" {
+            bail!("expected browser answer, got {}", desc.kind);
+        }
+        assert_eq!(desc.signaling_state, "stable");
+        SessionDescription::parse(SdpType::Answer, &desc.sdp)
+            .context("failed to parse browser answer SDP")
+    }
+
+    fn answer_offer(&self, offer: &SessionDescription) -> Result<SessionDescription> {
+        let state = self.set_remote_description(offer)?;
+        if state.signaling_state != "have-remote-offer" {
+            bail!(
+                "expected browser to enter have-remote-offer, got {}",
+                state.signaling_state
+            );
+        }
+        self.create_answer()
     }
 
     fn set_remote_description(&self, desc: &SessionDescription) -> Result<BrowserPeerState> {
@@ -226,6 +293,69 @@ impl BrowserPeer {
         let expected = expected.to_string();
         self.wait_for_js_condition(
             r#"(async () => window.__rustrtc.messages)()"#,
+            move |messages: &Vec<String>| Ok(messages.iter().any(|msg| msg == &expected)),
+        )
+    }
+
+    fn incoming_data_channel_info(&self) -> Result<Option<BrowserDataChannelInfo>> {
+        self.eval_json(
+            r#"(async () => {
+                const dc = window.__rustrtc.remoteDc;
+                if (!dc) {
+                    return null;
+                }
+                return {
+                    label: dc.label,
+                    ordered: dc.ordered,
+                    maxRetransmits: dc.maxRetransmits,
+                    maxPacketLifeTime: dc.maxPacketLifeTime,
+                    readyState: dc.readyState,
+                };
+            })()"#,
+        )
+    }
+
+    fn wait_for_incoming_data_channel_open(&self, label: &str) -> Result<BrowserDataChannelInfo> {
+        let expected_label = label.to_string();
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(info) = self.incoming_data_channel_info()?
+                && info.label == expected_label
+            {
+                match info.ready_state.as_str() {
+                    "open" => return Ok(info),
+                    "closing" | "closed" => {
+                        bail!("browser incoming data channel entered {}", info.ready_state)
+                    }
+                    _ => {}
+                }
+            }
+            if started.elapsed() > BROWSER_TIMEOUT {
+                bail!("timed out waiting for incoming browser data channel to open");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn send_incoming_data_channel_text(&self, text: &str) -> Result<()> {
+        self.eval_json::<bool>(&format!(
+            r#"(async () => {{
+                if (!window.__rustrtc.remoteDc) {{
+                    return false;
+                }}
+                window.__rustrtc.remoteDc.send({text});
+                return true;
+            }})()"#,
+            text = serde_json::to_string(text)?,
+        ))?
+        .then_some(())
+        .ok_or_else(|| anyhow!("browser does not have an incoming data channel yet"))
+    }
+
+    fn wait_for_incoming_message(&self, expected: &str) -> Result<()> {
+        let expected = expected.to_string();
+        self.wait_for_js_condition(
+            r#"(async () => window.__rustrtc.remoteMessages)()"#,
             move |messages: &Vec<String>| Ok(messages.iter().any(|msg| msg == &expected)),
         )
     }
@@ -429,6 +559,20 @@ async fn wait_for_rust_data_channel_message(dc: &Arc<DataChannel>, expected: &st
     }
 }
 
+async fn negotiate_rust_offer_to_browser(pc: &PeerConnection, browser: &BrowserPeer) -> Result<()> {
+    let offer = pc.create_offer().await?;
+    pc.set_local_description(offer)?;
+    pc.wait_for_gathering_complete().await;
+    let offer = pc
+        .local_description()
+        .context("missing local offer after gathering")?;
+    let answer = browser.answer_offer(&offer)?;
+    pc.set_remote_description(answer).await?;
+    pc.wait_for_connected().await?;
+    browser.wait_connected()?;
+    Ok(())
+}
+
 fn init_browser_test_runtime() {
     rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
     let _ = env_logger::builder().is_test(true).try_init();
@@ -565,6 +709,74 @@ async fn browser_datachannel_message_roundtrip() -> Result<()> {
 
     browser.send_data_channel_text("hello from chrome")?;
     wait_for_rust_data_channel_message(&data_channel, "hello from chrome").await?;
+
+    browser.close()?;
+    pc.close();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn rust_default_datachannel_is_ordered_in_browser() -> Result<()> {
+    init_browser_test_runtime();
+    let Some(browser) = BrowserPeer::launch()? else {
+        return Ok(());
+    };
+    browser.setup_peer(false, false)?;
+
+    let pc = PeerConnection::new(RtcConfiguration::default());
+    let data_channel = pc.create_data_channel("rust-default", None)?;
+
+    negotiate_rust_offer_to_browser(&pc, &browser).await?;
+    wait_for_rust_data_channel_open(&data_channel).await?;
+
+    let info = browser.wait_for_incoming_data_channel_open("rust-default")?;
+    assert!(info.ordered);
+    assert_eq!(info.max_retransmits, None);
+    assert_eq!(info.max_packet_life_time, None);
+
+    pc.send_text(data_channel.id, "default-from-rust").await?;
+    browser.wait_for_incoming_message("default-from-rust")?;
+
+    browser.send_incoming_data_channel_text("default-from-browser")?;
+    wait_for_rust_data_channel_message(&data_channel, "default-from-browser").await?;
+
+    browser.close()?;
+    pc.close();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn rust_explicit_unordered_datachannel_reaches_browser() -> Result<()> {
+    init_browser_test_runtime();
+    let Some(browser) = BrowserPeer::launch()? else {
+        return Ok(());
+    };
+    browser.setup_peer(false, false)?;
+
+    let pc = PeerConnection::new(RtcConfiguration::default());
+    let data_channel = pc.create_data_channel(
+        "rust-unordered",
+        Some(DataChannelConfig {
+            ordered: false,
+            ..Default::default()
+        }),
+    )?;
+
+    negotiate_rust_offer_to_browser(&pc, &browser).await?;
+    wait_for_rust_data_channel_open(&data_channel).await?;
+
+    let info = browser.wait_for_incoming_data_channel_open("rust-unordered")?;
+    assert!(!info.ordered);
+    assert_eq!(info.max_retransmits, None);
+    assert_eq!(info.max_packet_life_time, None);
+
+    pc.send_text(data_channel.id, "unordered-from-rust").await?;
+    browser.wait_for_incoming_message("unordered-from-rust")?;
+
+    browser.send_incoming_data_channel_text("unordered-from-browser")?;
+    wait_for_rust_data_channel_message(&data_channel, "unordered-from-browser").await?;
 
     browser.close()?;
     pc.close();

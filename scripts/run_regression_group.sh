@@ -33,6 +33,8 @@ run_group() {
       run_cmd cargo test --test ordered_channel_test
       run_cmd cargo test --test interop_datachannel
       run_cmd cargo test --test browser_interop browser_datachannel_message_roundtrip
+      run_cmd cargo test --test browser_interop rust_default_datachannel_is_ordered_in_browser
+      run_cmd cargo test --test browser_interop rust_explicit_unordered_datachannel_reaches_browser
       ;;
     network)
       run_cmd cargo test --test regression_baseline regression_network_entrypoints_exist
