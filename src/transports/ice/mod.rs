@@ -25,7 +25,7 @@ use self::stun::random_u32;
 use self::stun::{
     StunAttribute, StunClass, StunDecoded, StunMessage, StunMethod, random_bytes, random_u64,
 };
-use crate::{IceServer, IceTransportPolicy, RtcConfiguration};
+use crate::{IceServer, IceTransportPolicy, RtcConfiguration, RtcResult};
 
 pub(crate) const MAX_STUN_MESSAGE: usize = 1500;
 
@@ -526,6 +526,17 @@ impl IceTransportRunner {
 
 impl IceTransport {
     pub fn new(config: RtcConfiguration) -> (Self, impl std::future::Future<Output = ()> + Send) {
+        Self::try_new(config).expect("failed to create ICE transport")
+    }
+
+    pub fn try_new(
+        config: RtcConfiguration,
+    ) -> RtcResult<(Self, impl std::future::Future<Output = ()> + Send)> {
+        config.validate_runtime_support()?;
+        Ok(Self::build(config))
+    }
+
+    fn build(config: RtcConfiguration) -> (Self, impl std::future::Future<Output = ()> + Send) {
         let (candidate_tx, _) = broadcast::channel(100);
         let (socket_tx, socket_rx) = tokio::sync::mpsc::unbounded_channel();
         let gatherer = IceGatherer::new(config.clone(), candidate_tx.clone(), socket_tx);
@@ -1921,14 +1932,20 @@ impl IceTransportBuilder {
     }
 
     pub fn build(self) -> (IceTransport, impl std::future::Future<Output = ()> + Send) {
+        self.try_build().expect("failed to create ICE transport")
+    }
+
+    pub fn try_build(
+        self,
+    ) -> RtcResult<(IceTransport, impl std::future::Future<Output = ()> + Send)> {
         let mut config = self.config.clone();
         config.ice_servers.extend(self.servers);
-        let (transport, runner) = IceTransport::new(config);
+        let (transport, runner) = IceTransport::try_new(config)?;
         transport.set_role(self.role);
         if let Err(err) = transport.start_gathering() {
             debug!("ICE gather failed: {}", err);
         }
-        (transport, runner)
+        Ok((transport, runner))
     }
 }
 

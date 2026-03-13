@@ -1,3 +1,4 @@
+use crate::errors::{RtcError, RtcResult};
 use crate::media::depacketizer::{DefaultDepacketizerFactory, DepacketizerFactory};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Formatter};
@@ -63,9 +64,9 @@ pub enum IceTransportPolicy {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum BundlePolicy {
-    #[default]
     Balanced,
     MaxCompat,
+    #[default]
     MaxBundle,
 }
 
@@ -334,6 +335,50 @@ impl Default for RtcConfiguration {
     }
 }
 
+impl RtcConfiguration {
+    /// Reject unsupported knobs at construction time so callers do not end up
+    /// with a peer connection whose runtime behavior silently diverges.
+    pub fn validate_runtime_support(&self) -> RtcResult<()> {
+        for server in &self.ice_servers {
+            if server.credential_type == IceCredentialType::Oauth
+                && server
+                    .urls
+                    .iter()
+                    .any(|url| url.starts_with("turn:") || url.starts_with("turns:"))
+            {
+                return Err(RtcError::InvalidConfiguration(
+                    "IceCredentialType::Oauth is not supported for TURN; only password credentials are implemented"
+                        .into(),
+                ));
+            }
+        }
+
+        if self.bundle_policy != BundlePolicy::MaxBundle {
+            return Err(RtcError::InvalidConfiguration(format!(
+                "bundle_policy {:?} is not supported; the runtime currently only implements MaxBundle",
+                self.bundle_policy
+            )));
+        }
+
+        match (self.rtp_start_port, self.rtp_end_port) {
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(RtcError::InvalidConfiguration(
+                    "rtp port range requires both rtp_start_port and rtp_end_port".into(),
+                ));
+            }
+            (Some(start), Some(end)) if start > end => {
+                return Err(RtcError::InvalidConfiguration(format!(
+                    "rtp port range start {} must be less than or equal to end {}",
+                    start, end
+                )));
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+}
+
 pub struct RtcConfigurationBuilder {
     inner: RtcConfiguration,
 }
@@ -512,6 +557,7 @@ mod tests {
     #[test]
     fn test_rtc_configuration_defaults() {
         let config = RtcConfiguration::default();
+        assert_eq!(config.bundle_policy, BundlePolicy::MaxBundle);
         assert_eq!(config.ice_connection_timeout, Duration::from_secs(30));
         assert_eq!(config.sctp_rto_initial, Duration::from_secs(3));
         assert_eq!(config.sctp_rto_min, Duration::from_secs(1));

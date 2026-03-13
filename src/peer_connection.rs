@@ -13,8 +13,9 @@ use crate::transports::ice::{IceCandidate, IceGathererState, IceTransport, conn:
 use crate::transports::rtp::RtpTransport;
 use crate::transports::sctp::SctpTransport;
 use crate::{
-    Attribute, AudioCapability, Direction, MediaKind, MediaSection, Origin, RtcConfiguration,
-    RtcError, RtcResult, SdpType, SessionDescription, TransportMode, VideoCapability,
+    Attribute, AudioCapability, BundlePolicy, Direction, MediaKind, MediaSection, Origin,
+    RtcConfiguration, RtcError, RtcResult, SdpType, SessionDescription, TransportMode,
+    VideoCapability,
 };
 use base64::prelude::*;
 use std::collections::{HashMap, VecDeque};
@@ -393,8 +394,9 @@ impl PeerConnection {
     }
 
     pub fn try_new(config: RtcConfiguration) -> RtcResult<Self> {
+        config.validate_runtime_support()?;
         let is_rtp_mode = config.transport_mode == TransportMode::Rtp;
-        let (ice_transport, ice_runner) = IceTransport::new(config.clone());
+        let (ice_transport, ice_runner) = IceTransport::try_new(config.clone())?;
         let certificate = resolve_dtls_certificate(&config)?;
         let dtls_fingerprint = dtls::fingerprint(&certificate);
 
@@ -3609,11 +3611,12 @@ impl PeerConnectionInner {
         }
 
         if !desc.media_sections.is_empty() {
-            let should_bundle = match sdp_type {
-                SdpType::Offer => true,
-                SdpType::Answer => remote_offered_bundle,
-                _ => false,
-            };
+            let should_bundle = matches!(self.config.bundle_policy, BundlePolicy::MaxBundle)
+                && match sdp_type {
+                    SdpType::Offer => true,
+                    SdpType::Answer => remote_offered_bundle,
+                    _ => false,
+                };
 
             let should_bundle = should_bundle && desc.media_sections.len() > 1;
 
