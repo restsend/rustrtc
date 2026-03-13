@@ -358,12 +358,44 @@ fn map_crypto_suite(suite: &str) -> RtcResult<crate::srtp::SrtpProfile> {
     }
 }
 
+fn resolve_dtls_certificate(config: &RtcConfiguration) -> RtcResult<Arc<dtls::Certificate>> {
+    match config.certificates.as_slice() {
+        [] => dtls::generate_certificate()
+            .map(Arc::new)
+            .map_err(|e| RtcError::Internal(format!("failed to generate certificate: {}", e))),
+        [certificate] => {
+            let private_key_pem = certificate.private_key_pem.as_deref().ok_or_else(|| {
+                RtcError::InvalidConfiguration(
+                    "certificate.private_key_pem is required when certificates are configured"
+                        .into(),
+                )
+            })?;
+            // The runtime negotiates a single DTLS identity today, so reject
+            // ambiguous certificate lists instead of silently ignoring them.
+            dtls::load_certificate_from_pem(&certificate.pem_chain, private_key_pem)
+                .map(Arc::new)
+                .map_err(|e| {
+                    RtcError::InvalidConfiguration(format!(
+                        "failed to load configured certificate: {}",
+                        e
+                    ))
+                })
+        }
+        _ => Err(RtcError::InvalidConfiguration(
+            "multiple certificate configurations are not supported".into(),
+        )),
+    }
+}
+
 impl PeerConnection {
     pub fn new(config: RtcConfiguration) -> Self {
+        Self::try_new(config).expect("failed to create peer connection")
+    }
+
+    pub fn try_new(config: RtcConfiguration) -> RtcResult<Self> {
         let is_rtp_mode = config.transport_mode == TransportMode::Rtp;
         let (ice_transport, ice_runner) = IceTransport::new(config.clone());
-        let certificate =
-            Arc::new(dtls::generate_certificate().expect("failed to generate certificate"));
+        let certificate = resolve_dtls_certificate(&config)?;
         let dtls_fingerprint = dtls::fingerprint(&certificate);
 
         let (signaling_state_tx, signaling_state_rx) = watch::channel(SignalingState::Stable);
@@ -454,7 +486,7 @@ impl PeerConnection {
                 tokio::join!(gathering_loop, dtls_loop, ice_runner);
             });
         }
-        pc
+        Ok(pc)
     }
 
     pub fn config(&self) -> &RtcConfiguration {
