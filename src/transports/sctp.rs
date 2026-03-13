@@ -134,6 +134,24 @@ fn ssn_gt(a: u16, b: u16) -> bool {
     (a.wrapping_sub(b) as i16) > 0
 }
 
+fn dcep_channel_type(dc: &DataChannel) -> u8 {
+    if dc.ordered {
+        if dc.max_retransmits.is_some() {
+            0x01 // DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT
+        } else if dc.max_packet_life_time.is_some() {
+            0x02 // DATA_CHANNEL_PARTIAL_RELIABLE_TIMED
+        } else {
+            0x00 // DATA_CHANNEL_RELIABLE
+        }
+    } else if dc.max_retransmits.is_some() {
+        0x81 // DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT_UNORDERED
+    } else if dc.max_packet_life_time.is_some() {
+        0x82 // DATA_CHANNEL_PARTIAL_RELIABLE_TIMED_UNORDERED
+    } else {
+        0x80 // DATA_CHANNEL_RELIABLE_UNORDERED
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct OutboundChunk {
     pub(crate) stream_id: u16,
@@ -2567,20 +2585,17 @@ impl SctpInner {
 
                 if !found {
                     // Create new channel
+                    let reliability_mode = open.channel_type & 0x03;
                     let config = DataChannelConfig {
                         label: open.label.clone(),
                         protocol: open.protocol,
                         ordered: (open.channel_type & 0x80) == 0,
-                        max_retransmits: if (open.channel_type & 0x03) == 0x01
-                            || (open.channel_type & 0x03) == 0x81
-                        {
+                        max_retransmits: if reliability_mode == 0x01 {
                             Some(open.reliability_parameter as u16)
                         } else {
                             None
                         },
-                        max_packet_life_time: if (open.channel_type & 0x03) == 0x02
-                            || (open.channel_type & 0x03) == 0x82
-                        {
+                        max_packet_life_time: if reliability_mode == 0x02 {
                             Some(open.reliability_parameter as u16)
                         } else {
                             None
@@ -3261,23 +3276,7 @@ impl SctpInner {
     }
 
     pub async fn send_dcep_open(&self, dc: &DataChannel) -> Result<()> {
-        let channel_type = if dc.ordered {
-            if dc.max_retransmits.is_some() {
-                0x01 // DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT
-            } else if dc.max_packet_life_time.is_some() {
-                0x02 // DATA_CHANNEL_PARTIAL_RELIABLE_TIMED
-            } else {
-                0x00 // DATA_CHANNEL_RELIABLE
-            }
-        } else {
-            if dc.max_retransmits.is_some() {
-                0x81 // DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT_UNORDERED
-            } else if dc.max_packet_life_time.is_some() {
-                0x82 // DATA_CHANNEL_PARTIAL_RELIABLE_TIMED_UNORDERED
-            } else {
-                0x80 // DATA_CHANNEL_RELIABLE_UNORDERED
-            }
-        };
+        let channel_type = dcep_channel_type(dc);
 
         let reliability_parameter = if let Some(r) = dc.max_retransmits {
             r as u32
@@ -3384,6 +3383,70 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::time::Duration;
+
+    #[test]
+    fn test_dcep_channel_type_matches_ordering_and_reliability() {
+        let reliable_ordered = DataChannel::new(
+            0,
+            DataChannelConfig {
+                label: "ordered".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(dcep_channel_type(&reliable_ordered), 0x00);
+
+        let reliable_unordered = DataChannel::new(
+            1,
+            DataChannelConfig {
+                label: "unordered".into(),
+                ordered: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(dcep_channel_type(&reliable_unordered), 0x80);
+
+        let rexmit_ordered = DataChannel::new(
+            2,
+            DataChannelConfig {
+                label: "rexmit-ordered".into(),
+                max_retransmits: Some(3),
+                ..Default::default()
+            },
+        );
+        assert_eq!(dcep_channel_type(&rexmit_ordered), 0x01);
+
+        let rexmit_unordered = DataChannel::new(
+            3,
+            DataChannelConfig {
+                label: "rexmit-unordered".into(),
+                ordered: false,
+                max_retransmits: Some(3),
+                ..Default::default()
+            },
+        );
+        assert_eq!(dcep_channel_type(&rexmit_unordered), 0x81);
+
+        let timed_ordered = DataChannel::new(
+            4,
+            DataChannelConfig {
+                label: "timed-ordered".into(),
+                max_packet_life_time: Some(50),
+                ..Default::default()
+            },
+        );
+        assert_eq!(dcep_channel_type(&timed_ordered), 0x02);
+
+        let timed_unordered = DataChannel::new(
+            5,
+            DataChannelConfig {
+                label: "timed-unordered".into(),
+                ordered: false,
+                max_packet_life_time: Some(50),
+                ..Default::default()
+            },
+        );
+        assert_eq!(dcep_channel_type(&timed_unordered), 0x82);
+    }
 
     #[test]
     fn test_rto_calculator() {
