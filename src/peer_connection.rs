@@ -2,6 +2,7 @@ use crate::media::depacketizer::{Depacketizer, DepacketizerFactory};
 use crate::media::track::{MediaStreamTrack, SampleStreamSource, SampleStreamTrack, sample_track};
 use crate::rtp::{
     FirRequest, FullIntraRequest, GenericNack, PictureLossIndication, RtcpPacket, RtpPacket,
+    SenderReport,
 };
 use crate::stats::{StatsReport, gather_once};
 use crate::stats_collector::StatsCollector;
@@ -3723,6 +3724,9 @@ pub struct RtpSender {
     rtcp_tx: broadcast::Sender<RtcpPacket>,
     stop_tx: Arc<tokio::sync::Notify>,
     next_sequence_number: Arc<AtomicU16>,
+    packets_sent: Arc<AtomicU32>,
+    octets_sent: Arc<AtomicU32>,
+    last_rtp_timestamp: Arc<AtomicU32>,
     interceptors: Vec<Arc<dyn RtpSenderInterceptor + Send + Sync>>,
 }
 
@@ -3821,6 +3825,9 @@ impl RtpSender {
             rtcp_tx,
             stop_tx: Arc::new(tokio::sync::Notify::new()),
             next_sequence_number: Arc::new(AtomicU16::new(random_u32() as u16)),
+            packets_sent: Arc::new(AtomicU32::new(0)),
+            octets_sent: Arc::new(AtomicU32::new(0)),
+            last_rtp_timestamp: Arc::new(AtomicU32::new(0)),
             interceptors,
         }
     }
@@ -3890,6 +3897,9 @@ impl RtpSender {
         let params_lock = self.params.clone();
         let stop_rx = self.stop_tx.clone();
         let next_seq = self.next_sequence_number.clone();
+        let packets_sent = self.packets_sent.clone();
+        let octets_sent = self.octets_sent.clone();
+        let last_rtp_timestamp = self.last_rtp_timestamp.clone();
         let interceptors = self.interceptors.clone();
         let mut rtcp_rx = self.rtcp_tx.subscribe();
 
@@ -3897,12 +3907,34 @@ impl RtpSender {
             let mut sequence_number = next_seq.load(Ordering::SeqCst);
             let mut last_source_ts: Option<u32> = None;
             let mut timestamp_offset = random_u32(); // Start with random offset
+            let mut rtcp_interval = tokio::time::interval(std::time::Duration::from_secs(3));
+            rtcp_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let notified = stop_rx.notified();
             tokio::pin!(notified);
 
             loop {
                 tokio::select! {
                     _ = &mut notified => break,
+                    _ = rtcp_interval.tick(), if packets_sent.load(Ordering::Relaxed) > 0 => {
+                        let packet_count = packets_sent.load(Ordering::Relaxed);
+
+                        let octet_count = octets_sent.load(Ordering::Relaxed);
+                        let rtp_timestamp = last_rtp_timestamp.load(Ordering::Relaxed);
+                        let report = Self::build_sender_report(
+                            ssrc,
+                            rtp_timestamp,
+                            packet_count,
+                            octet_count,
+                            SystemTime::now(),
+                        );
+
+                        if let Err(e) = transport
+                            .send_rtcp(&[RtcpPacket::SenderReport(report)])
+                            .await
+                        {
+                            debug!("Failed to send Sender Report: {}", e);
+                        }
+                    }
                     rtcp = rtcp_rx.recv() => {
                         match rtcp {
                             Ok(packet) => {
@@ -3988,6 +4020,12 @@ impl RtpSender {
 
                                 if let Err(e) = transport.send_rtp(&packet).await {
                                     debug!("Failed to send RTP: {}", e);
+                                } else {
+                                    packets_sent.fetch_add(1, Ordering::Relaxed);
+                                    octets_sent
+                                        .fetch_add(packet.payload.len() as u32, Ordering::Relaxed);
+                                    last_rtp_timestamp
+                                        .store(packet.header.timestamp, Ordering::Relaxed);
                                 }
                             }
                             Err(crate::media::error::MediaError::Lagged) => {
@@ -4000,6 +4038,31 @@ impl RtpSender {
                 }
             }
         });
+    }
+
+    fn build_sender_report(
+        sender_ssrc: u32,
+        rtp_timestamp: u32,
+        packet_count: u32,
+        octet_count: u32,
+        now: SystemTime,
+    ) -> SenderReport {
+        let duration = now
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let ntp_seconds = duration.as_secs().saturating_add(2_208_988_800);
+        let ntp_fraction =
+            (duration.subsec_nanos() as u64 * (1u64 << 32) / 1_000_000_000) as u32;
+
+        SenderReport {
+            sender_ssrc,
+            ntp_most: ntp_seconds as u32,
+            ntp_least: ntp_fraction,
+            rtp_timestamp,
+            packet_count,
+            octet_count,
+            report_blocks: Vec::new(),
+        }
     }
 }
 
@@ -6015,5 +6078,18 @@ a=mid:0
             crate::transports::ice::IceRole::Controlled,
             "ICE-lite should set role to Controlled"
         );
+    }
+
+    #[test]
+    fn sender_report_builder_uses_rtp_counters() {
+        let report = RtpSender::build_sender_report(10000, 123456, 42, 4096, UNIX_EPOCH);
+
+        assert_eq!(report.sender_ssrc, 10000);
+        assert_eq!(report.rtp_timestamp, 123456);
+        assert_eq!(report.packet_count, 42);
+        assert_eq!(report.octet_count, 4096);
+        assert_eq!(report.ntp_most, 2_208_988_800);
+        assert_eq!(report.ntp_least, 0);
+        assert!(report.report_blocks.is_empty());
     }
 }
