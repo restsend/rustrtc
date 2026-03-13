@@ -26,11 +26,13 @@ run_group() {
     signaling)
       run_cmd cargo test --test regression_baseline regression_signaling_entrypoints_exist
       run_cmd cargo test --test rtp_reinvite_comprehensive_test
+      run_cmd cargo test --test browser_interop browser_pranswer_then_answer_connects
       ;;
     datachannel)
       run_cmd cargo test --test regression_baseline regression_datachannel_entrypoints_exist
       run_cmd cargo test --test ordered_channel_test
       run_cmd cargo test --test interop_datachannel
+      run_cmd cargo test --test browser_interop browser_datachannel_message_roundtrip
       ;;
     network)
       run_cmd cargo test --test regression_baseline regression_network_entrypoints_exist
@@ -40,6 +42,7 @@ run_group() {
       run_cmd cargo test --test regression_baseline regression_media_entrypoints_exist
       run_cmd cargo test --test media_flow
       run_cmd cargo test --test interop_simulcast
+      run_cmd cargo test --test browser_interop browser_offer_preserves_opus_fmtp_in_answer
       ;;
     stats)
       run_cmd cargo test --test regression_baseline regression_stats_entrypoints_exist

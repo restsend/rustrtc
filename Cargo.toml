@@ -61,6 +61,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 indicatif = "0.18.3"
 rustls = { version = "0.23.36" }
 serial_test = "3"
+headless_chrome = "1"
 
 [features]
 default = []
