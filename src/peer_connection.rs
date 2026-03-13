@@ -282,6 +282,9 @@ struct PeerConnectionInner {
     _ice_gathering_state_rx: watch::Receiver<IceGatheringState>,
     local_description: Mutex<Option<SessionDescription>>,
     remote_description: Mutex<Option<SessionDescription>>,
+    // Rollback must restore the last stable SDP plus the RTP runtime state
+    // derived from it, otherwise renegotiation side effects leak past abort.
+    rollback_snapshot: Mutex<Option<NegotiationSnapshot>>,
     transceivers: Mutex<Vec<Arc<RtpTransceiver>>>,
     next_mid: AtomicU16,
     ice_transport: IceTransport,
@@ -300,6 +303,28 @@ struct PeerConnectionInner {
     ssrc_generator: AtomicU32,
     disconnect_reason: watch::Sender<Option<DisconnectReason>>,
     _disconnect_reason_rx: watch::Receiver<Option<DisconnectReason>>,
+}
+
+#[derive(Clone)]
+struct NegotiationSnapshot {
+    local_description: Option<SessionDescription>,
+    remote_description: Option<SessionDescription>,
+    transceivers: Vec<TransceiverSnapshot>,
+    next_mid: u16,
+    remote_dtls_fingerprint: Option<String>,
+    dtls_role: Option<bool>,
+}
+
+#[derive(Clone)]
+struct TransceiverSnapshot {
+    transceiver: Arc<RtpTransceiver>,
+    direction: TransceiverDirection,
+    mid: Option<String>,
+    payload_map: HashMap<u8, RtpCodecParameters>,
+    extmap: HashMap<u8, String>,
+    receiver_ssrc: Option<u32>,
+    receiver_rtx_ssrc: Option<u32>,
+    receiver_track_event_sent: Option<bool>,
 }
 
 fn generate_sdes_key_params() -> String {
@@ -365,6 +390,7 @@ impl PeerConnection {
             _ice_gathering_state_rx: ice_gathering_state_rx,
             local_description: Mutex::new(None),
             remote_description: Mutex::new(None),
+            rollback_snapshot: Mutex::new(None),
             transceivers: Mutex::new(Vec::new()),
             next_mid: AtomicU16::new(0),
             ice_transport,
@@ -609,7 +635,10 @@ impl PeerConnection {
 
     pub async fn create_answer(&self) -> RtcResult<SessionDescription> {
         let state = &self.inner.signaling_state;
-        if *state.borrow() != SignalingState::HaveRemoteOffer {
+        if !matches!(
+            *state.borrow(),
+            SignalingState::HaveRemoteOffer | SignalingState::HaveLocalPranswer
+        ) {
             return Err(RtcError::InvalidState(
                 "create_answer requires remote offer".into(),
             ));
@@ -622,8 +651,120 @@ impl PeerConnection {
             .await
     }
 
+    fn capture_rollback_snapshot_if_absent(&self) {
+        let mut snapshot = self.inner.rollback_snapshot.lock().unwrap();
+        if snapshot.is_some() {
+            return;
+        }
+
+        let local_description = self.inner.local_description.lock().unwrap().clone();
+        let remote_description = self.inner.remote_description.lock().unwrap().clone();
+        let transceivers = self.inner.transceivers.lock().unwrap().clone();
+        let next_mid = self.inner.next_mid.load(Ordering::SeqCst);
+        let remote_dtls_fingerprint = self.inner.remote_dtls_fingerprint.lock().unwrap().clone();
+        let dtls_role = *self.inner.dtls_role.borrow();
+
+        *snapshot = Some(NegotiationSnapshot {
+            local_description,
+            remote_description,
+            transceivers: transceivers
+                .into_iter()
+                .map(|transceiver| {
+                    let receiver = transceiver.receiver();
+                    TransceiverSnapshot {
+                        direction: transceiver.direction(),
+                        mid: transceiver.mid(),
+                        payload_map: transceiver.get_payload_map(),
+                        extmap: transceiver.get_extmap(),
+                        receiver_ssrc: receiver.as_ref().map(|rx| rx.ssrc()),
+                        receiver_rtx_ssrc: receiver.as_ref().and_then(|rx| rx.rtx_ssrc()),
+                        receiver_track_event_sent: receiver
+                            .as_ref()
+                            .map(|rx| rx.track_event_sent.load(Ordering::SeqCst)),
+                        transceiver,
+                    }
+                })
+                .collect(),
+            next_mid,
+            remote_dtls_fingerprint,
+            dtls_role,
+        });
+    }
+
+    fn has_established_negotiation(&self) -> bool {
+        if let Some(snapshot) = self.inner.rollback_snapshot.lock().unwrap().as_ref() {
+            snapshot.local_description.is_some() || snapshot.remote_description.is_some()
+        } else {
+            let local = self.inner.local_description.lock().unwrap();
+            let remote = self.inner.remote_description.lock().unwrap();
+            local.is_some() || remote.is_some()
+        }
+    }
+
+    fn clear_rollback_snapshot(&self) {
+        self.inner.rollback_snapshot.lock().unwrap().take();
+    }
+
+    fn restore_rollback_snapshot(&self) -> RtcResult<()> {
+        let snapshot = self
+            .inner
+            .rollback_snapshot
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| {
+                RtcError::InvalidState("rollback requires a pending negotiation".into())
+            })?;
+
+        *self.inner.local_description.lock().unwrap() = snapshot.local_description;
+        *self.inner.remote_description.lock().unwrap() = snapshot.remote_description;
+        self.inner
+            .next_mid
+            .store(snapshot.next_mid, Ordering::SeqCst);
+        *self.inner.remote_dtls_fingerprint.lock().unwrap() = snapshot.remote_dtls_fingerprint;
+        let _ = self.inner.dtls_role.send(snapshot.dtls_role);
+
+        let restored_transceivers: Vec<Arc<RtpTransceiver>> = snapshot
+            .transceivers
+            .iter()
+            .map(|entry| entry.transceiver.clone())
+            .collect();
+        *self.inner.transceivers.lock().unwrap() = restored_transceivers;
+
+        for entry in snapshot.transceivers {
+            entry.transceiver.set_direction(entry.direction);
+            *entry.transceiver.mid.lock().unwrap() = entry.mid;
+            entry.transceiver.update_payload_map(entry.payload_map)?;
+            entry.transceiver.update_extmap(entry.extmap)?;
+
+            if let Some(receiver) = entry.transceiver.receiver() {
+                if let Some(ssrc) = entry.receiver_ssrc {
+                    receiver.set_ssrc(ssrc);
+                }
+                *receiver.rtx_ssrc.lock().unwrap() = entry.receiver_rtx_ssrc;
+                if let Some(track_event_sent) = entry.receiver_track_event_sent {
+                    receiver
+                        .track_event_sent
+                        .store(track_event_sent, Ordering::SeqCst);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn set_local_description(&self, desc: SessionDescription) -> RtcResult<()> {
         self.inner.validate_sdp_type(&desc.sdp_type)?;
+        let current_state = *self.inner.signaling_state.borrow();
+
+        if matches!(desc.sdp_type, SdpType::Offer) {
+            if current_state != SignalingState::Stable {
+                return Err(RtcError::InvalidState(
+                    "set_local_description(offer) requires stable signaling state".into(),
+                ));
+            }
+            self.capture_rollback_snapshot_if_absent();
+        }
 
         // For Offerer: extract parameters from local offer (our intended changes)
         // This allows Offerer to immediately update transceivers with new parameters
@@ -689,28 +830,53 @@ impl PeerConnection {
             let state = &self.inner.signaling_state;
             match desc.sdp_type {
                 SdpType::Offer => {
-                    if *state.borrow() != SignalingState::Stable {
-                        return Err(RtcError::InvalidState(
-                            "set_local_description(offer) requires stable signaling state".into(),
-                        ));
-                    }
                     let _ = state.send(SignalingState::HaveLocalOffer);
                 }
                 SdpType::Answer => {
-                    if *state.borrow() != SignalingState::HaveRemoteOffer {
+                    if !matches!(
+                        current_state,
+                        SignalingState::HaveRemoteOffer | SignalingState::HaveLocalPranswer
+                    ) {
                         return Err(RtcError::InvalidState(
                             "set_local_description(answer) requires remote offer".into(),
                         ));
                     }
                     let _ = state.send(SignalingState::Stable);
                 }
-                SdpType::Rollback | SdpType::Pranswer => {
-                    return Err(RtcError::NotImplemented("pranswer/rollback"));
+                SdpType::Pranswer => {
+                    if !matches!(
+                        current_state,
+                        SignalingState::HaveRemoteOffer | SignalingState::HaveLocalPranswer
+                    ) {
+                        return Err(RtcError::InvalidState(
+                            "set_local_description(pranswer) requires remote offer".into(),
+                        ));
+                    }
+                    let _ = state.send(SignalingState::HaveLocalPranswer);
+                }
+                SdpType::Rollback => {
+                    if !matches!(
+                        current_state,
+                        SignalingState::HaveLocalOffer
+                            | SignalingState::HaveRemoteOffer
+                            | SignalingState::HaveLocalPranswer
+                            | SignalingState::HaveRemotePranswer
+                    ) {
+                        return Err(RtcError::InvalidState(
+                            "set_local_description(rollback) requires pending negotiation".into(),
+                        ));
+                    }
+                    self.restore_rollback_snapshot()?;
+                    let _ = state.send(SignalingState::Stable);
+                    return Ok(());
                 }
             }
         }
         let mut local = self.inner.local_description.lock().unwrap();
         *local = Some(desc);
+        if matches!(local.as_ref().map(|d| d.sdp_type), Some(SdpType::Answer)) {
+            self.clear_rollback_snapshot();
+        }
         Ok(())
     }
 
@@ -743,15 +909,21 @@ impl PeerConnection {
             None
         };
 
+        let current_state = *self.inner.signaling_state.borrow();
+        if matches!(desc.sdp_type, SdpType::Offer) {
+            if current_state != SignalingState::Stable {
+                return Err(RtcError::InvalidState(
+                    "set_remote_description(offer) requires stable signaling state".into(),
+                ));
+            }
+            self.capture_rollback_snapshot_if_absent();
+        }
+
         // Check if this is a reinvite (not first negotiation)
-        let is_reinvite = {
-            let remote = self.inner.remote_description.lock().unwrap();
-            remote.is_some()
-        };
+        let is_reinvite = self.has_established_negotiation();
 
         if is_reinvite {
             // Apply reinvite at correct timing based on role
-            let current_state = *self.inner.signaling_state.borrow();
             match (desc.sdp_type, current_state) {
                 // Answerer receiving offer: apply immediately
                 (SdpType::Offer, SignalingState::Stable) => {
@@ -759,7 +931,10 @@ impl PeerConnection {
                     self.handle_reinvite(&desc).await?;
                 }
                 // Offerer receiving answer: apply now (was pending since we sent offer)
-                (SdpType::Answer, SignalingState::HaveLocalOffer) => {
+                (
+                    SdpType::Answer,
+                    SignalingState::HaveLocalOffer | SignalingState::HaveRemotePranswer,
+                ) => {
                     debug!("Offerer: applying reinvite from answer");
                     self.handle_reinvite(&desc).await?;
                 }
@@ -784,23 +959,45 @@ impl PeerConnection {
             let state = &self.inner.signaling_state;
             match desc.sdp_type {
                 SdpType::Offer => {
-                    if *state.borrow() != SignalingState::Stable {
-                        return Err(RtcError::InvalidState(
-                            "set_remote_description(offer) requires stable signaling state".into(),
-                        ));
-                    }
                     let _ = state.send(SignalingState::HaveRemoteOffer);
                 }
                 SdpType::Answer => {
-                    if *state.borrow() != SignalingState::HaveLocalOffer {
+                    if !matches!(
+                        current_state,
+                        SignalingState::HaveLocalOffer | SignalingState::HaveRemotePranswer
+                    ) {
                         return Err(RtcError::InvalidState(
                             "set_remote_description(answer) requires local offer".into(),
                         ));
                     }
                     let _ = state.send(SignalingState::Stable);
                 }
-                SdpType::Rollback | SdpType::Pranswer => {
-                    return Err(RtcError::NotImplemented("pranswer/rollback"));
+                SdpType::Pranswer => {
+                    if !matches!(
+                        current_state,
+                        SignalingState::HaveLocalOffer | SignalingState::HaveRemotePranswer
+                    ) {
+                        return Err(RtcError::InvalidState(
+                            "set_remote_description(pranswer) requires local offer".into(),
+                        ));
+                    }
+                    let _ = state.send(SignalingState::HaveRemotePranswer);
+                }
+                SdpType::Rollback => {
+                    if !matches!(
+                        current_state,
+                        SignalingState::HaveLocalOffer
+                            | SignalingState::HaveRemoteOffer
+                            | SignalingState::HaveLocalPranswer
+                            | SignalingState::HaveRemotePranswer
+                    ) {
+                        return Err(RtcError::InvalidState(
+                            "set_remote_description(rollback) requires pending negotiation".into(),
+                        ));
+                    }
+                    self.restore_rollback_snapshot()?;
+                    let _ = state.send(SignalingState::Stable);
+                    return Ok(());
                 }
             }
         }
@@ -1267,6 +1464,9 @@ impl PeerConnection {
 
         let mut remote = self.inner.remote_description.lock().unwrap();
         *remote = Some(desc);
+        if matches!(remote.as_ref().map(|d| d.sdp_type), Some(SdpType::Answer)) {
+            self.clear_rollback_snapshot();
+        }
 
         Ok(())
     }
@@ -3217,8 +3417,7 @@ impl PeerConnectionInner {
 
     fn validate_sdp_type(&self, sdp_type: &SdpType) -> RtcResult<()> {
         match sdp_type {
-            SdpType::Offer | SdpType::Answer => Ok(()),
-            _ => Err(RtcError::NotImplemented("pranswer/rollback")),
+            SdpType::Offer | SdpType::Answer | SdpType::Pranswer | SdpType::Rollback => Ok(()),
         }
     }
 
@@ -3506,6 +3705,8 @@ pub enum SignalingState {
     Stable,
     HaveLocalOffer,
     HaveRemoteOffer,
+    HaveLocalPranswer,
+    HaveRemotePranswer,
     Closed,
 }
 

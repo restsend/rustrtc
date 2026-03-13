@@ -1,5 +1,32 @@
+use rustrtc::sdp::{
+    Attribute, Direction, MediaSection, SdpType, SessionDescription, SessionSection,
+};
 use rustrtc::*;
 use std::collections::HashMap;
+
+fn create_audio_sdp(
+    sdp_type: SdpType,
+    mid: &str,
+    direction: Direction,
+    payload_type: u8,
+    ssrc: u32,
+) -> SessionDescription {
+    let mut desc = SessionDescription::new(sdp_type);
+    desc.session = SessionSection::default();
+
+    let mut section = MediaSection::new(MediaKind::Audio, mid);
+    section.direction = direction;
+    section.attributes.push(Attribute::new(
+        "rtpmap",
+        Some(format!("{payload_type} opus/48000/2")),
+    ));
+    section
+        .attributes
+        .push(Attribute::new("ssrc", Some(format!("{ssrc} cname:test"))));
+
+    desc.media_sections.push(section);
+    desc
+}
 
 /// Test basic payload type map update functionality
 #[tokio::test]
@@ -418,6 +445,37 @@ async fn test_reinvite_comprehensive() {
     assert!(payload_map.contains_key(&100));
     assert!(!payload_map.contains_key(&97));
     assert!(!payload_map.contains_key(&98));
+}
+
+#[tokio::test]
+async fn test_local_reinvite_rollback_restores_payload_map() {
+    let pc = PeerConnection::new(RtcConfiguration::default());
+    pc.add_transceiver(
+        MediaKind::Audio,
+        peer_connection::TransceiverDirection::SendRecv,
+    );
+
+    let initial_offer = create_audio_sdp(SdpType::Offer, "0", Direction::SendRecv, 111, 12345);
+    pc.set_local_description(initial_offer).unwrap();
+
+    let initial_answer = create_audio_sdp(SdpType::Answer, "0", Direction::SendRecv, 111, 12345);
+    pc.set_remote_description(initial_answer).await.unwrap();
+
+    let transceiver = pc.get_transceivers()[0].clone();
+    assert!(transceiver.get_payload_map().contains_key(&111));
+
+    let reinvite_offer = create_audio_sdp(SdpType::Offer, "0", Direction::SendRecv, 120, 12345);
+    pc.set_local_description(reinvite_offer).unwrap();
+    assert_eq!(pc.signaling_state(), SignalingState::HaveLocalOffer);
+    assert!(transceiver.get_payload_map().contains_key(&120));
+
+    pc.set_local_description(SessionDescription::new(SdpType::Rollback))
+        .unwrap();
+
+    let payload_map = transceiver.get_payload_map();
+    assert_eq!(pc.signaling_state(), SignalingState::Stable);
+    assert!(payload_map.contains_key(&111));
+    assert!(!payload_map.contains_key(&120));
 }
 
 // Helper functions to test private methods
