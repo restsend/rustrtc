@@ -776,6 +776,12 @@ impl MediaSection {
                     video.payload_type, video.codec_name, video.clock_rate
                 )),
             ));
+            if let Some(fmtp) = &video.fmtp {
+                self.attributes.push(Attribute::new(
+                    "fmtp",
+                    Some(format!("{} {}", video.payload_type, fmtp)),
+                ));
+            }
             for fb in &video.rtcp_fbs {
                 self.attributes.push(Attribute::new(
                     "rtcp-fb",

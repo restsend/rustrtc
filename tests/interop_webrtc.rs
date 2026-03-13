@@ -119,8 +119,11 @@ async fn interop_vp8_echo() -> Result<()> {
     let (source, track, _) = rustrtc::media::sample_track(rustrtc::media::MediaKind::Video, 10);
     let params = rustrtc::RtpCodecParameters {
         payload_type: 96,
+        codec_name: "VP8".to_string(),
         clock_rate: 90000,
         channels: 0,
+        fmtp: None,
+        rtcp_fbs: Vec::new(),
     };
     let sender = rustrtc::peer_connection::RtpSender::builder(track, 12345)
         .stream_id("stream".to_string())
@@ -303,8 +306,11 @@ async fn interop_vp8_echo_with_pli() -> Result<()> {
     let (source, track, _) = rustrtc::media::sample_track(rustrtc::media::MediaKind::Video, 10);
     let params = rustrtc::RtpCodecParameters {
         payload_type: 96,
+        codec_name: "VP8".to_string(),
         clock_rate: 90000,
         channels: 0,
+        fmtp: None,
+        rtcp_fbs: Vec::new(),
     };
     let sender = rustrtc::peer_connection::RtpSender::builder(track, 12345)
         .stream_id("stream".to_string())

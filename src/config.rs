@@ -181,6 +181,7 @@ pub struct VideoCapability {
     pub payload_type: u8,
     pub codec_name: String,
     pub clock_rate: u32,
+    pub fmtp: Option<String>,
     pub rtcp_fbs: Vec<String>,
 }
 
@@ -190,6 +191,7 @@ impl Default for VideoCapability {
             payload_type: 96,
             codec_name: "VP8".to_string(),
             clock_rate: 90000,
+            fmtp: None,
             rtcp_fbs: vec![
                 "nack".to_string(),
                 "nack pli".to_string(),

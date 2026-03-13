@@ -321,6 +321,7 @@ struct TransceiverSnapshot {
     direction: TransceiverDirection,
     mid: Option<String>,
     payload_map: HashMap<u8, RtpCodecParameters>,
+    active_codec: Option<RtpCodecParameters>,
     extmap: HashMap<u8, String>,
     receiver_ssrc: Option<u32>,
     receiver_rtx_ssrc: Option<u32>,
@@ -675,6 +676,10 @@ impl PeerConnection {
                         direction: transceiver.direction(),
                         mid: transceiver.mid(),
                         payload_map: transceiver.get_payload_map(),
+                        active_codec: transceiver
+                            .sender()
+                            .map(|sender| sender.params())
+                            .or_else(|| receiver.as_ref().map(|rx| rx.params())),
                         extmap: transceiver.get_extmap(),
                         receiver_ssrc: receiver.as_ref().map(|rx| rx.ssrc()),
                         receiver_rtx_ssrc: receiver.as_ref().and_then(|rx| rx.rtx_ssrc()),
@@ -735,6 +740,9 @@ impl PeerConnection {
             entry.transceiver.set_direction(entry.direction);
             *entry.transceiver.mid.lock().unwrap() = entry.mid;
             entry.transceiver.update_payload_map(entry.payload_map)?;
+            if let Some(codec) = entry.active_codec {
+                entry.transceiver.set_active_codec(codec);
+            }
             entry.transceiver.update_extmap(entry.extmap)?;
 
             if let Some(receiver) = entry.transceiver.receiver() {
@@ -796,12 +804,7 @@ impl PeerConnection {
                     }
 
                     if let Some(t) = matched_transceiver {
-                        let payload_map = Self::extract_payload_map(section);
-                        if !payload_map.is_empty() {
-                            let _ = t.update_payload_map(payload_map);
-                        }
-                        let extmap = Self::extract_extmap(section);
-                        let _ = t.update_extmap(extmap);
+                        let _ = Self::apply_section_codec_state(&t, section);
                     }
                 }
             } else {
@@ -871,6 +874,9 @@ impl PeerConnection {
                     return Ok(());
                 }
             }
+        }
+        if matches!(desc.sdp_type, SdpType::Answer | SdpType::Pranswer) {
+            self.apply_local_description_media_state(&desc);
         }
         let mut local = self.inner.local_description.lock().unwrap();
         *local = Some(desc);
@@ -1284,13 +1290,7 @@ impl PeerConnection {
                 }
 
                 if let Some(t) = found_transceiver {
-                    // Update transceiver parameters
-                    let payload_map = Self::extract_payload_map(section);
-                    if !payload_map.is_empty() {
-                        let _ = t.update_payload_map(payload_map);
-                    }
-                    let extmap = Self::extract_extmap(section);
-                    let _ = t.update_extmap(extmap);
+                    let _ = Self::apply_section_codec_state(&t, section);
                     let direction: TransceiverDirection = section.direction.into();
                     t.set_direction(direction);
 
@@ -1394,6 +1394,7 @@ impl PeerConnection {
                     }
 
                     *t.receiver.lock().unwrap() = Some(receiver);
+                    let _ = Self::apply_section_codec_state(&t, section);
 
                     transceivers.push(t.clone());
 
@@ -1420,13 +1421,7 @@ impl PeerConnection {
                 }
 
                 if let Some(t) = found_transceiver {
-                    // Update transceiver parameters
-                    let payload_map = Self::extract_payload_map(section);
-                    if !payload_map.is_empty() {
-                        let _ = t.update_payload_map(payload_map);
-                    }
-                    let extmap = Self::extract_extmap(section);
-                    let _ = t.update_extmap(extmap);
+                    let _ = Self::apply_section_codec_state(t, section);
                     let direction: TransceiverDirection = section.direction.into();
                     t.set_direction(direction);
 
@@ -2293,20 +2288,7 @@ impl PeerConnection {
                     }
                 }
 
-                // Extract and validate payload type mapping
-                let payload_map = Self::extract_payload_map(section);
-                if !payload_map.is_empty() {
-                    // Basic validation: check if we support these codecs
-                    for (pt, params) in &payload_map {
-                        trace!("Validating PT {}: clock_rate={}", pt, params.clock_rate);
-                        // TODO: Add full codec capability check against local capabilities
-                    }
-                    t.update_payload_map(payload_map)?;
-                }
-
-                // Extract and update extension mapping
-                let extmap = Self::extract_extmap(section);
-                t.update_extmap(extmap)?;
+                Self::apply_section_codec_state(t, section)?;
 
                 // Handle direction changes
                 let new_direction: TransceiverDirection = section.direction.into();
@@ -2329,9 +2311,112 @@ impl PeerConnection {
         Ok(())
     }
 
+    fn parse_fmtp_map(section: &crate::MediaSection) -> HashMap<u8, String> {
+        let mut fmtp_map = HashMap::new();
+
+        for attr in &section.attributes {
+            if attr.key != "fmtp" {
+                continue;
+            }
+            let Some(value) = attr.value.as_ref() else {
+                continue;
+            };
+            let mut parts = value.splitn(2, char::is_whitespace);
+            let Some(pt_str) = parts.next() else {
+                continue;
+            };
+            let Some(fmtp) = parts.next() else {
+                continue;
+            };
+            if let Ok(pt) = pt_str.parse::<u8>() {
+                fmtp_map.insert(pt, fmtp.trim().to_string());
+            }
+        }
+
+        fmtp_map
+    }
+
+    fn parse_rtcp_feedback_map(section: &crate::MediaSection) -> HashMap<u8, Vec<String>> {
+        let mut feedback = HashMap::new();
+
+        for attr in &section.attributes {
+            if attr.key != "rtcp-fb" {
+                continue;
+            }
+            let Some(value) = attr.value.as_ref() else {
+                continue;
+            };
+            let mut parts = value.splitn(2, char::is_whitespace);
+            let Some(pt_str) = parts.next() else {
+                continue;
+            };
+            let Some(fb) = parts.next() else {
+                continue;
+            };
+            if let Ok(pt) = pt_str.parse::<u8>() {
+                feedback
+                    .entry(pt)
+                    .or_insert_with(Vec::new)
+                    .push(fb.trim().to_string());
+            }
+        }
+
+        feedback
+    }
+
+    fn parse_fmtp_parameters(fmtp: &str) -> HashMap<String, String> {
+        let mut params = HashMap::new();
+
+        for item in fmtp.split(';') {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            if let Some((key, value)) = item.split_once('=') {
+                params.insert(key.trim().to_string(), value.trim().to_string());
+            } else {
+                params.insert(item.to_string(), String::new());
+            }
+        }
+
+        params
+    }
+
+    fn extract_payload_types(section: &crate::MediaSection) -> Vec<u8> {
+        if !section.formats.is_empty() {
+            return section
+                .formats
+                .iter()
+                .filter_map(|fmt| fmt.parse::<u8>().ok())
+                .collect();
+        }
+
+        let mut payload_types = Vec::new();
+        for attr in &section.attributes {
+            if attr.key != "rtpmap" {
+                continue;
+            }
+            let Some(value) = attr.value.as_ref() else {
+                continue;
+            };
+            let Some(pt_str) = value.split_whitespace().next() else {
+                continue;
+            };
+            if let Ok(pt) = pt_str.parse::<u8>()
+                && !payload_types.contains(&pt)
+            {
+                payload_types.push(pt);
+            }
+        }
+
+        payload_types
+    }
+
     /// Extract payload type to codec parameters mapping from media section
     fn extract_payload_map(section: &crate::MediaSection) -> HashMap<u8, RtpCodecParameters> {
         let mut payload_map = HashMap::new();
+        let fmtp_map = Self::parse_fmtp_map(section);
+        let rtcp_feedback_map = Self::parse_rtcp_feedback_map(section);
 
         // Parse rtpmap attributes: "96 opus/48000/2"
         for attr in &section.attributes {
@@ -2343,19 +2428,26 @@ impl PeerConnection {
                             // Parse codec/rate/channels
                             let codec_parts: Vec<&str> = parts[1].split('/').collect();
                             if codec_parts.len() >= 2 {
+                                let codec_name = codec_parts[0].to_string();
                                 let clock_rate = codec_parts[1].parse().unwrap_or(90000);
                                 let channels = if codec_parts.len() >= 3 {
                                     codec_parts[2].parse().unwrap_or(0)
                                 } else {
                                     0
                                 };
+                                let fmtp = fmtp_map.get(&pt).cloned();
+                                let rtcp_fbs =
+                                    rtcp_feedback_map.get(&pt).cloned().unwrap_or_default();
 
                                 payload_map.insert(
                                     pt,
                                     RtpCodecParameters {
                                         payload_type: pt,
+                                        codec_name,
                                         clock_rate,
                                         channels,
+                                        fmtp,
+                                        rtcp_fbs,
                                     },
                                 );
                             }
@@ -2366,6 +2458,141 @@ impl PeerConnection {
         }
 
         payload_map
+    }
+
+    fn codecs_match(
+        local: &RtpCodecParameters,
+        remote: &RtpCodecParameters,
+        kind: MediaKind,
+    ) -> bool {
+        if !local.codec_name.eq_ignore_ascii_case(&remote.codec_name) {
+            return false;
+        }
+        if local.clock_rate != remote.clock_rate {
+            return false;
+        }
+
+        if kind == MediaKind::Audio
+            && local.channels != 0
+            && remote.channels != 0
+            && local.channels != remote.channels
+        {
+            return false;
+        }
+
+        true
+    }
+
+    fn intersect_rtcp_feedback(remote: &[String], local: &[String]) -> Vec<String> {
+        remote
+            .iter()
+            .filter(|fb| local.iter().any(|candidate| candidate == *fb))
+            .cloned()
+            .collect()
+    }
+
+    fn rewrite_section_codecs(
+        section: &mut crate::MediaSection,
+        codecs: &[RtpCodecParameters],
+        kind: MediaKind,
+    ) {
+        section
+            .attributes
+            .retain(|attr| !matches!(attr.key.as_str(), "rtpmap" | "fmtp" | "rtcp-fb"));
+        section.formats = codecs
+            .iter()
+            .map(|codec| codec.payload_type.to_string())
+            .collect();
+
+        for codec in codecs {
+            let rtpmap = if kind == MediaKind::Audio {
+                format!(
+                    "{} {}/{}/{}",
+                    codec.payload_type, codec.codec_name, codec.clock_rate, codec.channels
+                )
+            } else {
+                format!(
+                    "{} {}/{}",
+                    codec.payload_type, codec.codec_name, codec.clock_rate
+                )
+            };
+            section
+                .attributes
+                .push(Attribute::new("rtpmap", Some(rtpmap)));
+
+            if let Some(fmtp) = &codec.fmtp {
+                section.attributes.push(Attribute::new(
+                    "fmtp",
+                    Some(format!("{} {}", codec.payload_type, fmtp)),
+                ));
+            }
+            for fb in &codec.rtcp_fbs {
+                section.attributes.push(Attribute::new(
+                    "rtcp-fb",
+                    Some(format!("{} {}", codec.payload_type, fb)),
+                ));
+            }
+        }
+    }
+
+    fn reject_media_section(section: &mut crate::MediaSection) {
+        section.port = 0;
+        section.direction = Direction::Inactive;
+        section
+            .attributes
+            .retain(|attr| !matches!(attr.key.as_str(), "rtpmap" | "fmtp" | "rtcp-fb"));
+        if section.formats.is_empty() {
+            section.formats.push("0".to_string());
+        }
+    }
+
+    fn apply_section_payload_state(
+        transceiver: &Arc<RtpTransceiver>,
+        section: &crate::MediaSection,
+    ) -> RtcResult<()> {
+        let payload_map = Self::extract_payload_map(section);
+        let preferred_codec = Self::extract_payload_types(section)
+            .into_iter()
+            .find_map(|pt| payload_map.get(&pt).cloned())
+            .or_else(|| payload_map.values().next().cloned());
+
+        transceiver.update_payload_map(payload_map)?;
+        if let Some(codec) = preferred_codec {
+            transceiver.set_active_codec(codec);
+        }
+
+        Ok(())
+    }
+
+    fn apply_section_codec_state(
+        transceiver: &Arc<RtpTransceiver>,
+        section: &crate::MediaSection,
+    ) -> RtcResult<()> {
+        Self::apply_section_payload_state(transceiver, section)?;
+        let extmap = Self::extract_extmap(section);
+        transceiver.update_extmap(extmap)?;
+        Ok(())
+    }
+
+    fn apply_local_description_media_state(&self, desc: &SessionDescription) {
+        let transceivers = self.inner.transceivers.lock().unwrap().clone();
+
+        for section in &desc.media_sections {
+            let matched_transceiver = transceivers
+                .iter()
+                .find(|t| t.mid().as_ref() == Some(&section.mid))
+                .cloned()
+                .or_else(|| {
+                    transceivers
+                        .iter()
+                        .find(|t| t.mid().is_none() && t.kind() == section.kind)
+                        .cloned()
+                });
+
+            if let Some(transceiver) = matched_transceiver {
+                let _ = Self::apply_section_payload_state(&transceiver, section);
+            }
+        }
     }
 
     /// Extract extension header mapping from media section
@@ -3286,7 +3513,9 @@ impl PeerConnectionInner {
             if sdp_type == SdpType::Answer && !remote_offered_rtcp_mux {
                 section.attributes.retain(|attr| attr.key != "rtcp-mux");
             }
-            if let Some(sender) = sender_info {
+            if section.port != 0
+                && let Some(sender) = sender_info
+            {
                 Self::attach_sender_attributes(
                     &mut section,
                     sender.ssrc(),
@@ -3295,7 +3524,7 @@ impl PeerConnectionInner {
                     sender.track_id(),
                     &mode,
                 );
-            } else if direction.sends() {
+            } else if section.port != 0 && direction.sends() {
                 if let Some(ssrc) = *transceiver.sender_ssrc.lock().unwrap() {
                     let cname = format!("rustrtc-cname-{ssrc}");
                     let stream_id = transceiver
@@ -3421,6 +3650,102 @@ impl PeerConnectionInner {
         }
     }
 
+    fn local_codec_capabilities(&self, kind: MediaKind) -> Vec<RtpCodecParameters> {
+        match kind {
+            MediaKind::Audio => {
+                let default_cap = AudioCapability::default();
+                let caps = if let Some(config) = &self.config.media_capabilities {
+                    if config.audio.is_empty() {
+                        vec![default_cap]
+                    } else {
+                        config.audio.clone()
+                    }
+                } else {
+                    vec![default_cap]
+                };
+
+                caps.into_iter()
+                    .map(|cap| RtpCodecParameters {
+                        payload_type: cap.payload_type,
+                        codec_name: cap.codec_name,
+                        clock_rate: cap.clock_rate,
+                        channels: cap.channels,
+                        fmtp: cap.fmtp,
+                        rtcp_fbs: cap.rtcp_fbs,
+                    })
+                    .collect()
+            }
+            MediaKind::Video => {
+                let default_cap = VideoCapability::default();
+                let caps = if let Some(config) = &self.config.media_capabilities {
+                    if config.video.is_empty() {
+                        vec![default_cap]
+                    } else {
+                        config.video.clone()
+                    }
+                } else {
+                    vec![default_cap]
+                };
+
+                caps.into_iter()
+                    .map(|cap| RtpCodecParameters {
+                        payload_type: cap.payload_type,
+                        codec_name: cap.codec_name,
+                        clock_rate: cap.clock_rate,
+                        channels: 0,
+                        fmtp: cap.fmtp,
+                        rtcp_fbs: cap.rtcp_fbs,
+                    })
+                    .collect()
+            }
+            MediaKind::Application => Vec::new(),
+        }
+    }
+
+    fn negotiate_answer_codecs(&self, section: &crate::MediaSection) -> Vec<RtpCodecParameters> {
+        let remote = self.remote_description.lock().unwrap();
+        let Some(remote) = remote.as_ref() else {
+            return Vec::new();
+        };
+        let Some(remote_section) = remote
+            .media_sections
+            .iter()
+            .find(|item| item.mid == section.mid)
+        else {
+            return Vec::new();
+        };
+
+        let offered_codecs = PeerConnection::extract_payload_map(remote_section);
+        let offered_pts = PeerConnection::extract_payload_types(remote_section);
+        let local_capabilities = self.local_codec_capabilities(section.kind);
+        let mut negotiated = Vec::new();
+
+        for pt in offered_pts {
+            let Some(remote_codec) = offered_codecs.get(&pt) else {
+                continue;
+            };
+            let Some(local_codec) = local_capabilities.iter().find(|candidate| {
+                PeerConnection::codecs_match(candidate, remote_codec, section.kind)
+            }) else {
+                continue;
+            };
+
+            let mut codec = local_codec.clone();
+            codec.payload_type = pt;
+            codec.codec_name = remote_codec.codec_name.clone();
+            codec.rtcp_fbs = PeerConnection::intersect_rtcp_feedback(
+                &remote_codec.rtcp_fbs,
+                &local_codec.rtcp_fbs,
+            );
+            if codec.fmtp.is_none() {
+                codec.fmtp = remote_codec.fmtp.clone();
+            }
+            negotiated.push(codec);
+        }
+
+        negotiated
+    }
+
     fn populate_media_capabilities(
         &self,
         section: &mut MediaSection,
@@ -3428,6 +3753,15 @@ impl PeerConnectionInner {
         sdp_type: SdpType,
     ) {
         section.apply_config(&self.config);
+
+        if sdp_type == SdpType::Answer && matches!(kind, MediaKind::Audio | MediaKind::Video) {
+            let negotiated_codecs = self.negotiate_answer_codecs(section);
+            if negotiated_codecs.is_empty() {
+                PeerConnection::reject_media_section(section);
+            } else {
+                PeerConnection::rewrite_section_codecs(section, &negotiated_codecs, kind);
+            }
+        }
 
         // Add extmap for Video
         if kind == MediaKind::Video {
@@ -3779,20 +4113,35 @@ impl From<Direction> for TransceiverDirection {
 
 static TRANSCEIVER_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RtpCodecParameters {
     pub payload_type: u8,
+    pub codec_name: String,
     pub clock_rate: u32,
     pub channels: u8,
+    pub fmtp: Option<String>,
+    pub rtcp_fbs: Vec<String>,
 }
 
 impl Default for RtpCodecParameters {
     fn default() -> Self {
         Self {
             payload_type: 96,
+            codec_name: "VP8".to_string(),
             clock_rate: 90000,
             channels: 0,
+            fmtp: None,
+            rtcp_fbs: Vec::new(),
         }
+    }
+}
+
+impl RtpCodecParameters {
+    pub fn codec_specific_parameters(&self) -> HashMap<String, String> {
+        self.fmtp
+            .as_deref()
+            .map(PeerConnection::parse_fmtp_parameters)
+            .unwrap_or_default()
     }
 }
 
@@ -3978,6 +4327,15 @@ impl RtpTransceiver {
         self.payload_map.read().unwrap().clone()
     }
 
+    pub fn set_active_codec(&self, codec: RtpCodecParameters) {
+        if let Some(sender) = self.sender() {
+            sender.set_params(codec.clone());
+        }
+        if let Some(receiver) = self.receiver() {
+            receiver.set_params(codec);
+        }
+    }
+
     /// Get current extmap (for testing/debugging)
     pub fn get_extmap(&self) -> HashMap<u8, String> {
         self.extmap.read().unwrap().clone()
@@ -4129,6 +4487,10 @@ impl RtpSender {
 
     pub fn params(&self) -> RtpCodecParameters {
         self.params.lock().unwrap().clone()
+    }
+
+    pub fn set_params(&self, params: RtpCodecParameters) {
+        *self.params.lock().unwrap() = params;
     }
 
     pub fn interceptors(&self) -> &[Arc<dyn RtpSenderInterceptor + Send + Sync>] {
@@ -4419,13 +4781,25 @@ impl RtpReceiverBuilder {
         let params = match self.kind {
             MediaKind::Audio => RtpCodecParameters {
                 payload_type: 111,
+                codec_name: "opus".to_string(),
                 clock_rate: 48000,
                 channels: 2,
+                fmtp: Some("minptime=10;useinbandfec=1".to_string()),
+                rtcp_fbs: Vec::new(),
             },
             MediaKind::Video => RtpCodecParameters {
                 payload_type: 96,
+                codec_name: "VP8".to_string(),
                 clock_rate: 90000,
                 channels: 0,
+                fmtp: None,
+                rtcp_fbs: vec![
+                    "nack".to_string(),
+                    "nack pli".to_string(),
+                    "ccm fir".to_string(),
+                    "goog-remb".to_string(),
+                    "transport-cc".to_string(),
+                ],
             },
             _ => RtpCodecParameters::default(),
         };
@@ -4470,13 +4844,25 @@ impl RtpReceiver {
         let params = match kind {
             MediaKind::Audio => RtpCodecParameters {
                 payload_type: 111,
+                codec_name: "opus".to_string(),
                 clock_rate: 48000,
                 channels: 2,
+                fmtp: Some("minptime=10;useinbandfec=1".to_string()),
+                rtcp_fbs: Vec::new(),
             },
             MediaKind::Video => RtpCodecParameters {
                 payload_type: 96,
+                codec_name: "VP8".to_string(),
                 clock_rate: 90000,
                 channels: 0,
+                fmtp: None,
+                rtcp_fbs: vec![
+                    "nack".to_string(),
+                    "nack pli".to_string(),
+                    "ccm fir".to_string(),
+                    "goog-remb".to_string(),
+                    "transport-cc".to_string(),
+                ],
             },
             _ => RtpCodecParameters::default(),
         };
@@ -4556,6 +4942,10 @@ impl RtpReceiver {
     pub fn get_simulcast_rids(&self) -> Vec<String> {
         let tracks = self.simulcast_tracks.lock().unwrap();
         tracks.keys().cloned().collect()
+    }
+
+    pub fn params(&self) -> RtpCodecParameters {
+        self.params.lock().unwrap().clone()
     }
 
     pub fn set_params(&self, params: RtpCodecParameters) {
@@ -4944,8 +5334,11 @@ mod tests {
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 111,
+            codec_name: "opus".to_string(),
             clock_rate: 48000,
             channels: 2,
+            fmtp: Some("minptime=10;useinbandfec=1".to_string()),
+            rtcp_fbs: Vec::new(),
         };
         let sender = RtpSender::builder(track, 12345)
             .stream_id("stream".to_string())
@@ -5221,8 +5614,11 @@ mod tests {
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 111,
+            codec_name: "opus".to_string(),
             clock_rate: 48000,
             channels: 2,
+            fmtp: Some("minptime=10;useinbandfec=1".to_string()),
+            rtcp_fbs: Vec::new(),
         };
         let sender = RtpSender::builder(track, 12345)
             .stream_id("stream".to_string())
@@ -5632,8 +6028,11 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 8,
+            codec_name: "PCMA".to_string(),
             clock_rate: 8000,
             channels: 1,
+            fmtp: None,
+            rtcp_fbs: Vec::new(),
         };
         let sender = RtpSender::builder(track, 12345)
             .stream_id("s".to_string())
@@ -5754,8 +6153,11 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 8,
+            codec_name: "PCMA".to_string(),
             clock_rate: 8000,
             channels: 1,
+            fmtp: None,
+            rtcp_fbs: Vec::new(),
         };
         let sender = RtpSender::builder(track, 12345)
             .stream_id("s".to_string())
@@ -5857,8 +6259,11 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 0,
+            codec_name: "PCMU".to_string(),
             clock_rate: 8000,
             channels: 1,
+            fmtp: None,
+            rtcp_fbs: Vec::new(),
         };
         let sender = RtpSender::builder(track, 42)
             .stream_id("s".to_string())
@@ -6112,8 +6517,11 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 8,
+            codec_name: "PCMA".to_string(),
             clock_rate: 8000,
             channels: 1,
+            fmtp: None,
+            rtcp_fbs: Vec::new(),
         };
         let sender = RtpSender::builder(track, 100)
             .stream_id("s".to_string())
@@ -6143,8 +6551,11 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 8,
+            codec_name: "PCMA".to_string(),
             clock_rate: 8000,
             channels: 1,
+            fmtp: None,
+            rtcp_fbs: Vec::new(),
         };
         let sender = RtpSender::builder(track, 100)
             .stream_id("s".to_string())
@@ -6175,8 +6586,11 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 0,
+            codec_name: "PCMU".to_string(),
             clock_rate: 8000,
             channels: 1,
+            fmtp: None,
+            rtcp_fbs: Vec::new(),
         };
         let sender = RtpSender::builder(track, 100)
             .stream_id("s".to_string())
@@ -6239,8 +6653,11 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 8,
+            codec_name: "PCMA".to_string(),
             clock_rate: 8000,
             channels: 1,
+            fmtp: None,
+            rtcp_fbs: Vec::new(),
         };
         let sender = RtpSender::builder(track, 100)
             .stream_id("s".to_string())
@@ -6299,8 +6716,11 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 8,
+            codec_name: "PCMA".to_string(),
             clock_rate: 8000,
             channels: 1,
+            fmtp: None,
+            rtcp_fbs: Vec::new(),
         };
         let sender = RtpSender::builder(track, 100)
             .stream_id("s".to_string())

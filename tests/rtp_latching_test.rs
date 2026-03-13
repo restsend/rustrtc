@@ -98,8 +98,11 @@ async fn test_rtp_latching() -> Result<()> {
     let source = Arc::new(source);
     let params = RtpCodecParameters {
         payload_type: 96,
+        codec_name: "VP8".to_string(),
         clock_rate: 90000,
         channels: 0,
+        fmtp: None,
+        rtcp_fbs: Vec::new(),
     };
     let _sender = pc.add_track(track.clone(), params.clone())?;
 

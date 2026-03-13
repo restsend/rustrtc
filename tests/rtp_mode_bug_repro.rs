@@ -62,8 +62,11 @@ async fn test_rtp_mode_missing_data_bug_repro() -> Result<()> {
         rustrtc::media::track::sample_track(rustrtc::media::frame::MediaKind::Video, 100);
     let params = RtpCodecParameters {
         payload_type: 96,
+        codec_name: "VP8".to_string(),
         clock_rate: 90000,
         channels: 0,
+        fmtp: None,
+        rtcp_fbs: Vec::new(),
     };
     pc_fake.add_track(track, params)?;
 
