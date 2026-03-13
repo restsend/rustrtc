@@ -1318,6 +1318,7 @@ impl PeerConnection {
             srtp_required,
             allow_ssrc_change,
         ));
+        rtp_transport.attach_stats_collector(self.inner.stats_collector.clone());
         {
             let mut rx = ice_conn.rtp_receiver.write().unwrap();
             *rx = Some(Arc::downgrade(&rtp_transport)

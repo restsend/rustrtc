@@ -171,6 +171,47 @@ struct SessionKeys {
     salt: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ReplayWindow {
+    max_index: Option<u64>,
+    bitmap: u64,
+}
+
+impl ReplayWindow {
+    fn check_and_accept(&mut self, index: u64) -> SrtpResult<()> {
+        let Some(max_index) = self.max_index else {
+            self.max_index = Some(index);
+            self.bitmap = 1;
+            return Ok(());
+        };
+
+        if index > max_index {
+            let delta = index - max_index;
+            // Jumping past the full bitmap discards all older history at once.
+            self.bitmap = if delta >= u64::BITS as u64 {
+                1
+            } else {
+                (self.bitmap << (delta as u32)) | 1
+            };
+            self.max_index = Some(index);
+            return Ok(());
+        }
+
+        let delta = max_index - index;
+        if delta >= u64::BITS as u64 {
+            return Err(SrtpError::PacketTooOld);
+        }
+
+        let mask = 1u64 << (delta as u32);
+        if self.bitmap & mask != 0 {
+            return Err(SrtpError::ReplayDetected);
+        }
+
+        self.bitmap |= mask;
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct SrtpContext {
     ssrc: u32,
@@ -183,7 +224,9 @@ pub struct SrtpContext {
     direction: SrtpDirection,
     rollover_counter: u32,
     last_sequence: Option<u16>,
-    rtcp_index: u32,
+    rtp_replay_window: ReplayWindow,
+    next_rtcp_index: u32,
+    rtcp_replay_window: ReplayWindow,
 }
 
 impl fmt::Debug for SrtpContext {
@@ -250,7 +293,9 @@ impl SrtpContext {
             direction,
             rollover_counter: 0,
             last_sequence: None,
-            rtcp_index: 0,
+            rtp_replay_window: ReplayWindow::default(),
+            next_rtcp_index: 0,
+            rtcp_replay_window: ReplayWindow::default(),
         })
     }
 
@@ -322,8 +367,8 @@ impl SrtpContext {
     }
 
     pub fn protect_rtcp(&mut self, packet: &mut Vec<u8>) -> SrtpResult<()> {
-        self.rtcp_index += 1;
-        let index = self.rtcp_index;
+        self.next_rtcp_index += 1;
+        let index = self.next_rtcp_index;
         // E-bit = 1 (Encrypted)
         let index_with_e = index | 0x8000_0000;
 
@@ -392,11 +437,6 @@ impl SrtpContext {
             ]);
             let index = index_with_e & 0x7FFF_FFFF;
 
-            // Replay check
-            if index > self.rtcp_index {
-                self.rtcp_index = index;
-            }
-
             let nonce = self.build_gcm_rtcp_nonce(index);
             let cipher = self
                 .rtcp_gcm_cipher
@@ -425,6 +465,7 @@ impl SrtpContext {
             // Reconstruct packet: Header || Plaintext
             packet.truncate(8);
             packet.extend_from_slice(&plaintext);
+            self.rtcp_replay_window.check_and_accept(index as u64)?;
 
             return Ok(());
         }
@@ -453,15 +494,11 @@ impl SrtpContext {
         let e_bit = (index_with_e & 0x8000_0000) != 0;
         let index = index_with_e & 0x7FFF_FFFF;
 
-        // Replay check (simplified: just check if index is newer than last seen?)
-        // For now, we just update.
-        if index > self.rtcp_index {
-            self.rtcp_index = index;
-        }
-
         if e_bit && packet.len() > 8 {
             self.cipher_rtcp(packet, index)?;
         }
+
+        self.rtcp_replay_window.check_and_accept(index as u64)?;
 
         Ok(())
     }
@@ -549,6 +586,7 @@ impl SrtpContext {
         }
 
         let roc = self.estimate_roc(packet.header.sequence_number);
+        let packet_index = Self::packet_index(packet.header.sequence_number, roc);
 
         if let SrtpProfile::AeadAes128Gcm = self._profile {
             let nonce = self.build_gcm_nonce(packet.header.sequence_number, roc);
@@ -572,6 +610,7 @@ impl SrtpContext {
                 .map_err(|_| SrtpError::AuthenticationFailed)?;
 
             packet.payload = plaintext;
+            self.rtp_replay_window.check_and_accept(packet_index)?;
             self.update(packet.header.sequence_number, roc);
             return Ok(());
         }
@@ -585,6 +624,7 @@ impl SrtpContext {
             return Err(SrtpError::AuthenticationFailed);
         }
         self.cipher_payload(packet, roc)?;
+        self.rtp_replay_window.check_and_accept(packet_index)?;
         self.update(packet.header.sequence_number, roc);
         Ok(())
     }
@@ -651,7 +691,7 @@ impl SrtpContext {
     }
 
     fn build_iv(&self, sequence: u16, roc: u32) -> [u8; 16] {
-        let index = ((roc as u64) << 16) | sequence as u64;
+        let index = Self::packet_index(sequence, roc);
         let mut iv = [0u8; 16];
         for (i, byte) in self.rtp_keys.salt.iter().enumerate().take(14) {
             iv[i] = *byte;
@@ -668,6 +708,10 @@ impl SrtpContext {
             iv[i] ^= block[i];
         }
         iv
+    }
+
+    fn packet_index(sequence: u16, roc: u32) -> u64 {
+        ((roc as u64) << 16) | sequence as u64
     }
 
     fn estimate_roc(&self, sequence: u16) -> u32 {
@@ -696,7 +740,7 @@ impl SrtpContext {
 
         let current_index =
             ((self.rollover_counter as u64) << 16) | (self.last_sequence.unwrap() as u64);
-        let new_index = ((roc as u64) << 16) | (sequence as u64);
+        let new_index = Self::packet_index(sequence, roc);
 
         if new_index > current_index {
             self.rollover_counter = roc;

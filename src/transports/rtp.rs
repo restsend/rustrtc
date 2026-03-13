@@ -1,5 +1,7 @@
+use crate::errors::SrtpError;
 use crate::rtp::{RtcpPacket, RtpPacket, is_rtcp, marshal_rtcp_packets, parse_rtcp_packets};
 use crate::srtp::SrtpSession;
+use crate::stats_collector::StatsCollector;
 use crate::transports::PacketReceiver;
 use crate::transports::ice::conn::IceConn;
 use anyhow::Result;
@@ -20,6 +22,7 @@ pub struct RtpTransport {
     provisional_listener: Mutex<Option<mpsc::Sender<(RtpPacket, SocketAddr)>>>,
     rid_extension_id: Mutex<Option<u8>>,
     abs_send_time_extension_id: Mutex<Option<u8>>,
+    stats_collector: Mutex<Option<Arc<StatsCollector>>>,
     srtp_required: bool,
 }
 
@@ -43,6 +46,7 @@ impl RtpTransport {
             provisional_listener: Mutex::new(None),
             rid_extension_id: Mutex::new(None),
             abs_send_time_extension_id: Mutex::new(None),
+            stats_collector: Mutex::new(None),
             srtp_required,
             // allow_ssrc_change,
             // pt_to_ssrc: Mutex::new(HashMap::new()),
@@ -57,6 +61,11 @@ impl RtpTransport {
     pub fn start_srtp(&self, srtp_session: SrtpSession) {
         let mut session = self.srtp_session.lock().unwrap();
         *session = Some(Arc::new(Mutex::new(srtp_session)));
+    }
+
+    pub fn attach_stats_collector(&self, stats_collector: Arc<StatsCollector>) {
+        let mut collector = self.stats_collector.lock().unwrap();
+        *collector = Some(stats_collector);
     }
 
     pub fn register_listener_sync(&self, ssrc: u32, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
@@ -200,6 +209,13 @@ impl RtpTransport {
 
         count
     }
+
+    fn record_srtp_replay_reject(&self, is_rtcp: bool, error: &SrtpError) {
+        let collector = self.stats_collector.lock().unwrap().clone();
+        if let Some(collector) = collector {
+            collector.record_srtp_replay_reject(is_rtcp, error);
+        }
+    }
 }
 
 #[async_trait]
@@ -216,7 +232,12 @@ impl PacketReceiver for RtpTransport {
                     match srtp.unprotect_rtcp(&mut buf) {
                         Ok(_) => buf,
                         Err(e) => {
-                            tracing::warn!("SRTP unprotect RTCP failed: {}", e);
+                            self.record_srtp_replay_reject(true, &e);
+                            if e.is_replay_related() {
+                                tracing::warn!("SRTP replay rejected RTCP packet: {}", e);
+                            } else {
+                                tracing::warn!("SRTP unprotect RTCP failed: {}", e);
+                            }
                             return;
                         }
                     }
@@ -230,7 +251,13 @@ impl PacketReceiver for RtpTransport {
                                     return;
                                 }
                             },
-                            Err(_) => {
+                            Err(e) => {
+                                self.record_srtp_replay_reject(false, &e);
+                                if e.is_replay_related() {
+                                    tracing::warn!("SRTP replay rejected RTP packet: {}", e);
+                                } else {
+                                    tracing::debug!("SRTP unprotect RTP failed: {}", e);
+                                }
                                 return;
                             }
                         },
