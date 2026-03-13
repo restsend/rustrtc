@@ -346,8 +346,6 @@ mod tests {
 
         let (_ice_tx, ice_rx) = watch::channel(None::<IceSocketWrapper>);
         let ice_conn = IceConn::new(ice_rx, "127.0.0.1:1234".parse().unwrap());
-        // These tests inject raw RTP packets directly, so the transport must be
-        // constructed with SRTP disabled after the constructor signature change.
         let transport = RtpTransport::new(ice_conn, false);
 
         let (tx, mut rx) = mpsc::channel(10);
@@ -397,8 +395,6 @@ mod tests {
         // Setup RtpTransport with a mock/dummy IceConn
         let (_ice_tx, ice_rx) = watch::channel(None::<IceSocketWrapper>);
         let ice_conn = IceConn::new(ice_rx, "127.0.0.1:1234".parse().unwrap());
-        // This test also feeds raw RTP directly, so keep SRTP disabled when
-        // constructing the transport.
         let transport = RtpTransport::new(ice_conn, false);
 
         // Register a provisional listener
