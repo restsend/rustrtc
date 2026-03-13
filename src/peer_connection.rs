@@ -1244,6 +1244,9 @@ impl PeerConnection {
 
         // Create IceConn and register it immediately to avoid dropping packets
         let ice_conn = IceConn::new(socket_rx.clone(), pair.remote.address);
+        if self.config().transport_mode == TransportMode::Rtp && self.config().enable_latching {
+            ice_conn.enable_latch_on_rtp();
+        }
 
         // Monitor selected pair changes to update remote address
         let mut pair_rx = self.inner.ice_transport.subscribe_selected_pair();
@@ -2415,9 +2418,13 @@ async fn run_ice_dtls_loop(
                     // Log the outcome but always proceed — a nomination failure doesn't
                     // mean the path is unusable; DTLS may still succeed.
                     match wait_result {
-                        Some(true) => debug!("ICE nomination completed successfully, starting DTLS"),
+                        Some(true) => {
+                            debug!("ICE nomination completed successfully, starting DTLS")
+                        }
                         Some(false) => debug!("ICE nomination failed, proceeding to DTLS anyway"),
-                        None => debug!("ICE nomination wait timed-out or ICE changed state, proceeding to DTLS"),
+                        None => debug!(
+                            "ICE nomination wait timed-out or ICE changed state, proceeding to DTLS"
+                        ),
                     }
                 }
 
