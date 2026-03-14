@@ -167,6 +167,7 @@ impl SessionDescription {
         }
         out
     }
+
     pub fn dtls_fingerprint(&self) -> SdpResult<Option<SdpFingerprint>> {
         let mut fingerprint = None;
 
@@ -268,6 +269,7 @@ fn normalize_fingerprint_value(value: &str) -> SdpResult<String> {
 
     Ok(formatted)
 }
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionSection {
     pub version: u8,
@@ -906,5 +908,47 @@ impl MediaSection {
             attr.write_line(out)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_session_description_extracts_normalized_dtls_fingerprint() {
+        let sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=fingerprint:sha-256 aa:bb:cc:dd\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+a=mid:0\r\n";
+
+        let desc = SessionDescription::parse(SdpType::Offer, sdp).unwrap();
+        let fingerprint = desc.dtls_fingerprint().unwrap().unwrap();
+
+        assert_eq!(fingerprint.algorithm, "sha-256");
+        assert_eq!(fingerprint.value, "AA:BB:CC:DD");
+    }
+
+    #[test]
+    fn test_session_description_rejects_conflicting_dtls_fingerprints() {
+        let sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=fingerprint:sha-256 AA:BB:CC:DD\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+a=mid:0\r\n\
+a=fingerprint:sha-256 AA:BB:CC:EE\r\n";
+
+        let desc = SessionDescription::parse(SdpType::Offer, sdp).unwrap();
+        let err = desc.dtls_fingerprint().unwrap_err();
+
+        assert_eq!(
+            err,
+            SdpError::Parse("conflicting DTLS fingerprint attributes in SDP".into())
+        );
     }
 }
