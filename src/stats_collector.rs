@@ -1,4 +1,4 @@
-use crate::errors::RtcResult;
+use crate::errors::{RtcResult, SrtpError};
 use crate::peer_connection::{RtpReceiverInterceptor, RtpSenderInterceptor};
 use crate::rtp::{ReceiverReport, RtcpPacket, RtpPacket, SenderReport};
 use crate::stats::{StatsEntry, StatsId, StatsKind, StatsProvider};
@@ -82,12 +82,30 @@ impl Default for LocalOutboundStats {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct ReplayRejectStats {
+    rtp_duplicates: u64,
+    rtp_too_old: u64,
+    rtcp_duplicates: u64,
+    rtcp_too_old: u64,
+}
+
+impl ReplayRejectStats {
+    fn has_rejects(&self) -> bool {
+        self.rtp_duplicates != 0
+            || self.rtp_too_old != 0
+            || self.rtcp_duplicates != 0
+            || self.rtcp_too_old != 0
+    }
+}
+
 #[derive(Default)]
 pub struct StatsCollector {
     remote_inbound: Mutex<HashMap<u32, RemoteInboundStats>>,
     remote_outbound: Mutex<HashMap<u32, RemoteOutboundStats>>,
     local_inbound: Mutex<HashMap<u32, LocalInboundStats>>,
     local_outbound: Mutex<HashMap<u32, LocalOutboundStats>>,
+    replay_rejects: Mutex<ReplayRejectStats>,
 }
 
 impl StatsCollector {
@@ -99,6 +117,17 @@ impl StatsCollector {
         match packet {
             RtcpPacket::SenderReport(sr) => self.handle_sr(sr),
             RtcpPacket::ReceiverReport(rr) => self.handle_rr(rr),
+            _ => {}
+        }
+    }
+
+    pub fn record_srtp_replay_reject(&self, is_rtcp: bool, error: &SrtpError) {
+        let mut rejects = self.replay_rejects.lock().unwrap();
+        match (is_rtcp, error) {
+            (false, SrtpError::ReplayDetected) => rejects.rtp_duplicates += 1,
+            (false, SrtpError::PacketTooOld) => rejects.rtp_too_old += 1,
+            (true, SrtpError::ReplayDetected) => rejects.rtcp_duplicates += 1,
+            (true, SrtpError::PacketTooOld) => rejects.rtcp_too_old += 1,
             _ => {}
         }
     }
@@ -245,6 +274,22 @@ impl StatsProvider for StatsCollector {
             }
         }
 
+        {
+            let rejects = self.replay_rejects.lock().unwrap();
+            if rejects.has_rejects() {
+                let entry =
+                    StatsEntry::new(StatsId::new("transport-security"), StatsKind::Transport)
+                        .with_value("srtpReplayRejectDuplicates", json!(rejects.rtp_duplicates))
+                        .with_value("srtpReplayRejectTooOld", json!(rejects.rtp_too_old))
+                        .with_value(
+                            "srtcpReplayRejectDuplicates",
+                            json!(rejects.rtcp_duplicates),
+                        )
+                        .with_value("srtcpReplayRejectTooOld", json!(rejects.rtcp_too_old));
+                entries.push(entry);
+            }
+        }
+
         Ok(entries)
     }
 }
@@ -334,5 +379,24 @@ mod tests {
         assert_eq!(inbound.values["ssrc"], 67890);
         assert_eq!(inbound.values["packetsReceived"], 1);
         assert_eq!(inbound.values["bytesReceived"], 112);
+    }
+
+    #[tokio::test]
+    async fn test_stats_collector_replay_rejects() {
+        let collector = StatsCollector::new();
+        collector.record_srtp_replay_reject(false, &SrtpError::ReplayDetected);
+        collector.record_srtp_replay_reject(false, &SrtpError::PacketTooOld);
+        collector.record_srtp_replay_reject(true, &SrtpError::ReplayDetected);
+
+        let stats = collector.collect().await.unwrap();
+        let transport = stats
+            .iter()
+            .find(|entry| entry.kind == StatsKind::Transport)
+            .unwrap();
+
+        assert_eq!(transport.values["srtpReplayRejectDuplicates"], 1);
+        assert_eq!(transport.values["srtpReplayRejectTooOld"], 1);
+        assert_eq!(transport.values["srtcpReplayRejectDuplicates"], 1);
+        assert_eq!(transport.values["srtcpReplayRejectTooOld"], 0);
     }
 }

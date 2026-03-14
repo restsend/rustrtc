@@ -4,23 +4,62 @@ use rustrtc::media::frame::{MediaSample, VideoFrame};
 use rustrtc::transports::ice::stun::StunMessage;
 use rustrtc::{PeerConnection, RtcConfiguration, RtpCodecParameters, SdpType, TransportMode};
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
-#[tokio::test]
-async fn test_rtp_latching() -> Result<()> {
-    let _ = env_logger::builder().is_test(true).try_init();
+async fn can_exchange_udp(ip_a: IpAddr, ip_b: IpAddr) -> Result<bool> {
+    let socket_a = match UdpSocket::bind(SocketAddr::new(ip_a, 0)).await {
+        Ok(socket) => socket,
+        Err(_) => return Ok(false),
+    };
+    let socket_b = match UdpSocket::bind(SocketAddr::new(ip_b, 0)).await {
+        Ok(socket) => socket,
+        Err(_) => return Ok(false),
+    };
+    let addr_a = socket_a.local_addr()?;
 
-    // 0. Find distinct local IPs
+    socket_b.send_to(b"PING", addr_a).await?;
+
+    let mut buf = [0u8; 10];
+    let Ok(Ok((_, src_b))) =
+        tokio::time::timeout(Duration::from_millis(100), socket_a.recv_from(&mut buf)).await
+    else {
+        return Ok(false);
+    };
+
+    socket_a.send_to(b"PONG", src_b).await?;
+    Ok(
+        tokio::time::timeout(Duration::from_millis(100), socket_b.recv_from(&mut buf))
+            .await
+            .is_ok(),
+    )
+}
+
+fn is_compatible_latching_pair(ip_a: IpAddr, ip_b: IpAddr) -> bool {
+    // Latching reuses the selected local candidate. Mixed loopback/LAN pairs can
+    // pass a raw UDP probe but still fail to deliver the migration STUN packet
+    // to the bound local candidate on some hosts.
+    ip_a.is_loopback() == ip_b.is_loopback()
+}
+
+async fn select_test_ip_pair() -> Result<Option<(IpAddr, IpAddr)>> {
+    let loopback_a = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let loopback_b = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+
+    // Prefer two deterministic loopback aliases so the latching test is not
+    // coupled to whichever LAN or transient interface the host happens to have.
+    if can_exchange_udp(loopback_a, loopback_b).await? {
+        return Ok(Some((loopback_a, loopback_b)));
+    }
+
     let interfaces = NetworkInterface::show().unwrap();
     let mut ips = HashSet::new();
     for itf in interfaces {
         for addr in itf.addr {
             let ip = addr.ip();
             if ip.is_ipv4() && !ip.is_multicast() && !ip.is_unspecified() {
-                // Try to bind to it to see if it's usable
                 if std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok() {
                     ips.insert(ip);
                 }
@@ -29,16 +68,6 @@ async fn test_rtp_latching() -> Result<()> {
     }
 
     let ipv4_ips: Vec<_> = ips.into_iter().collect();
-    if ipv4_ips.len() < 2 {
-        println!(
-            "Skipping test_rtp_latching: Need at least 2 distinct local IPv4s, found {:?}",
-            ipv4_ips
-        );
-        return Ok(());
-    }
-
-    // Try to find a pair of IPs that can talk to each other
-    let mut selected_pair = None;
     for i in 0..ipv4_ips.len() {
         for j in 0..ipv4_ips.len() {
             if i == j {
@@ -46,38 +75,26 @@ async fn test_rtp_latching() -> Result<()> {
             }
             let ip_a = ipv4_ips[i];
             let ip_b = ipv4_ips[j];
-
-            // Verify connectivity from B to A
-            let socket_a = UdpSocket::bind(SocketAddr::new(ip_a, 0)).await?;
-            let socket_b = UdpSocket::bind(SocketAddr::new(ip_b, 0)).await?;
-            let addr_a = socket_a.local_addr()?;
-
-            socket_b.send_to(b"PING", addr_a).await?;
-
-            let mut buf = [0u8; 10];
-            if let Ok(Ok((_, src_b))) =
-                tokio::time::timeout(Duration::from_millis(100), socket_a.recv_from(&mut buf)).await
-            {
-                // Verify return path A -> B
-                socket_a.send_to(b"PONG", src_b).await?;
-                if let Ok(Ok(_)) =
-                    tokio::time::timeout(Duration::from_millis(100), socket_b.recv_from(&mut buf))
-                        .await
-                {
-                    selected_pair = Some((ip_a, ip_b));
-                    break;
-                }
+            if is_compatible_latching_pair(ip_a, ip_b) && can_exchange_udp(ip_a, ip_b).await? {
+                return Ok(Some((ip_a, ip_b)));
             }
-        }
-        if selected_pair.is_some() {
-            break;
         }
     }
 
-    let (ip1, ip2) = if let Some(pair) = selected_pair {
+    Ok(None)
+}
+
+#[tokio::test]
+async fn test_rtp_latching() -> Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    // 0. Find a pair of local IPs that can exchange UDP reliably.
+    let (ip1, ip2) = if let Some(pair) = select_test_ip_pair().await? {
         pair
     } else {
-        println!("Skipping test_rtp_latching: No two local IPs can reach each other via UDP.");
+        println!(
+            "Skipping test_rtp_latching: No usable local IP pair can reach each other via UDP."
+        );
         return Ok(());
     };
 
@@ -87,7 +104,9 @@ async fn test_rtp_latching() -> Result<()> {
     let mut config = RtcConfiguration::default();
     config.transport_mode = TransportMode::Rtp;
     config.enable_latching = true;
-    config.bind_ip = Some("0.0.0.0".to_string());
+    // Bind to the initial destination IP so the selected local candidate stays
+    // on the same routing domain that the latching probe will use.
+    config.bind_ip = Some(ip1.to_string());
     config.rtp_start_port = Some(40000);
     config.rtp_end_port = Some(40100);
     let pc = PeerConnection::new(config);
@@ -98,8 +117,11 @@ async fn test_rtp_latching() -> Result<()> {
     let source = Arc::new(source);
     let params = RtpCodecParameters {
         payload_type: 96,
+        codec_name: "VP8".to_string(),
         clock_rate: 90000,
         channels: 0,
+        fmtp: None,
+        rtcp_fbs: Vec::new(),
     };
     let _sender = pc.add_track(track.clone(), params.clone())?;
 
@@ -178,15 +200,14 @@ async fn test_rtp_latching() -> Result<()> {
     };
     println!("Remote 2 (Migrated) at {}", addr2);
 
-    // Retrieve PC's listening address
-    // We assume the first media section's port is binding
-    let local_desc = pc.local_description().unwrap();
-    let pc_port = local_desc.media_sections[0].port;
-    if pc_port == 0 {
-        panic!("PC port is 0, gathering failed?");
-    }
-    // Since PC is bound to 0.0.0.0, it should be reachable on all local IPs
-    let pc_addr: SocketAddr = SocketAddr::new(ip1, pc_port);
+    // Send the latching STUN probe to the currently selected local candidate
+    // instead of assuming a specific interface address from the test harness.
+    let selected_pair = pc
+        .ice_transport()
+        .get_selected_pair()
+        .await
+        .expect("selected ICE pair should exist after RTP mode connects");
+    let pc_addr = selected_pair.local.address;
     println!("PC listening at {}", pc_addr);
 
     // Send STUN Binding Request from socket2 to PC to trigger latching
@@ -196,6 +217,21 @@ async fn test_rtp_latching() -> Result<()> {
 
     println!("Sending STUN Binding Request from {} to {}", addr2, pc_addr);
     socket2.send_to(&req_bytes, pc_addr).await?;
+
+    let wait_for_latch = async {
+        loop {
+            if let Some(pair) = pc.ice_transport().get_selected_pair().await
+                && pair.remote.address == addr2
+            {
+                return Ok::<(), anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+
+    tokio::time::timeout(Duration::from_secs(2), wait_for_latch)
+        .await
+        .expect("timed out waiting for ICE latching update")?;
 
     // 6. Verify PC sends to addr2
     println!("Waiting for packets on addr2...");

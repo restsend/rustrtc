@@ -13,8 +13,9 @@ use crate::transports::ice::{IceCandidate, IceGathererState, IceTransport, conn:
 use crate::transports::rtp::RtpTransport;
 use crate::transports::sctp::SctpTransport;
 use crate::{
-    Attribute, AudioCapability, Direction, MediaKind, MediaSection, Origin, RtcConfiguration,
-    RtcError, RtcResult, SdpType, SessionDescription, TransportMode, VideoCapability,
+    Attribute, AudioCapability, BundlePolicy, Direction, MediaKind, MediaSection, Origin,
+    RtcConfiguration, RtcError, RtcResult, SdpType, SessionDescription, TransportMode,
+    VideoCapability,
 };
 use base64::prelude::*;
 use std::collections::{HashMap, VecDeque};
@@ -282,6 +283,9 @@ struct PeerConnectionInner {
     _ice_gathering_state_rx: watch::Receiver<IceGatheringState>,
     local_description: Mutex<Option<SessionDescription>>,
     remote_description: Mutex<Option<SessionDescription>>,
+    // Rollback must restore the last stable SDP plus the RTP runtime state
+    // derived from it, otherwise renegotiation side effects leak past abort.
+    rollback_snapshot: Mutex<Option<NegotiationSnapshot>>,
     transceivers: Mutex<Vec<Arc<RtpTransceiver>>>,
     next_mid: AtomicU16,
     ice_transport: IceTransport,
@@ -300,6 +304,29 @@ struct PeerConnectionInner {
     ssrc_generator: AtomicU32,
     disconnect_reason: watch::Sender<Option<DisconnectReason>>,
     _disconnect_reason_rx: watch::Receiver<Option<DisconnectReason>>,
+}
+
+#[derive(Clone)]
+struct NegotiationSnapshot {
+    local_description: Option<SessionDescription>,
+    remote_description: Option<SessionDescription>,
+    transceivers: Vec<TransceiverSnapshot>,
+    next_mid: u16,
+    remote_dtls_fingerprint: Option<String>,
+    dtls_role: Option<bool>,
+}
+
+#[derive(Clone)]
+struct TransceiverSnapshot {
+    transceiver: Arc<RtpTransceiver>,
+    direction: TransceiverDirection,
+    mid: Option<String>,
+    payload_map: HashMap<u8, RtpCodecParameters>,
+    active_codec: Option<RtpCodecParameters>,
+    extmap: HashMap<u8, String>,
+    receiver_ssrc: Option<u32>,
+    receiver_rtx_ssrc: Option<u32>,
+    receiver_track_event_sent: Option<bool>,
 }
 
 fn generate_sdes_key_params() -> String {
@@ -332,12 +359,45 @@ fn map_crypto_suite(suite: &str) -> RtcResult<crate::srtp::SrtpProfile> {
     }
 }
 
+fn resolve_dtls_certificate(config: &RtcConfiguration) -> RtcResult<Arc<dtls::Certificate>> {
+    match config.certificates.as_slice() {
+        [] => dtls::generate_certificate()
+            .map(Arc::new)
+            .map_err(|e| RtcError::Internal(format!("failed to generate certificate: {}", e))),
+        [certificate] => {
+            let private_key_pem = certificate.private_key_pem.as_deref().ok_or_else(|| {
+                RtcError::InvalidConfiguration(
+                    "certificate.private_key_pem is required when certificates are configured"
+                        .into(),
+                )
+            })?;
+            // The runtime negotiates a single DTLS identity today, so reject
+            // ambiguous certificate lists instead of silently ignoring them.
+            dtls::load_certificate_from_pem(&certificate.pem_chain, private_key_pem)
+                .map(Arc::new)
+                .map_err(|e| {
+                    RtcError::InvalidConfiguration(format!(
+                        "failed to load configured certificate: {}",
+                        e
+                    ))
+                })
+        }
+        _ => Err(RtcError::InvalidConfiguration(
+            "multiple certificate configurations are not supported".into(),
+        )),
+    }
+}
+
 impl PeerConnection {
     pub fn new(config: RtcConfiguration) -> Self {
+        Self::try_new(config).expect("failed to create peer connection")
+    }
+
+    pub fn try_new(config: RtcConfiguration) -> RtcResult<Self> {
+        config.validate_runtime_support()?;
         let is_rtp_mode = config.transport_mode == TransportMode::Rtp;
-        let (ice_transport, ice_runner) = IceTransport::new(config.clone());
-        let certificate =
-            Arc::new(dtls::generate_certificate().expect("failed to generate certificate"));
+        let (ice_transport, ice_runner) = IceTransport::try_new(config.clone())?;
+        let certificate = resolve_dtls_certificate(&config)?;
         let dtls_fingerprint = dtls::fingerprint(&certificate);
 
         let (signaling_state_tx, signaling_state_rx) = watch::channel(SignalingState::Stable);
@@ -365,6 +425,7 @@ impl PeerConnection {
             _ice_gathering_state_rx: ice_gathering_state_rx,
             local_description: Mutex::new(None),
             remote_description: Mutex::new(None),
+            rollback_snapshot: Mutex::new(None),
             transceivers: Mutex::new(Vec::new()),
             next_mid: AtomicU16::new(0),
             ice_transport,
@@ -427,7 +488,7 @@ impl PeerConnection {
                 tokio::join!(gathering_loop, dtls_loop, ice_runner);
             });
         }
-        pc
+        Ok(pc)
     }
 
     pub fn config(&self) -> &RtcConfiguration {
@@ -609,7 +670,10 @@ impl PeerConnection {
 
     pub async fn create_answer(&self) -> RtcResult<SessionDescription> {
         let state = &self.inner.signaling_state;
-        if *state.borrow() != SignalingState::HaveRemoteOffer {
+        if !matches!(
+            *state.borrow(),
+            SignalingState::HaveRemoteOffer | SignalingState::HaveLocalPranswer
+        ) {
             return Err(RtcError::InvalidState(
                 "create_answer requires remote offer".into(),
             ));
@@ -622,8 +686,127 @@ impl PeerConnection {
             .await
     }
 
+    fn capture_rollback_snapshot_if_absent(&self) {
+        let mut snapshot = self.inner.rollback_snapshot.lock().unwrap();
+        if snapshot.is_some() {
+            return;
+        }
+
+        let local_description = self.inner.local_description.lock().unwrap().clone();
+        let remote_description = self.inner.remote_description.lock().unwrap().clone();
+        let transceivers = self.inner.transceivers.lock().unwrap().clone();
+        let next_mid = self.inner.next_mid.load(Ordering::SeqCst);
+        let remote_dtls_fingerprint = self.inner.remote_dtls_fingerprint.lock().unwrap().clone();
+        let dtls_role = *self.inner.dtls_role.borrow();
+
+        *snapshot = Some(NegotiationSnapshot {
+            local_description,
+            remote_description,
+            transceivers: transceivers
+                .into_iter()
+                .map(|transceiver| {
+                    let receiver = transceiver.receiver();
+                    TransceiverSnapshot {
+                        direction: transceiver.direction(),
+                        mid: transceiver.mid(),
+                        payload_map: transceiver.get_payload_map(),
+                        active_codec: transceiver
+                            .sender()
+                            .map(|sender| sender.params())
+                            .or_else(|| receiver.as_ref().map(|rx| rx.params())),
+                        extmap: transceiver.get_extmap(),
+                        receiver_ssrc: receiver.as_ref().map(|rx| rx.ssrc()),
+                        receiver_rtx_ssrc: receiver.as_ref().and_then(|rx| rx.rtx_ssrc()),
+                        receiver_track_event_sent: receiver
+                            .as_ref()
+                            .map(|rx| rx.track_event_sent.load(Ordering::SeqCst)),
+                        transceiver,
+                    }
+                })
+                .collect(),
+            next_mid,
+            remote_dtls_fingerprint,
+            dtls_role,
+        });
+    }
+
+    fn has_established_negotiation(&self) -> bool {
+        if let Some(snapshot) = self.inner.rollback_snapshot.lock().unwrap().as_ref() {
+            snapshot.local_description.is_some() || snapshot.remote_description.is_some()
+        } else {
+            let local = self.inner.local_description.lock().unwrap();
+            let remote = self.inner.remote_description.lock().unwrap();
+            local.is_some() || remote.is_some()
+        }
+    }
+
+    fn clear_rollback_snapshot(&self) {
+        self.inner.rollback_snapshot.lock().unwrap().take();
+    }
+
+    fn restore_rollback_snapshot(&self) -> RtcResult<()> {
+        let snapshot = self
+            .inner
+            .rollback_snapshot
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| {
+                RtcError::InvalidState("rollback requires a pending negotiation".into())
+            })?;
+
+        *self.inner.local_description.lock().unwrap() = snapshot.local_description;
+        *self.inner.remote_description.lock().unwrap() = snapshot.remote_description;
+        self.inner
+            .next_mid
+            .store(snapshot.next_mid, Ordering::SeqCst);
+        *self.inner.remote_dtls_fingerprint.lock().unwrap() = snapshot.remote_dtls_fingerprint;
+        let _ = self.inner.dtls_role.send(snapshot.dtls_role);
+
+        let restored_transceivers: Vec<Arc<RtpTransceiver>> = snapshot
+            .transceivers
+            .iter()
+            .map(|entry| entry.transceiver.clone())
+            .collect();
+        *self.inner.transceivers.lock().unwrap() = restored_transceivers;
+
+        for entry in snapshot.transceivers {
+            entry.transceiver.set_direction(entry.direction);
+            *entry.transceiver.mid.lock().unwrap() = entry.mid;
+            entry.transceiver.update_payload_map(entry.payload_map)?;
+            if let Some(codec) = entry.active_codec {
+                entry.transceiver.set_active_codec(codec);
+            }
+            entry.transceiver.update_extmap(entry.extmap)?;
+
+            if let Some(receiver) = entry.transceiver.receiver() {
+                if let Some(ssrc) = entry.receiver_ssrc {
+                    receiver.set_ssrc(ssrc);
+                }
+                *receiver.rtx_ssrc.lock().unwrap() = entry.receiver_rtx_ssrc;
+                if let Some(track_event_sent) = entry.receiver_track_event_sent {
+                    receiver
+                        .track_event_sent
+                        .store(track_event_sent, Ordering::SeqCst);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn set_local_description(&self, desc: SessionDescription) -> RtcResult<()> {
         self.inner.validate_sdp_type(&desc.sdp_type)?;
+        let current_state = *self.inner.signaling_state.borrow();
+
+        if matches!(desc.sdp_type, SdpType::Offer) {
+            if current_state != SignalingState::Stable {
+                return Err(RtcError::InvalidState(
+                    "set_local_description(offer) requires stable signaling state".into(),
+                ));
+            }
+            self.capture_rollback_snapshot_if_absent();
+        }
 
         // For Offerer: extract parameters from local offer (our intended changes)
         // This allows Offerer to immediately update transceivers with new parameters
@@ -655,12 +838,7 @@ impl PeerConnection {
                     }
 
                     if let Some(t) = matched_transceiver {
-                        let payload_map = Self::extract_payload_map(section);
-                        if !payload_map.is_empty() {
-                            let _ = t.update_payload_map(payload_map);
-                        }
-                        let extmap = Self::extract_extmap(section);
-                        let _ = t.update_extmap(extmap);
+                        let _ = Self::apply_section_codec_state(&t, section);
                     }
                 }
             } else {
@@ -689,34 +867,64 @@ impl PeerConnection {
             let state = &self.inner.signaling_state;
             match desc.sdp_type {
                 SdpType::Offer => {
-                    if *state.borrow() != SignalingState::Stable {
-                        return Err(RtcError::InvalidState(
-                            "set_local_description(offer) requires stable signaling state".into(),
-                        ));
-                    }
                     let _ = state.send(SignalingState::HaveLocalOffer);
                 }
                 SdpType::Answer => {
-                    if *state.borrow() != SignalingState::HaveRemoteOffer {
+                    if !matches!(
+                        current_state,
+                        SignalingState::HaveRemoteOffer | SignalingState::HaveLocalPranswer
+                    ) {
                         return Err(RtcError::InvalidState(
                             "set_local_description(answer) requires remote offer".into(),
                         ));
                     }
                     let _ = state.send(SignalingState::Stable);
                 }
-                SdpType::Rollback | SdpType::Pranswer => {
-                    return Err(RtcError::NotImplemented("pranswer/rollback"));
+                SdpType::Pranswer => {
+                    if !matches!(
+                        current_state,
+                        SignalingState::HaveRemoteOffer | SignalingState::HaveLocalPranswer
+                    ) {
+                        return Err(RtcError::InvalidState(
+                            "set_local_description(pranswer) requires remote offer".into(),
+                        ));
+                    }
+                    let _ = state.send(SignalingState::HaveLocalPranswer);
+                }
+                SdpType::Rollback => {
+                    if !matches!(
+                        current_state,
+                        SignalingState::HaveLocalOffer
+                            | SignalingState::HaveRemoteOffer
+                            | SignalingState::HaveLocalPranswer
+                            | SignalingState::HaveRemotePranswer
+                    ) {
+                        return Err(RtcError::InvalidState(
+                            "set_local_description(rollback) requires pending negotiation".into(),
+                        ));
+                    }
+                    self.restore_rollback_snapshot()?;
+                    let _ = state.send(SignalingState::Stable);
+                    return Ok(());
                 }
             }
         }
+        if matches!(desc.sdp_type, SdpType::Answer | SdpType::Pranswer) {
+            self.apply_local_description_media_state(&desc);
+        }
         let mut local = self.inner.local_description.lock().unwrap();
         *local = Some(desc);
+        if matches!(local.as_ref().map(|d| d.sdp_type), Some(SdpType::Answer)) {
+            self.clear_rollback_snapshot();
+        }
         Ok(())
     }
 
     pub async fn set_remote_description(&self, desc: SessionDescription) -> RtcResult<()> {
         self.inner.validate_sdp_type(&desc.sdp_type)?;
-        let remote_dtls_fingerprint = if self.config().transport_mode == TransportMode::WebRtc {
+        let remote_dtls_fingerprint = if self.config().transport_mode == TransportMode::WebRtc
+            && desc.sdp_type != SdpType::Rollback
+        {
             match desc.dtls_fingerprint() {
                 Ok(Some(fingerprint)) if fingerprint.algorithm == "sha-256" => {
                     Some(fingerprint.value)
@@ -743,15 +951,21 @@ impl PeerConnection {
             None
         };
 
+        let current_state = *self.inner.signaling_state.borrow();
+        if matches!(desc.sdp_type, SdpType::Offer) {
+            if current_state != SignalingState::Stable {
+                return Err(RtcError::InvalidState(
+                    "set_remote_description(offer) requires stable signaling state".into(),
+                ));
+            }
+            self.capture_rollback_snapshot_if_absent();
+        }
+
         // Check if this is a reinvite (not first negotiation)
-        let is_reinvite = {
-            let remote = self.inner.remote_description.lock().unwrap();
-            remote.is_some()
-        };
+        let is_reinvite = self.has_established_negotiation();
 
         if is_reinvite {
             // Apply reinvite at correct timing based on role
-            let current_state = *self.inner.signaling_state.borrow();
             match (desc.sdp_type, current_state) {
                 // Answerer receiving offer: apply immediately
                 (SdpType::Offer, SignalingState::Stable) => {
@@ -759,7 +973,10 @@ impl PeerConnection {
                     self.handle_reinvite(&desc).await?;
                 }
                 // Offerer receiving answer: apply now (was pending since we sent offer)
-                (SdpType::Answer, SignalingState::HaveLocalOffer) => {
+                (
+                    SdpType::Answer,
+                    SignalingState::HaveLocalOffer | SignalingState::HaveRemotePranswer,
+                ) => {
                     debug!("Offerer: applying reinvite from answer");
                     self.handle_reinvite(&desc).await?;
                 }
@@ -784,23 +1001,45 @@ impl PeerConnection {
             let state = &self.inner.signaling_state;
             match desc.sdp_type {
                 SdpType::Offer => {
-                    if *state.borrow() != SignalingState::Stable {
-                        return Err(RtcError::InvalidState(
-                            "set_remote_description(offer) requires stable signaling state".into(),
-                        ));
-                    }
                     let _ = state.send(SignalingState::HaveRemoteOffer);
                 }
                 SdpType::Answer => {
-                    if *state.borrow() != SignalingState::HaveLocalOffer {
+                    if !matches!(
+                        current_state,
+                        SignalingState::HaveLocalOffer | SignalingState::HaveRemotePranswer
+                    ) {
                         return Err(RtcError::InvalidState(
                             "set_remote_description(answer) requires local offer".into(),
                         ));
                     }
                     let _ = state.send(SignalingState::Stable);
                 }
-                SdpType::Rollback | SdpType::Pranswer => {
-                    return Err(RtcError::NotImplemented("pranswer/rollback"));
+                SdpType::Pranswer => {
+                    if !matches!(
+                        current_state,
+                        SignalingState::HaveLocalOffer | SignalingState::HaveRemotePranswer
+                    ) {
+                        return Err(RtcError::InvalidState(
+                            "set_remote_description(pranswer) requires local offer".into(),
+                        ));
+                    }
+                    let _ = state.send(SignalingState::HaveRemotePranswer);
+                }
+                SdpType::Rollback => {
+                    if !matches!(
+                        current_state,
+                        SignalingState::HaveLocalOffer
+                            | SignalingState::HaveRemoteOffer
+                            | SignalingState::HaveLocalPranswer
+                            | SignalingState::HaveRemotePranswer
+                    ) {
+                        return Err(RtcError::InvalidState(
+                            "set_remote_description(rollback) requires pending negotiation".into(),
+                        ));
+                    }
+                    self.restore_rollback_snapshot()?;
+                    let _ = state.send(SignalingState::Stable);
+                    return Ok(());
                 }
             }
         }
@@ -1087,13 +1326,7 @@ impl PeerConnection {
                 }
 
                 if let Some(t) = found_transceiver {
-                    // Update transceiver parameters
-                    let payload_map = Self::extract_payload_map(section);
-                    if !payload_map.is_empty() {
-                        let _ = t.update_payload_map(payload_map);
-                    }
-                    let extmap = Self::extract_extmap(section);
-                    let _ = t.update_extmap(extmap);
+                    let _ = Self::apply_section_codec_state(&t, section);
                     let direction: TransceiverDirection = section.direction.into();
                     t.set_direction(direction);
 
@@ -1197,6 +1430,7 @@ impl PeerConnection {
                     }
 
                     *t.receiver.lock().unwrap() = Some(receiver);
+                    let _ = Self::apply_section_codec_state(&t, section);
 
                     transceivers.push(t.clone());
 
@@ -1223,13 +1457,7 @@ impl PeerConnection {
                 }
 
                 if let Some(t) = found_transceiver {
-                    // Update transceiver parameters
-                    let payload_map = Self::extract_payload_map(section);
-                    if !payload_map.is_empty() {
-                        let _ = t.update_payload_map(payload_map);
-                    }
-                    let extmap = Self::extract_extmap(section);
-                    let _ = t.update_extmap(extmap);
+                    let _ = Self::apply_section_codec_state(t, section);
                     let direction: TransceiverDirection = section.direction.into();
                     t.set_direction(direction);
 
@@ -1267,6 +1495,9 @@ impl PeerConnection {
 
         let mut remote = self.inner.remote_description.lock().unwrap();
         *remote = Some(desc);
+        if matches!(remote.as_ref().map(|d| d.sdp_type), Some(SdpType::Answer)) {
+            self.clear_rollback_snapshot();
+        }
 
         Ok(())
     }
@@ -1318,6 +1549,7 @@ impl PeerConnection {
             srtp_required,
             allow_ssrc_change,
         ));
+        rtp_transport.attach_stats_collector(self.inner.stats_collector.clone());
         {
             let mut rx = ice_conn.rtp_receiver.write().unwrap();
             *rx = Some(Arc::downgrade(&rtp_transport)
@@ -2092,20 +2324,7 @@ impl PeerConnection {
                     }
                 }
 
-                // Extract and validate payload type mapping
-                let payload_map = Self::extract_payload_map(section);
-                if !payload_map.is_empty() {
-                    // Basic validation: check if we support these codecs
-                    for (pt, params) in &payload_map {
-                        trace!("Validating PT {}: clock_rate={}", pt, params.clock_rate);
-                        // TODO: Add full codec capability check against local capabilities
-                    }
-                    t.update_payload_map(payload_map)?;
-                }
-
-                // Extract and update extension mapping
-                let extmap = Self::extract_extmap(section);
-                t.update_extmap(extmap)?;
+                Self::apply_section_codec_state(t, section)?;
 
                 // Handle direction changes
                 let new_direction: TransceiverDirection = section.direction.into();
@@ -2128,9 +2347,112 @@ impl PeerConnection {
         Ok(())
     }
 
+    fn parse_fmtp_map(section: &crate::MediaSection) -> HashMap<u8, String> {
+        let mut fmtp_map = HashMap::new();
+
+        for attr in &section.attributes {
+            if attr.key != "fmtp" {
+                continue;
+            }
+            let Some(value) = attr.value.as_ref() else {
+                continue;
+            };
+            let mut parts = value.splitn(2, char::is_whitespace);
+            let Some(pt_str) = parts.next() else {
+                continue;
+            };
+            let Some(fmtp) = parts.next() else {
+                continue;
+            };
+            if let Ok(pt) = pt_str.parse::<u8>() {
+                fmtp_map.insert(pt, fmtp.trim().to_string());
+            }
+        }
+
+        fmtp_map
+    }
+
+    fn parse_rtcp_feedback_map(section: &crate::MediaSection) -> HashMap<u8, Vec<String>> {
+        let mut feedback = HashMap::new();
+
+        for attr in &section.attributes {
+            if attr.key != "rtcp-fb" {
+                continue;
+            }
+            let Some(value) = attr.value.as_ref() else {
+                continue;
+            };
+            let mut parts = value.splitn(2, char::is_whitespace);
+            let Some(pt_str) = parts.next() else {
+                continue;
+            };
+            let Some(fb) = parts.next() else {
+                continue;
+            };
+            if let Ok(pt) = pt_str.parse::<u8>() {
+                feedback
+                    .entry(pt)
+                    .or_insert_with(Vec::new)
+                    .push(fb.trim().to_string());
+            }
+        }
+
+        feedback
+    }
+
+    fn parse_fmtp_parameters(fmtp: &str) -> HashMap<String, String> {
+        let mut params = HashMap::new();
+
+        for item in fmtp.split(';') {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            if let Some((key, value)) = item.split_once('=') {
+                params.insert(key.trim().to_string(), value.trim().to_string());
+            } else {
+                params.insert(item.to_string(), String::new());
+            }
+        }
+
+        params
+    }
+
+    fn extract_payload_types(section: &crate::MediaSection) -> Vec<u8> {
+        if !section.formats.is_empty() {
+            return section
+                .formats
+                .iter()
+                .filter_map(|fmt| fmt.parse::<u8>().ok())
+                .collect();
+        }
+
+        let mut payload_types = Vec::new();
+        for attr in &section.attributes {
+            if attr.key != "rtpmap" {
+                continue;
+            }
+            let Some(value) = attr.value.as_ref() else {
+                continue;
+            };
+            let Some(pt_str) = value.split_whitespace().next() else {
+                continue;
+            };
+            if let Ok(pt) = pt_str.parse::<u8>()
+                && !payload_types.contains(&pt)
+            {
+                payload_types.push(pt);
+            }
+        }
+
+        payload_types
+    }
+
     /// Extract payload type to codec parameters mapping from media section
     fn extract_payload_map(section: &crate::MediaSection) -> HashMap<u8, RtpCodecParameters> {
         let mut payload_map = HashMap::new();
+        let fmtp_map = Self::parse_fmtp_map(section);
+        let rtcp_feedback_map = Self::parse_rtcp_feedback_map(section);
 
         // Parse rtpmap attributes: "96 opus/48000/2"
         for attr in &section.attributes {
@@ -2142,19 +2464,26 @@ impl PeerConnection {
                             // Parse codec/rate/channels
                             let codec_parts: Vec<&str> = parts[1].split('/').collect();
                             if codec_parts.len() >= 2 {
+                                let codec_name = codec_parts[0].to_string();
                                 let clock_rate = codec_parts[1].parse().unwrap_or(90000);
                                 let channels = if codec_parts.len() >= 3 {
                                     codec_parts[2].parse().unwrap_or(0)
                                 } else {
                                     0
                                 };
+                                let fmtp = fmtp_map.get(&pt).cloned();
+                                let rtcp_fbs =
+                                    rtcp_feedback_map.get(&pt).cloned().unwrap_or_default();
 
                                 payload_map.insert(
                                     pt,
                                     RtpCodecParameters {
                                         payload_type: pt,
+                                        codec_name,
                                         clock_rate,
                                         channels,
+                                        fmtp,
+                                        rtcp_fbs,
                                     },
                                 );
                             }
@@ -2165,6 +2494,141 @@ impl PeerConnection {
         }
 
         payload_map
+    }
+
+    fn codecs_match(
+        local: &RtpCodecParameters,
+        remote: &RtpCodecParameters,
+        kind: MediaKind,
+    ) -> bool {
+        if !local.codec_name.eq_ignore_ascii_case(&remote.codec_name) {
+            return false;
+        }
+        if local.clock_rate != remote.clock_rate {
+            return false;
+        }
+
+        if kind == MediaKind::Audio
+            && local.channels != 0
+            && remote.channels != 0
+            && local.channels != remote.channels
+        {
+            return false;
+        }
+
+        true
+    }
+
+    fn intersect_rtcp_feedback(remote: &[String], local: &[String]) -> Vec<String> {
+        remote
+            .iter()
+            .filter(|fb| local.iter().any(|candidate| candidate == *fb))
+            .cloned()
+            .collect()
+    }
+
+    fn rewrite_section_codecs(
+        section: &mut crate::MediaSection,
+        codecs: &[RtpCodecParameters],
+        kind: MediaKind,
+    ) {
+        section
+            .attributes
+            .retain(|attr| !matches!(attr.key.as_str(), "rtpmap" | "fmtp" | "rtcp-fb"));
+        section.formats = codecs
+            .iter()
+            .map(|codec| codec.payload_type.to_string())
+            .collect();
+
+        for codec in codecs {
+            let rtpmap = if kind == MediaKind::Audio {
+                format!(
+                    "{} {}/{}/{}",
+                    codec.payload_type, codec.codec_name, codec.clock_rate, codec.channels
+                )
+            } else {
+                format!(
+                    "{} {}/{}",
+                    codec.payload_type, codec.codec_name, codec.clock_rate
+                )
+            };
+            section
+                .attributes
+                .push(Attribute::new("rtpmap", Some(rtpmap)));
+
+            if let Some(fmtp) = &codec.fmtp {
+                section.attributes.push(Attribute::new(
+                    "fmtp",
+                    Some(format!("{} {}", codec.payload_type, fmtp)),
+                ));
+            }
+            for fb in &codec.rtcp_fbs {
+                section.attributes.push(Attribute::new(
+                    "rtcp-fb",
+                    Some(format!("{} {}", codec.payload_type, fb)),
+                ));
+            }
+        }
+    }
+
+    fn reject_media_section(section: &mut crate::MediaSection) {
+        section.port = 0;
+        section.direction = Direction::Inactive;
+        section
+            .attributes
+            .retain(|attr| !matches!(attr.key.as_str(), "rtpmap" | "fmtp" | "rtcp-fb"));
+        if section.formats.is_empty() {
+            section.formats.push("0".to_string());
+        }
+    }
+
+    fn apply_section_payload_state(
+        transceiver: &Arc<RtpTransceiver>,
+        section: &crate::MediaSection,
+    ) -> RtcResult<()> {
+        let payload_map = Self::extract_payload_map(section);
+        let preferred_codec = Self::extract_payload_types(section)
+            .into_iter()
+            .find_map(|pt| payload_map.get(&pt).cloned())
+            .or_else(|| payload_map.values().next().cloned());
+
+        transceiver.update_payload_map(payload_map)?;
+        if let Some(codec) = preferred_codec {
+            transceiver.set_active_codec(codec);
+        }
+
+        Ok(())
+    }
+
+    fn apply_section_codec_state(
+        transceiver: &Arc<RtpTransceiver>,
+        section: &crate::MediaSection,
+    ) -> RtcResult<()> {
+        Self::apply_section_payload_state(transceiver, section)?;
+        let extmap = Self::extract_extmap(section);
+        transceiver.update_extmap(extmap)?;
+        Ok(())
+    }
+
+    fn apply_local_description_media_state(&self, desc: &SessionDescription) {
+        let transceivers = self.inner.transceivers.lock().unwrap().clone();
+
+        for section in &desc.media_sections {
+            let matched_transceiver = transceivers
+                .iter()
+                .find(|t| t.mid().as_ref() == Some(&section.mid))
+                .cloned()
+                .or_else(|| {
+                    transceivers
+                        .iter()
+                        .find(|t| t.mid().is_none() && t.kind() == section.kind)
+                        .cloned()
+                });
+
+            if let Some(transceiver) = matched_transceiver {
+                let _ = Self::apply_section_payload_state(&transceiver, section);
+            }
+        }
     }
 
     /// Extract extension header mapping from media section
@@ -3085,7 +3549,9 @@ impl PeerConnectionInner {
             if sdp_type == SdpType::Answer && !remote_offered_rtcp_mux {
                 section.attributes.retain(|attr| attr.key != "rtcp-mux");
             }
-            if let Some(sender) = sender_info {
+            if section.port != 0
+                && let Some(sender) = sender_info
+            {
                 Self::attach_sender_attributes(
                     &mut section,
                     sender.ssrc(),
@@ -3094,7 +3560,7 @@ impl PeerConnectionInner {
                     sender.track_id(),
                     &mode,
                 );
-            } else if direction.sends() {
+            } else if section.port != 0 && direction.sends() {
                 if let Some(ssrc) = *transceiver.sender_ssrc.lock().unwrap() {
                     let cname = format!("rustrtc-cname-{ssrc}");
                     let stream_id = transceiver
@@ -3147,11 +3613,12 @@ impl PeerConnectionInner {
         }
 
         if !desc.media_sections.is_empty() {
-            let should_bundle = match sdp_type {
-                SdpType::Offer => true,
-                SdpType::Answer => remote_offered_bundle,
-                _ => false,
-            };
+            let should_bundle = matches!(self.config.bundle_policy, BundlePolicy::MaxBundle)
+                && match sdp_type {
+                    SdpType::Offer => true,
+                    SdpType::Answer => remote_offered_bundle,
+                    _ => false,
+                };
 
             let should_bundle = should_bundle && desc.media_sections.len() > 1;
 
@@ -3216,9 +3683,104 @@ impl PeerConnectionInner {
 
     fn validate_sdp_type(&self, sdp_type: &SdpType) -> RtcResult<()> {
         match sdp_type {
-            SdpType::Offer | SdpType::Answer => Ok(()),
-            _ => Err(RtcError::NotImplemented("pranswer/rollback")),
+            SdpType::Offer | SdpType::Answer | SdpType::Pranswer | SdpType::Rollback => Ok(()),
         }
+    }
+
+    fn local_codec_capabilities(&self, kind: MediaKind) -> Vec<RtpCodecParameters> {
+        match kind {
+            MediaKind::Audio => {
+                let default_cap = AudioCapability::default();
+                let caps = if let Some(config) = &self.config.media_capabilities {
+                    if config.audio.is_empty() {
+                        vec![default_cap]
+                    } else {
+                        config.audio.clone()
+                    }
+                } else {
+                    vec![default_cap]
+                };
+
+                caps.into_iter()
+                    .map(|cap| RtpCodecParameters {
+                        payload_type: cap.payload_type,
+                        codec_name: cap.codec_name,
+                        clock_rate: cap.clock_rate,
+                        channels: cap.channels,
+                        fmtp: cap.fmtp,
+                        rtcp_fbs: cap.rtcp_fbs,
+                    })
+                    .collect()
+            }
+            MediaKind::Video => {
+                let default_cap = VideoCapability::default();
+                let caps = if let Some(config) = &self.config.media_capabilities {
+                    if config.video.is_empty() {
+                        vec![default_cap]
+                    } else {
+                        config.video.clone()
+                    }
+                } else {
+                    vec![default_cap]
+                };
+
+                caps.into_iter()
+                    .map(|cap| RtpCodecParameters {
+                        payload_type: cap.payload_type,
+                        codec_name: cap.codec_name,
+                        clock_rate: cap.clock_rate,
+                        channels: 0,
+                        fmtp: cap.fmtp,
+                        rtcp_fbs: cap.rtcp_fbs,
+                    })
+                    .collect()
+            }
+            MediaKind::Application => Vec::new(),
+        }
+    }
+
+    fn negotiate_answer_codecs(&self, section: &crate::MediaSection) -> Vec<RtpCodecParameters> {
+        let remote = self.remote_description.lock().unwrap();
+        let Some(remote) = remote.as_ref() else {
+            return Vec::new();
+        };
+        let Some(remote_section) = remote
+            .media_sections
+            .iter()
+            .find(|item| item.mid == section.mid)
+        else {
+            return Vec::new();
+        };
+
+        let offered_codecs = PeerConnection::extract_payload_map(remote_section);
+        let offered_pts = PeerConnection::extract_payload_types(remote_section);
+        let local_capabilities = self.local_codec_capabilities(section.kind);
+        let mut negotiated = Vec::new();
+
+        for pt in offered_pts {
+            let Some(remote_codec) = offered_codecs.get(&pt) else {
+                continue;
+            };
+            let Some(local_codec) = local_capabilities.iter().find(|candidate| {
+                PeerConnection::codecs_match(candidate, remote_codec, section.kind)
+            }) else {
+                continue;
+            };
+
+            let mut codec = local_codec.clone();
+            codec.payload_type = pt;
+            codec.codec_name = remote_codec.codec_name.clone();
+            codec.rtcp_fbs = PeerConnection::intersect_rtcp_feedback(
+                &remote_codec.rtcp_fbs,
+                &local_codec.rtcp_fbs,
+            );
+            if codec.fmtp.is_none() {
+                codec.fmtp = remote_codec.fmtp.clone();
+            }
+            negotiated.push(codec);
+        }
+
+        negotiated
     }
 
     fn populate_media_capabilities(
@@ -3228,6 +3790,15 @@ impl PeerConnectionInner {
         sdp_type: SdpType,
     ) {
         section.apply_config(&self.config);
+
+        if sdp_type == SdpType::Answer && matches!(kind, MediaKind::Audio | MediaKind::Video) {
+            let negotiated_codecs = self.negotiate_answer_codecs(section);
+            if negotiated_codecs.is_empty() {
+                PeerConnection::reject_media_section(section);
+            } else {
+                PeerConnection::rewrite_section_codecs(section, &negotiated_codecs, kind);
+            }
+        }
 
         // Add extmap for Video
         if kind == MediaKind::Video {
@@ -3505,6 +4076,8 @@ pub enum SignalingState {
     Stable,
     HaveLocalOffer,
     HaveRemoteOffer,
+    HaveLocalPranswer,
+    HaveRemotePranswer,
     Closed,
 }
 
@@ -3577,20 +4150,35 @@ impl From<Direction> for TransceiverDirection {
 
 static TRANSCEIVER_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RtpCodecParameters {
     pub payload_type: u8,
+    pub codec_name: String,
     pub clock_rate: u32,
     pub channels: u8,
+    pub fmtp: Option<String>,
+    pub rtcp_fbs: Vec<String>,
 }
 
 impl Default for RtpCodecParameters {
     fn default() -> Self {
         Self {
             payload_type: 96,
+            codec_name: "VP8".to_string(),
             clock_rate: 90000,
             channels: 0,
+            fmtp: None,
+            rtcp_fbs: Vec::new(),
         }
+    }
+}
+
+impl RtpCodecParameters {
+    pub fn codec_specific_parameters(&self) -> HashMap<String, String> {
+        self.fmtp
+            .as_deref()
+            .map(PeerConnection::parse_fmtp_parameters)
+            .unwrap_or_default()
     }
 }
 
@@ -3776,6 +4364,15 @@ impl RtpTransceiver {
         self.payload_map.read().unwrap().clone()
     }
 
+    pub fn set_active_codec(&self, codec: RtpCodecParameters) {
+        if let Some(sender) = self.sender() {
+            sender.set_params(codec.clone());
+        }
+        if let Some(receiver) = self.receiver() {
+            receiver.set_params(codec);
+        }
+    }
+
     /// Get current extmap (for testing/debugging)
     pub fn get_extmap(&self) -> HashMap<u8, String> {
         self.extmap.read().unwrap().clone()
@@ -3927,6 +4524,10 @@ impl RtpSender {
 
     pub fn params(&self) -> RtpCodecParameters {
         self.params.lock().unwrap().clone()
+    }
+
+    pub fn set_params(&self, params: RtpCodecParameters) {
+        *self.params.lock().unwrap() = params;
     }
 
     pub fn interceptors(&self) -> &[Arc<dyn RtpSenderInterceptor + Send + Sync>] {
@@ -4217,13 +4818,25 @@ impl RtpReceiverBuilder {
         let params = match self.kind {
             MediaKind::Audio => RtpCodecParameters {
                 payload_type: 111,
+                codec_name: "opus".to_string(),
                 clock_rate: 48000,
                 channels: 2,
+                fmtp: Some("minptime=10;useinbandfec=1".to_string()),
+                rtcp_fbs: Vec::new(),
             },
             MediaKind::Video => RtpCodecParameters {
                 payload_type: 96,
+                codec_name: "VP8".to_string(),
                 clock_rate: 90000,
                 channels: 0,
+                fmtp: None,
+                rtcp_fbs: vec![
+                    "nack".to_string(),
+                    "nack pli".to_string(),
+                    "ccm fir".to_string(),
+                    "goog-remb".to_string(),
+                    "transport-cc".to_string(),
+                ],
             },
             _ => RtpCodecParameters::default(),
         };
@@ -4268,13 +4881,25 @@ impl RtpReceiver {
         let params = match kind {
             MediaKind::Audio => RtpCodecParameters {
                 payload_type: 111,
+                codec_name: "opus".to_string(),
                 clock_rate: 48000,
                 channels: 2,
+                fmtp: Some("minptime=10;useinbandfec=1".to_string()),
+                rtcp_fbs: Vec::new(),
             },
             MediaKind::Video => RtpCodecParameters {
                 payload_type: 96,
+                codec_name: "VP8".to_string(),
                 clock_rate: 90000,
                 channels: 0,
+                fmtp: None,
+                rtcp_fbs: vec![
+                    "nack".to_string(),
+                    "nack pli".to_string(),
+                    "ccm fir".to_string(),
+                    "goog-remb".to_string(),
+                    "transport-cc".to_string(),
+                ],
             },
             _ => RtpCodecParameters::default(),
         };
@@ -4354,6 +4979,10 @@ impl RtpReceiver {
     pub fn get_simulcast_rids(&self) -> Vec<String> {
         let tracks = self.simulcast_tracks.lock().unwrap();
         tracks.keys().cloned().collect()
+    }
+
+    pub fn params(&self) -> RtpCodecParameters {
+        self.params.lock().unwrap().clone()
     }
 
     pub fn set_params(&self, params: RtpCodecParameters) {
@@ -4742,8 +5371,11 @@ mod tests {
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 111,
+            codec_name: "opus".to_string(),
             clock_rate: 48000,
             channels: 2,
+            fmtp: Some("minptime=10;useinbandfec=1".to_string()),
+            rtcp_fbs: Vec::new(),
         };
         let sender = RtpSender::builder(track, 12345)
             .stream_id("stream".to_string())
@@ -5019,8 +5651,11 @@ mod tests {
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 111,
+            codec_name: "opus".to_string(),
             clock_rate: 48000,
             channels: 2,
+            fmtp: Some("minptime=10;useinbandfec=1".to_string()),
+            rtcp_fbs: Vec::new(),
         };
         let sender = RtpSender::builder(track, 12345)
             .stream_id("stream".to_string())
@@ -5430,8 +6065,11 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 8,
+            codec_name: "PCMA".to_string(),
             clock_rate: 8000,
             channels: 1,
+            fmtp: None,
+            rtcp_fbs: Vec::new(),
         };
         let sender = RtpSender::builder(track, 12345)
             .stream_id("s".to_string())
@@ -5552,8 +6190,11 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 8,
+            codec_name: "PCMA".to_string(),
             clock_rate: 8000,
             channels: 1,
+            fmtp: None,
+            rtcp_fbs: Vec::new(),
         };
         let sender = RtpSender::builder(track, 12345)
             .stream_id("s".to_string())
@@ -5655,8 +6296,11 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 0,
+            codec_name: "PCMU".to_string(),
             clock_rate: 8000,
             channels: 1,
+            fmtp: None,
+            rtcp_fbs: Vec::new(),
         };
         let sender = RtpSender::builder(track, 42)
             .stream_id("s".to_string())
@@ -5910,8 +6554,11 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 8,
+            codec_name: "PCMA".to_string(),
             clock_rate: 8000,
             channels: 1,
+            fmtp: None,
+            rtcp_fbs: Vec::new(),
         };
         let sender = RtpSender::builder(track, 100)
             .stream_id("s".to_string())
@@ -5941,8 +6588,11 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 8,
+            codec_name: "PCMA".to_string(),
             clock_rate: 8000,
             channels: 1,
+            fmtp: None,
+            rtcp_fbs: Vec::new(),
         };
         let sender = RtpSender::builder(track, 100)
             .stream_id("s".to_string())
@@ -5973,8 +6623,11 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 0,
+            codec_name: "PCMU".to_string(),
             clock_rate: 8000,
             channels: 1,
+            fmtp: None,
+            rtcp_fbs: Vec::new(),
         };
         let sender = RtpSender::builder(track, 100)
             .stream_id("s".to_string())
@@ -6037,8 +6690,11 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 8,
+            codec_name: "PCMA".to_string(),
             clock_rate: 8000,
             channels: 1,
+            fmtp: None,
+            rtcp_fbs: Vec::new(),
         };
         let sender = RtpSender::builder(track, 100)
             .stream_id("s".to_string())
@@ -6097,8 +6753,11 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 8,
+            codec_name: "PCMA".to_string(),
             clock_rate: 8000,
             channels: 1,
+            fmtp: None,
+            rtcp_fbs: Vec::new(),
         };
         let sender = RtpSender::builder(track, 100)
             .stream_id("s".to_string())

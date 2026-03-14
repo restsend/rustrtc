@@ -20,10 +20,13 @@ use p256::{PublicKey, ecdh::EphemeralSecret, elliptic_curve::sec1::ToEncodedPoin
 use rand_core::OsRng;
 use rcgen::generate_simple_self_signed;
 use sha2::{Digest, Sha256};
+use std::io::Cursor;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use x509_parser::certificate::X509Certificate;
+use x509_parser::error::PEMError;
+use x509_parser::pem::Pem;
 use x509_parser::prelude::FromDer;
 use x509_parser::public_key::PublicKey as X509PublicKey;
 
@@ -44,6 +47,32 @@ pub fn generate_certificate() -> Result<Certificate> {
         certificate: vec![cert.cert.der().to_vec()],
         private_key: pem,
         dtls_signing_key: signing_key,
+    })
+}
+
+pub fn load_certificate_from_pem(
+    pem_chain: &[String],
+    private_key_pem: &str,
+) -> Result<Certificate> {
+    let mut certificate_chain = Vec::new();
+    for pem_bundle in pem_chain {
+        certificate_chain.extend(parse_certificate_pem_bundle(pem_bundle)?);
+    }
+
+    if certificate_chain.is_empty() {
+        return Err(anyhow::anyhow!(
+            "configured certificate chain did not contain any CERTIFICATE PEM blocks"
+        ));
+    }
+
+    let signing_key = SigningKey::from_pkcs8_pem(private_key_pem)
+        .map_err(|e| anyhow::anyhow!("failed to parse PKCS#8 private key: {}", e))?;
+    ensure_certificate_matches_private_key(&certificate_chain[0], &signing_key)?;
+
+    Ok(Certificate {
+        certificate: certificate_chain,
+        private_key: private_key_pem.to_string(),
+        dtls_signing_key: Some(Arc::new(signing_key)),
     })
 }
 
@@ -77,6 +106,48 @@ fn certificate_public_key(certificate_der: &[u8]) -> Result<VerifyingKey> {
             "Unsupported DTLS certificate public key algorithm"
         )),
     }
+}
+
+fn parse_certificate_pem_bundle(pem_bundle: &str) -> Result<Vec<Vec<u8>>> {
+    let mut cursor = Cursor::new(pem_bundle.as_bytes());
+    let mut certificates = Vec::new();
+
+    loop {
+        match Pem::read(&mut cursor) {
+            Ok((pem, _)) => {
+                if pem.label == "CERTIFICATE" {
+                    X509Certificate::from_der(&pem.contents).map_err(|e| {
+                        anyhow::anyhow!("failed to parse certificate PEM block: {:?}", e)
+                    })?;
+                    certificates.push(pem.contents);
+                }
+            }
+            Err(PEMError::MissingHeader) => break,
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "failed to parse certificate PEM bundle: {:?}",
+                    err
+                ));
+            }
+        }
+    }
+
+    Ok(certificates)
+}
+
+fn ensure_certificate_matches_private_key(
+    certificate_der: &[u8],
+    signing_key: &SigningKey,
+) -> Result<()> {
+    let certificate_key = certificate_public_key(certificate_der)?;
+    let certificate_bytes = certificate_key.to_encoded_point(false);
+    let signing_key_bytes = signing_key.verifying_key().to_encoded_point(false);
+    if certificate_bytes.as_bytes() != signing_key_bytes.as_bytes() {
+        return Err(anyhow::anyhow!(
+            "certificate public key does not match configured private key"
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn verify_server_key_exchange_signature(
@@ -175,6 +246,7 @@ struct DtlsInner {
     write_epoch: AtomicU16,
     is_client: bool,
     expected_remote_fingerprint: Option<String>,
+    handshake_reassembly_limit: usize,
 }
 
 pub struct DtlsTransport {
@@ -225,7 +297,7 @@ impl DtlsTransport {
         conn: Arc<IceConn>,
         certificate: Certificate,
         is_client: bool,
-        _buffer_size: usize,
+        buffer_size: usize,
         expected_remote_fingerprint: Option<String>,
     ) -> Result<(
         Arc<Self>,
@@ -246,6 +318,7 @@ impl DtlsTransport {
             write_epoch: AtomicU16::new(0),
             is_client,
             expected_remote_fingerprint,
+            handshake_reassembly_limit: buffer_size.max(1),
         });
 
         let close_tx = Arc::new(tokio::sync::Notify::new());
@@ -390,6 +463,11 @@ impl Drop for DtlsTransport {
 }
 
 impl DtlsInner {
+    fn mark_failed(&self) {
+        *self.state.lock().unwrap() = DtlsState::Failed;
+        let _ = self.state_tx.send(DtlsState::Failed);
+    }
+
     async fn handle_retransmit(&self, ctx: &HandshakeContext, _is_client: bool) {
         if *self.state.lock().unwrap() != DtlsState::Handshaking {
             return;
@@ -585,6 +663,16 @@ impl DtlsInner {
                 Ok(Some(msg)) => {
                     let consumed = msg_buf.len() - body.len();
                     let raw_msg = msg_buf.slice(0..consumed);
+                    let fragment_end = msg
+                        .fragment_offset
+                        .checked_add(msg.fragment_length)
+                        .ok_or_else(|| anyhow::anyhow!("DTLS fragment range overflow"))?;
+                    if fragment_end > msg.total_length {
+                        self.mark_failed();
+                        return Err(anyhow::anyhow!(
+                            "DTLS fragment range exceeds declared message length"
+                        ));
+                    }
 
                     if msg.message_seq < ctx.recv_message_seq {
                         // If we just processed a HelloVerifyRequest, the server may
@@ -648,10 +736,30 @@ impl DtlsInner {
                     let (processing_msg, processing_raw) = if msg.total_length
                         != msg.fragment_length
                     {
+                        if msg.total_length as usize > self.handshake_reassembly_limit {
+                            self.mark_failed();
+                            return Err(anyhow::anyhow!(
+                                "DTLS handshake message exceeds reassembly limit: {} > {}",
+                                msg.total_length,
+                                self.handshake_reassembly_limit
+                            ));
+                        }
+
                         if ctx.incomplete_msg_seq != msg.message_seq || msg.fragment_offset == 0 {
                             // New message or first fragment, reset buffer
                             ctx.incomplete_handshake.clear();
                             ctx.incomplete_msg_seq = msg.message_seq;
+                        }
+
+                        if ctx.incomplete_handshake.len() + msg.body.len()
+                            > self.handshake_reassembly_limit
+                        {
+                            self.mark_failed();
+                            return Err(anyhow::anyhow!(
+                                "DTLS handshake reassembly buffer exceeded limit: {} > {}",
+                                ctx.incomplete_handshake.len() + msg.body.len(),
+                                self.handshake_reassembly_limit
+                            ));
                         }
 
                         ctx.incomplete_handshake.extend_from_slice(&msg.body[..]);

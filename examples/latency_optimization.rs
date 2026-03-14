@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 
 #[tokio::main]
 async fn main() {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .ok();
     // You can enable tracing to debug if needed
     // tracing_subscriber::fmt::init();
 
@@ -63,8 +64,11 @@ async fn run_single_iteration() -> Option<u128> {
     let (_source, track, _) = sample_track(MediaKind::Audio, 100);
     let params = rustrtc::RtpCodecParameters {
         payload_type: 111,
+        codec_name: "opus".to_string(),
         clock_rate: 48000,
         channels: 2,
+        fmtp: None,
+        rtcp_fbs: Vec::new(),
     };
     let _ = pc1.add_track(track, params);
 

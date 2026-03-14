@@ -82,6 +82,7 @@ pub enum StunAttribute {
     Username(String),
     Realm(String),
     Nonce(String),
+    ErrorCode(u16),
     Software(String),
     RequestedTransport(u8),
     Lifetime(u32),
@@ -91,6 +92,7 @@ pub enum StunAttribute {
     UseCandidate,
     XorPeerAddress(SocketAddr),
     XorMappedAddress(SocketAddr),
+    XorRelayedAddress(SocketAddr),
     ChannelNumber(u16),
     Data(Vec<u8>),
 }
@@ -107,6 +109,7 @@ pub struct StunDecoded {
     pub realm: Option<String>,
     pub nonce: Option<String>,
     pub data: Option<Vec<u8>>,
+    pub channel_number: Option<u16>,
     pub use_candidate: bool,
 }
 
@@ -175,6 +178,7 @@ fn append_attribute(buffer: &mut Vec<u8>, attr: &StunAttribute, tx_id: &[u8; 12]
         StunAttribute::Username(value) => append_string_attr(buffer, 0x0006, value),
         StunAttribute::Realm(value) => append_string_attr(buffer, 0x0014, value),
         StunAttribute::Nonce(value) => append_string_attr(buffer, 0x0015, value),
+        StunAttribute::ErrorCode(code) => append_error_code(buffer, *code),
         StunAttribute::Software(value) => append_string_attr(buffer, 0x8022, value),
         StunAttribute::RequestedTransport(v) => {
             buffer.extend_from_slice(&0x0019u16.to_be_bytes());
@@ -214,6 +218,10 @@ fn append_attribute(buffer: &mut Vec<u8>, attr: &StunAttribute, tx_id: &[u8; 12]
             append_xor_address(buffer, 0x0020, addr, tx_id);
             return;
         }
+        StunAttribute::XorRelayedAddress(addr) => {
+            append_xor_address(buffer, 0x0016, addr, tx_id);
+            return;
+        }
         StunAttribute::ChannelNumber(value) => {
             buffer.extend_from_slice(&0x000Cu16.to_be_bytes());
             buffer.extend_from_slice(&4u16.to_be_bytes());
@@ -227,6 +235,13 @@ fn append_attribute(buffer: &mut Vec<u8>, attr: &StunAttribute, tx_id: &[u8; 12]
 
 fn append_string_attr(buffer: &mut Vec<u8>, typ: u16, value: &str) {
     append_raw_attribute(buffer, typ, value.as_bytes());
+}
+
+fn append_error_code(buffer: &mut Vec<u8>, code: u16) {
+    let class = (code / 100) as u8;
+    let number = (code % 100) as u8;
+    let value = [0u8, 0u8, class, number];
+    append_raw_attribute(buffer, 0x0009, &value);
 }
 
 fn append_raw_attribute(buffer: &mut Vec<u8>, typ: u16, value: &[u8]) {
@@ -322,6 +337,7 @@ fn decode_stun_message(bytes: &[u8]) -> Result<StunDecoded> {
     let mut realm = None;
     let mut nonce = None;
     let mut data = None;
+    let mut channel_number = None;
     let mut use_candidate = false;
     while offset + 4 <= bytes.len() {
         let typ = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
@@ -366,6 +382,11 @@ fn decode_stun_message(bytes: &[u8]) -> Result<StunDecoded> {
             0x0013 => {
                 data = Some(value.to_vec());
             }
+            0x000C => {
+                if value.len() >= 2 {
+                    channel_number = Some(u16::from_be_bytes([value[0], value[1]]));
+                }
+            }
             0x0025 => {
                 use_candidate = true;
             }
@@ -385,6 +406,7 @@ fn decode_stun_message(bytes: &[u8]) -> Result<StunDecoded> {
         realm,
         nonce,
         data,
+        channel_number,
         use_candidate,
     })
 }

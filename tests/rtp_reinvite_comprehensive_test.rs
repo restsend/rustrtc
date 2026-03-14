@@ -5,10 +5,16 @@ use rustrtc::sdp::{
 /// Tests cover: Offerer/Answerer timing, SSRC changes, Direction changes, parameter validation
 use rustrtc::*;
 
+const TEST_FINGERPRINT: &str = "sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99";
+
 /// Helper to create a minimal valid SDP
 fn create_minimal_sdp(sdp_type: SdpType, mid: &str, direction: Direction) -> SessionDescription {
     let mut desc = SessionDescription::new(sdp_type);
     desc.session = SessionSection::default();
+    desc.session.attributes.push(Attribute::new(
+        "fingerprint",
+        Some(TEST_FINGERPRINT.to_string()),
+    ));
 
     let mut section = MediaSection::new(MediaKind::Audio, mid);
     section.direction = direction;
@@ -484,4 +490,82 @@ async fn test_extmap_changes_in_reinvite() {
         new_extmap.contains_key(&7),
         "Should contain new extmap ID 7"
     );
+}
+
+/// Test 11: Reinvite can progress through pranswer to final answer
+#[tokio::test]
+async fn test_reinvite_pranswer_then_answer() {
+    let config = RtcConfiguration::default();
+    let pc = PeerConnection::new(config);
+
+    pc.add_transceiver(
+        MediaKind::Audio,
+        peer_connection::TransceiverDirection::SendRecv,
+    );
+
+    let initial_offer = create_minimal_sdp(SdpType::Offer, "0", Direction::SendRecv);
+    pc.set_local_description(initial_offer).unwrap();
+
+    let initial_answer = create_minimal_sdp(SdpType::Answer, "0", Direction::SendRecv);
+    pc.set_remote_description(initial_answer).await.unwrap();
+    assert_eq!(pc.signaling_state(), SignalingState::Stable);
+
+    let mut reinvite_offer = create_minimal_sdp(SdpType::Offer, "0", Direction::SendRecv);
+    reinvite_offer.media_sections[0].attributes.clear();
+    reinvite_offer.media_sections[0]
+        .attributes
+        .push(Attribute::new(
+            "rtpmap",
+            Some("120 opus/48000/2".to_string()),
+        ));
+    reinvite_offer.media_sections[0]
+        .attributes
+        .push(Attribute::new("ssrc", Some("12345 cname:test".to_string())));
+
+    pc.set_local_description(reinvite_offer).unwrap();
+    assert_eq!(pc.signaling_state(), SignalingState::HaveLocalOffer);
+    assert!(
+        pc.get_transceivers()[0]
+            .get_payload_map()
+            .contains_key(&120)
+    );
+
+    let mut remote_pranswer = create_minimal_sdp(SdpType::Pranswer, "0", Direction::SendRecv);
+    remote_pranswer.media_sections[0].attributes.clear();
+    remote_pranswer.media_sections[0]
+        .attributes
+        .push(Attribute::new(
+            "rtpmap",
+            Some("120 opus/48000/2".to_string()),
+        ));
+    remote_pranswer.media_sections[0]
+        .attributes
+        .push(Attribute::new("ssrc", Some("12345 cname:test".to_string())));
+
+    pc.set_remote_description(remote_pranswer).await.unwrap();
+    assert_eq!(pc.signaling_state(), SignalingState::HaveRemotePranswer);
+    assert!(
+        pc.get_transceivers()[0]
+            .get_payload_map()
+            .contains_key(&120)
+    );
+
+    let mut remote_answer = create_minimal_sdp(SdpType::Answer, "0", Direction::SendRecv);
+    remote_answer.media_sections[0].attributes.clear();
+    remote_answer.media_sections[0]
+        .attributes
+        .push(Attribute::new(
+            "rtpmap",
+            Some("120 opus/48000/2".to_string()),
+        ));
+    remote_answer.media_sections[0]
+        .attributes
+        .push(Attribute::new("ssrc", Some("12345 cname:test".to_string())));
+
+    pc.set_remote_description(remote_answer).await.unwrap();
+
+    let payload_map = pc.get_transceivers()[0].get_payload_map();
+    assert_eq!(pc.signaling_state(), SignalingState::Stable);
+    assert!(payload_map.contains_key(&120));
+    assert!(!payload_map.contains_key(&111));
 }

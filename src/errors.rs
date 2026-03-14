@@ -49,8 +49,18 @@ pub enum SrtpError {
     PacketTooShort,
     #[error("SRTP authentication failed")]
     AuthenticationFailed,
+    #[error("SRTP replay detected")]
+    ReplayDetected,
+    #[error("SRTP packet is outside the replay window")]
+    PacketTooOld,
     #[error("SRTP internal error: {0}")]
     Internal(String),
+}
+
+impl SrtpError {
+    pub fn is_replay_related(&self) -> bool {
+        matches!(self, Self::ReplayDetected | Self::PacketTooOld)
+    }
 }
 
 impl From<RtpError> for SrtpError {

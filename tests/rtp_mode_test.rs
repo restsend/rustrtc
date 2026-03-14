@@ -2,8 +2,8 @@ use anyhow::Result;
 use rustrtc::media::MediaStreamTrack;
 use rustrtc::media::frame::{MediaSample, VideoFrame};
 use rustrtc::{
-    MediaKind, PeerConnection, RtcConfiguration, RtpCodecParameters, TransceiverDirection,
-    TransportMode,
+    MediaKind, PeerConnection, PeerConnectionEvent, RtcConfiguration, RtpCodecParameters,
+    TransceiverDirection, TransportMode,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,11 +15,13 @@ async fn test_rtp_mode_peer_connection() -> Result<()> {
     // PC1: Publisher (RTP Mode)
     let mut config1 = RtcConfiguration::default();
     config1.transport_mode = TransportMode::Rtp;
+    config1.bind_ip = Some("127.0.0.1".to_string());
     let pc1 = PeerConnection::new(config1);
 
     // PC2: Receiver (RTP Mode)
     let mut config2 = RtcConfiguration::default();
     config2.transport_mode = TransportMode::Rtp;
+    config2.bind_ip = Some("127.0.0.1".to_string());
     let pc2 = PeerConnection::new(config2);
 
     // PC1 adds a track
@@ -28,13 +30,26 @@ async fn test_rtp_mode_peer_connection() -> Result<()> {
     let source = Arc::new(source);
     let params = RtpCodecParameters {
         payload_type: 96,
+        codec_name: "VP8".to_string(),
         clock_rate: 90000,
         channels: 0,
+        fmtp: None,
+        rtcp_fbs: Vec::new(),
     };
     let _sender = pc1.add_track(track.clone(), params.clone())?;
 
     // PC2 adds a transceiver to receive
     pc2.add_transceiver(MediaKind::Video, TransceiverDirection::RecvOnly);
+
+    let (track_tx, mut track_rx) = tokio::sync::mpsc::unbounded_channel();
+    let pc2_clone = pc2.clone();
+    tokio::spawn(async move {
+        while let Some(event) = pc2_clone.recv().await {
+            if let PeerConnectionEvent::Track(transceiver) = event {
+                let _ = track_tx.send(transceiver);
+            }
+        }
+    });
 
     // Exchange SDP
     // 1. PC1 Create Offer
@@ -76,7 +91,7 @@ async fn test_rtp_mode_peer_connection() -> Result<()> {
 
     // Start sending data from PC1
     let source_clone = source.clone();
-    let _send_task = tokio::spawn(async move {
+    let send_task = tokio::spawn(async move {
         let mut seq = 0;
         // Send enough packets to ensure reception
         for _ in 0..100 {
@@ -96,9 +111,14 @@ async fn test_rtp_mode_peer_connection() -> Result<()> {
         }
     });
 
-    // Check if PC2 receives data
-    let transceivers = pc2.get_transceivers();
-    let receiver = transceivers[0].receiver().unwrap();
+    // RTP mode only exposes a stable remote track after the receiver latches the
+    // first incoming SSRC and emits the Track event.
+    let transceiver = tokio::time::timeout(Duration::from_secs(5), track_rx.recv())
+        .await?
+        .expect("PC2 should emit a Track event after RTP starts flowing");
+    let receiver = transceiver
+        .receiver()
+        .expect("track event should include receiver");
     let track_remote = receiver.track();
 
     // Read a few packets
@@ -132,6 +152,8 @@ async fn test_rtp_mode_peer_connection() -> Result<()> {
         Ok(Err(e)) => panic!("Read task failed: {}", e),
         Err(_) => 0, // Timeout
     };
+
+    send_task.abort();
 
     println!("Received {} packets", received_count);
     assert!(received_count >= 10, "Should receive at least 10 packets");

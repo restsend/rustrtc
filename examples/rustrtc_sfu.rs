@@ -31,7 +31,8 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .ok();
     tracing_subscriber::fmt()
         .with_env_filter("debug,rustrtc=debug")
         .init();
@@ -375,8 +376,15 @@ async fn setup_new_peer(peer: Arc<Peer>, room: Arc<Room>) {
 
                         let params = RtpCodecParameters {
                             payload_type,
+                            codec_name: if kind == MediaKind::Video {
+                                "VP8".to_string()
+                            } else {
+                                "opus".to_string()
+                            },
                             clock_rate: clock_rate as u32,
                             channels,
+                            fmtp: None,
+                            rtcp_fbs: Vec::new(),
                         };
 
                         let track_info = Arc::new(TrackInfo {

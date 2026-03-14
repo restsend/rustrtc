@@ -31,8 +31,11 @@ mod tests {
         // 3. Create RtpSender
         let params = RtpCodecParameters {
             payload_type: 111,
+            codec_name: "opus".to_string(),
             clock_rate: 48000,
             channels: 2,
+            fmtp: Some("minptime=10;useinbandfec=1".to_string()),
+            rtcp_fbs: Vec::new(),
         };
         let sender = RtpSender::builder(track, 12345)
             .stream_id("stream".to_string())
@@ -102,8 +105,11 @@ mod tests {
         // 3. Create RtpSender
         let params = RtpCodecParameters {
             payload_type: 96,
+            codec_name: "VP8".to_string(),
             clock_rate: 90000,
             channels: 0,
+            fmtp: None,
+            rtcp_fbs: Vec::new(),
         };
         let sender = RtpSender::builder(track, 12345)
             .stream_id("stream".to_string())

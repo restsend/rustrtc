@@ -54,9 +54,8 @@ impl HandshakeMessage {
     pub fn encode(&self, buf: &mut BytesMut) {
         buf.put_u8(self.msg_type as u8);
 
-        // Length (24-bit) - length of the body (not fragment)
-        // For simple non-fragmented messages, this is body.len()
-        let len = self.body.len() as u32;
+        // Length (24-bit) is the full handshake body length, not just this fragment.
+        let len = self.total_length;
         buf.put_u8((len >> 16) as u8);
         buf.put_u8((len >> 8) as u8);
         buf.put_u8(len as u8);
@@ -579,10 +578,34 @@ mod tests {
         let decoded = HandshakeMessage::decode(&mut decode_buf).unwrap().unwrap();
 
         assert_eq!(decoded.msg_type, msg.msg_type);
+        assert_eq!(decoded.total_length, msg.total_length);
         assert_eq!(decoded.message_seq, msg.message_seq);
         assert_eq!(decoded.fragment_offset, msg.fragment_offset);
         assert_eq!(decoded.fragment_length, msg.fragment_length);
         assert_eq!(decoded.body, msg.body);
+    }
+
+    #[test]
+    fn test_handshake_message_encode_decode_fragment_header() {
+        let msg = HandshakeMessage {
+            msg_type: HandshakeType::ClientHello,
+            message_seq: 2,
+            fragment_offset: 8,
+            fragment_length: 4,
+            total_length: 12,
+            body: Bytes::from_static(b"frag"),
+        };
+
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf);
+
+        let mut decode_buf = buf.freeze();
+        let decoded = HandshakeMessage::decode(&mut decode_buf).unwrap().unwrap();
+
+        assert_eq!(decoded.total_length, 12);
+        assert_eq!(decoded.fragment_offset, 8);
+        assert_eq!(decoded.fragment_length, 4);
+        assert_eq!(decoded.body, Bytes::from_static(b"frag"));
     }
 
     #[test]

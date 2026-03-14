@@ -130,15 +130,30 @@ impl From<usize> for DataChannelState {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DataChannelConfig {
     pub label: String,
     pub protocol: String,
+    // Match browser/WebRTC defaults: a channel without overrides is ordered and reliable.
     pub ordered: bool,
     pub max_retransmits: Option<u16>,
     pub max_packet_life_time: Option<u16>,
     pub max_payload_size: Option<usize>,
     pub negotiated: Option<u16>,
+}
+
+impl Default for DataChannelConfig {
+    fn default() -> Self {
+        Self {
+            label: String::new(),
+            protocol: String::new(),
+            ordered: true,
+            max_retransmits: None,
+            max_packet_life_time: None,
+            max_payload_size: None,
+            negotiated: None,
+        }
+    }
 }
 
 pub struct DataChannel {

@@ -1,3 +1,4 @@
+use crate::errors::{RtcError, RtcResult};
 use crate::media::depacketizer::{DefaultDepacketizerFactory, DepacketizerFactory};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Formatter};
@@ -63,9 +64,9 @@ pub enum IceTransportPolicy {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum BundlePolicy {
-    #[default]
     Balanced,
     MaxCompat,
+    #[default]
     MaxBundle,
 }
 
@@ -181,6 +182,7 @@ pub struct VideoCapability {
     pub payload_type: u8,
     pub codec_name: String,
     pub clock_rate: u32,
+    pub fmtp: Option<String>,
     pub rtcp_fbs: Vec<String>,
 }
 
@@ -190,6 +192,7 @@ impl Default for VideoCapability {
             payload_type: 96,
             codec_name: "VP8".to_string(),
             clock_rate: 90000,
+            fmtp: None,
             rtcp_fbs: vec![
                 "nack".to_string(),
                 "nack pli".to_string(),
@@ -270,6 +273,8 @@ pub struct RtcConfiguration {
     pub external_ip: Option<String>,
     pub bind_ip: Option<String>,
     pub disable_ipv6: bool,
+    #[serde(default)]
+    pub allow_insecure_turn_tls: bool,
     pub ssrc_start: u32,
     pub stun_timeout: std::time::Duration,
     /// Timeout for the ICE nomination binding check (USE-CANDIDATE).
@@ -309,6 +314,7 @@ impl Default for RtcConfiguration {
             external_ip: None,
             bind_ip: None,
             disable_ipv6: false,
+            allow_insecure_turn_tls: false,
             ssrc_start: 10000,
             stun_timeout: std::time::Duration::from_secs(5),
             nomination_timeout: std::time::Duration::from_secs(10),
@@ -329,6 +335,50 @@ impl Default for RtcConfiguration {
             enable_ice_lite: false,
             depacketizer_strategy: DepacketizerStrategy::default(),
         }
+    }
+}
+
+impl RtcConfiguration {
+    /// Reject unsupported knobs at construction time so callers do not end up
+    /// with a peer connection whose runtime behavior silently diverges.
+    pub fn validate_runtime_support(&self) -> RtcResult<()> {
+        for server in &self.ice_servers {
+            if server.credential_type == IceCredentialType::Oauth
+                && server
+                    .urls
+                    .iter()
+                    .any(|url| url.starts_with("turn:") || url.starts_with("turns:"))
+            {
+                return Err(RtcError::InvalidConfiguration(
+                    "IceCredentialType::Oauth is not supported for TURN; only password credentials are implemented"
+                        .into(),
+                ));
+            }
+        }
+
+        if self.bundle_policy != BundlePolicy::MaxBundle {
+            return Err(RtcError::InvalidConfiguration(format!(
+                "bundle_policy {:?} is not supported; the runtime currently only implements MaxBundle",
+                self.bundle_policy
+            )));
+        }
+
+        match (self.rtp_start_port, self.rtp_end_port) {
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(RtcError::InvalidConfiguration(
+                    "rtp port range requires both rtp_start_port and rtp_end_port".into(),
+                ));
+            }
+            (Some(start), Some(end)) if start > end => {
+                return Err(RtcError::InvalidConfiguration(format!(
+                    "rtp port range start {} must be less than or equal to end {}",
+                    start, end
+                )));
+            }
+            _ => {}
+        }
+
+        Ok(())
     }
 }
 
@@ -371,6 +421,11 @@ impl RtcConfigurationBuilder {
 
     pub fn bundle_policy(mut self, policy: BundlePolicy) -> Self {
         self.inner.bundle_policy = policy;
+        self
+    }
+
+    pub fn allow_insecure_turn_tls(mut self, allow: bool) -> Self {
+        self.inner.allow_insecure_turn_tls = allow;
         self
     }
 
@@ -510,6 +565,7 @@ mod tests {
     #[test]
     fn test_rtc_configuration_defaults() {
         let config = RtcConfiguration::default();
+        assert_eq!(config.bundle_policy, BundlePolicy::MaxBundle);
         assert_eq!(config.ice_connection_timeout, Duration::from_secs(30));
         assert_eq!(config.sctp_rto_initial, Duration::from_secs(3));
         assert_eq!(config.sctp_rto_min, Duration::from_secs(1));

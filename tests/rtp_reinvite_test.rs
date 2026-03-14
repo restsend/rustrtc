@@ -1,5 +1,51 @@
+use rustrtc::sdp::{
+    Attribute, Direction, MediaSection, SdpType, SessionDescription, SessionSection,
+};
 use rustrtc::*;
 use std::collections::HashMap;
+
+const TEST_FINGERPRINT: &str = "sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99";
+
+fn create_audio_sdp(
+    sdp_type: SdpType,
+    mid: &str,
+    direction: Direction,
+    payload_type: u8,
+    ssrc: u32,
+) -> SessionDescription {
+    let mut desc = SessionDescription::new(sdp_type);
+    desc.session = SessionSection::default();
+    desc.session.attributes.push(Attribute::new(
+        "fingerprint",
+        Some(TEST_FINGERPRINT.to_string()),
+    ));
+
+    let mut section = MediaSection::new(MediaKind::Audio, mid);
+    section.direction = direction;
+    section.attributes.push(Attribute::new(
+        "rtpmap",
+        Some(format!("{payload_type} opus/48000/2")),
+    ));
+    section
+        .attributes
+        .push(Attribute::new("ssrc", Some(format!("{ssrc} cname:test"))));
+
+    desc.media_sections.push(section);
+    desc
+}
+
+fn codec_params(
+    payload_type: u8,
+    clock_rate: u32,
+    channels: u8,
+) -> peer_connection::RtpCodecParameters {
+    peer_connection::RtpCodecParameters {
+        payload_type,
+        clock_rate,
+        channels,
+        ..peer_connection::RtpCodecParameters::default()
+    }
+}
 
 /// Test basic payload type map update functionality
 #[tokio::test]
@@ -12,14 +58,7 @@ async fn test_payload_type_update() {
 
     // Initial mapping: PT 111 = Opus at 48000Hz
     let mut initial_map = HashMap::new();
-    initial_map.insert(
-        111,
-        peer_connection::RtpCodecParameters {
-            payload_type: 111,
-            clock_rate: 48000,
-            channels: 2,
-        },
-    );
+    initial_map.insert(111, codec_params(111, 48000, 2));
     transceiver.update_payload_map(initial_map.clone()).unwrap();
 
     // Verify initial state
@@ -30,14 +69,7 @@ async fn test_payload_type_update() {
 
     // Update mapping: change PT 111 to different parameters
     let mut updated_map = HashMap::new();
-    updated_map.insert(
-        111,
-        peer_connection::RtpCodecParameters {
-            payload_type: 111,
-            clock_rate: 16000,
-            channels: 1,
-        },
-    );
+    updated_map.insert(111, codec_params(111, 16000, 1));
     transceiver.update_payload_map(updated_map).unwrap();
 
     // Verify updated state
@@ -47,14 +79,7 @@ async fn test_payload_type_update() {
 
     // Add new PT mapping
     let mut new_map = HashMap::new();
-    new_map.insert(
-        120,
-        peer_connection::RtpCodecParameters {
-            payload_type: 120,
-            clock_rate: 90000,
-            channels: 0,
-        },
-    );
+    new_map.insert(120, codec_params(120, 90000, 0));
     transceiver.update_payload_map(new_map).unwrap();
 
     // Verify old PT is removed and new one exists
@@ -115,14 +140,7 @@ async fn test_concurrent_payload_map_access() {
 
     // Initial mapping
     let mut initial_map = HashMap::new();
-    initial_map.insert(
-        96,
-        peer_connection::RtpCodecParameters {
-            payload_type: 96,
-            clock_rate: 90000,
-            channels: 0,
-        },
-    );
+    initial_map.insert(96, codec_params(96, 90000, 0));
     transceiver.update_payload_map(initial_map).unwrap();
 
     // Spawn multiple reader tasks that read before the write
@@ -148,14 +166,7 @@ async fn test_concurrent_payload_map_access() {
     // Perform a write in the middle
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     let mut new_map = HashMap::new();
-    new_map.insert(
-        97,
-        peer_connection::RtpCodecParameters {
-            payload_type: 97,
-            clock_rate: 90000,
-            channels: 0,
-        },
-    );
+    new_map.insert(97, codec_params(97, 90000, 0));
     transceiver.update_payload_map(new_map).unwrap();
 
     // Wait for all readers
@@ -271,14 +282,7 @@ async fn test_reinvite_payload_change() {
 
     // Initial payload map
     let mut initial_map = HashMap::new();
-    initial_map.insert(
-        111,
-        peer_connection::RtpCodecParameters {
-            payload_type: 111,
-            clock_rate: 48000,
-            channels: 2,
-        },
-    );
+    initial_map.insert(111, codec_params(111, 48000, 2));
     transceiver.update_payload_map(initial_map).unwrap();
 
     // Verify initial state
@@ -289,14 +293,7 @@ async fn test_reinvite_payload_change() {
 
     // Simulate reinvite with different PT
     let mut reinvite_map = HashMap::new();
-    reinvite_map.insert(
-        120,
-        peer_connection::RtpCodecParameters {
-            payload_type: 120,
-            clock_rate: 48000,
-            channels: 2,
-        },
-    );
+    reinvite_map.insert(120, codec_params(120, 48000, 2));
     transceiver.update_payload_map(reinvite_map).unwrap();
 
     // Verify updated state - old PT removed, new PT added
@@ -316,22 +313,8 @@ async fn test_reinvite_comprehensive() {
 
     // Stage 1: Initial negotiation
     let mut initial_payload_map = HashMap::new();
-    initial_payload_map.insert(
-        96,
-        peer_connection::RtpCodecParameters {
-            payload_type: 96,
-            clock_rate: 90000,
-            channels: 0,
-        },
-    );
-    initial_payload_map.insert(
-        97,
-        peer_connection::RtpCodecParameters {
-            payload_type: 97,
-            clock_rate: 90000,
-            channels: 0,
-        },
-    );
+    initial_payload_map.insert(96, codec_params(96, 90000, 0));
+    initial_payload_map.insert(97, codec_params(97, 90000, 0));
     transceiver.update_payload_map(initial_payload_map).unwrap();
 
     let mut initial_extmap = HashMap::new();
@@ -357,19 +340,11 @@ async fn test_reinvite_comprehensive() {
     let mut updated_payload_map = HashMap::new();
     updated_payload_map.insert(
         98, // Changed from 96
-        peer_connection::RtpCodecParameters {
-            payload_type: 98,
-            clock_rate: 90000,
-            channels: 0,
-        },
+        codec_params(98, 90000, 0),
     );
     updated_payload_map.insert(
         97, // Kept
-        peer_connection::RtpCodecParameters {
-            payload_type: 97,
-            clock_rate: 90000,
-            channels: 0,
-        },
+        codec_params(97, 90000, 0),
     );
     transceiver.update_payload_map(updated_payload_map).unwrap();
 
@@ -402,14 +377,7 @@ async fn test_reinvite_comprehensive() {
 
     // Stage 3: Another reinvite - simplify to single codec
     let mut final_payload_map = HashMap::new();
-    final_payload_map.insert(
-        100,
-        peer_connection::RtpCodecParameters {
-            payload_type: 100,
-            clock_rate: 90000,
-            channels: 0,
-        },
-    );
+    final_payload_map.insert(100, codec_params(100, 90000, 0));
     transceiver.update_payload_map(final_payload_map).unwrap();
 
     // Verify final state
@@ -418,6 +386,37 @@ async fn test_reinvite_comprehensive() {
     assert!(payload_map.contains_key(&100));
     assert!(!payload_map.contains_key(&97));
     assert!(!payload_map.contains_key(&98));
+}
+
+#[tokio::test]
+async fn test_local_reinvite_rollback_restores_payload_map() {
+    let pc = PeerConnection::new(RtcConfiguration::default());
+    pc.add_transceiver(
+        MediaKind::Audio,
+        peer_connection::TransceiverDirection::SendRecv,
+    );
+
+    let initial_offer = create_audio_sdp(SdpType::Offer, "0", Direction::SendRecv, 111, 12345);
+    pc.set_local_description(initial_offer).unwrap();
+
+    let initial_answer = create_audio_sdp(SdpType::Answer, "0", Direction::SendRecv, 111, 12345);
+    pc.set_remote_description(initial_answer).await.unwrap();
+
+    let transceiver = pc.get_transceivers()[0].clone();
+    assert!(transceiver.get_payload_map().contains_key(&111));
+
+    let reinvite_offer = create_audio_sdp(SdpType::Offer, "0", Direction::SendRecv, 120, 12345);
+    pc.set_local_description(reinvite_offer).unwrap();
+    assert_eq!(pc.signaling_state(), SignalingState::HaveLocalOffer);
+    assert!(transceiver.get_payload_map().contains_key(&120));
+
+    pc.set_local_description(SessionDescription::new(SdpType::Rollback))
+        .unwrap();
+
+    let payload_map = transceiver.get_payload_map();
+    assert_eq!(pc.signaling_state(), SignalingState::Stable);
+    assert!(payload_map.contains_key(&111));
+    assert!(!payload_map.contains_key(&120));
 }
 
 // Helper functions to test private methods
@@ -441,14 +440,7 @@ fn extract_payload_map_helper(
                                 0
                             };
 
-                            payload_map.insert(
-                                pt,
-                                peer_connection::RtpCodecParameters {
-                                    payload_type: pt,
-                                    clock_rate,
-                                    channels,
-                                },
-                            );
+                            payload_map.insert(pt, codec_params(pt, clock_rate, channels));
                         }
                     }
                 }

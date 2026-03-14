@@ -14,12 +14,38 @@ use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration as WebrtcConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
+#[tokio::test]
+async fn default_create_data_channel_none_is_ordered() -> Result<()> {
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .ok();
+
+    let pc = PeerConnection::new(RtcConfiguration::default());
+    let dc = pc.create_data_channel("default-ordered", None)?;
+
+    assert!(
+        dc.ordered,
+        "default channel should match browser ordered semantics"
+    );
+    assert!(
+        dc.max_retransmits.is_none(),
+        "default channel should remain fully reliable"
+    );
+    assert!(
+        dc.max_packet_life_time.is_none(),
+        "default channel should not set a lifetime limit"
+    );
+
+    pc.close();
+    Ok(())
+}
+
 /// Test: ordered channels with negotiated mode
 /// This mimics the browser scenario where channels are ordered.
 /// Sends data from RustRTC to webrtc-rs via ordered channels.
 #[tokio::test]
 async fn ordered_negotiated_channel_test() -> Result<()> {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .ok();
 
     const NUM_CHANNELS: usize = 2;
     const CHUNK_COUNT: usize = 50;
@@ -259,7 +285,8 @@ async fn ordered_negotiated_channel_test() -> Result<()> {
 /// This mimics the browser stress test scenario exactly.
 #[tokio::test]
 async fn dcep_ordered_channel_test() -> Result<()> {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .ok();
 
     const CHUNK_COUNT: usize = 20;
     const CHUNK_SIZE: usize = 1000;
@@ -440,7 +467,8 @@ async fn dcep_ordered_channel_test() -> Result<()> {
 /// sends "pong" back, then sends bulk data.
 #[tokio::test]
 async fn dcep_ordered_bidirectional_test() -> Result<()> {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .ok();
 
     const CHUNK_COUNT: usize = 20;
     const CHUNK_SIZE: usize = 1000;

@@ -36,6 +36,8 @@ const MAX_BUFFERED_AMOUNT: usize = 256 * 1024; // 256KB - reduced for lower memo
 // Memory limits for inbound queues - balanced for memory efficiency and loss tolerance
 // These values provide good memory efficiency while maintaining tolerance for packet loss
 const MAX_INBOUND_STREAM_PENDING: usize = 128; // max pending ordered messages per stream
+const MAX_INBOUND_MESSAGE_REASSEMBLY_SIZE: usize = 64 * 1024;
+const MAX_INBOUND_STREAM_BUFFER_SIZE: usize = 128 * 1024;
 const MAX_DUPS_BUFFER_SIZE: usize = 32; // max duplicate TSNs to track (increased for lossy networks)
 const MAX_RECEIVED_QUEUE_SIZE: usize = 512; // max out-of-order packets (increased for lossy networks)
 
@@ -74,6 +76,7 @@ pub(crate) struct ChunkRecord {
 struct InboundStream {
     next_ssn: u16,
     pending: BTreeMap<u16, Bytes>,
+    buffered_bytes: usize,
 }
 
 impl InboundStream {
@@ -81,29 +84,23 @@ impl InboundStream {
         Self {
             next_ssn: 0,
             pending: BTreeMap::new(),
+            buffered_bytes: 0,
         }
     }
 
     fn enqueue(&mut self, ssn: u16, msg: Bytes) -> Vec<Bytes> {
-        // Limit pending queue size to prevent memory bloat
-        if self.pending.len() >= MAX_INBOUND_STREAM_PENDING {
-            // Drain any ready messages first
-            let ready = self.drain_ready();
-            if !ready.is_empty() {
-                return ready;
-            }
-            // If still full, drop oldest pending message to prevent unbounded growth
-            if let Some(&oldest_ssn) = self.pending.keys().next() {
-                self.pending.remove(&oldest_ssn);
-            }
+        let msg_len = msg.len();
+        if let Some(old_msg) = self.pending.insert(ssn, msg) {
+            self.buffered_bytes = self.buffered_bytes.saturating_sub(old_msg.len());
         }
-        self.pending.insert(ssn, msg);
+        self.buffered_bytes += msg_len;
         self.drain_ready()
     }
 
     fn drain_ready(&mut self) -> Vec<Bytes> {
         let mut out = Vec::new();
         while let Some(msg) = self.pending.remove(&self.next_ssn) {
+            self.buffered_bytes = self.buffered_bytes.saturating_sub(msg.len());
             out.push(msg);
             self.next_ssn = self.next_ssn.wrapping_add(1);
         }
@@ -121,7 +118,9 @@ impl InboundStream {
                 .cloned()
                 .collect();
             for s in remove {
-                self.pending.remove(&s);
+                if let Some(msg) = self.pending.remove(&s) {
+                    self.buffered_bytes = self.buffered_bytes.saturating_sub(msg.len());
+                }
             }
         }
     }
@@ -133,6 +132,24 @@ fn tsn_gt(a: u32, b: u32) -> bool {
 
 fn ssn_gt(a: u16, b: u16) -> bool {
     (a.wrapping_sub(b) as i16) > 0
+}
+
+fn dcep_channel_type(dc: &DataChannel) -> u8 {
+    if dc.ordered {
+        if dc.max_retransmits.is_some() {
+            0x01 // DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT
+        } else if dc.max_packet_life_time.is_some() {
+            0x02 // DATA_CHANNEL_PARTIAL_RELIABLE_TIMED
+        } else {
+            0x00 // DATA_CHANNEL_RELIABLE
+        }
+    } else if dc.max_retransmits.is_some() {
+        0x81 // DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT_UNORDERED
+    } else if dc.max_packet_life_time.is_some() {
+        0x82 // DATA_CHANNEL_PARTIAL_RELIABLE_TIMED_UNORDERED
+    } else {
+        0x80 // DATA_CHANNEL_RELIABLE_UNORDERED
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2325,6 +2342,29 @@ impl SctpInner {
         Ok(())
     }
 
+    fn close_data_channel_for_reassembly_overflow(
+        &self,
+        dc: &Arc<DataChannel>,
+        stream_id: u16,
+        reason: &str,
+    ) {
+        // Drop partially reassembled data before closing so malformed peers cannot pin memory.
+        dc.reassembly_buffer.lock().unwrap().clear();
+        self.inbound_streams.lock().unwrap().remove(&stream_id);
+
+        let old_state = dc
+            .state
+            .swap(DataChannelState::Closed as usize, Ordering::SeqCst);
+        if old_state != DataChannelState::Closed as usize {
+            debug!(
+                "Closing DataChannel {} because inbound reassembly exceeded limits: {}",
+                stream_id, reason
+            );
+            dc.send_event(DataChannelEvent::Close);
+            dc.close_channel();
+        }
+    }
+
     async fn handle_data(&self, flags: u8, chunk: Bytes) -> Result<()> {
         let mut buf = chunk.clone();
         if buf.remaining() < 12 {
@@ -2475,6 +2515,17 @@ impl SctpInner {
                 }
                 buffer.clear();
             }
+
+            if buffer.len() + user_data.len() > MAX_INBOUND_MESSAGE_REASSEMBLY_SIZE {
+                drop(buffer);
+                self.close_data_channel_for_reassembly_overflow(
+                    &dc,
+                    stream_id,
+                    "single message exceeded the inbound reassembly limit",
+                );
+                return Ok(());
+            }
+
             buffer.extend_from_slice(&user_data);
             if e_bit {
                 let msg = std::mem::take(&mut *buffer).freeze();
@@ -2486,6 +2537,17 @@ impl SctpInner {
                     let mut streams = self.inbound_streams.lock().unwrap();
                     let stream = streams.entry(stream_id).or_insert_with(InboundStream::new);
                     let ready = stream.enqueue(stream_seq, msg);
+                    if stream.pending.len() > MAX_INBOUND_STREAM_PENDING
+                        || stream.buffered_bytes > MAX_INBOUND_STREAM_BUFFER_SIZE
+                    {
+                        drop(streams);
+                        self.close_data_channel_for_reassembly_overflow(
+                            &dc,
+                            stream_id,
+                            "ordered reassembly queue exceeded the per-channel buffer limit",
+                        );
+                        return Ok(());
+                    }
                     for m in ready {
                         dc.send_event(DataChannelEvent::Message(m));
                     }
@@ -2523,20 +2585,17 @@ impl SctpInner {
 
                 if !found {
                     // Create new channel
+                    let reliability_mode = open.channel_type & 0x03;
                     let config = DataChannelConfig {
                         label: open.label.clone(),
                         protocol: open.protocol,
                         ordered: (open.channel_type & 0x80) == 0,
-                        max_retransmits: if (open.channel_type & 0x03) == 0x01
-                            || (open.channel_type & 0x03) == 0x81
-                        {
+                        max_retransmits: if reliability_mode == 0x01 {
                             Some(open.reliability_parameter as u16)
                         } else {
                             None
                         },
-                        max_packet_life_time: if (open.channel_type & 0x03) == 0x02
-                            || (open.channel_type & 0x03) == 0x82
-                        {
+                        max_packet_life_time: if reliability_mode == 0x02 {
                             Some(open.reliability_parameter as u16)
                         } else {
                             None
@@ -3217,23 +3276,7 @@ impl SctpInner {
     }
 
     pub async fn send_dcep_open(&self, dc: &DataChannel) -> Result<()> {
-        let channel_type = if dc.ordered {
-            if dc.max_retransmits.is_some() {
-                0x01 // DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT
-            } else if dc.max_packet_life_time.is_some() {
-                0x02 // DATA_CHANNEL_PARTIAL_RELIABLE_TIMED
-            } else {
-                0x00 // DATA_CHANNEL_RELIABLE
-            }
-        } else {
-            if dc.max_retransmits.is_some() {
-                0x81 // DATA_CHANNEL_PARTIAL_RELIABLE_REXMIT_UNORDERED
-            } else if dc.max_packet_life_time.is_some() {
-                0x82 // DATA_CHANNEL_PARTIAL_RELIABLE_TIMED_UNORDERED
-            } else {
-                0x80 // DATA_CHANNEL_RELIABLE_UNORDERED
-            }
-        };
+        let channel_type = dcep_channel_type(dc);
 
         let reliability_parameter = if let Some(r) = dc.max_retransmits {
             r as u32
@@ -3340,6 +3383,70 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::time::Duration;
+
+    #[test]
+    fn test_dcep_channel_type_matches_ordering_and_reliability() {
+        let reliable_ordered = DataChannel::new(
+            0,
+            DataChannelConfig {
+                label: "ordered".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(dcep_channel_type(&reliable_ordered), 0x00);
+
+        let reliable_unordered = DataChannel::new(
+            1,
+            DataChannelConfig {
+                label: "unordered".into(),
+                ordered: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(dcep_channel_type(&reliable_unordered), 0x80);
+
+        let rexmit_ordered = DataChannel::new(
+            2,
+            DataChannelConfig {
+                label: "rexmit-ordered".into(),
+                max_retransmits: Some(3),
+                ..Default::default()
+            },
+        );
+        assert_eq!(dcep_channel_type(&rexmit_ordered), 0x01);
+
+        let rexmit_unordered = DataChannel::new(
+            3,
+            DataChannelConfig {
+                label: "rexmit-unordered".into(),
+                ordered: false,
+                max_retransmits: Some(3),
+                ..Default::default()
+            },
+        );
+        assert_eq!(dcep_channel_type(&rexmit_unordered), 0x81);
+
+        let timed_ordered = DataChannel::new(
+            4,
+            DataChannelConfig {
+                label: "timed-ordered".into(),
+                max_packet_life_time: Some(50),
+                ..Default::default()
+            },
+        );
+        assert_eq!(dcep_channel_type(&timed_ordered), 0x02);
+
+        let timed_unordered = DataChannel::new(
+            5,
+            DataChannelConfig {
+                label: "timed-unordered".into(),
+                ordered: false,
+                max_packet_life_time: Some(50),
+                ..Default::default()
+            },
+        );
+        assert_eq!(dcep_channel_type(&timed_unordered), 0x82);
+    }
 
     #[test]
     fn test_rto_calculator() {

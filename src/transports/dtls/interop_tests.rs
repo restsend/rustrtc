@@ -16,7 +16,8 @@ use webrtc_util::conn::Listener;
 #[tokio::test]
 #[ignore]
 async fn test_interop_rustrtc_client_webrtc_server() -> Result<()> {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .ok();
 
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())

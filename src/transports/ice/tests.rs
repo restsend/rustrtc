@@ -26,6 +26,37 @@ fn parse_turn_uri() {
     assert_eq!(uri.port, 3478);
     assert_eq!(uri.transport, IceTransportProtocol::Tcp);
     assert_eq!(uri.kind, IceUriKind::Turn);
+    assert!(!uri.secure);
+}
+
+#[test]
+fn parse_turns_uri_defaults_to_secure_tcp() {
+    let uri = IceServerUri::parse("turns:example.com").unwrap();
+    assert_eq!(uri.host, "example.com");
+    assert_eq!(uri.port, 5349);
+    assert_eq!(uri.transport, IceTransportProtocol::Tcp);
+    assert_eq!(uri.kind, IceUriKind::Turn);
+    assert!(uri.secure);
+}
+
+#[tokio::test]
+async fn stuns_probe_rejects_tcp_fallback() -> Result<()> {
+    let (tx, _) = broadcast::channel(100);
+    let (socket_tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let gatherer = IceGatherer::new(RtcConfiguration::default(), tx, socket_tx);
+    let uri = IceServerUri::parse("stuns:127.0.0.1:5349").unwrap();
+
+    let err = gatherer
+        .probe_stun(&uri)
+        .await
+        .expect_err("stuns probe should fail until ICE-TCP exists");
+
+    assert!(
+        err.to_string()
+            .contains("refusing the previous UDP fallback"),
+        "unexpected error: {err}"
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -123,7 +154,7 @@ async fn turn_client_can_create_permission() -> Result<()> {
     let uri = IceServerUri::parse(&turn_server.turn_url())?;
     let server =
         IceServer::new(vec![turn_server.turn_url()]).with_credential(TEST_USERNAME, TEST_PASSWORD);
-    let client = TurnClient::connect(&uri, false).await?;
+    let client = TurnClient::connect(&uri, false, false).await?;
     let creds = TurnCredentials::from_server(&server)?;
     client.allocate(creds).await?;
     let peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
