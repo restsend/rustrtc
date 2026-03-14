@@ -922,7 +922,9 @@ impl PeerConnection {
 
     pub async fn set_remote_description(&self, desc: SessionDescription) -> RtcResult<()> {
         self.inner.validate_sdp_type(&desc.sdp_type)?;
-        let remote_dtls_fingerprint = if self.config().transport_mode == TransportMode::WebRtc {
+        let remote_dtls_fingerprint = if self.config().transport_mode == TransportMode::WebRtc
+            && desc.sdp_type != SdpType::Rollback
+        {
             match desc.dtls_fingerprint() {
                 Ok(Some(fingerprint)) if fingerprint.algorithm == "sha-256" => {
                     Some(fingerprint.value)

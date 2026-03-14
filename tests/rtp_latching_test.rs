@@ -37,6 +37,13 @@ async fn can_exchange_udp(ip_a: IpAddr, ip_b: IpAddr) -> Result<bool> {
     )
 }
 
+fn is_compatible_latching_pair(ip_a: IpAddr, ip_b: IpAddr) -> bool {
+    // Latching reuses the selected local candidate. Mixed loopback/LAN pairs can
+    // pass a raw UDP probe but still fail to deliver the migration STUN packet
+    // to the bound local candidate on some hosts.
+    ip_a.is_loopback() == ip_b.is_loopback()
+}
+
 async fn select_test_ip_pair() -> Result<Option<(IpAddr, IpAddr)>> {
     let loopback_a = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let loopback_b = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
@@ -68,7 +75,7 @@ async fn select_test_ip_pair() -> Result<Option<(IpAddr, IpAddr)>> {
             }
             let ip_a = ipv4_ips[i];
             let ip_b = ipv4_ips[j];
-            if can_exchange_udp(ip_a, ip_b).await? {
+            if is_compatible_latching_pair(ip_a, ip_b) && can_exchange_udp(ip_a, ip_b).await? {
                 return Ok(Some((ip_a, ip_b)));
             }
         }

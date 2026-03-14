@@ -4,6 +4,8 @@ use rustrtc::sdp::{
 use rustrtc::*;
 use std::collections::HashMap;
 
+const TEST_FINGERPRINT: &str = "sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99";
+
 fn create_audio_sdp(
     sdp_type: SdpType,
     mid: &str,
@@ -13,6 +15,10 @@ fn create_audio_sdp(
 ) -> SessionDescription {
     let mut desc = SessionDescription::new(sdp_type);
     desc.session = SessionSection::default();
+    desc.session.attributes.push(Attribute::new(
+        "fingerprint",
+        Some(TEST_FINGERPRINT.to_string()),
+    ));
 
     let mut section = MediaSection::new(MediaKind::Audio, mid);
     section.direction = direction;

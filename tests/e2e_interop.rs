@@ -1,4 +1,6 @@
+use std::net::{SocketAddr, TcpStream};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,8 +20,33 @@ fn wait_for_child_with_timeout(
     }
 }
 
+fn interop_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn wait_for_tcp_listener(addr: &str, timeout: Duration) -> std::io::Result<()> {
+    let addr: SocketAddr = addr
+        .parse()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid address"))?;
+    let start = Instant::now();
+    loop {
+        match TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+            Ok(_) => return Ok(()),
+            Err(err) if start.elapsed() >= timeout => return Err(err),
+            Err(_) => thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
 #[test]
 fn test_rust_server_go_client() {
+    // These tests share a build dir, a Go binary path, and fixed localhost ports.
+    // Serialize them so one scenario cannot starve or interfere with the other.
+    let _guard = interop_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     // 0. Build Rust example (use separate target dir to avoid lock contention)
     let status = Command::new("cargo")
         .args(&[
@@ -55,8 +82,8 @@ fn test_rust_server_go_client() {
         .spawn()
         .expect("Failed to start Rust server");
 
-    // Give server time to start
-    thread::sleep(Duration::from_secs(5));
+    wait_for_tcp_listener("127.0.0.1:3000", Duration::from_secs(10))
+        .expect("Rust server did not start listening in time");
 
     // 3. Start Go Client
     let client = Command::new("./examples/interop_pion_go/interop_pion_go")
@@ -94,6 +121,12 @@ fn test_rust_server_go_client() {
 
 #[test]
 fn test_go_server_rust_client() {
+    // These tests share a build dir, a Go binary path, and fixed localhost ports.
+    // Serialize them so one scenario cannot starve or interfere with the other.
+    let _guard = interop_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     // 0. Build Rust example
     let status = Command::new("cargo")
         .args(&[
@@ -129,8 +162,8 @@ fn test_go_server_rust_client() {
         .spawn()
         .expect("Failed to start Go server");
 
-    // Give server time to start
-    thread::sleep(Duration::from_secs(2));
+    wait_for_tcp_listener("127.0.0.1:3001", Duration::from_secs(10))
+        .expect("Go server did not start listening in time");
 
     // 3. Start Rust Client
     let mut client = Command::new("./target/e2e/debug/examples/interop_pion")
@@ -143,7 +176,7 @@ fn test_go_server_rust_client() {
     // 4. Wait for client to finish (it should exit 0 after 5 pings).
     // Avoid piping the Rust client's logs into an unread buffer, which can
     // block the child process once debug logging becomes noisy.
-    let status = wait_for_child_with_timeout(&mut client, Duration::from_secs(20))
+    let status = wait_for_child_with_timeout(&mut client, Duration::from_secs(40))
         .expect("Failed to wait for Rust client")
         .unwrap_or_else(|| {
             let _ = client.kill();

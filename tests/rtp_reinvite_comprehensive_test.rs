@@ -5,10 +5,16 @@ use rustrtc::sdp::{
 /// Tests cover: Offerer/Answerer timing, SSRC changes, Direction changes, parameter validation
 use rustrtc::*;
 
+const TEST_FINGERPRINT: &str = "sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99";
+
 /// Helper to create a minimal valid SDP
 fn create_minimal_sdp(sdp_type: SdpType, mid: &str, direction: Direction) -> SessionDescription {
     let mut desc = SessionDescription::new(sdp_type);
     desc.session = SessionSection::default();
+    desc.session.attributes.push(Attribute::new(
+        "fingerprint",
+        Some(TEST_FINGERPRINT.to_string()),
+    ));
 
     let mut section = MediaSection::new(MediaKind::Audio, mid);
     section.direction = direction;
