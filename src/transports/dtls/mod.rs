@@ -1760,8 +1760,11 @@ impl DtlsInner {
                 Some(packet) = handshake_rx.recv() => {
                     if let Err(e) = self.handle_incoming_packet(packet, &mut ctx, &incoming_data_tx, &certificate, is_client).await {
                         warn!("DTLS handshake loop error in handle_incoming_packet: {}", e);
-                        // Do not abort handshake on packet processing error (e.g. decrypt fail, bad record)
-                        // return Err(e);
+                        // Bad records can be ignored, but once verification has
+                        // marked the transport as failed we should stop retrying.
+                        if *self.state.lock().unwrap() == DtlsState::Failed {
+                            return Err(e);
+                        }
                     }
                 }
             }
