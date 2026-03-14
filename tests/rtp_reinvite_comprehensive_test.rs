@@ -31,7 +31,8 @@ fn create_minimal_sdp(sdp_type: SdpType, mid: &str, direction: Direction) -> Ses
 /// Test 1: Offerer timing - parameters should apply when answer is received
 #[tokio::test]
 async fn test_reinvite_offerer_timing() {
-    let config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::default();
+    config.transport_mode = TransportMode::Rtp;
     let pc = PeerConnection::new(config);
 
     // Initial negotiation
@@ -99,7 +100,8 @@ async fn test_reinvite_offerer_timing() {
 /// Test 2: Answerer timing - parameters should apply when offer is received
 #[tokio::test]
 async fn test_reinvite_answerer_timing() {
-    let config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::default();
+    config.transport_mode = TransportMode::Rtp;
     let pc = PeerConnection::new(config);
 
     // Simulate being the answerer - receive initial offer
@@ -138,7 +140,8 @@ async fn test_reinvite_answerer_timing() {
 /// Test 3: SSRC change detection
 #[tokio::test]
 async fn test_ssrc_change_detection() {
-    let config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::default();
+    config.transport_mode = TransportMode::Rtp;
     let pc = PeerConnection::new(config);
 
     // Initial negotiation
@@ -172,7 +175,8 @@ async fn test_ssrc_change_detection() {
 /// Test 4: Direction change - SendRecv to SendOnly (hold)
 #[tokio::test]
 async fn test_direction_change_hold() {
-    let config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::default();
+    config.transport_mode = TransportMode::Rtp;
     let pc = PeerConnection::new(config);
 
     pc.add_transceiver(
@@ -202,7 +206,8 @@ async fn test_direction_change_hold() {
 /// Test 5: Direction change - SendOnly to SendRecv (unhold)
 #[tokio::test]
 async fn test_direction_change_unhold() {
-    let config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::default();
+    config.transport_mode = TransportMode::Rtp;
     let pc = PeerConnection::new(config);
 
     // Initial negotiation with SendOnly
@@ -230,7 +235,8 @@ async fn test_direction_change_unhold() {
 /// Test 6: Direction change - SendRecv to Inactive
 #[tokio::test]
 async fn test_direction_change_inactive() {
-    let config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::default();
+    config.transport_mode = TransportMode::Rtp;
     let pc = PeerConnection::new(config);
 
     // Initial negotiation
@@ -255,7 +261,8 @@ async fn test_direction_change_inactive() {
 /// Test 7: Multiple parameter changes in one reinvite
 #[tokio::test]
 async fn test_combined_parameter_changes() {
-    let config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::default();
+    config.transport_mode = TransportMode::Rtp;
     let pc = PeerConnection::new(config);
 
     // Initial negotiation
@@ -313,7 +320,8 @@ async fn test_combined_parameter_changes() {
 /// Test 8: Reject reinvite in invalid state (glare detection)
 #[tokio::test]
 async fn test_glare_detection() {
-    let config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::default();
+    config.transport_mode = TransportMode::Rtp;
     let pc = PeerConnection::new(config);
 
     // Initial negotiation
@@ -346,7 +354,8 @@ async fn test_glare_detection() {
 /// Test 9: Multiple sequential reinvites
 #[tokio::test]
 async fn test_sequential_reinvites() {
-    let config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::default();
+    config.transport_mode = TransportMode::Rtp;
     let pc = PeerConnection::new(config);
 
     // Initial negotiation
@@ -403,7 +412,8 @@ async fn test_sequential_reinvites() {
 /// Test 10: Extmap ID changes
 #[tokio::test]
 async fn test_extmap_changes_in_reinvite() {
-    let config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::default();
+    config.transport_mode = TransportMode::Rtp;
     let pc = PeerConnection::new(config);
 
     // Add transceiver first (answerer must have transceiver to receive remote offer)

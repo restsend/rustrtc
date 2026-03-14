@@ -85,18 +85,25 @@ pub(crate) fn verify_server_key_exchange_signature(
     server_random: &[u8],
     server_key_exchange: &ServerKeyExchange,
 ) -> Result<()> {
+    let pk_len = server_key_exchange.public_key.len();
+    if pk_len > 255 {
+        return Err(anyhow::anyhow!(
+            "ServerKeyExchange public key too long: {} bytes",
+            pk_len
+        ));
+    }
+
     let verifying_key = certificate_public_key(certificate_der)?;
     let signature = Signature::from_der(&server_key_exchange.signature)
         .map_err(|e| anyhow::anyhow!("Invalid ServerKeyExchange signature format: {}", e))?;
 
-    let mut signed_params = Vec::with_capacity(
-        client_random.len() + server_random.len() + 4 + server_key_exchange.public_key.len(),
-    );
+    let mut signed_params =
+        Vec::with_capacity(client_random.len() + server_random.len() + 4 + pk_len);
     signed_params.extend_from_slice(client_random);
     signed_params.extend_from_slice(server_random);
     signed_params.push(server_key_exchange.curve_type);
     signed_params.extend_from_slice(&server_key_exchange.named_curve.to_be_bytes());
-    signed_params.push(server_key_exchange.public_key.len() as u8);
+    signed_params.push(pk_len as u8);
     signed_params.extend_from_slice(&server_key_exchange.public_key);
 
     verifying_key

@@ -364,3 +364,77 @@ fn test_verify_server_key_exchange_signature_rejects_tampering() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_verify_server_key_exchange_signature_rejects_oversized_public_key() -> Result<()> {
+    let certificate = generate_certificate()?;
+    let client_random = Random::new().to_bytes();
+    let server_random = Random::new().to_bytes();
+
+    // Build a ServerKeyExchange with a public key that exceeds 255 bytes.
+    let oversized_key = vec![0x04u8; 256];
+    let server_key_exchange = ServerKeyExchange {
+        curve_type: 3,
+        named_curve: 23,
+        public_key: oversized_key,
+        signature: vec![],
+    };
+
+    let err = verify_server_key_exchange_signature(
+        &certificate.certificate[0],
+        &client_random,
+        &server_random,
+        &server_key_exchange,
+    )
+    .unwrap_err();
+
+    assert!(
+        err.to_string().contains("too long"),
+        "expected 'too long' error, got: {}",
+        err
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_dtls_handshake_no_fingerprint_skips_check() -> Result<()> {
+    // When expected_remote_fingerprint is None the handshake should succeed
+    // regardless of the server certificate (fingerprint check is opt-in).
+    let client_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let server_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+
+    let client_addr = client_socket.local_addr()?;
+    let server_addr = server_socket.local_addr()?;
+
+    let (client_socket_tx, _) = watch::channel(Some(IceSocketWrapper::Udp(client_socket.clone())));
+    let client_conn = IceConn::new(client_socket_tx.subscribe(), server_addr);
+
+    let (server_socket_tx, _) = watch::channel(Some(IceSocketWrapper::Udp(server_socket.clone())));
+    let server_conn = IceConn::new(server_socket_tx.subscribe(), client_addr);
+
+    let client_cert = generate_certificate()?;
+    let server_cert = generate_certificate()?;
+
+    // Client passes None — no fingerprint binding expected
+    let (client_dtls, _client_rx, client_runner) =
+        DtlsTransport::new(client_conn.clone(), client_cert, true, 1500, None).await?;
+    tokio::spawn(client_runner);
+    let (server_dtls, _server_rx, server_runner) =
+        DtlsTransport::new(server_conn.clone(), server_cert, false, 1500, None).await?;
+    tokio::spawn(server_runner);
+
+    spawn_socket_pump(client_socket, client_conn);
+    spawn_socket_pump(server_socket, server_conn);
+
+    assert!(matches!(
+        wait_for_terminal_state(&client_dtls).await?,
+        DtlsState::Connected(..)
+    ));
+    assert!(matches!(
+        wait_for_terminal_state(&server_dtls).await?,
+        DtlsState::Connected(..)
+    ));
+
+    Ok(())
+}

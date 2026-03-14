@@ -727,7 +727,11 @@ impl PeerConnection {
                         fingerprint.algorithm
                     )));
                 }
-                Ok(None) => None,
+                Ok(None) => {
+                    return Err(RtcError::InvalidConfiguration(
+                        "remote SDP in WebRTC mode must contain a DTLS fingerprint".into(),
+                    ));
+                }
                 Err(err) => {
                     return Err(RtcError::InvalidConfiguration(format!(
                         "invalid DTLS fingerprint in remote SDP: {}",
@@ -4855,6 +4859,8 @@ mod tests {
                        s=-\r\n\
                        t=0 0\r\n\
                        a=extmap:3 urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id\r\n\
+                       a=fingerprint:sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99\r\n\
+                       a=setup:passive\r\n\
                        c=IN IP4 127.0.0.1\r\n\
                        m=video 9 RTP/SAVPF 96\r\n\
                        a=rtpmap:96 VP8/90000\r\n\
@@ -5088,6 +5094,8 @@ c=IN IP4 127.0.0.1\r\n\
 a=mid:0\r\n\
 a=sendrecv\r\n\
 a=rtpmap:96 VP8/90000\r\n\
+a=fingerprint:sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99\r\n\
+a=setup:passive\r\n\
 a=ssrc:12345 cname:foo\r\n\
 a=ssrc:67890 cname:foo\r\n\
 a=ssrc-group:FID 12345 67890\r\n";
@@ -5120,6 +5128,8 @@ c=IN IP4 127.0.0.1\r\n\
 a=mid:0\r\n\
 a=sendrecv\r\n\
 a=rtpmap:96 VP8/90000\r\n\
+a=fingerprint:sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99\r\n\
+a=setup:passive\r\n\
 a=ssrc-group:FID 12345 67890\r\n\
 a=ssrc:12345 cname:foo\r\n\
 a=ssrc:67890 cname:foo\r\n";
@@ -5152,6 +5162,8 @@ c=IN IP4 127.0.0.1\r\n\
 a=mid:0\r\n\
 a=sendrecv\r\n\
 a=rtpmap:96 VP8/90000\r\n\
+a=fingerprint:sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99\r\n\
+a=setup:passive\r\n\
 a=ssrc:67890 cname:foo\r\n\
 a=ssrc:12345 cname:foo\r\n\
 a=ssrc-group:FID 12345 67890\r\n";
@@ -6247,5 +6259,132 @@ a=mid:0
         assert_eq!(report.ntp_most, 2_208_988_800);
         assert_eq!(report.ntp_least, 0);
         assert!(report.report_blocks.is_empty());
+    }
+
+    // ---------------------------------------------------------------------------
+    // DTLS fingerprint security tests
+    // ---------------------------------------------------------------------------
+
+    /// WebRTC mode: SDP without any a=fingerprint attribute must be rejected so
+    /// that an attacker cannot strip the fingerprint and bypass identity binding.
+    #[tokio::test]
+    async fn test_set_remote_description_rejects_missing_fingerprint_webrtc() {
+        use crate::{SdpType, SessionDescription, TransportMode};
+
+        let pc = PeerConnection::new(RtcConfiguration::default()); // WebRtc mode
+        assert_eq!(pc.config().transport_mode, TransportMode::WebRtc);
+
+        // SDP has no a=fingerprint — must be rejected
+        let sdp_str = "v=0\r\n\
+                       o=- 123 0 IN IP4 127.0.0.1\r\n\
+                       s=-\r\n\
+                       t=0 0\r\n\
+                       m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+                       a=rtpmap:111 opus/48000/2\r\n\
+                       a=setup:passive\r\n";
+
+        let desc = SessionDescription::parse(SdpType::Offer, sdp_str).unwrap();
+        let err = pc.set_remote_description(desc).await.unwrap_err();
+        assert!(
+            matches!(err, RtcError::InvalidConfiguration(_)),
+            "expected InvalidConfiguration, got: {:?}",
+            err
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fingerprint"),
+            "error should mention fingerprint: {}",
+            msg
+        );
+    }
+
+    /// WebRTC mode: SDP with a valid sha-256 a=fingerprint must be accepted.
+    #[tokio::test]
+    async fn test_set_remote_description_accepts_valid_sha256_fingerprint_webrtc() {
+        use crate::{SdpType, SessionDescription, TransportMode};
+
+        let pc = PeerConnection::new(RtcConfiguration::default());
+        assert_eq!(pc.config().transport_mode, TransportMode::WebRtc);
+
+        // Syntactically valid sha-256 fingerprint (random bytes)
+        let fp = "sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:\
+                  AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99";
+        let sdp_str = format!(
+            "v=0\r\n\
+             o=- 123 0 IN IP4 127.0.0.1\r\n\
+             s=-\r\n\
+             t=0 0\r\n\
+             m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+             a=rtpmap:111 opus/48000/2\r\n\
+             a=setup:passive\r\n\
+             a=fingerprint:{fp}\r\n"
+        );
+        let desc = SessionDescription::parse(SdpType::Offer, &sdp_str).unwrap();
+        // Should not return InvalidConfiguration for fingerprint
+        let result = pc.set_remote_description(desc).await;
+        // The call may fail for other reasons (ICE, state), but NOT due to fingerprint
+        if let Err(ref e) = result {
+            assert!(
+                !e.to_string().contains("fingerprint"),
+                "unexpected fingerprint error: {}",
+                e
+            );
+        }
+    }
+
+    /// WebRTC mode: SDP with an unsupported fingerprint algorithm (sha-1) must be rejected.
+    #[tokio::test]
+    async fn test_set_remote_description_rejects_unsupported_fingerprint_algorithm() {
+        use crate::{SdpType, SessionDescription, TransportMode};
+
+        let pc = PeerConnection::new(RtcConfiguration::default());
+        assert_eq!(pc.config().transport_mode, TransportMode::WebRtc);
+
+        let sdp_str = "v=0\r\n\
+                       o=- 123 0 IN IP4 127.0.0.1\r\n\
+                       s=-\r\n\
+                       t=0 0\r\n\
+                       m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+                       a=rtpmap:111 opus/48000/2\r\n\
+                       a=setup:passive\r\n\
+                       a=fingerprint:sha-1 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD\r\n";
+
+        let desc = SessionDescription::parse(SdpType::Offer, sdp_str).unwrap();
+        let err = pc.set_remote_description(desc).await.unwrap_err();
+        assert!(
+            matches!(err, RtcError::InvalidConfiguration(_)),
+            "expected InvalidConfiguration for sha-1, got: {:?}",
+            err
+        );
+        assert!(err.to_string().contains("sha-1"));
+    }
+
+    /// RTP mode: missing fingerprint is fine — no DTLS identity binding applies.
+    #[tokio::test]
+    async fn test_set_remote_description_allows_missing_fingerprint_rtp_mode() {
+        use crate::{SdpType, SessionDescription, TransportMode};
+
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+        let pc = PeerConnection::new(config);
+
+        let sdp_str = "v=0\r\n\
+                       o=- 123 0 IN IP4 127.0.0.1\r\n\
+                       s=-\r\n\
+                       t=0 0\r\n\
+                       c=IN IP4 127.0.0.1\r\n\
+                       m=audio 4000 RTP/AVP 111\r\n\
+                       a=rtpmap:111 opus/48000/2\r\n";
+
+        let desc = SessionDescription::parse(SdpType::Offer, sdp_str).unwrap();
+        // Must not fail with a fingerprint error
+        let result = pc.set_remote_description(desc).await;
+        if let Err(ref e) = result {
+            assert!(
+                !e.to_string().contains("fingerprint"),
+                "unexpected fingerprint error in RTP mode: {}",
+                e
+            );
+        }
     }
 }
