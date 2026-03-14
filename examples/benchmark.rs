@@ -70,7 +70,8 @@ impl BenchResult {
 
 #[tokio::main]
 async fn main() {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .ok();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -486,8 +487,11 @@ async fn run_rustrtc(count: usize) -> (f64, u64, u64) {
             let (_source, track, _) = sample_track(MediaKind::Audio, 100);
             let params = rustrtc::RtpCodecParameters {
                 payload_type: 111,
+                codec_name: "opus".to_string(),
                 clock_rate: 48000,
                 channels: 2,
+                fmtp: None,
+                rtcp_fbs: Vec::new(),
             };
             pc1.add_track(track, params).unwrap();
 

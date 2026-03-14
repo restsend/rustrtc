@@ -9,6 +9,7 @@ use tokio::time::timeout;
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
+use webrtc::api::setting_engine::SettingEngine;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
@@ -20,7 +21,8 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 const CHANNEL_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn init_test_runtime() {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .ok();
     let _ = env_logger::builder().is_test(true).try_init();
 }
 
@@ -29,7 +31,14 @@ async fn create_webrtc_peer() -> Result<Arc<RTCPeerConnection>> {
     media_engine.register_default_codecs()?;
     let mut registry = Registry::new();
     registry = register_default_interceptors(registry, &mut media_engine)?;
+    let mut setting_engine = SettingEngine::default();
+    // These same-host interop tests should stay focused on DataChannel semantics,
+    // not on whatever transient IPv6/link-local interfaces happen to exist on
+    // the developer machine that day.
+    setting_engine.set_ip_filter(Box::new(|ip| ip.is_ipv4()));
+    setting_engine.set_include_loopback_candidate(true);
     let api = APIBuilder::new()
+        .with_setting_engine(setting_engine)
         .with_media_engine(media_engine)
         .with_interceptor_registry(registry)
         .build();

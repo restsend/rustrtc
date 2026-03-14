@@ -2185,16 +2185,16 @@ impl IceGatherer {
 
     async fn probe_stun(&self, uri: &IceServerUri) -> Result<Option<IceCandidate>> {
         let addr = uri.resolve(self.config.disable_ipv6).await?;
-        let socket = match uri.transport {
-            IceTransportProtocol::Udp => {
-                self.bind_socket(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)))
-                    .await?
-            }
-            IceTransportProtocol::Tcp => {
-                self.bind_socket(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)))
-                    .await?
-            }
-        };
+        if uri.transport == IceTransportProtocol::Tcp {
+            bail!(
+                "STUN over {} is not supported without ICE-TCP; refusing the previous UDP fallback",
+                if uri.secure { "TLS" } else { "TCP" }
+            );
+        }
+
+        let socket = self
+            .bind_socket(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)))
+            .await?;
         let local_addr = socket.local_addr()?;
         let tx_id = random_bytes::<12>();
         let message = StunMessage::binding_request(tx_id, Some("rustrtc"));
@@ -2221,7 +2221,12 @@ impl IceGatherer {
         server: &IceServer,
     ) -> Result<Option<IceCandidate>> {
         let credentials = TurnCredentials::from_server(server)?;
-        let client = TurnClient::connect(uri, self.config.disable_ipv6).await?;
+        let client = TurnClient::connect(
+            uri,
+            self.config.disable_ipv6,
+            self.config.allow_insecure_turn_tls,
+        )
+        .await?;
         let allocation = client.allocate(credentials).await?;
         let relayed_addr = allocation.relayed_address;
 
@@ -2237,7 +2242,10 @@ impl IceGatherer {
         Ok(Some(IceCandidate::relay(
             relayed_addr,
             1,
-            allocation.transport.as_str(),
+            // TURN control traffic may ride over UDP/TCP/TLS, but the relayed
+            // candidate still advertises the peer-facing transport requested in
+            // Allocate. Today we only request UDP relays.
+            "udp",
         )))
     }
 
@@ -2266,6 +2274,7 @@ pub(crate) struct IceServerUri {
     host: String,
     port: u16,
     transport: IceTransportProtocol,
+    secure: bool,
 }
 
 impl IceServerUri {
@@ -2300,6 +2309,9 @@ impl IceServerUri {
         if scheme.starts_with("stun") && query.contains("transport") {
             bail!("stun URI must not include transport parameter");
         }
+        if scheme == "turns" && transport != IceTransportProtocol::Tcp {
+            bail!("turns URI must use TCP transport");
+        }
         let kind = match scheme {
             "stun" | "stuns" => IceUriKind::Stun,
             "turn" | "turns" => IceUriKind::Turn,
@@ -2310,6 +2322,7 @@ impl IceServerUri {
             host,
             port,
             transport,
+            secure: matches!(scheme, "stuns" | "turns"),
         })
     }
 
@@ -2341,15 +2354,6 @@ enum IceUriKind {
 pub(crate) enum IceTransportProtocol {
     Udp,
     Tcp,
-}
-
-impl IceTransportProtocol {
-    fn as_str(&self) -> &'static str {
-        match self {
-            IceTransportProtocol::Udp => "udp",
-            IceTransportProtocol::Tcp => "tcp",
-        }
-    }
 }
 
 fn default_port_for_scheme(scheme: &str) -> Result<u16> {

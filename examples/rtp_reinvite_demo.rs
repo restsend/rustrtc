@@ -9,7 +9,8 @@ use std::collections::HashMap;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .ok();
     // Initialize logging
     tracing_subscriber::fmt::init();
 
@@ -34,8 +35,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         111,
         peer_connection::RtpCodecParameters {
             payload_type: 111,
+            codec_name: "opus".to_string(),
             clock_rate: 48000,
             channels: 2,
+            fmtp: None,
+            rtcp_fbs: Vec::new(),
         },
     );
     transceiver.update_payload_map(initial_payload_map)?;
@@ -70,8 +74,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         120, // Changed from 111
         peer_connection::RtpCodecParameters {
             payload_type: 120,
+            codec_name: "opus".to_string(),
             clock_rate: 48000,
             channels: 2,
+            fmtp: None,
+            rtcp_fbs: Vec::new(),
         },
     );
 

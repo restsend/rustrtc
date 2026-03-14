@@ -273,6 +273,8 @@ pub struct RtcConfiguration {
     pub external_ip: Option<String>,
     pub bind_ip: Option<String>,
     pub disable_ipv6: bool,
+    #[serde(default)]
+    pub allow_insecure_turn_tls: bool,
     pub ssrc_start: u32,
     pub stun_timeout: std::time::Duration,
     /// Timeout for the ICE nomination binding check (USE-CANDIDATE).
@@ -312,6 +314,7 @@ impl Default for RtcConfiguration {
             external_ip: None,
             bind_ip: None,
             disable_ipv6: false,
+            allow_insecure_turn_tls: false,
             ssrc_start: 10000,
             stun_timeout: std::time::Duration::from_secs(5),
             nomination_timeout: std::time::Duration::from_secs(10),
@@ -418,6 +421,11 @@ impl RtcConfigurationBuilder {
 
     pub fn bundle_policy(mut self, policy: BundlePolicy) -> Self {
         self.inner.bundle_policy = policy;
+        self
+    }
+
+    pub fn allow_insecure_turn_tls(mut self, allow: bool) -> Self {
+        self.inner.allow_insecure_turn_tls = allow;
         self
     }
 

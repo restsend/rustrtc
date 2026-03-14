@@ -469,24 +469,15 @@ Follow-up:
 ### ISSUE-10 `network/ice-tcp-decision`
 
 目标:
-- 明确是否实现 ICE-TCP，并让该结论可自动验证
+- 明确实现 ICE-TCP，并让该结论可自动验证
 
-任务 A: 如果决定暂不实现
-1. 在配置、日志和文档中明确声明不支持
-2. 对 TCP candidate 输入提前报错或安全忽略
-
-任务 B: 如果决定实现
 1. 增加 `tcptype`
 2. 扩展 SDP 解析与生成
 3. 增加 TCP host candidate gather
 4. 增加 TCP connectivity check
 
 自动测试方案:
-- 若暂不实现:
-  - `tests/ice_tcp_not_supported.rs`
-    - `tcp_candidate_rejected_with_clear_error`
-    - `tcp_candidate_does_not_trigger_invalid_udp_logic`
-- 若实现:
+- 实现:
   - `tests/ice_tcp_connectivity.rs`
   - `tests/ice_tcp_sdp_roundtrip.rs`
 

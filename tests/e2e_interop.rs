@@ -1,6 +1,22 @@
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+fn wait_for_child_with_timeout(
+    child: &mut Child,
+    timeout: Duration,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if start.elapsed() >= timeout {
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
 
 #[test]
 fn test_rust_server_go_client() {
@@ -119,13 +135,20 @@ fn test_go_server_rust_client() {
     // 3. Start Rust Client
     let mut client = Command::new("./target/e2e/debug/examples/interop_pion")
         .args(&["client", "127.0.0.1:3001"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .expect("Failed to start Rust client");
 
-    // 4. Wait for client to finish (it should exit 0 after 5 pings)
-    let status = client.wait().expect("Failed to wait for Rust client");
+    // 4. Wait for client to finish (it should exit 0 after 5 pings).
+    // Avoid piping the Rust client's logs into an unread buffer, which can
+    // block the child process once debug logging becomes noisy.
+    let status = wait_for_child_with_timeout(&mut client, Duration::from_secs(20))
+        .expect("Failed to wait for Rust client")
+        .unwrap_or_else(|| {
+            let _ = client.kill();
+            panic!("Rust client timed out");
+        });
 
     // Kill server
     let _ = server.kill();

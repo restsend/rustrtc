@@ -52,8 +52,15 @@ async fn start_forwarding(pc: PeerConnection, pt: u8, echo_addr: SocketAddr) {
         let sender = rustrtc::peer_connection::RtpSender::builder(outgoing_track, ssrc)
             .params(rustrtc::RtpCodecParameters {
                 payload_type: pt,
+                codec_name: if pt == 0 {
+                    "PCMU".to_string()
+                } else {
+                    "VP8".to_string()
+                },
                 clock_rate,
                 channels: if pt == 0 { 1 } else { 0 },
+                fmtp: None,
+                rtcp_fbs: Vec::new(),
             })
             .build();
         transceiver.set_sender(Some(sender));
@@ -161,6 +168,7 @@ async fn offer(Json(payload): Json<OfferRequest>) -> impl IntoResponse {
         payload_type: 96,
         codec_name: "VP8".to_string(),
         clock_rate: 90000,
+        fmtp: None,
         rtcp_fbs: vec![],
     }];
     config.media_capabilities = Some(caps);

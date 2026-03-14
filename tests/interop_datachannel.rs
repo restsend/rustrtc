@@ -7,13 +7,35 @@ use tokio::time::timeout;
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
+use webrtc::api::setting_engine::SettingEngine;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration as WebrtcConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
+fn build_webrtc_api() -> Result<webrtc::api::API> {
+    let mut media_engine = MediaEngine::default();
+    media_engine.register_default_codecs()?;
+    let mut registry = Registry::new();
+    registry = register_default_interceptors(registry, &mut media_engine)?;
+
+    let mut setting_engine = SettingEngine::default();
+    // Same-host interop tests become flaky when webrtc-rs enumerates transient
+    // IPv6/link-local interfaces from the developer machine. Keep the harness
+    // focused on stable IPv4 plus loopback candidates.
+    setting_engine.set_ip_filter(Box::new(|ip| ip.is_ipv4()));
+    setting_engine.set_include_loopback_candidate(true);
+
+    Ok(APIBuilder::new()
+        .with_setting_engine(setting_engine)
+        .with_media_engine(media_engine)
+        .with_interceptor_registry(registry)
+        .build())
+}
+
 #[tokio::test]
 async fn interop_datachannel_test() -> Result<()> {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .ok();
     let _ = env_logger::builder().is_test(true).try_init();
 
     // 1. Create RustRTC PeerConnection (Offerer)
@@ -30,14 +52,7 @@ async fn interop_datachannel_test() -> Result<()> {
     )?;
 
     // 2. Create WebRTC PeerConnection (Answerer)
-    let mut m = MediaEngine::default();
-    m.register_default_codecs()?;
-    let mut registry = Registry::new();
-    registry = register_default_interceptors(registry, &mut m)?;
-    let api = APIBuilder::new()
-        .with_media_engine(m)
-        .with_interceptor_registry(registry)
-        .build();
+    let api = build_webrtc_api()?;
 
     let webrtc_config = WebrtcConfiguration::default();
     let webrtc_pc = api.new_peer_connection(webrtc_config).await?;
@@ -173,7 +188,8 @@ async fn interop_datachannel_test() -> Result<()> {
 
 #[tokio::test]
 async fn interop_datachannel_dcep_test() -> Result<()> {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .ok();
 
     let _ = env_logger::builder().is_test(true).try_init();
 
@@ -185,14 +201,7 @@ async fn interop_datachannel_dcep_test() -> Result<()> {
     let rust_dc = rust_pc.create_data_channel("dcep-channel", None)?;
 
     // 2. Create WebRTC PeerConnection (Answerer)
-    let mut m = MediaEngine::default();
-    m.register_default_codecs()?;
-    let mut registry = Registry::new();
-    registry = register_default_interceptors(registry, &mut m)?;
-    let api = APIBuilder::new()
-        .with_media_engine(m)
-        .with_interceptor_registry(registry)
-        .build();
+    let api = build_webrtc_api()?;
 
     let webrtc_config = WebrtcConfiguration::default();
     let webrtc_pc = api.new_peer_connection(webrtc_config).await?;
@@ -287,7 +296,8 @@ async fn interop_datachannel_dcep_test() -> Result<()> {
 
 #[tokio::test]
 async fn interop_datachannel_incoming_test() -> Result<()> {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .ok();
     let _ = env_logger::builder().is_test(true).try_init();
 
     // 1. Create RustRTC PeerConnection (Answerer)
@@ -295,14 +305,7 @@ async fn interop_datachannel_incoming_test() -> Result<()> {
     let rust_pc = PeerConnection::new(rust_config);
 
     // 2. Create WebRTC PeerConnection (Offerer)
-    let mut m = MediaEngine::default();
-    m.register_default_codecs()?;
-    let mut registry = Registry::new();
-    registry = register_default_interceptors(registry, &mut m)?;
-    let api = APIBuilder::new()
-        .with_media_engine(m)
-        .with_interceptor_registry(registry)
-        .build();
+    let api = build_webrtc_api()?;
 
     let webrtc_config = WebrtcConfiguration::default();
     let webrtc_pc = api.new_peer_connection(webrtc_config).await?;

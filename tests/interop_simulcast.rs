@@ -7,6 +7,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 use webrtc::api::APIBuilder;
 use webrtc::api::media_engine::MediaEngine;
+use webrtc::api::setting_engine::SettingEngine;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration as WebrtcConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
@@ -20,9 +21,50 @@ use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirecti
 use webrtc::track::track_local::TrackLocalWriter;
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 
+fn build_webrtc_api() -> Result<webrtc::api::API> {
+    let mut media_engine = MediaEngine::default();
+    media_engine.register_default_codecs()?;
+    media_engine.register_header_extension(
+        RTCRtpHeaderExtensionCapability {
+            uri: "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id".to_owned(),
+        },
+        RTPCodecType::Video,
+        Some(RTCRtpTransceiverDirection::Sendrecv),
+    )?;
+    media_engine.register_header_extension(
+        RTCRtpHeaderExtensionCapability {
+            uri: "urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id".to_owned(),
+        },
+        RTPCodecType::Video,
+        Some(RTCRtpTransceiverDirection::Sendrecv),
+    )?;
+    media_engine.register_header_extension(
+        RTCRtpHeaderExtensionCapability {
+            uri: "urn:ietf:params:rtp-hdrext:sdes:mid".to_owned(),
+        },
+        RTPCodecType::Video,
+        Some(RTCRtpTransceiverDirection::Sendrecv),
+    )?;
+
+    let registry = Registry::new();
+    let mut setting_engine = SettingEngine::default();
+    // Same-host browser/webrtc-rs interop gets flaky when transient IPv6 or
+    // link-local interfaces are mixed into candidate gathering. Keep this test
+    // focused on simulcast behavior over stable IPv4 plus loopback paths.
+    setting_engine.set_ip_filter(Box::new(|ip| ip.is_ipv4()));
+    setting_engine.set_include_loopback_candidate(true);
+
+    Ok(APIBuilder::new()
+        .with_setting_engine(setting_engine)
+        .with_media_engine(media_engine)
+        .with_interceptor_registry(registry)
+        .build())
+}
+
 #[tokio::test]
 async fn test_simulcast_ingest_and_switch() -> Result<()> {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .ok();
 
     let _ = env_logger::builder().is_test(true).try_init();
 
@@ -34,35 +76,7 @@ async fn test_simulcast_ingest_and_switch() -> Result<()> {
     let transceiver = rust_pc.add_transceiver(MediaKind::Video, TransceiverDirection::RecvOnly);
 
     // 2. Create WebRTC PeerConnection (Client)
-    let mut m = MediaEngine::default();
-    m.register_default_codecs()?;
-    m.register_header_extension(
-        RTCRtpHeaderExtensionCapability {
-            uri: "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id".to_owned(),
-        },
-        RTPCodecType::Video,
-        Some(RTCRtpTransceiverDirection::Sendrecv),
-    )?;
-    m.register_header_extension(
-        RTCRtpHeaderExtensionCapability {
-            uri: "urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id".to_owned(),
-        },
-        RTPCodecType::Video,
-        Some(RTCRtpTransceiverDirection::Sendrecv),
-    )?;
-    m.register_header_extension(
-        RTCRtpHeaderExtensionCapability {
-            uri: "urn:ietf:params:rtp-hdrext:sdes:mid".to_owned(),
-        },
-        RTPCodecType::Video,
-        Some(RTCRtpTransceiverDirection::Sendrecv),
-    )?;
-    let registry = Registry::new();
-    // registry = webrtc::api::interceptor_registry::register_default_interceptors(registry, &mut m)?;
-    let api = APIBuilder::new()
-        .with_media_engine(m)
-        .with_interceptor_registry(registry)
-        .build();
+    let api = build_webrtc_api()?;
 
     let webrtc_config = WebrtcConfiguration::default();
     let webrtc_pc = api.new_peer_connection(webrtc_config).await?;

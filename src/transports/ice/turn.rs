@@ -1,13 +1,19 @@
 use anyhow::{Result, anyhow, bail};
 use md5::{Digest as Md5Digest, Md5};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
+use tokio_rustls::TlsConnector;
+
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme,
+};
 
 use super::stun::{StunAttribute, StunClass, StunMessage, StunMethod, random_bytes};
 use super::{IceServerUri, IceTransportProtocol, MAX_STUN_MESSAGE};
@@ -39,13 +45,20 @@ impl TurnCredentials {
     }
 }
 
-#[derive(Debug)]
 pub struct TurnClient {
     transport: TurnTransport,
     auth: Mutex<Option<TurnAuthState>>,
     channels: Mutex<HashMap<SocketAddr, u16>>,
     channel_map: Mutex<HashMap<u16, SocketAddr>>,
     next_channel: Mutex<u16>,
+}
+
+impl std::fmt::Debug for TurnClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnClient")
+            .field("protocol", &self.transport.protocol())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -85,7 +98,11 @@ impl TurnAuthState {
 }
 
 impl TurnClient {
-    pub(crate) async fn connect(uri: &IceServerUri, disable_ipv6: bool) -> Result<Self> {
+    pub(crate) async fn connect(
+        uri: &IceServerUri,
+        disable_ipv6: bool,
+        allow_insecure_tls: bool,
+    ) -> Result<Self> {
         let addr = uri.resolve(disable_ipv6).await?;
         let transport = match uri.transport {
             IceTransportProtocol::Udp => {
@@ -97,8 +114,13 @@ impl TurnClient {
             }
             IceTransportProtocol::Tcp => {
                 let stream = TcpStream::connect(addr).await?;
-                let (read, write) = stream.into_split();
-                TurnTransport::Tcp {
+                let (read, write) = if uri.secure {
+                    split_tls_stream(stream, &uri.host, allow_insecure_tls).await?
+                } else {
+                    split_stream(stream)
+                };
+                TurnTransport::Stream {
+                    protocol: IceTransportProtocol::Tcp,
                     read: Arc::new(Mutex::new(read)),
                     write: Arc::new(Mutex::new(write)),
                 }
@@ -164,7 +186,6 @@ impl TurnClient {
                         }
                         return Ok(TurnAllocation {
                             relayed_address: relayed,
-                            transport: self.transport.protocol(),
                         });
                     }
                     bail!("TURN success without relayed address");
@@ -282,7 +303,7 @@ impl TurnClient {
             TurnTransport::Udp { socket, server } => {
                 socket.send_to(data, *server).await?;
             }
-            TurnTransport::Tcp { write, .. } => {
+            TurnTransport::Stream { write, .. } => {
                 let mut frame = Vec::with_capacity(2 + data.len());
                 frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
                 frame.extend_from_slice(data);
@@ -298,20 +319,23 @@ impl TurnClient {
                 let (len, _) = timeout(DEFAULT_STUN_TIMEOUT, socket.recv_from(buf)).await??;
                 Ok(len)
             }
-            TurnTransport::Tcp { read, .. } => {
-                let mut header = [0u8; 2];
-                let mut stream = read.lock().await;
-                stream.read_exact(&mut header).await?;
-                let len = u16::from_be_bytes(header) as usize;
-                let mut offset = 0;
-                while offset < len {
-                    let read = stream.read(&mut buf[offset..len]).await?;
-                    if read == 0 {
-                        bail!("TURN TCP stream closed");
+            TurnTransport::Stream { read, .. } => {
+                timeout(DEFAULT_STUN_TIMEOUT, async {
+                    let mut header = [0u8; 2];
+                    let mut stream = read.lock().await;
+                    stream.read_exact(&mut header).await?;
+                    let len = u16::from_be_bytes(header) as usize;
+                    let mut offset = 0;
+                    while offset < len {
+                        let read = stream.read(&mut buf[offset..len]).await?;
+                        if read == 0 {
+                            bail!("TURN TCP stream closed");
+                        }
+                        offset += read;
                     }
-                    offset += read;
-                }
-                Ok(len)
+                    Ok(len)
+                })
+                .await?
             }
         }
     }
@@ -482,28 +506,130 @@ struct TurnNonce {
 #[derive(Clone)]
 pub(crate) struct TurnAllocation {
     pub relayed_address: SocketAddr,
-    pub transport: IceTransportProtocol,
 }
 
 impl TurnTransport {
     fn protocol(&self) -> IceTransportProtocol {
         match self {
             TurnTransport::Udp { .. } => IceTransportProtocol::Udp,
-            TurnTransport::Tcp { .. } => IceTransportProtocol::Tcp,
+            TurnTransport::Stream { protocol, .. } => *protocol,
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum TurnTransport {
     Udp {
         socket: Arc<UdpSocket>,
         server: SocketAddr,
     },
-    Tcp {
-        read: Arc<Mutex<OwnedReadHalf>>,
-        write: Arc<Mutex<OwnedWriteHalf>>,
+    Stream {
+        protocol: IceTransportProtocol,
+        read: Arc<Mutex<BoxedReader>>,
+        write: Arc<Mutex<BoxedWriter>>,
     },
+}
+
+type BoxedReader = Box<dyn AsyncRead + Send + Unpin>;
+type BoxedWriter = Box<dyn AsyncWrite + Send + Unpin>;
+
+fn split_stream<S>(stream: S) -> (BoxedReader, BoxedWriter)
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let (read, write) = tokio::io::split(stream);
+    (Box::new(read), Box::new(write))
+}
+
+async fn split_tls_stream(
+    stream: TcpStream,
+    host: &str,
+    allow_insecure_tls: bool,
+) -> Result<(BoxedReader, BoxedWriter)> {
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .ok();
+
+    let mut root_store = RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let mut config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    if allow_insecure_tls {
+        // This is intentionally opt-in and only used by local regression tests
+        // that spin up a self-signed TURN/TLS server inside the test process.
+        config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(NoCertificateVerification));
+    }
+
+    let server_name = server_name_from_host(host)?;
+    let tls_stream = TlsConnector::from(Arc::new(config))
+        .connect(server_name, stream)
+        .await?;
+    Ok(split_stream(tls_stream))
+}
+
+fn server_name_from_host(host: &str) -> Result<ServerName<'static>> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(ServerName::IpAddress(ip.into()));
+    }
+
+    ServerName::try_from(host.to_string())
+        .map_err(|_| anyhow!("invalid TURN TLS server name {}", host))
+}
+
+#[derive(Debug)]
+struct NoCertificateVerification;
+
+impl ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, RustlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA1,
+            SignatureScheme::ECDSA_SHA1_Legacy,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::ED25519,
+            SignatureScheme::ED448,
+        ]
+    }
 }
 
 fn long_term_key(username: &str, realm: &str, password: &str) -> Vec<u8> {

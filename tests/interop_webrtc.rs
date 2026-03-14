@@ -36,7 +36,8 @@ fn build_webrtc_api() -> Result<webrtc::api::API> {
 
 #[tokio::test]
 async fn interop_ice_dtls_handshake() -> Result<()> {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .ok();
     let _ = env_logger::builder().is_test(true).try_init();
 
     // 1. Create RustRTC PeerConnection (Offerer)

@@ -574,7 +574,8 @@ async fn negotiate_rust_offer_to_browser(pc: &PeerConnection, browser: &BrowserP
 }
 
 fn init_browser_test_runtime() {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .ok();
     let _ = env_logger::builder().is_test(true).try_init();
 }
 

@@ -27,7 +27,8 @@ use webrtc::media::io::ivf_reader::IVFReader;
 
 #[tokio::main]
 async fn main() {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .ok();
     tracing_subscriber::fmt()
         .with_env_filter("debug,rustrtc=debug")
         .init();
@@ -126,6 +127,7 @@ async fn handle_rustrtc_offer(payload: OfferRequest) -> Json<OfferResponse> {
         payload_type: vp8_pt,
         codec_name: "VP8".to_string(),
         clock_rate: 90000,
+        fmtp: None,
         rtcp_fbs: vec!["nack pli".to_string(), "transport-cc".to_string()],
     }];
     config.media_capabilities = Some(caps);
@@ -247,8 +249,11 @@ async fn start_echo(pc: PeerConnection, vp8_pt: u8) {
             .stream_id("stream".to_string())
             .params(rustrtc::RtpCodecParameters {
                 payload_type: vp8_pt,
+                codec_name: "VP8".to_string(),
                 clock_rate: 90000,
                 channels: 0,
+                fmtp: None,
+                rtcp_fbs: Vec::new(),
             })
             .build();
 
@@ -426,8 +431,11 @@ async fn start_video_playback(pc: PeerConnection, vp8_pt: u8) {
             .stream_id("stream".to_string())
             .params(rustrtc::RtpCodecParameters {
                 payload_type: vp8_pt,
+                codec_name: "VP8".to_string(),
                 clock_rate: 90000,
                 channels: 0,
+                fmtp: None,
+                rtcp_fbs: Vec::new(),
             })
             .build();
 

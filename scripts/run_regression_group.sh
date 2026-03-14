@@ -39,6 +39,9 @@ run_group() {
     network)
       run_cmd cargo test --test regression_baseline regression_network_entrypoints_exist
       run_cmd cargo test --test interop_turn
+      run_cmd cargo test --test interop_turn_tcp
+      run_cmd cargo test --test interop_turn_tls
+      run_cmd cargo test --test turn_candidate_semantics
       ;;
     media)
       run_cmd cargo test --test regression_baseline regression_media_entrypoints_exist

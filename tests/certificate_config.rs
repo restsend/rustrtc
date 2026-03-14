@@ -30,7 +30,8 @@ fn der_to_pem(label: &str, der: &[u8]) -> String {
 }
 
 fn init_test_runtime() {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .ok();
 }
 
 #[tokio::test]

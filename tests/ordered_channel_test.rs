@@ -16,7 +16,8 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
 #[tokio::test]
 async fn default_create_data_channel_none_is_ordered() -> Result<()> {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .ok();
 
     let pc = PeerConnection::new(RtcConfiguration::default());
     let dc = pc.create_data_channel("default-ordered", None)?;
@@ -43,7 +44,8 @@ async fn default_create_data_channel_none_is_ordered() -> Result<()> {
 /// Sends data from RustRTC to webrtc-rs via ordered channels.
 #[tokio::test]
 async fn ordered_negotiated_channel_test() -> Result<()> {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .ok();
 
     const NUM_CHANNELS: usize = 2;
     const CHUNK_COUNT: usize = 50;
@@ -283,7 +285,8 @@ async fn ordered_negotiated_channel_test() -> Result<()> {
 /// This mimics the browser stress test scenario exactly.
 #[tokio::test]
 async fn dcep_ordered_channel_test() -> Result<()> {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .ok();
 
     const CHUNK_COUNT: usize = 20;
     const CHUNK_SIZE: usize = 1000;
@@ -464,7 +467,8 @@ async fn dcep_ordered_channel_test() -> Result<()> {
 /// sends "pong" back, then sends bulk data.
 #[tokio::test]
 async fn dcep_ordered_bidirectional_test() -> Result<()> {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .ok();
 
     const CHUNK_COUNT: usize = 20;
     const CHUNK_SIZE: usize = 1000;
