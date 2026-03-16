@@ -723,7 +723,7 @@ impl SctpTransport {
             t1_active: AtomicBool::new(false),
             cookie_hmac_key: {
                 let mut key = [0u8; 16];
-                use rand::RngCore;
+                use rand::Rng;
                 rand::rng().fill_bytes(&mut key);
                 key
             },
@@ -3693,7 +3693,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let config = RtcConfiguration::default();
         let mut config = config;
@@ -3782,7 +3784,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let config = RtcConfiguration::default();
         let mut config = config;
@@ -4049,7 +4053,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let config = RtcConfiguration::default();
         let mut config = config;
@@ -4239,7 +4245,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let config = RtcConfiguration::default();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -4321,7 +4329,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let mut config = RtcConfiguration::default();
         config.sctp_max_association_retransmits = 20;
@@ -4404,7 +4414,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let config = RtcConfiguration::default();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -4548,7 +4560,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let config = RtcConfiguration::default();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -5086,7 +5100,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let mut config = RtcConfiguration::default();
         config.sctp_rto_max = Duration::from_secs(4);
@@ -5167,7 +5183,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let config = RtcConfiguration::default();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -5247,7 +5265,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let config = RtcConfiguration::default();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -5346,7 +5366,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let config = RtcConfiguration::default();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -5471,7 +5493,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let config = RtcConfiguration::default();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -5594,7 +5618,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let mut config = RtcConfiguration::default();
         config.sctp_max_association_retransmits = 10; // Low threshold to test protection
@@ -6439,7 +6465,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let config = RtcConfiguration::default();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -6585,7 +6613,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let mut config = RtcConfiguration::default();
         config.sctp_max_association_retransmits = 10; // Set a reasonable limit
@@ -6725,7 +6755,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let config = RtcConfiguration::default();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -6818,7 +6850,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let mut config = RtcConfiguration::default();
         config.sctp_max_association_retransmits = 5; // Low limit to test protection
@@ -6989,7 +7023,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let config = RtcConfiguration::default();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -7138,7 +7174,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let config = RtcConfiguration::default();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -7221,7 +7259,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let mut config = RtcConfiguration::default();
         config.sctp_max_association_retransmits = 10;
@@ -7336,7 +7376,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let mut config = RtcConfiguration::default();
         config.sctp_max_association_retransmits = 20;
@@ -7497,7 +7539,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let mut config = RtcConfiguration::default();
         config.sctp_max_association_retransmits = 20;
@@ -7568,7 +7612,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let config = RtcConfiguration::default();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -7745,7 +7791,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         // Test with default config
         let default_config = RtcConfiguration::default();
@@ -7806,7 +7854,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         // Default config: max_burst = 0 (heuristic)
         let default_config = RtcConfiguration::default();
@@ -7856,7 +7906,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         // Test with a smaller max_cwnd
         let mut config = RtcConfiguration::default();
@@ -7878,7 +7930,9 @@ mod tests {
 
         tokio::spawn(_runner);
         *sctp.inner.state.lock().unwrap() = SctpState::Connected;
-        sctp.inner.remote_verification_tag.store(1, Ordering::SeqCst);
+        sctp.inner
+            .remote_verification_tag
+            .store(1, Ordering::SeqCst);
 
         assert_eq!(sctp.inner.max_cwnd, 32 * 1024);
 
@@ -7926,7 +7980,8 @@ mod tests {
 
         let final_cwnd = sctp.inner.cwnd_tx.load(Ordering::SeqCst);
         println!(
-            "max_cwnd={}, final_cwnd={}", config.sctp_max_cwnd, final_cwnd
+            "max_cwnd={}, final_cwnd={}",
+            config.sctp_max_cwnd, final_cwnd
         );
         assert!(
             final_cwnd <= config.sctp_max_cwnd,
@@ -7945,7 +8000,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let mut config = RtcConfiguration::default();
         config.sctp_receive_window = 512 * 1024; // 512 KB
@@ -7982,7 +8039,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let mut config = RtcConfiguration::default();
         config.sctp_rto_initial = Duration::from_millis(500);
@@ -8112,11 +8171,7 @@ mod tests {
         let burst_constrained_cwnd = (flight_val + burst_limit).min(cwnd_val);
         let effective_window = burst_constrained_cwnd.min(rwnd_val);
 
-        assert_eq!(
-            burst_limit,
-            4800,
-            "burst_limit should be 4 * 1200 = 4800"
-        );
+        assert_eq!(burst_limit, 4800, "burst_limit should be 4 * 1200 = 4800");
         assert_eq!(
             effective_window, 4800,
             "effective_window should be constrained by burst_limit"
@@ -8162,7 +8217,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         // Configure with 8 max heartbeat failures (instead of default 4)
         let mut config = RtcConfiguration::default();
@@ -8183,7 +8240,9 @@ mod tests {
         );
         tokio::spawn(_runner);
         *sctp.inner.state.lock().unwrap() = SctpState::Connected;
-        sctp.inner.remote_verification_tag.store(1, Ordering::SeqCst);
+        sctp.inner
+            .remote_verification_tag
+            .store(1, Ordering::SeqCst);
 
         // Simulate consecutive heartbeat failures during RTO backoff
         // (RTO > 2.0 means is_rto_backing_off = true)
@@ -8193,7 +8252,8 @@ mod tests {
         }
 
         // Set heartbeat_sent_time so the failure path is triggered
-        *sctp.inner.heartbeat_sent_time.lock().unwrap() = Some(Instant::now() - Duration::from_secs(30));
+        *sctp.inner.heartbeat_sent_time.lock().unwrap() =
+            Some(Instant::now() - Duration::from_secs(30));
 
         // With default config (max_heartbeat_failures=4), the connection would close after 4 failures.
         // With our config (max_heartbeat_failures=8), it should survive through 7 failures.
@@ -8206,10 +8266,17 @@ mod tests {
                 "Connection should NOT close at heartbeat failure #{} (max=8)",
                 i
             );
-            let failures = sctp.inner.consecutive_heartbeat_failures.load(Ordering::SeqCst);
-            println!("Heartbeat failure #{}: consecutive_failures={}, state={:?}", i, failures, state);
+            let failures = sctp
+                .inner
+                .consecutive_heartbeat_failures
+                .load(Ordering::SeqCst);
+            println!(
+                "Heartbeat failure #{}: consecutive_failures={}, state={:?}",
+                i, failures, state
+            );
             // Re-set heartbeat_sent_time for next iteration
-            *sctp.inner.heartbeat_sent_time.lock().unwrap() = Some(Instant::now() - Duration::from_secs(30));
+            *sctp.inner.heartbeat_sent_time.lock().unwrap() =
+                Some(Instant::now() - Duration::from_secs(30));
         }
 
         // The 8th failure should close the connection
@@ -8234,7 +8301,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let mut config = RtcConfiguration::default();
         config.sctp_max_cwnd = 16 * 1024; // Small max_cwnd = 16 KB
@@ -8254,7 +8323,9 @@ mod tests {
         );
         tokio::spawn(_runner);
         *sctp.inner.state.lock().unwrap() = SctpState::Connected;
-        sctp.inner.remote_verification_tag.store(1, Ordering::SeqCst);
+        sctp.inner
+            .remote_verification_tag
+            .store(1, Ordering::SeqCst);
 
         // Set up ssthresh at minimum, cwnd approaching ssthresh
         sctp.inner.ssthresh.store(SSTHRESH_MIN, Ordering::SeqCst);
@@ -8359,9 +8430,13 @@ mod tests {
         let blocks = build_gap_ack_blocks_from_map(&received, cumulative);
 
         // Should skip blocks that would overflow u16
-        assert!(blocks.is_empty() || blocks.iter().all(|(s, e)| {
-            *s <= u16::MAX && *e <= u16::MAX
-        }), "Gap blocks should not overflow u16");
+        assert!(
+            blocks.is_empty()
+                || blocks
+                    .iter()
+                    .all(|(s, e)| { *s <= u16::MAX && *e <= u16::MAX }),
+            "Gap blocks should not overflow u16"
+        );
     }
 
     /// Test 3: SSN u16 wraparound handling
@@ -8376,9 +8451,18 @@ mod tests {
 
         // Test ssn_gt function for wraparound detection
         // ssn_gt(5, 65530) should be true (5 > 65530 via wraparound)
-        assert!(ssn_gt(5, 65530), "SSN 5 should be greater than 65530 (wraparound)");
-        assert!(!ssn_gt(65530, 5), "SSN 65530 should not be greater than 5 (wraparound)");
-        assert!(ssn_gt(0, 65535), "SSN 0 should be greater than 65535 (wraparound)");
+        assert!(
+            ssn_gt(5, 65530),
+            "SSN 5 should be greater than 65530 (wraparound)"
+        );
+        assert!(
+            !ssn_gt(65530, 5),
+            "SSN 65530 should not be greater than 5 (wraparound)"
+        );
+        assert!(
+            ssn_gt(0, 65535),
+            "SSN 0 should be greater than 65535 (wraparound)"
+        );
     }
 
     /// Test 4: Fast Recovery reentry cooldown boundary
@@ -8391,7 +8475,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let config = RtcConfiguration::default();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -8414,7 +8500,9 @@ mod tests {
             .store(12345, Ordering::SeqCst);
 
         // Set fast recovery as active with recent entry time
-        sctp.inner.fast_recovery_active.store(true, Ordering::SeqCst);
+        sctp.inner
+            .fast_recovery_active
+            .store(true, Ordering::SeqCst);
         sctp.inner
             .fast_recovery_exit_tsn
             .store(200, Ordering::SeqCst);
@@ -8422,10 +8510,7 @@ mod tests {
 
         // Verify cooldown constant exists and has correct value
         let _cooldown_ms = FAST_RECOVERY_REENTRY_COOLDOWN.as_millis();
-        assert_eq!(
-            _cooldown_ms, 200,
-            "Fast recovery cooldown should be 200ms"
-        );
+        assert_eq!(_cooldown_ms, 200, "Fast recovery cooldown should be 200ms");
 
         // Verify that last_fast_recovery_entry is tracked
         let entry_time = *sctp.inner.last_fast_recovery_entry.lock().unwrap();
@@ -8447,7 +8532,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let config = RtcConfiguration::default();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -8536,7 +8623,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let config = RtcConfiguration::default();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -8603,7 +8692,8 @@ mod tests {
         assert!(
             rto_after < rto_before,
             "RTO should decay on SACK progress: {} -> {}",
-            rto_before, rto_after
+            rto_before,
+            rto_after
         );
     }
 
@@ -8618,13 +8708,15 @@ mod tests {
 
         // Normal mode: (0 + 19200).min(12000) = 12000
         let burst_constrained = (flight_val + burst_limit_normal).min(cwnd_val);
-        assert_eq!(burst_constrained, cwnd_val, "Should use cwnd when burst allows");
+        assert_eq!(
+            burst_constrained, cwnd_val,
+            "Should use cwnd when burst allows"
+        );
 
         // In recovery mode: (0 + 4800).min(12000) = 4800
         let burst_constrained_recovery = (flight_val + burst_limit_recovery).min(cwnd_val);
         assert_eq!(
-            burst_constrained_recovery,
-            4800,
+            burst_constrained_recovery, 4800,
             "Recovery mode should limit burst to 4800"
         );
 
@@ -8671,7 +8763,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let config = RtcConfiguration::default();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -8706,10 +8800,15 @@ mod tests {
         );
 
         // Fill most of the window
-        sctp.inner.used_rwnd.store(local_rwnd - 1000, Ordering::SeqCst);
+        sctp.inner
+            .used_rwnd
+            .store(local_rwnd - 1000, Ordering::SeqCst);
 
         let nearly_full = sctp.inner.advertised_rwnd();
-        assert!(nearly_full < 2000, "Window nearly full should advertise small rwnd");
+        assert!(
+            nearly_full < 2000,
+            "Window nearly full should advertise small rwnd"
+        );
     }
 
     /// Test 11: transmit() drains outbound_queue respecting effective window
@@ -8721,7 +8820,9 @@ mod tests {
             "127.0.0.1:5000".parse().unwrap(),
         );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
-        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None).await.unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
 
         let config = RtcConfiguration::default();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();

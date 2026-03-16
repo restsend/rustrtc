@@ -16,8 +16,11 @@ use hmac::{Hmac, Mac};
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey, signature::RandomizedSigner};
 use p256::pkcs8::DecodePrivateKey;
-use p256::{PublicKey, ecdh::EphemeralSecret, elliptic_curve::sec1::ToEncodedPoint};
-use rand_core::OsRng;
+use p256::{
+    PublicKey,
+    ecdh::EphemeralSecret,
+    elliptic_curve::{rand_core::OsRng, sec1::ToEncodedPoint},
+};
 use rcgen::generate_simple_self_signed;
 use sha2::{Digest, Sha256};
 use std::io::Cursor;
@@ -1868,8 +1871,11 @@ impl DtlsInner {
                 Some(packet) = handshake_rx.recv() => {
                     if let Err(e) = self.handle_incoming_packet(packet, &mut ctx, &incoming_data_tx, &certificate, is_client).await {
                         warn!("DTLS handshake loop error in handle_incoming_packet: {}", e);
-                        // Do not abort handshake on packet processing error (e.g. decrypt fail, bad record)
-                        // return Err(e);
+                        // Bad records can be ignored, but once verification has
+                        // marked the transport as failed we should stop retrying.
+                        if *self.state.lock().unwrap() == DtlsState::Failed {
+                            return Err(e);
+                        }
                     }
                 }
             }

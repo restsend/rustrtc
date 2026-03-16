@@ -19,7 +19,10 @@ pub struct IceConn {
 }
 
 impl IceConn {
-    pub fn new(socket_rx: watch::Receiver<Option<IceSocketWrapper>>, remote_addr: SocketAddr) -> Arc<Self> {
+    pub fn new(
+        socket_rx: watch::Receiver<Option<IceSocketWrapper>>,
+        remote_addr: SocketAddr,
+    ) -> Arc<Self> {
         Arc::new(Self {
             socket_rx,
             remote_addr: RwLock::new(remote_addr),

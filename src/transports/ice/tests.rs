@@ -1137,8 +1137,7 @@ fn test_base_address_returns_related_address_for_host_candidate() {
 
     // address should still be the external address
     assert_eq!(
-        candidate.address,
-        external_addr,
+        candidate.address, external_addr,
         "address should be the external IP"
     );
 }
@@ -1198,8 +1197,14 @@ async fn test_ice_connection_with_external_ip() -> Result<()> {
         wait_ice_connected(ctrl_state, Duration::from_secs(10)),
         wait_ice_connected(ctrd_state, Duration::from_secs(10)),
     );
-    assert!(ok1, "Controlling agent failed to reach Connected with external_ip");
-    assert!(ok2, "Controlled agent failed to reach Connected with external_ip");
+    assert!(
+        ok1,
+        "Controlling agent failed to reach Connected with external_ip"
+    );
+    assert!(
+        ok2,
+        "Controlled agent failed to reach Connected with external_ip"
+    );
 
     // Verify selected pair exists
     let selected_pair = controlling.get_selected_pair().await;
@@ -1322,8 +1327,14 @@ async fn test_ice_connection_without_external_ip() -> Result<()> {
         wait_ice_connected(ctrl_state, Duration::from_secs(10)),
         wait_ice_connected(ctrd_state, Duration::from_secs(10)),
     );
-    assert!(ok1, "Controlling agent failed to reach Connected without external_ip");
-    assert!(ok2, "Controlled agent failed to reach Connected without external_ip");
+    assert!(
+        ok1,
+        "Controlling agent failed to reach Connected without external_ip"
+    );
+    assert!(
+        ok2,
+        "Controlled agent failed to reach Connected without external_ip"
+    );
 
     // Verify selected pair exists and is valid
     let ctrl_pair = controlling.get_selected_pair().await;
@@ -1396,16 +1407,13 @@ async fn test_nomination_delayed_by_dtls_socket_contention() -> Result<()> {
         "Controlled side should signal nomination success after receiving USE-CANDIDATE"
     );
 
-    let ctrl_nom = timeout(
-        Duration::from_millis(600),
-        async {
-            if ctrl_nom_rx.borrow().is_some() {
-                return *ctrl_nom_rx.borrow();
-            }
-            ctrl_nom_rx.changed().await.ok()?;
-            *ctrl_nom_rx.borrow()
-        },
-    )
+    let ctrl_nom = timeout(Duration::from_millis(600), async {
+        if ctrl_nom_rx.borrow().is_some() {
+            return *ctrl_nom_rx.borrow();
+        }
+        ctrl_nom_rx.changed().await.ok()?;
+        *ctrl_nom_rx.borrow()
+    })
     .await;
 
     let elapsed = ice_connected_at.elapsed();
@@ -1462,7 +1470,11 @@ async fn test_nomination_fails_immediately_on_host_unreachable() -> Result<()> {
             true,
         )
         .await;
-        let signal = if result.is_ok() { Some(true) } else { Some(false) };
+        let signal = if result.is_ok() {
+            Some(true)
+        } else {
+            Some(false)
+        };
         let _ = inner_clone.nomination_complete.send(signal);
     });
 
@@ -1597,9 +1609,7 @@ async fn test_dtls_proceeds_after_nomination_timeout() -> Result<()> {
     .flatten();
 
     if let (Some(sock), Some(ctrl_pair)) = (ctrl_sock, controlling.get_selected_pair().await) {
-        let _ = sock
-            .send_to(&test_payload, ctrl_pair.remote.address)
-            .await;
+        let _ = sock.send_to(&test_payload, ctrl_pair.remote.address).await;
         let received = timeout(Duration::from_secs(2), rx2.recv()).await;
         if let Ok(Some(pkt)) = received {
             assert_eq!(
@@ -1683,4 +1693,3 @@ async fn test_nomination_race_under_high_packet_loss() -> Result<()> {
 
     Ok(())
 }
-

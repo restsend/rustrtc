@@ -14,23 +14,21 @@ pub trait PacketReceiver: Send + Sync {
 }
 
 pub fn get_local_ip() -> Result<IpAddr, anyhow::Error> {
-    use network_interface::{NetworkInterface, NetworkInterfaceConfig};
-    if let Ok(interfaces) = NetworkInterface::show() {
+    use local_ip_address::list_afinet_netifas;
+    if let Ok(interfaces) = list_afinet_netifas() {
         // Score function to prioritize interfaces
         // Higher score = better choice
 
         // Collect all IPv4 addresses with their scores
         let mut candidates: Vec<(std::net::Ipv4Addr, i32, String)> = Vec::new();
 
-        for interface in interfaces.iter() {
-            for addr in &interface.addr {
-                if let network_interface::Addr::V4(ipv4) = addr {
-                    let ip = ipv4.ip;
-                    let score = interface_priority(&interface.name, &ip);
-                    if score > -1000 {
-                        // Only consider non-disqualified interfaces
-                        candidates.push((ip, score, interface.name.clone()));
-                    }
+        for (name, addr) in &interfaces {
+            if let IpAddr::V4(ip) = addr {
+                let ip = *ip;
+                let score = interface_priority(name, &ip);
+                if score > -1000 {
+                    // Only consider non-disqualified interfaces
+                    candidates.push((ip, score, name.clone()));
                 }
             }
         }

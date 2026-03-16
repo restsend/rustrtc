@@ -467,7 +467,7 @@ fn crc32(data: &[u8]) -> u32 {
     hasher.finalize()
 }
 
-use rand::{Rng, RngCore};
+use rand::{Rng, RngExt};
 
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     let mut buf = [0u8; N];

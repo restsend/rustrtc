@@ -651,4 +651,20 @@ mod tests {
         // CipherSuite (2) + CompressionMethod (1) = 42 bytes
         assert_eq!(buf.len(), 42);
     }
+
+    #[test]
+    fn test_certificate_message_encode_decode() {
+        let message = CertificateMessage {
+            certificates: vec![vec![1, 2, 3], vec![4, 5]],
+        };
+
+        let mut buf = BytesMut::new();
+        message.encode(&mut buf);
+
+        let mut encoded = buf.freeze();
+        let decoded = CertificateMessage::decode(&mut encoded).unwrap();
+
+        assert_eq!(decoded.certificates, message.certificates);
+        assert!(encoded.is_empty());
+    }
 }

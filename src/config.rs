@@ -326,7 +326,7 @@ impl Default for RtcConfiguration {
             sctp_receive_window: 128 * 1024, // 128KB - reduced for lower memory footprint
             sctp_heartbeat_interval: std::time::Duration::from_secs(15),
             sctp_max_heartbeat_failures: 4,
-            sctp_max_burst: 0, // 0 = use default heuristic
+            sctp_max_burst: 0,         // 0 = use default heuristic
             sctp_max_cwnd: 256 * 1024, // 256 KB
             dtls_buffer_size: 2048,
             rtp_start_port: None,
@@ -633,7 +633,9 @@ mod tests {
         assert!(config.sctp_rto_initial < defaults.sctp_rto_initial);
         assert!(config.sctp_rto_min < defaults.sctp_rto_min);
         assert!(config.sctp_rto_max < defaults.sctp_rto_max);
-        assert!(config.sctp_max_association_retransmits > defaults.sctp_max_association_retransmits);
+        assert!(
+            config.sctp_max_association_retransmits > defaults.sctp_max_association_retransmits
+        );
         assert!(config.sctp_max_heartbeat_failures > defaults.sctp_max_heartbeat_failures);
         assert!(config.sctp_max_burst > 0); // Explicit burst limit vs. heuristic
     }

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use network_interface::{NetworkInterface, NetworkInterfaceConfig};
+use local_ip_address::list_afinet_netifas;
 use rustrtc::media::frame::{MediaSample, VideoFrame};
 use rustrtc::transports::ice::stun::StunMessage;
 use rustrtc::{PeerConnection, RtcConfiguration, RtpCodecParameters, SdpType, TransportMode};
@@ -54,14 +54,24 @@ async fn select_test_ip_pair() -> Result<Option<(IpAddr, IpAddr)>> {
         return Ok(Some((loopback_a, loopback_b)));
     }
 
-    let interfaces = NetworkInterface::show().unwrap();
+    // 0. Find distinct local IPs
+    let interfaces = list_afinet_netifas().unwrap();
     let mut ips = HashSet::new();
-    for itf in interfaces {
-        for addr in itf.addr {
-            let ip = addr.ip();
-            if ip.is_ipv4() && !ip.is_multicast() && !ip.is_unspecified() {
-                if std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok() {
-                    ips.insert(ip);
+    for (name, addr) in interfaces {
+        if let IpAddr::V4(ip) = addr {
+            if !ip.is_multicast() && !ip.is_unspecified() && !ip.is_loopback() {
+                // Skip common virtual interface prefixes
+                if name.starts_with("utun")
+                    || name.starts_with("gif")
+                    || name.starts_with("stf")
+                    || name.starts_with("awdl")
+                    || name.starts_with("llw")
+                {
+                    continue;
+                }
+                // Try to bind to it to see if it's usable
+                if std::net::UdpSocket::bind(SocketAddr::new(IpAddr::V4(ip), 0)).is_ok() {
+                    ips.insert(IpAddr::V4(ip));
                 }
             }
         }

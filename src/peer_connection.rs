@@ -511,7 +511,9 @@ impl PeerConnection {
             .map(|list| list.len())
             .unwrap_or(0);
         let ssrc = 2000 + index as u32;
+        let transceiver = Arc::new(RtpTransceiver::new(kind, direction));
         let mut builder = RtpReceiverBuilder::new(kind, ssrc)
+            .payload_map(transceiver.payload_map.clone())
             .interceptor(self.inner.stats_collector.clone())
             .depacketizer_factory(self.inner.config.depacketizer_strategy.factory.clone());
 
@@ -543,8 +545,6 @@ impl PeerConnection {
             builder = builder.nack();
         }
         let receiver = builder.build();
-
-        let transceiver = Arc::new(RtpTransceiver::new(kind, direction));
         if direction.sends() {
             let rand_val = random_u32();
             let ssrc = self
@@ -556,7 +556,7 @@ impl PeerConnection {
             *transceiver.sender_track_id.lock().unwrap() =
                 Some(format!("track-{}", transceiver.id()));
         }
-        *transceiver.receiver.lock().unwrap() = Some(receiver);
+        transceiver.set_receiver(Some(receiver));
 
         let mut list = self.inner.transceivers.lock().unwrap();
         list.push(transceiver.clone());
@@ -1368,6 +1368,7 @@ impl PeerConnection {
                     let receiver_ssrc = ssrc.unwrap_or_else(|| 2000 + transceivers.len() as u32);
 
                     let mut builder = RtpReceiverBuilder::new(kind, receiver_ssrc)
+                        .payload_map(t.payload_map.clone())
                         .interceptor(self.inner.stats_collector.clone());
 
                     let nack_enabled = if let Some(caps) = &self.inner.config.media_capabilities {
@@ -4749,6 +4750,7 @@ pub struct RtpReceiver {
     source: Arc<SampleStreamSource>,
     ssrc: Mutex<u32>,
     params: Mutex<RtpCodecParameters>,
+    payload_map: Arc<std::sync::RwLock<HashMap<u8, RtpCodecParameters>>>,
     transport: Mutex<Option<Arc<RtpTransport>>>,
     packet_tx: Mutex<Option<mpsc::Sender<(crate::rtp::RtpPacket, std::net::SocketAddr)>>>,
     rtcp_feedback_ssrc: Mutex<Option<u32>>,
@@ -4779,6 +4781,7 @@ pub struct RtpReceiverBuilder {
     ssrc: u32,
     interceptors: Vec<Arc<dyn RtpReceiverInterceptor>>,
     depacketizer_factory: Option<Arc<dyn DepacketizerFactory>>,
+    payload_map: Arc<std::sync::RwLock<HashMap<u8, RtpCodecParameters>>>,
 }
 
 impl RtpReceiverBuilder {
@@ -4788,11 +4791,20 @@ impl RtpReceiverBuilder {
             ssrc,
             interceptors: Vec::new(),
             depacketizer_factory: None,
+            payload_map: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
 
     pub fn depacketizer_factory(mut self, factory: Arc<dyn DepacketizerFactory>) -> Self {
         self.depacketizer_factory = Some(factory);
+        self
+    }
+
+    pub fn payload_map(
+        mut self,
+        payload_map: Arc<std::sync::RwLock<HashMap<u8, RtpCodecParameters>>>,
+    ) -> Self {
+        self.payload_map = payload_map;
         self
     }
 
@@ -4846,6 +4858,7 @@ impl RtpReceiverBuilder {
             source: Arc::new(source),
             ssrc: Mutex::new(self.ssrc),
             params: Mutex::new(params),
+            payload_map: self.payload_map,
             transport: Mutex::new(None),
             packet_tx: Mutex::new(None),
             rtcp_feedback_ssrc: Mutex::new(None),
@@ -4909,6 +4922,7 @@ impl RtpReceiver {
             source: Arc::new(source),
             ssrc: Mutex::new(ssrc),
             params: Mutex::new(params),
+            payload_map: Arc::new(std::sync::RwLock::new(HashMap::new())),
             transport: Mutex::new(None),
             packet_tx: Mutex::new(None),
             rtcp_feedback_ssrc: Mutex::new(None),
@@ -4997,6 +5011,15 @@ impl RtpReceiver {
         self.packet_tx.lock().unwrap().clone()
     }
 
+    fn codec_params_for_payload_type(&self, payload_type: u8) -> RtpCodecParameters {
+        self.payload_map
+            .read()
+            .unwrap()
+            .get(&payload_type)
+            .cloned()
+            .unwrap_or_else(|| self.params.lock().unwrap().clone())
+    }
+
     pub fn rtx_ssrc(&self) -> Option<u32> {
         *self.rtx_ssrc.lock().unwrap()
     }
@@ -5049,9 +5072,17 @@ impl RtpReceiver {
         transport.register_listener_sync(ssrc, tx.clone());
         transport.register_provisional_listener(tx.clone());
 
-        // Also register current payload type as a fallback
-        let pt = self.params.lock().unwrap().payload_type;
-        transport.register_pt_listener(pt, tx.clone());
+        // Register the negotiated payload types when available, keeping the
+        // default PT as a fallback before negotiation completes.
+        let default_pt = self.params.lock().unwrap().payload_type;
+        transport.register_pt_listener(default_pt, tx.clone());
+
+        let payload_types: Vec<u8> = self.payload_map.read().unwrap().keys().copied().collect();
+        for pt in payload_types {
+            if pt != default_pt {
+                transport.register_pt_listener(pt, tx.clone());
+            }
+        }
 
         *self.packet_tx.lock().unwrap() = Some(tx);
 
@@ -5216,7 +5247,7 @@ impl RtpReceiver {
                                                 }
                                             }
 
-                                            let params = this.params.lock().unwrap().clone();
+                                            let params = this.codec_params_for_payload_type(packet.header.payload_type);
                                             let clock_rate = params.clock_rate;
 
                                             // Fix: Use Depacketizer to handle frames correctly
@@ -6048,6 +6079,153 @@ a=mid:0
         // Ensure adding transceiver works with custom strategy
         let transceiver = pc.add_transceiver(MediaKind::Video, TransceiverDirection::RecvOnly);
         assert_eq!(transceiver.kind(), MediaKind::Video);
+    }
+
+    #[tokio::test]
+    async fn receiver_uses_negotiated_clock_rate_for_incoming_audio_pt() {
+        use crate::media::MediaStreamTrack;
+        use crate::media::depacketizer::{
+            Depacketizer, DepacketizerFactory, PassThroughDepacketizer,
+        };
+
+        #[derive(Debug)]
+        struct MockFactory;
+
+        impl DepacketizerFactory for MockFactory {
+            fn create(&self, _kind: crate::media::frame::MediaKind) -> Box<dyn Depacketizer> {
+                Box::new(PassThroughDepacketizer)
+            }
+        }
+
+        let transceiver = Arc::new(RtpTransceiver::new_for_test(
+            MediaKind::Audio,
+            TransceiverDirection::RecvOnly,
+        ));
+        let receiver = RtpReceiverBuilder::new(MediaKind::Audio, 1234)
+            .payload_map(transceiver.payload_map.clone())
+            .depacketizer_factory(Arc::new(MockFactory))
+            .build();
+        transceiver.set_receiver(Some(receiver.clone()));
+
+        let mut payload_map = HashMap::new();
+        payload_map.insert(
+            8,
+            RtpCodecParameters {
+                payload_type: 8,
+                clock_rate: 8000,
+                channels: 1,
+            },
+        );
+        transceiver.update_payload_map(payload_map).unwrap();
+
+        let (_socket_tx, socket_rx) =
+            tokio::sync::watch::channel::<Option<crate::transports::ice::IceSocketWrapper>>(None);
+        let ice_conn =
+            crate::transports::ice::conn::IceConn::new(socket_rx, "127.0.0.1:0".parse().unwrap());
+        let transport = Arc::new(crate::transports::rtp::RtpTransport::new(ice_conn, false));
+        receiver.set_transport(transport, None, None);
+
+        let packet_tx = receiver.packet_tx().unwrap();
+        let packet = RtpPacket::new(
+            crate::rtp::RtpHeader::new(8, 1, 160, 0x1234_5678),
+            vec![0x55, 0x66],
+        );
+        packet_tx
+            .send((packet, "127.0.0.1:5004".parse().unwrap()))
+            .await
+            .unwrap();
+
+        let sample =
+            tokio::time::timeout(std::time::Duration::from_secs(1), receiver.track().recv())
+                .await
+                .unwrap()
+                .unwrap();
+
+        match sample {
+            crate::media::MediaSample::Audio(frame) => {
+                assert_eq!(frame.clock_rate, 8000);
+                assert_eq!(frame.payload_type, Some(8));
+            }
+            other => panic!("expected audio sample, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_remote_description_updates_audio_clock_rate_for_received_frames() {
+        use crate::media::MediaStreamTrack;
+        use crate::media::depacketizer::{
+            Depacketizer, DepacketizerFactory, PassThroughDepacketizer,
+        };
+
+        #[derive(Debug)]
+        struct MockFactory;
+
+        impl DepacketizerFactory for MockFactory {
+            fn create(&self, _kind: crate::media::frame::MediaKind) -> Box<dyn Depacketizer> {
+                Box::new(PassThroughDepacketizer)
+            }
+        }
+
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+        config.depacketizer_strategy.factory = Arc::new(MockFactory);
+
+        let pc = PeerConnection::new(config);
+        let transceiver = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::RecvOnly);
+
+        let remote_sdp = "\
+v=0
+o=- 12345 12345 IN IP4 192.168.1.100
+s=-
+c=IN IP4 192.168.1.100
+t=0 0
+m=audio 9000 RTP/AVP 8
+a=rtpmap:8 PCMA/8000
+a=sendonly
+a=mid:0
+";
+
+        let remote_offer = SessionDescription::parse(SdpType::Offer, remote_sdp).unwrap();
+        pc.set_remote_description(remote_offer).await.unwrap();
+
+        let payload_map = transceiver.get_payload_map();
+        let codec = payload_map.get(&8).unwrap();
+        assert_eq!(codec.clock_rate, 8000);
+        assert_eq!(codec.channels, 0);
+
+        let receiver = transceiver.receiver().unwrap();
+        let (_socket_tx, socket_rx) =
+            tokio::sync::watch::channel::<Option<crate::transports::ice::IceSocketWrapper>>(None);
+        let ice_conn =
+            crate::transports::ice::conn::IceConn::new(socket_rx, "127.0.0.1:0".parse().unwrap());
+        let transport = Arc::new(crate::transports::rtp::RtpTransport::new(ice_conn, false));
+        receiver.set_transport(transport, None, None);
+        tokio::task::yield_now().await;
+
+        let packet_tx = receiver.packet_tx().unwrap();
+        let packet = RtpPacket::new(
+            crate::rtp::RtpHeader::new(8, 7, 320, 0x2233_4455),
+            vec![0x11, 0x22, 0x33],
+        );
+        packet_tx
+            .send((packet, "127.0.0.1:5004".parse().unwrap()))
+            .await
+            .unwrap();
+
+        let sample =
+            tokio::time::timeout(std::time::Duration::from_secs(1), receiver.track().recv())
+                .await
+                .unwrap()
+                .unwrap();
+
+        match sample {
+            crate::media::MediaSample::Audio(frame) => {
+                assert_eq!(frame.clock_rate, 8000);
+                assert_eq!(frame.payload_type, Some(8));
+                assert_eq!(frame.rtp_timestamp, 320);
+            }
+            other => panic!("expected audio sample, got {:?}", other),
+        }
     }
 
     // ===== RTP mode ICE-skip verification tests =====
