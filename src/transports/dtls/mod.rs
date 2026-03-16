@@ -16,8 +16,11 @@ use hmac::{Hmac, Mac};
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey, signature::RandomizedSigner};
 use p256::pkcs8::DecodePrivateKey;
-use p256::{PublicKey, ecdh::EphemeralSecret, elliptic_curve::sec1::ToEncodedPoint};
-use rand_core::OsRng;
+use p256::{
+    PublicKey,
+    ecdh::EphemeralSecret,
+    elliptic_curve::{rand_core::OsRng, sec1::ToEncodedPoint},
+};
 use rcgen::generate_simple_self_signed;
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};

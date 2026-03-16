@@ -1604,12 +1604,18 @@ async fn perform_binding_check(
                         | std::io::ErrorKind::NotConnected
                 );
                 if is_fatal {
-                    debug!("socket.send_to {} fatal error, aborting nomination: {}", remote.address, e);
+                    debug!(
+                        "socket.send_to {} fatal error, aborting nomination: {}",
+                        remote.address, e
+                    );
                     return Err(e.into());
                 }
                 // Transient error (e.g., EHOSTUNREACH / os error 65 during route setup).
                 // Treat as a dropped send — wait for next RTO and retry.
-                debug!("socket.send_to {} transient error, will retry: {}", remote.address, e);
+                debug!(
+                    "socket.send_to {} transient error, will retry: {}",
+                    remote.address, e
+                );
             }
         }
 
@@ -2062,15 +2068,21 @@ impl IceGatherer {
             // Default: bind to loopback and all LAN IPs
             bind_ips.push(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
 
-            use network_interface::{NetworkInterface, NetworkInterfaceConfig};
-            if let Ok(interfaces) = NetworkInterface::show() {
-                for interface in interfaces {
-                    for addr in interface.addr {
-                        if let network_interface::Addr::V4(ipv4) = addr {
-                            let ip = IpAddr::V4(ipv4.ip);
-                            if !ip.is_loopback() && !bind_ips.contains(&ip) {
-                                bind_ips.push(ip);
+            use local_ip_address::list_afinet_netifas;
+            if let Ok(interfaces) = list_afinet_netifas() {
+                for (name, addr) in interfaces {
+                    if let IpAddr::V4(ip) = addr {
+                        if !ip.is_loopback() && !bind_ips.contains(&IpAddr::V4(ip)) {
+                            // Skip common virtual interface prefixes
+                            if name.starts_with("utun")
+                                || name.starts_with("gif")
+                                || name.starts_with("stf")
+                                || name.starts_with("awdl")
+                                || name.starts_with("llw")
+                            {
+                                continue;
                             }
+                            bind_ips.push(IpAddr::V4(ip));
                         }
                     }
                 }
