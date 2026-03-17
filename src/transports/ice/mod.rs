@@ -18,7 +18,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use tokio::net::{UdpSocket, lookup_host};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio::time::timeout;
-use tracing::{debug, instrument, trace};
+use tracing::{debug, instrument, trace, warn};
 
 #[cfg(any(test, feature = "simulator"))]
 use self::stun::random_u32;
@@ -1219,6 +1219,17 @@ async fn handle_packet(
         match StunMessage::decode(packet) {
             Ok(msg) => {
                 if msg.class == StunClass::Request {
+                    if inner.config.transport_mode == crate::TransportMode::Rtp
+                        && !inner.config.enable_ice_lite
+                    {
+                        warn!(
+                            remote_addr = %addr,
+                            method = ?msg.method,
+                            class = ?msg.class,
+                            "Rejecting STUN on RTP transport without ICE-lite"
+                        );
+                        return;
+                    }
                     // Start of Latching Logic for RTP mode
                     if inner.config.transport_mode == crate::TransportMode::Rtp
                         && inner.config.enable_latching
@@ -1976,13 +1987,29 @@ impl IceGatherer {
 
     async fn bind_socket(&self, ip: IpAddr) -> Result<UdpSocket> {
         if let (Some(start), Some(end)) = (self.config.rtp_start_port, self.config.rtp_end_port) {
-            for port in start..=end {
+            let start = start.saturating_add(start % 2);
+            let end = end - (end % 2);
+
+            if start > end {
+                bail!("No usable even RTP ports in range {}..={}", start, end);
+            }
+
+            let port_count = (((end - start) / 2) + 1) as u64;
+            let start_index = (random_u64() % port_count) as u16;
+            let mut port = start + (start_index * 2);
+
+            for _ in 0..port_count {
                 match UdpSocket::bind(SocketAddr::new(ip, port)).await {
                     Ok(socket) => return Ok(socket),
-                    Err(_) => continue,
+                    Err(_) => {
+                        port = port.saturating_add(2);
+                        if port > end {
+                            port = start;
+                        }
+                    }
                 }
             }
-            bail!("No available ports in range {}..{}", start, end)
+            bail!("No available even RTP ports in range {}..={}", start, end)
         } else {
             UdpSocket::bind(SocketAddr::new(ip, 0))
                 .await
