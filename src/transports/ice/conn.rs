@@ -16,6 +16,7 @@ pub struct IceConn {
     pub dtls_receiver: RwLock<Option<Weak<dyn PacketReceiver>>>,
     pub rtp_receiver: RwLock<Option<Weak<dyn PacketReceiver>>>,
     pub latch_on_rtp: AtomicBool,
+    pub rtp_latched: AtomicBool,
 }
 
 impl IceConn {
@@ -30,6 +31,7 @@ impl IceConn {
             dtls_receiver: RwLock::new(None),
             rtp_receiver: RwLock::new(None),
             latch_on_rtp: AtomicBool::new(false),
+            rtp_latched: AtomicBool::new(false),
         })
     }
 
@@ -164,13 +166,12 @@ impl PacketReceiver for IceConn {
             }
         } else if (128..192).contains(&first_byte) {
             // RTP / RTCP
-            if self.latch_on_rtp.load(Ordering::Relaxed) && addr != current_remote {
+            if self.latch_on_rtp.load(Ordering::Relaxed)
+                && addr != current_remote
+                && !self.rtp_latched.load(Ordering::Relaxed)
+            {
                 *self.remote_addr.write().unwrap() = addr;
-                let current_rtcp = *self.remote_rtcp_addr.read().unwrap();
-                if let Some(mut rtcp_addr) = current_rtcp {
-                    rtcp_addr.set_ip(addr.ip());
-                    *self.remote_rtcp_addr.write().unwrap() = Some(rtcp_addr);
-                }
+                self.rtp_latched.store(true, Ordering::Relaxed);
             }
             let receiver = {
                 let rx_lock = self.rtp_receiver.read().unwrap();
