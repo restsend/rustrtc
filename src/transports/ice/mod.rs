@@ -18,7 +18,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use tokio::net::{UdpSocket, lookup_host};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio::time::timeout;
-use tracing::{debug, instrument, trace};
+use tracing::{debug, instrument, trace, warn};
 
 #[cfg(any(test, feature = "simulator"))]
 use self::stun::random_u32;
@@ -1219,36 +1219,16 @@ async fn handle_packet(
         match StunMessage::decode(packet) {
             Ok(msg) => {
                 if msg.class == StunClass::Request {
-                    // Start of Latching Logic for RTP mode
                     if inner.config.transport_mode == crate::TransportMode::Rtp
-                        && inner.config.enable_latching
+                        && !inner.config.enable_ice_lite
                     {
-                        let mut update = false;
-                        {
-                            let selected_pair = inner.selected_pair.lock().unwrap();
-                            if let Some(pair) = selected_pair.as_ref() {
-                                if pair.remote.address != addr
-                                    && msg.method == StunMethod::Binding
-                                    && pair.remote.address.port() == addr.port()
-                                // Match port only
-                                {
-                                    debug!(
-                                        "RTP Latching: Switching remote address from {} to {} based on STUN Binding Request",
-                                        pair.remote.address, addr
-                                    );
-                                    update = true;
-                                }
-                            }
-                        }
-
-                        if update {
-                            let mut pair = inner.selected_pair.lock().unwrap().clone().unwrap();
-                            pair.remote.address = addr;
-
-                            *inner.selected_pair.lock().unwrap() = Some(pair.clone());
-                            // This send should trigger the pair_monitor in PeerConnection via watcher
-                            let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
-                        }
+                        warn!(
+                            remote_addr = %addr,
+                            method = ?msg.method,
+                            class = ?msg.class,
+                            "Rejecting STUN on RTP transport without ICE-lite"
+                        );
+                        return;
                     }
                     handle_stun_request(&sender, &msg, addr, inner).await;
                 } else if msg.class == StunClass::SuccessResponse {
@@ -1976,13 +1956,29 @@ impl IceGatherer {
 
     async fn bind_socket(&self, ip: IpAddr) -> Result<UdpSocket> {
         if let (Some(start), Some(end)) = (self.config.rtp_start_port, self.config.rtp_end_port) {
-            for port in start..=end {
+            let start = start.saturating_add(start % 2);
+            let end = end - (end % 2);
+
+            if start > end {
+                bail!("No usable even RTP ports in range {}..={}", start, end);
+            }
+
+            let port_count = (((end - start) / 2) + 1) as u64;
+            let start_index = (random_u64() % port_count) as u16;
+            let mut port = start + (start_index * 2);
+
+            for _ in 0..port_count {
                 match UdpSocket::bind(SocketAddr::new(ip, port)).await {
                     Ok(socket) => return Ok(socket),
-                    Err(_) => continue,
+                    Err(_) => {
+                        port = port.saturating_add(2);
+                        if port > end {
+                            port = start;
+                        }
+                    }
                 }
             }
-            bail!("No available ports in range {}..{}", start, end)
+            bail!("No available even RTP ports in range {}..={}", start, end)
         } else {
             UdpSocket::bind(SocketAddr::new(ip, 0))
                 .await
