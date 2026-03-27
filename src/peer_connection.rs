@@ -1266,8 +1266,15 @@ impl PeerConnection {
             }
         }
 
-        let mut remote = self.inner.remote_description.lock().unwrap();
-        *remote = Some(desc);
+        {
+            let mut remote = self.inner.remote_description.lock().unwrap();
+            *remote = Some(desc);
+        }
+
+        // Refresh mux/RTCP routing after any remote description change.
+        // If the transport already exists, this keeps the derived RTCP
+        // destination in sync across answers and re-INVITEs.
+        self.update_rtcp_mux_from_remote();
 
         Ok(())
     }
@@ -1713,6 +1720,32 @@ impl PeerConnection {
                 "Failed to export keying material - DTLS state: {}",
                 dtls.get_state()
             );
+        }
+    }
+
+    /// Update the RTCP address based on the current remote description.
+    ///
+    /// Call this after `set_remote_description` to ensure the transport correctly
+    /// separates RTP and RTCP when the remote peer does not support rtcp-mux.
+    /// If the remote SDP contains `a=rtcp-mux`, RTCP will be multiplexed on the
+    /// RTP port. Otherwise, RTCP is sent to the port specified by `a=rtcp` or
+    /// the default RTP port + 1.
+    pub fn update_rtcp_mux_from_remote(&self) {
+        let transport_guard = self.inner.rtp_transport.lock().unwrap();
+        let Some(transport) = transport_guard.as_ref() else {
+            return;
+        };
+        let ice_conn = transport.ice_conn();
+        let remote_addr = *ice_conn.remote_addr.read().unwrap();
+        let remote_desc = self.inner.remote_description.lock().unwrap();
+        if let Some(desc) = &*remote_desc {
+            let rtcp_addr = Self::remote_rtcp_addr_from_sdp(desc, remote_addr);
+            ice_conn.set_remote_rtcp_addr(rtcp_addr);
+            if let Some(addr) = rtcp_addr {
+                tracing::debug!("RTCP-MUX updated: separate RTCP address {}", addr);
+            } else {
+                tracing::debug!("RTCP-MUX updated: multiplexing on RTP port");
+            }
         }
     }
 

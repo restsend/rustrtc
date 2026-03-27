@@ -17,6 +17,7 @@ pub struct IceConn {
     pub rtp_receiver: RwLock<Option<Weak<dyn PacketReceiver>>>,
     pub latch_on_rtp: AtomicBool,
     pub rtp_latched: AtomicBool,
+    pub rtcp_latched: AtomicBool,
 }
 
 impl IceConn {
@@ -32,6 +33,7 @@ impl IceConn {
             rtp_receiver: RwLock::new(None),
             latch_on_rtp: AtomicBool::new(false),
             rtp_latched: AtomicBool::new(false),
+            rtcp_latched: AtomicBool::new(false),
         })
     }
 
@@ -41,6 +43,7 @@ impl IceConn {
 
     pub fn set_remote_rtcp_addr(&self, addr: Option<SocketAddr>) {
         *self.remote_rtcp_addr.write().unwrap() = addr;
+        self.rtcp_latched.store(false, Ordering::Relaxed);
     }
 
     pub fn set_dtls_receiver(&self, receiver: Arc<dyn PacketReceiver>) {
@@ -166,12 +169,24 @@ impl PacketReceiver for IceConn {
             }
         } else if (128..192).contains(&first_byte) {
             // RTP / RTCP
-            if self.latch_on_rtp.load(Ordering::Relaxed)
-                && addr != current_remote
-                && !self.rtp_latched.load(Ordering::Relaxed)
-            {
-                *self.remote_addr.write().unwrap() = addr;
-                self.rtp_latched.store(true, Ordering::Relaxed);
+            let is_rtcp = packet.len() >= 2 && (200..=211).contains(&packet[1]);
+
+            if self.latch_on_rtp.load(Ordering::Relaxed) {
+                if is_rtcp {
+                    // RTCP may teach the RTCP destination in non-mux mode, but it must
+                    // never override the RTP remote address.
+                    let mut remote_rtcp_addr = self.remote_rtcp_addr.write().unwrap();
+                    if let Some(current_rtcp_remote) = *remote_rtcp_addr
+                        && addr != current_rtcp_remote
+                        && !self.rtcp_latched.load(Ordering::Relaxed)
+                    {
+                        *remote_rtcp_addr = Some(addr);
+                        self.rtcp_latched.store(true, Ordering::Relaxed);
+                    }
+                } else if addr != current_remote && !self.rtp_latched.load(Ordering::Relaxed) {
+                    *self.remote_addr.write().unwrap() = addr;
+                    self.rtp_latched.store(true, Ordering::Relaxed);
+                }
             }
             let receiver = {
                 let rx_lock = self.rtp_receiver.read().unwrap();
