@@ -284,4 +284,141 @@ mod tests {
 
         assert_eq!(*conn.remote_addr.read().unwrap(), latched_addr);
     }
+
+    #[tokio::test]
+    async fn test_rtcp_does_not_override_rtp_remote_addr() {
+        let (_tx, rx) = watch::channel(None);
+        let rtp_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4000);
+        let rtcp_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4001);
+        let conn = IceConn::new(rx, rtp_addr);
+        conn.enable_latch_on_rtp();
+        conn.set_rtp_receiver(Arc::new(NoopReceiver));
+        conn.set_remote_rtcp_addr(Some(rtcp_addr));
+
+        let rtp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
+        conn.receive(Bytes::from_static(&[0x80, 0x60, 0x00, 0x00]), rtp_src)
+            .await;
+        assert_eq!(*conn.remote_addr.read().unwrap(), rtp_src);
+        assert!(conn.rtp_latched.load(Ordering::Relaxed));
+
+        let rtcp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5001);
+        conn.receive(Bytes::from_static(&[0x80, 0xC8, 0x00, 0x00]), rtcp_src)
+            .await;
+
+        assert_eq!(
+            *conn.remote_addr.read().unwrap(),
+            rtp_src,
+            "RTCP should not override RTP remote address"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_latches_rtcp_addr_in_non_mux_mode() {
+        let (_tx, rx) = watch::channel(None);
+        let rtp_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4000);
+        let initial_rtcp_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4001);
+        let conn = IceConn::new(rx, rtp_addr);
+        conn.enable_latch_on_rtp();
+        conn.set_rtp_receiver(Arc::new(NoopReceiver));
+        conn.set_remote_rtcp_addr(Some(initial_rtcp_addr));
+
+        let rtp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
+        conn.receive(Bytes::from_static(&[0x80, 0x60, 0x00, 0x00]), rtp_src)
+            .await;
+
+        let rtcp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5001);
+        conn.receive(Bytes::from_static(&[0x80, 0xC8, 0x00, 0x00]), rtcp_src)
+            .await;
+
+        assert_eq!(
+            *conn.remote_rtcp_addr.read().unwrap(),
+            Some(rtcp_src),
+            "RTCP should latch its own destination"
+        );
+        assert!(conn.rtcp_latched.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_does_not_re_latch_after_locked() {
+        let (_tx, rx) = watch::channel(None);
+        let rtp_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4000);
+        let conn = IceConn::new(rx, rtp_addr);
+        conn.enable_latch_on_rtp();
+        conn.set_rtp_receiver(Arc::new(NoopReceiver));
+        conn.set_remote_rtcp_addr(Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            4001,
+        )));
+
+        let rtp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
+        conn.receive(Bytes::from_static(&[0x80, 0x60, 0x00, 0x00]), rtp_src)
+            .await;
+
+        let rtcp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5001);
+        conn.receive(Bytes::from_static(&[0x80, 0xC8, 0x00, 0x00]), rtcp_src)
+            .await;
+        assert_eq!(*conn.remote_rtcp_addr.read().unwrap(), Some(rtcp_src));
+
+        let rogue_rtcp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6001);
+        conn.receive(Bytes::from_static(&[0x80, 0xC8, 0x00, 0x00]), rogue_rtcp_src)
+            .await;
+
+        assert_eq!(
+            *conn.remote_rtcp_addr.read().unwrap(),
+            Some(rtcp_src),
+            "RTCP should not re-latch after already latched"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_ignored_in_mux_mode() {
+        let (_tx, rx) = watch::channel(None);
+        let rtp_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4000);
+        let conn = IceConn::new(rx, rtp_addr);
+        conn.enable_latch_on_rtp();
+        conn.set_rtp_receiver(Arc::new(NoopReceiver));
+
+        let rtp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
+        conn.receive(Bytes::from_static(&[0x80, 0x60, 0x00, 0x00]), rtp_src)
+            .await;
+        assert_eq!(*conn.remote_addr.read().unwrap(), rtp_src);
+
+        conn.receive(Bytes::from_static(&[0x80, 0xC8, 0x00, 0x00]), rtp_src)
+            .await;
+        assert_eq!(*conn.remote_addr.read().unwrap(), rtp_src);
+        assert!(
+            conn.remote_rtcp_addr.read().unwrap().is_none(),
+            "RTCP address should remain None in mux mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_all_rtcp_payload_types_recognized() {
+        let (_tx, rx) = watch::channel(None);
+        let rtp_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4000);
+        let conn = IceConn::new(rx, rtp_addr);
+        conn.enable_latch_on_rtp();
+        conn.set_rtp_receiver(Arc::new(NoopReceiver));
+        conn.set_remote_rtcp_addr(Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            4001,
+        )));
+
+        let rtp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
+        conn.receive(Bytes::from_static(&[0x80, 0x60, 0x00, 0x00]), rtp_src)
+            .await;
+
+        for pt in 200u8..=211u8 {
+            let rtcp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000 + pt as u16);
+            let packet = Bytes::from(vec![0x80, pt, 0x00, 0x00]);
+            conn.receive(packet, rtcp_src).await;
+
+            assert_eq!(
+                *conn.remote_addr.read().unwrap(),
+                rtp_src,
+                "RTP address changed for RTCP PT={}",
+                pt
+            );
+        }
+    }
 }
