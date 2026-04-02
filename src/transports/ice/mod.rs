@@ -15,6 +15,7 @@ use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -69,7 +70,7 @@ struct BufferStats {
     pub packets_dropped: AtomicU64,
     pub current_size: AtomicU32,
     pub peak_size: AtomicU32,
-    pub last_log_time: std::sync::Mutex<Instant>,
+    pub last_log_time: parking_lot::Mutex<Instant>,
 }
 
 impl Default for BufferStats {
@@ -79,7 +80,7 @@ impl Default for BufferStats {
             packets_dropped: AtomicU64::new(0),
             current_size: AtomicU32::new(0),
             peak_size: AtomicU32::new(0),
-            last_log_time: std::sync::Mutex::new(Instant::now()),
+            last_log_time: parking_lot::Mutex::new(Instant::now()),
         }
     }
 }
@@ -99,27 +100,27 @@ struct IceTransportInner {
     state: watch::Sender<IceTransportState>,
     _state_rx_keeper: watch::Receiver<IceTransportState>,
     gathering_state: watch::Sender<IceGathererState>,
-    role: std::sync::Mutex<IceRole>,
-    selected_pair: std::sync::Mutex<Option<IceCandidatePair>>,
+    role: parking_lot::Mutex<IceRole>,
+    selected_pair: parking_lot::Mutex<Option<IceCandidatePair>>,
     local_candidates: Mutex<Vec<IceCandidate>>,
-    remote_candidates: std::sync::Mutex<Vec<IceCandidate>>,
-    gather_state: std::sync::Mutex<IceGathererState>,
+    remote_candidates: parking_lot::Mutex<Vec<IceCandidate>>,
+    gather_state: parking_lot::Mutex<IceGathererState>,
     config: RtcConfiguration,
     gatherer: IceGatherer,
-    local_parameters: std::sync::Mutex<IceParameters>,
-    remote_parameters: std::sync::Mutex<Option<IceParameters>>,
-    pending_transactions: std::sync::Mutex<HashMap<[u8; 12], oneshot::Sender<StunDecoded>>>,
-    data_receiver: std::sync::Mutex<Option<Arc<dyn PacketReceiver>>>,
+    local_parameters: parking_lot::Mutex<IceParameters>,
+    remote_parameters: parking_lot::Mutex<Option<IceParameters>>,
+    pending_transactions: parking_lot::Mutex<HashMap<[u8; 12], oneshot::Sender<StunDecoded>>>,
+    data_receiver: parking_lot::Mutex<Option<Arc<dyn PacketReceiver>>>,
     /// Ring buffer for packets when no receiver is registered yet.
     /// Uses VecDeque for efficient pop_front removal.
-    buffered_packets: std::sync::Mutex<VecDeque<(Vec<u8>, SocketAddr)>>,
+    buffered_packets: parking_lot::Mutex<VecDeque<(Vec<u8>, SocketAddr)>>,
     /// Statistics for monitoring buffer behavior
     buffer_stats: Arc<BufferStats>,
     selected_socket: watch::Sender<Option<IceSocketWrapper>>,
     _socket_rx_keeper: watch::Receiver<Option<IceSocketWrapper>>,
     selected_pair_notifier: watch::Sender<Option<IceCandidatePair>>,
     _selected_pair_rx_keeper: watch::Receiver<Option<IceCandidatePair>>,
-    last_received: std::sync::Mutex<Instant>,
+    last_received: parking_lot::Mutex<Instant>,
     candidate_tx: broadcast::Sender<IceCandidate>,
     cmd_tx: mpsc::UnboundedSender<IceCommand>,
     checking_pairs: Mutex<std::collections::HashSet<(SocketAddr, SocketAddr)>>,
@@ -147,7 +148,7 @@ impl std::fmt::Debug for IceTransportInner {
             .field("data_receiver", &"PacketReceiver")
             .field(
                 "buffered_packets",
-                &self.buffered_packets.lock().unwrap().len(),
+                &self.buffered_packets.lock().len(),
             )
             .field("buffer_stats", &self.buffer_stats)
             .field("selected_socket", &self.selected_socket)
@@ -180,6 +181,7 @@ impl IceTransportRunner {
         );
         let mut read_futures: FuturesUnordered<BoxFuture<'static, ()>> = FuturesUnordered::new();
         let mut gathering_future: BoxFuture<'static, ()> = Box::pin(futures::future::pending());
+        let mut turn_refresh_future: BoxFuture<'static, ()> = Box::pin(futures::future::pending());
 
         loop {
             tokio::select! {
@@ -204,10 +206,10 @@ impl IceTransportRunner {
                 res = self.candidate_rx.recv() => {
                     match res {
                         Ok(_) => {
-                             let inner = self.inner.clone();
-                             tokio::spawn(async move {
-                                 perform_connectivity_checks_async(inner).await;
-                             });
+                            let inner = self.inner.clone();
+                            read_futures.push(Box::pin(async move {
+                                perform_connectivity_checks_async(inner).await;
+                            }));
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -226,23 +228,34 @@ impl IceTransportRunner {
                                     let mut buffer = inner.local_candidates.lock().await;
                                     *buffer = inner.gatherer.local_candidates();
                                 }
-                                *inner.gather_state.lock().unwrap() = IceGathererState::Complete;
+                                *inner.gather_state.lock() = IceGathererState::Complete;
                                 let _ = inner.gathering_state.send(IceGathererState::Complete);
                             });
                         }
                         IceCommand::RunChecks => {
-                             let inner = self.inner.clone();
-                             tokio::spawn(async move {
-                                 perform_connectivity_checks_async(inner).await;
-                             });
+                            let inner = self.inner.clone();
+                            read_futures.push(Box::pin(async move {
+                                perform_connectivity_checks_async(inner).await;
+                            }));
                         }
                     }
                 }
                 _ = interval.tick() => {
-                    Self::run_keepalive_tick(&self.inner).await;
+                    if let Some(f) = Self::run_keepalive_tick(&self.inner).await {
+                        read_futures.push(f);
+                    }
                 }
                 _ = turn_refresh_interval.tick() => {
-                    Self::run_turn_refresh(&self.inner).await;
+                    // Only start a new refresh if the previous one has completed.
+                    // If still running (e.g. server slow), skip this tick rather than
+                    // stacking up concurrent refreshes.
+                    let inner = self.inner.clone();
+                    turn_refresh_future = Box::pin(async move {
+                        Self::run_turn_refresh(&inner).await;
+                    });
+                }
+                _ = &mut turn_refresh_future => {
+                    turn_refresh_future = Box::pin(futures::future::pending());
                 }
                 Some(_) = read_futures.next() => {
                     // Read loop finished
@@ -339,10 +352,13 @@ impl IceTransportRunner {
         }
     }
 
-    async fn run_keepalive_tick(inner: &Arc<IceTransportInner>) {
+    /// Returns an optional cleanup future that should be pushed into `read_futures`
+    /// by the caller. The future waits up to 5 s for the keepalive response then
+    /// removes the transaction from `pending_transactions`.
+    async fn run_keepalive_tick(inner: &Arc<IceTransportInner>) -> Option<BoxFuture<'static, ()>> {
         let state = *inner.state.borrow();
         if state == IceTransportState::Connected || state == IceTransportState::Disconnected {
-            let elapsed = inner.last_received.lock().unwrap().elapsed();
+            let elapsed = inner.last_received.lock().elapsed();
             let ice_conn_timeout = inner.config.ice_connection_timeout;
             if elapsed > ice_conn_timeout {
                 let _ = inner.state.send(IceTransportState::Failed);
@@ -355,18 +371,18 @@ impl IceTransportRunner {
             }
 
             // Send Keepalive
-            let pair_opt = inner.selected_pair.lock().unwrap().clone();
+            let pair_opt = inner.selected_pair.lock().clone();
             if let Some(pair) = pair_opt {
                 if let Some(socket) = resolve_socket(inner, &pair) {
                     let tx_id = random_bytes::<12>();
                     let mut msg = StunMessage::binding_request(tx_id, Some("rustrtc"));
 
-                    let remote_params = inner.remote_parameters.lock().unwrap().clone();
+                    let remote_params = inner.remote_parameters.lock().clone();
                     if let Some(params) = remote_params {
                         let username = format!(
                             "{}:{}",
                             params.username_fragment,
-                            inner.local_parameters.lock().unwrap().username_fragment
+                            inner.local_parameters.lock().username_fragment
                         );
                         msg.attributes.push(StunAttribute::Username(username));
                         msg.attributes
@@ -376,20 +392,21 @@ impl IceTransportRunner {
                             // Register transaction to avoid "Unmatched transaction" logs
                             let (tx, rx) = oneshot::channel();
                             {
-                                let mut map = inner.pending_transactions.lock().unwrap();
+                                let mut map = inner.pending_transactions.lock();
                                 map.insert(tx_id, tx);
                             }
 
                             let inner_weak = Arc::downgrade(inner);
-                            tokio::spawn(async move {
+                            let cleanup: BoxFuture<'static, ()> = Box::pin(async move {
                                 let _ = timeout(Duration::from_secs(5), rx).await;
                                 if let Some(inner) = inner_weak.upgrade() {
-                                    let mut map = inner.pending_transactions.lock().unwrap();
+                                    let mut map = inner.pending_transactions.lock();
                                     map.remove(&tx_id);
                                 }
                             });
 
                             let _ = socket.send_to(&bytes, pair.remote.address).await;
+                            return Some(cleanup);
                         }
                     } else if inner.config.transport_mode != crate::TransportMode::WebRtc {
                         if let Ok(bytes) = msg.encode(None, false) {
@@ -399,6 +416,7 @@ impl IceTransportRunner {
                 }
             }
         }
+        None
     }
 
     /// Periodically refresh TURN allocations, permissions, and channel bindings
@@ -408,158 +426,204 @@ impl IceTransportRunner {
     ///   - ChannelBind lifetime: 600s, must be refreshed
     ///
     /// This runs every ~120s which is well under all three timeouts.
+    ///
+    /// Each request is awaited directly (no spawning) so that a 401/438
+    /// stale-nonce response is detected immediately and the nonce is refreshed
+    /// before retrying — preventing silent refresh failures that eventually let
+    /// ChannelBindings expire and cause SCTP disconnects.
     async fn run_turn_refresh(inner: &Arc<IceTransportInner>) {
         let state = *inner.state.borrow();
         if state != IceTransportState::Connected && state != IceTransportState::Disconnected {
             return;
         }
 
-        let pair_opt = inner.selected_pair.lock().unwrap().clone();
+        let pair_opt = inner.selected_pair.lock().clone();
         let pair = match pair_opt {
             Some(p) if p.local.typ == IceCandidateType::Relay => p,
             _ => return, // Not using TURN relay, nothing to refresh
         };
 
         let client = {
-            let clients = inner.gatherer.turn_clients.lock().unwrap();
+            let clients = inner.gatherer.turn_clients.lock();
             match clients.get(&pair.local.address) {
                 Some(c) => c.clone(),
                 None => return,
             }
         };
 
-        // 1. Refresh the allocation (extends lifetime)
-        match client.create_refresh_packet().await {
-            Ok((bytes, tx_id)) => {
-                let (tx, rx) = oneshot::channel();
-                {
-                    let mut map = inner.pending_transactions.lock().unwrap();
-                    map.insert(tx_id, tx);
-                }
+        // Helper: send a pre-built STUN packet, await the response, and return it.
+        // Cleans up pending_transactions on timeout or error.
+        async fn send_and_await(
+            client: &Arc<TurnClient>,
+            inner: &Arc<IceTransportInner>,
+            bytes: Vec<u8>,
+            tx_id: [u8; 12],
+        ) -> Option<StunDecoded> {
+            let (tx, rx) = oneshot::channel();
+            inner
+                .pending_transactions
+                .lock()
+                .insert(tx_id, tx);
 
-                if let Err(e) = client.send(&bytes).await {
-                    debug!("TURN Refresh send failed: {}", e);
-                } else {
-                    let inner_weak = Arc::downgrade(inner);
-                    tokio::spawn(async move {
-                        match timeout(Duration::from_secs(5), rx).await {
-                            Ok(Ok(msg)) => {
-                                if msg.class == StunClass::SuccessResponse {
-                                    trace!("TURN allocation refreshed successfully");
-                                } else {
-                                    debug!("TURN Refresh failed: error={:?}", msg.error_code);
-                                }
-                            }
-                            _ => {
-                                debug!("TURN Refresh timeout");
-                            }
-                        }
-                        if let Some(inner) = inner_weak.upgrade() {
-                            let mut map = inner.pending_transactions.lock().unwrap();
-                            map.remove(&tx_id);
-                        }
-                    });
-                }
+            if let Err(e) = client.send(&bytes).await {
+                debug!("TURN refresh send failed: {}", e);
+                inner
+                    .pending_transactions
+                    .lock()
+                    .remove(&tx_id);
+                return None;
             }
-            Err(e) => {
-                debug!("TURN Refresh packet creation failed: {}", e);
+
+            match timeout(Duration::from_secs(5), rx).await {
+                Ok(Ok(msg)) => Some(msg),
+                _ => {
+                    inner
+                        .pending_transactions
+                        .lock()
+                        .remove(&tx_id);
+                    None
+                }
             }
         }
 
-        // 2. Refresh permission for the remote peer
+        // 1. Refresh the allocation (extends lifetime).
+        //    On 401/438 update the nonce and retry once.
+        'alloc: for attempt in 0..2u8 {
+            match client.create_refresh_packet().await {
+                Ok((bytes, tx_id)) => {
+                    match send_and_await(&client, inner, bytes, tx_id).await {
+                        Some(msg) if msg.class == StunClass::SuccessResponse => {
+                            trace!("TURN allocation refreshed successfully");
+                            break 'alloc;
+                        }
+                        Some(msg)
+                            if matches!(msg.error_code, Some(401) | Some(438))
+                                && attempt == 0 =>
+                        {
+                            // Stale nonce: update and retry
+                            if let (Some(realm), Some(nonce)) = (msg.realm, msg.nonce) {
+                                debug!(
+                                    "TURN Refresh got {}: updating nonce, retrying",
+                                    msg.error_code.unwrap()
+                                );
+                                client.update_nonce(realm, nonce).await;
+                            }
+                            continue 'alloc;
+                        }
+                        Some(msg) => {
+                            debug!("TURN Refresh failed: error={:?}", msg.error_code);
+                        }
+                        None => {
+                            debug!("TURN Refresh timeout or send error");
+                        }
+                    }
+                }
+                Err(e) => debug!("TURN Refresh packet creation failed: {}", e),
+            }
+            break;
+        }
+
+        // 2. Refresh permission for the remote peer.
+        //    On 401/438 update the nonce and retry once.
         let remote_addr = pair.remote.address;
-        match client.create_permission_packet(remote_addr).await {
-            Ok((bytes, tx_id)) => {
-                let (tx, rx) = oneshot::channel();
-                {
-                    let mut map = inner.pending_transactions.lock().unwrap();
-                    map.insert(tx_id, tx);
-                }
-
-                if let Err(e) = client.send(&bytes).await {
-                    debug!("TURN CreatePermission refresh send failed: {}", e);
-                } else {
-                    let inner_weak = Arc::downgrade(inner);
-                    tokio::spawn(async move {
-                        match timeout(Duration::from_secs(5), rx).await {
-                            Ok(Ok(msg)) => {
-                                if msg.class == StunClass::SuccessResponse {
-                                    trace!("TURN permission refreshed for {}", remote_addr);
-                                } else {
-                                    debug!(
-                                        "TURN CreatePermission refresh failed: error={:?}",
-                                        msg.error_code
-                                    );
-                                }
-                            }
-                            _ => {
-                                debug!("TURN CreatePermission refresh timeout");
-                            }
+        'perm: for attempt in 0..2u8 {
+            match client.create_permission_packet(remote_addr).await {
+                Ok((bytes, tx_id)) => {
+                    match send_and_await(&client, inner, bytes, tx_id).await {
+                        Some(msg) if msg.class == StunClass::SuccessResponse => {
+                            trace!("TURN permission refreshed for {}", remote_addr);
+                            break 'perm;
                         }
-                        if let Some(inner) = inner_weak.upgrade() {
-                            let mut map = inner.pending_transactions.lock().unwrap();
-                            map.remove(&tx_id);
+                        Some(msg)
+                            if matches!(msg.error_code, Some(401) | Some(438))
+                                && attempt == 0 =>
+                        {
+                            if let (Some(realm), Some(nonce)) = (msg.realm, msg.nonce) {
+                                debug!(
+                                    "TURN CreatePermission got {}: updating nonce, retrying",
+                                    msg.error_code.unwrap()
+                                );
+                                client.update_nonce(realm, nonce).await;
+                            }
+                            continue 'perm;
                         }
-                    });
+                        Some(msg) => {
+                            debug!(
+                                "TURN CreatePermission refresh failed: error={:?}",
+                                msg.error_code
+                            );
+                        }
+                        None => {
+                            debug!("TURN CreatePermission refresh timeout or send error");
+                        }
+                    }
                 }
+                Err(e) => debug!("TURN CreatePermission packet creation failed: {}", e),
             }
-            Err(e) => {
-                debug!("TURN CreatePermission packet creation failed: {}", e);
-            }
+            break;
         }
 
-        // 3. Refresh channel bindings for all bound peers
+        // 3. Refresh channel bindings for all bound peers.
+        //    On 401/438 update the nonce and retry once per channel.
         let bound_peers = client.bound_peers().await;
         let num_bindings = bound_peers.len();
         for peer in bound_peers {
             if let Some(channel) = client.get_channel(peer).await {
-                match client.create_channel_rebind_packet(peer, channel).await {
-                    Ok((bytes, tx_id)) => {
-                        let (tx, rx) = oneshot::channel();
-                        {
-                            let mut map = inner.pending_transactions.lock().unwrap();
-                            map.insert(tx_id, tx);
+                'chan: for attempt in 0..2u8 {
+                    match client.create_channel_rebind_packet(peer, channel).await {
+                        Ok((bytes, tx_id)) => {
+                            match send_and_await(&client, inner, bytes, tx_id).await {
+                                Some(msg) if msg.class == StunClass::SuccessResponse => {
+                                    trace!(
+                                        "TURN ChannelBind refreshed: {} -> ch {}",
+                                        peer,
+                                        channel
+                                    );
+                                    break 'chan;
+                                }
+                                Some(msg)
+                                    if matches!(msg.error_code, Some(401) | Some(438))
+                                        && attempt == 0 =>
+                                {
+                                    if let (Some(realm), Some(nonce)) = (msg.realm, msg.nonce) {
+                                        debug!(
+                                            "TURN ChannelBind got {}: updating nonce, retrying ch {}",
+                                            msg.error_code.unwrap(),
+                                            channel
+                                        );
+                                        client.update_nonce(realm, nonce).await;
+                                    }
+                                    continue 'chan;
+                                }
+                                Some(msg) => {
+                                    debug!(
+                                        "TURN ChannelBind refresh failed: ch={} error={:?}",
+                                        channel,
+                                        msg.error_code
+                                    );
+                                }
+                                None => {
+                                    debug!(
+                                        "TURN ChannelBind refresh timeout or send error: ch={}",
+                                        channel
+                                    );
+                                }
+                            }
                         }
-
-                        if let Err(e) = client.send(&bytes).await {
-                            debug!("TURN ChannelBind refresh send failed: {}", e);
-                        } else {
-                            let inner_weak = Arc::downgrade(inner);
-                            tokio::spawn(async move {
-                                match timeout(Duration::from_secs(5), rx).await {
-                                    Ok(Ok(msg)) => {
-                                        if msg.class == StunClass::SuccessResponse {
-                                            trace!(
-                                                "TURN ChannelBind refreshed: {} -> ch {}",
-                                                peer, channel
-                                            );
-                                        } else {
-                                            debug!(
-                                                "TURN ChannelBind refresh failed: error={:?}",
-                                                msg.error_code
-                                            );
-                                        }
-                                    }
-                                    _ => {
-                                        debug!("TURN ChannelBind refresh timeout");
-                                    }
-                                }
-                                if let Some(inner) = inner_weak.upgrade() {
-                                    let mut map = inner.pending_transactions.lock().unwrap();
-                                    map.remove(&tx_id);
-                                }
-                            });
+                        Err(e) => {
+                            debug!(
+                                "TURN ChannelBind refresh packet creation failed: {}",
+                                e
+                            );
                         }
                     }
-                    Err(e) => {
-                        debug!("TURN ChannelBind refresh packet creation failed: {}", e);
-                    }
+                    break;
                 }
             }
         }
 
         debug!(
-            "TURN refresh sent: allocation + permission({}) + {} channel bindings",
+            "TURN refresh done: allocation + permission({}) + {} channel bindings",
             remote_addr, num_bindings
         );
     }
@@ -582,23 +646,23 @@ impl IceTransport {
             state: state_tx,
             _state_rx_keeper: state_rx,
             gathering_state: gathering_state_tx,
-            role: std::sync::Mutex::new(IceRole::Controlled),
-            selected_pair: std::sync::Mutex::new(None),
+            role: parking_lot::Mutex::new(IceRole::Controlled),
+            selected_pair: parking_lot::Mutex::new(None),
             local_candidates: Mutex::new(Vec::new()),
-            remote_candidates: std::sync::Mutex::new(Vec::new()),
-            gather_state: std::sync::Mutex::new(IceGathererState::New),
+            remote_candidates: parking_lot::Mutex::new(Vec::new()),
+            gather_state: parking_lot::Mutex::new(IceGathererState::New),
             config: config.clone(),
             gatherer,
-            local_parameters: std::sync::Mutex::new(IceParameters::generate()),
-            remote_parameters: std::sync::Mutex::new(None),
-            pending_transactions: std::sync::Mutex::new(HashMap::new()),
-            data_receiver: std::sync::Mutex::new(None),
-            buffered_packets: std::sync::Mutex::new(VecDeque::new()),
+            local_parameters: parking_lot::Mutex::new(IceParameters::generate()),
+            remote_parameters: parking_lot::Mutex::new(None),
+            pending_transactions: parking_lot::Mutex::new(HashMap::new()),
+            data_receiver: parking_lot::Mutex::new(None),
+            buffered_packets: parking_lot::Mutex::new(VecDeque::new()),
             selected_socket: selected_socket_tx,
             _socket_rx_keeper: selected_socket_rx,
             selected_pair_notifier: selected_pair_tx,
             _selected_pair_rx_keeper: selected_pair_rx,
-            last_received: std::sync::Mutex::new(Instant::now()),
+            last_received: parking_lot::Mutex::new(Instant::now()),
             candidate_tx: candidate_tx.clone(),
             cmd_tx,
             checking_pairs: Mutex::new(std::collections::HashSet::new()),
@@ -654,7 +718,7 @@ impl IceTransport {
     }
 
     pub async fn role(&self) -> IceRole {
-        *self.inner.role.lock().unwrap()
+        *self.inner.role.lock()
     }
 
     pub fn local_candidates(&self) -> Vec<IceCandidate> {
@@ -662,15 +726,15 @@ impl IceTransport {
     }
 
     pub fn remote_candidates(&self) -> Vec<IceCandidate> {
-        self.inner.remote_candidates.lock().unwrap().clone()
+        self.inner.remote_candidates.lock().clone()
     }
 
     pub fn local_parameters(&self) -> IceParameters {
-        self.inner.local_parameters.lock().unwrap().clone()
+        self.inner.local_parameters.lock().clone()
     }
 
     pub fn set_remote_parameters(&self, params: IceParameters) {
-        *self.inner.remote_parameters.lock().unwrap() = Some(params);
+        *self.inner.remote_parameters.lock() = Some(params);
     }
 
     fn start_keepalive(&self) {
@@ -679,7 +743,7 @@ impl IceTransport {
 
     pub fn start_gathering(&self) -> Result<()> {
         {
-            let mut state = self.inner.gather_state.lock().unwrap();
+            let mut state = self.inner.gather_state.lock();
             if *state == IceGathererState::Complete || *state == IceGathererState::Gathering {
                 return Ok(());
             }
@@ -695,7 +759,7 @@ impl IceTransport {
         self.start_gathering()?;
         self.start_keepalive();
         {
-            let mut params = self.inner.remote_parameters.lock().unwrap();
+            let mut params = self.inner.remote_parameters.lock();
             *params = Some(remote);
         }
         if let Err(e) = self.inner.state.send(IceTransportState::Checking) {
@@ -769,7 +833,7 @@ impl IceTransport {
         let remote = IceCandidate::host(remote_addr, 1);
         let pair = IceCandidatePair::new(local, remote);
 
-        *self.inner.selected_pair.lock().unwrap() = Some(pair.clone());
+        *self.inner.selected_pair.lock() = Some(pair.clone());
         let _ = self.inner.selected_pair_notifier.send(Some(pair.clone()));
         if let Some(socket) = resolve_socket(&self.inner, &pair) {
             let _ = self.inner.selected_socket.send(Some(socket));
@@ -801,7 +865,6 @@ impl IceTransport {
             .gatherer
             .sockets
             .lock()
-            .unwrap()
             .push(socket.clone());
 
         // Register the socket wrapper for the read loop (handled by runner)
@@ -831,13 +894,13 @@ impl IceTransport {
         self.inner.gatherer.push_candidate(local_candidate.clone());
 
         // Set gathering as complete
-        *self.inner.gatherer.state.lock().unwrap() = IceGathererState::Complete;
+        *self.inner.gatherer.state.lock() = IceGathererState::Complete;
         let _ = self.inner.gathering_state.send(IceGathererState::Complete);
 
         // Set up the selected pair
         let remote_candidate = IceCandidate::host(remote_addr, 1);
         let pair = IceCandidatePair::new(local_candidate, remote_candidate);
-        *self.inner.selected_pair.lock().unwrap() = Some(pair.clone());
+        *self.inner.selected_pair.lock() = Some(pair.clone());
         let _ = self.inner.selected_pair_notifier.send(Some(pair));
         let _ = self
             .inner
@@ -870,7 +933,6 @@ impl IceTransport {
             .gatherer
             .sockets
             .lock()
-            .unwrap()
             .push(socket.clone());
         let _ = self
             .inner
@@ -896,7 +958,7 @@ impl IceTransport {
         }
         self.inner.gatherer.push_candidate(local_candidate);
 
-        *self.inner.gatherer.state.lock().unwrap() = IceGathererState::Complete;
+        *self.inner.gatherer.state.lock() = IceGathererState::Complete;
         let _ = self.inner.gathering_state.send(IceGathererState::Complete);
 
         Ok(cand_addr)
@@ -919,7 +981,7 @@ impl IceTransport {
                 )
             });
         let pair = IceCandidatePair::new(local_candidate, remote_candidate);
-        *self.inner.selected_pair.lock().unwrap() = Some(pair.clone());
+        *self.inner.selected_pair.lock() = Some(pair.clone());
         let _ = self.inner.selected_pair_notifier.send(Some(pair.clone()));
         if let Some(socket) = resolve_socket(&self.inner, &pair) {
             let _ = self.inner.selected_socket.send(Some(socket));
@@ -931,24 +993,24 @@ impl IceTransport {
         let _ = self.inner.state.send(IceTransportState::Closed);
         let _ = self.inner.selected_socket.send(None);
         let _ = self.inner.selected_pair_notifier.send(None);
-        *self.inner.selected_pair.lock().unwrap() = None;
-        self.inner.gatherer.sockets.lock().unwrap().clear();
-        self.inner.gatherer.turn_clients.lock().unwrap().clear();
+        *self.inner.selected_pair.lock() = None;
+        self.inner.gatherer.sockets.lock().clear();
+        self.inner.gatherer.turn_clients.lock().clear();
     }
 
     pub fn set_role(&self, role: IceRole) {
-        *self.inner.role.lock().unwrap() = role;
+        *self.inner.role.lock() = role;
     }
 
     pub fn add_remote_candidate(&self, candidate: IceCandidate) {
-        let mut list = self.inner.remote_candidates.lock().unwrap();
+        let mut list = self.inner.remote_candidates.lock();
         list.push(candidate);
         drop(list);
         self.try_connectivity_checks();
     }
 
     pub fn select_pair(&self, pair: IceCandidatePair) {
-        *self.inner.selected_pair.lock().unwrap() = Some(pair.clone());
+        *self.inner.selected_pair.lock() = Some(pair.clone());
         let _ = self.inner.selected_pair_notifier.send(Some(pair.clone()));
         if let Some(socket) = resolve_socket(&self.inner, &pair) {
             let _ = self.inner.selected_socket.send(Some(socket));
@@ -961,9 +1023,9 @@ impl IceTransport {
     }
 
     pub async fn get_selected_socket(&self) -> Option<IceSocketWrapper> {
-        let pair = self.inner.selected_pair.lock().unwrap().clone()?;
+        let pair = self.inner.selected_pair.lock().clone()?;
         if pair.local.typ == IceCandidateType::Relay {
-            let clients = self.inner.gatherer.turn_clients.lock().unwrap();
+            let clients = self.inner.gatherer.turn_clients.lock();
             clients
                 .get(&pair.local.address)
                 .map(|c| IceSocketWrapper::Turn(c.clone(), pair.local.address))
@@ -976,17 +1038,17 @@ impl IceTransport {
     }
 
     pub async fn get_selected_pair(&self) -> Option<IceCandidatePair> {
-        self.inner.selected_pair.lock().unwrap().clone()
+        self.inner.selected_pair.lock().clone()
     }
 
     pub async fn set_data_receiver(&self, receiver: Arc<dyn PacketReceiver>) {
         {
-            let mut rx_lock = self.inner.data_receiver.lock().unwrap();
+            let mut rx_lock = self.inner.data_receiver.lock();
             *rx_lock = Some(receiver.clone());
         }
 
         let packets: Vec<_> = {
-            let mut buffer = self.inner.buffered_packets.lock().unwrap();
+            let mut buffer = self.inner.buffered_packets.lock();
             if buffer.is_empty() {
                 return;
             }
@@ -1064,13 +1126,13 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     }
 
     // If we already have a selected pair, don't run more checks
-    if inner.selected_pair.lock().unwrap().is_some() {
+    if inner.selected_pair.lock().is_some() {
         return;
     }
 
     let locals = inner.gatherer.local_candidates();
-    let remotes = inner.remote_candidates.lock().unwrap().clone();
-    let role = *inner.role.lock().unwrap();
+    let remotes = inner.remote_candidates.lock().clone();
+    let role = *inner.role.lock();
 
     if locals.is_empty() || remotes.is_empty() {
         return;
@@ -1150,7 +1212,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         if let Some(pair) = res {
             // Check if another concurrent check already selected a pair
             {
-                let existing = inner.selected_pair.lock().unwrap();
+                let existing = inner.selected_pair.lock();
                 if existing.is_some() {
                     debug!(
                         "ICE: Ignoring pair {} -> {} (already have selected pair)",
@@ -1160,7 +1222,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
                     break;
                 }
             }
-            *inner.selected_pair.lock().unwrap() = Some(pair.clone());
+            *inner.selected_pair.lock() = Some(pair.clone());
             let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
             if let Some(socket) = resolve_socket(&inner, &pair) {
                 let _ = inner.selected_socket.send(Some(socket));
@@ -1217,7 +1279,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
 
     if !success {
         let state = *inner.state.borrow();
-        let has_selected_pair = inner.selected_pair.lock().unwrap().is_some();
+        let has_selected_pair = inner.selected_pair.lock().is_some();
         // Only set Failed if we're not already connected AND we don't have a working pair
         if state != IceTransportState::Connected && !has_selected_pair {
             let _ = inner.state.send(IceTransportState::Failed);
@@ -1227,7 +1289,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
 
 fn resolve_socket(inner: &IceTransportInner, pair: &IceCandidatePair) -> Option<IceSocketWrapper> {
     if pair.local.typ == IceCandidateType::Relay {
-        let clients = inner.gatherer.turn_clients.lock().unwrap();
+        let clients = inner.gatherer.turn_clients.lock();
         clients
             .get(&pair.local.address)
             .map(|c| IceSocketWrapper::Turn(c.clone(), pair.local.address))
@@ -1253,7 +1315,7 @@ async fn handle_packet(
         return;
     }
     {
-        *inner.last_received.lock().unwrap() = Instant::now();
+        *inner.last_received.lock() = Instant::now();
     }
     let b = packet[0];
     if b < 2 {
@@ -1275,7 +1337,7 @@ async fn handle_packet(
                     }
                     handle_stun_request(&sender, &msg, addr, inner).await;
                 } else if msg.class == StunClass::SuccessResponse {
-                    let mut map = inner.pending_transactions.lock().unwrap();
+                    let mut map = inner.pending_transactions.lock();
                     if let Some(tx) = map.remove(&msg.transaction_id) {
                         let _ = tx.send(msg);
                     } else {
@@ -1293,7 +1355,7 @@ async fn handle_packet(
                     );
                     if let Some(code) = msg.error_code {
                         if code == 401 {
-                            let remote_params = inner.remote_parameters.lock().unwrap().clone();
+                            let remote_params = inner.remote_parameters.lock().clone();
                             debug!(
                                 "STUN 401 received. Current remote params: {:?}",
                                 remote_params
@@ -1309,11 +1371,11 @@ async fn handle_packet(
         }
     } else {
         // DTLS or RTP
-        let receiver = inner.data_receiver.lock().unwrap().clone();
+        let receiver = inner.data_receiver.lock().clone();
         if let Some(rx) = receiver {
             rx.receive(Bytes::copy_from_slice(packet), addr).await;
         } else {
-            let mut buffer = inner.buffered_packets.lock().unwrap();
+            let mut buffer = inner.buffered_packets.lock();
             let stats = inner.buffer_stats.clone();
             let capacity = inner.config.rtp_buffer_capacity;
 
@@ -1353,7 +1415,7 @@ async fn handle_packet(
             }
 
             // Periodic logging
-            let mut last_log = stats.last_log_time.lock().unwrap();
+            let mut last_log = stats.last_log_time.lock();
             if last_log.elapsed() >= inner.config.buffer_stats_log_interval {
                 let received = stats.packets_received.load(Ordering::Relaxed);
                 let dropped = stats.packets_dropped.load(Ordering::Relaxed);
@@ -1376,7 +1438,7 @@ async fn handle_stun_request(
 ) {
     let response = StunMessage::binding_success_response(msg.transaction_id, addr);
 
-    let password = inner.local_parameters.lock().unwrap().password.clone();
+    let password = inner.local_parameters.lock().password.clone();
     if let Ok(bytes) = response.encode(Some(password.as_bytes()), true) {
         match sender.send_to(&bytes, addr).await {
             Ok(_) => trace!("Sent STUN Response to {}", addr),
@@ -1409,7 +1471,7 @@ async fn handle_stun_request(
     // Check if we know this candidate
     let mut known = false;
     {
-        let remotes = inner.remote_candidates.lock().unwrap();
+        let remotes = inner.remote_candidates.lock();
         for cand in remotes.iter() {
             if cand.address == addr {
                 known = true;
@@ -1429,14 +1491,14 @@ async fn handle_stun_request(
         );
         candidate.priority = IceCandidate::priority_for(IceCandidateType::PeerReflexive, 1);
 
-        let mut list = inner.remote_candidates.lock().unwrap();
+        let mut list = inner.remote_candidates.lock();
         list.push(candidate);
         drop(list);
 
         let _ = inner.cmd_tx.send(IceCommand::RunChecks);
     }
     if inner.config.enable_latching {
-        let current_pair = inner.selected_pair.lock().unwrap().clone();
+        let current_pair = inner.selected_pair.lock().clone();
         if let Some(pair) = current_pair {
             if pair.remote.address.port() == addr.port() && pair.remote.address.ip() != addr.ip() {
                 debug!(
@@ -1446,7 +1508,7 @@ async fn handle_stun_request(
                 let mut new_remote = pair.remote.clone();
                 new_remote.address = addr;
                 let new_pair = IceCandidatePair::new(pair.local.clone(), new_remote);
-                *inner.selected_pair.lock().unwrap() = Some(new_pair.clone());
+                *inner.selected_pair.lock() = Some(new_pair.clone());
                 let _ = inner.selected_pair_notifier.send(Some(new_pair.clone()));
                 if let Some(socket) = resolve_socket(&inner, &new_pair) {
                     let _ = inner.selected_socket.send(Some(socket));
@@ -1456,7 +1518,7 @@ async fn handle_stun_request(
     }
 
     if msg.use_candidate {
-        let role = *inner.role.lock().unwrap();
+        let role = *inner.role.lock();
         if role == IceRole::Controlled {
             let local_addr = match sender {
                 IceSocketWrapper::Udp(s) => s
@@ -1469,7 +1531,7 @@ async fn handle_stun_request(
             let local_cand = locals.iter().find(|c| c.base_address() == local_addr);
 
             let pair = {
-                let remotes = inner.remote_candidates.lock().unwrap();
+                let remotes = inner.remote_candidates.lock();
                 let remote_cand = remotes.iter().find(|c| c.address == addr);
                 if let (Some(l), Some(r)) = (local_cand, remote_cand) {
                     Some(IceCandidatePair::new(l.clone(), r.clone()))
@@ -1483,7 +1545,7 @@ async fn handle_stun_request(
                     "Controlled agent selected pair via UseCandidate: {} -> {}",
                     pair.local.address, pair.remote.address
                 );
-                *inner.selected_pair.lock().unwrap() = Some(pair.clone());
+                *inner.selected_pair.lock() = Some(pair.clone());
                 let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
                 if let Some(socket) = resolve_socket(&inner, &pair) {
                     let _ = inner.selected_socket.send(Some(socket));
@@ -1508,14 +1570,14 @@ async fn handle_stun_request(
 }
 
 struct TransactionGuard<'a> {
-    map: &'a std::sync::Mutex<HashMap<[u8; 12], oneshot::Sender<StunDecoded>>>,
+    map: &'a parking_lot::Mutex<HashMap<[u8; 12], oneshot::Sender<StunDecoded>>>,
     tx_id: [u8; 12],
 }
 
 impl<'a> Drop for TransactionGuard<'a> {
     fn drop(&mut self) {
         // debug!("TransactionGuard: dropping tx={:?}", self.tx_id);
-        let mut map = self.map.lock().unwrap();
+        let mut map = self.map.lock();
         map.remove(&self.tx_id);
     }
 }
@@ -1531,8 +1593,8 @@ async fn perform_binding_check(
         bail!("only UDP connectivity checks are supported");
     }
 
-    let local_params = inner.local_parameters.lock().unwrap().clone();
-    let remote_params = match inner.remote_parameters.lock().unwrap().clone() {
+    let local_params = inner.local_parameters.lock().clone();
+    let remote_params = match inner.remote_parameters.lock().clone() {
         Some(p) => p,
         None => bail!("no remote params"),
     };
@@ -1563,7 +1625,7 @@ async fn perform_binding_check(
 
     let (tx, mut rx) = oneshot::channel();
     {
-        let mut map = inner.pending_transactions.lock().unwrap();
+        let mut map = inner.pending_transactions.lock();
         map.insert(tx_id, tx);
     }
 
@@ -1575,7 +1637,7 @@ async fn perform_binding_check(
 
     let (socket, turn_client) = if local.typ == IceCandidateType::Relay {
         let gatherer = &inner.gatherer;
-        let clients = gatherer.turn_clients.lock().unwrap();
+        let clients = gatherer.turn_clients.lock();
         let client = clients.get(&local.address).cloned();
         (None, client)
     } else {
@@ -1592,7 +1654,7 @@ async fn perform_binding_check(
 
         let (perm_tx, perm_rx) = oneshot::channel();
         {
-            let mut map = inner.pending_transactions.lock().unwrap();
+            let mut map = inner.pending_transactions.lock();
             map.insert(perm_tx_id, perm_tx);
         }
 
@@ -1615,7 +1677,7 @@ async fn perform_binding_check(
                     {
                         let (bind_tx, bind_rx) = oneshot::channel();
                         {
-                            let mut map = inner.pending_transactions.lock().unwrap();
+                            let mut map = inner.pending_transactions.lock();
                             map.insert(bind_tx_id, bind_tx);
                         }
 
@@ -1625,35 +1687,33 @@ async fn perform_binding_check(
                             let inner_weak = Arc::downgrade(&inner);
                             let timeout_dur = inner.config.stun_timeout;
 
-                            tokio::spawn(async move {
-                                match timeout(timeout_dur, bind_rx).await {
-                                    Ok(Ok(msg)) => {
-                                        if msg.class == StunClass::SuccessResponse {
-                                            client_clone
-                                                .add_channel(remote_addr, channel_num)
-                                                .await;
-                                            debug!(
-                                                "TURN ChannelBound: {} -> {}",
-                                                remote_addr, channel_num
-                                            );
-                                        }
-                                    }
-                                    _ => {
-                                        // Timeout or error
-                                        if let Some(inner) = inner_weak.upgrade() {
-                                            let mut map =
-                                                inner.pending_transactions.lock().unwrap();
-                                            map.remove(&bind_tx_id);
-                                        }
+                            match timeout(timeout_dur, bind_rx).await {
+                                Ok(Ok(msg)) => {
+                                    if msg.class == StunClass::SuccessResponse {
+                                        client_clone
+                                            .add_channel(remote_addr, channel_num)
+                                            .await;
+                                        debug!(
+                                            "TURN ChannelBound: {} -> {}",
+                                            remote_addr, channel_num
+                                        );
                                     }
                                 }
-                            });
+                                _ => {
+                                    // Timeout or error: clean up pending transaction
+                                    if let Some(inner) = inner_weak.upgrade() {
+                                        let mut map =
+                                            inner.pending_transactions.lock();
+                                        map.remove(&bind_tx_id);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
             _ => {
-                let mut map = inner.pending_transactions.lock().unwrap();
+                let mut map = inner.pending_transactions.lock();
                 map.remove(&perm_tx_id);
                 bail!("CreatePermission timeout");
             }
@@ -2027,10 +2087,10 @@ impl IceTransportBuilder {
 
 #[derive(Debug, Clone)]
 struct IceGatherer {
-    state: Arc<std::sync::Mutex<IceGathererState>>,
-    local_candidates: Arc<std::sync::Mutex<Vec<IceCandidate>>>,
-    sockets: Arc<std::sync::Mutex<Vec<Arc<UdpSocket>>>>,
-    turn_clients: Arc<std::sync::Mutex<HashMap<SocketAddr, Arc<TurnClient>>>>,
+    state: Arc<parking_lot::Mutex<IceGathererState>>,
+    local_candidates: Arc<parking_lot::Mutex<Vec<IceCandidate>>>,
+    sockets: Arc<parking_lot::Mutex<Vec<Arc<UdpSocket>>>>,
+    turn_clients: Arc<parking_lot::Mutex<HashMap<SocketAddr, Arc<TurnClient>>>>,
     config: RtcConfiguration,
     candidate_tx: broadcast::Sender<IceCandidate>,
     socket_tx: tokio::sync::mpsc::UnboundedSender<IceSocketWrapper>,
@@ -2043,10 +2103,10 @@ impl IceGatherer {
         socket_tx: tokio::sync::mpsc::UnboundedSender<IceSocketWrapper>,
     ) -> Self {
         Self {
-            state: Arc::new(std::sync::Mutex::new(IceGathererState::New)),
-            local_candidates: Arc::new(std::sync::Mutex::new(Vec::new())),
-            sockets: Arc::new(std::sync::Mutex::new(Vec::new())),
-            turn_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            state: Arc::new(parking_lot::Mutex::new(IceGathererState::New)),
+            local_candidates: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            sockets: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            turn_clients: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             config,
             candidate_tx,
             socket_tx,
@@ -2054,11 +2114,11 @@ impl IceGatherer {
     }
 
     fn state(&self) -> IceGathererState {
-        *self.state.lock().unwrap()
+        *self.state.lock()
     }
 
     fn local_candidates(&self) -> Vec<IceCandidate> {
-        self.local_candidates.lock().unwrap().clone()
+        self.local_candidates.lock().clone()
     }
 
     async fn bind_socket(&self, ip: IpAddr) -> Result<UdpSocket> {
@@ -2094,7 +2154,7 @@ impl IceGatherer {
     }
 
     fn get_socket(&self, addr: SocketAddr) -> Option<Arc<UdpSocket>> {
-        let sockets = self.sockets.lock().unwrap();
+        let sockets = self.sockets.lock();
         for socket in sockets.iter() {
             if let Ok(local) = socket.local_addr() {
                 if local == addr {
@@ -2124,7 +2184,7 @@ impl IceGatherer {
     #[instrument(skip(self))]
     async fn gather(&self) -> Result<()> {
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock();
             if *state == IceGathererState::Complete {
                 return Ok(());
             }
@@ -2147,7 +2207,7 @@ impl IceGatherer {
 
         tokio::join!(host_fut, server_fut);
 
-        *self.state.lock().unwrap() = IceGathererState::Complete;
+        *self.state.lock() = IceGathererState::Complete;
         Ok(())
     }
 
@@ -2197,7 +2257,7 @@ impl IceGatherer {
                 Ok(socket) => {
                     if let Ok(addr) = socket.local_addr() {
                         let socket = Arc::new(socket);
-                        self.sockets.lock().unwrap().push(socket.clone());
+                        self.sockets.lock().push(socket.clone());
                         let _ = self.socket_tx.send(IceSocketWrapper::Udp(socket));
 
                         if let Some(ext_ip) = &self.config.external_ip
@@ -2306,7 +2366,7 @@ impl IceGatherer {
         let parsed = StunMessage::decode(&buf[..len])?;
         if let Some(mapped) = parsed.xor_mapped_address {
             let socket = Arc::new(socket);
-            self.sockets.lock().unwrap().push(socket.clone());
+            self.sockets.lock().push(socket.clone());
             let _ = self.socket_tx.send(IceSocketWrapper::Udp(socket));
             return Ok(Some(IceCandidate::server_reflexive(local_addr, mapped, 1)));
         }
@@ -2326,7 +2386,6 @@ impl IceGatherer {
         let client = Arc::new(client);
         self.turn_clients
             .lock()
-            .unwrap()
             .insert(relayed_addr, client.clone());
         let _ = self
             .socket_tx
@@ -2343,7 +2402,7 @@ impl IceGatherer {
         if self.config.disable_ipv6 && candidate.address.is_ipv6() {
             return;
         }
-        let mut candidates = self.local_candidates.lock().unwrap();
+        let mut candidates = self.local_candidates.lock();
         if candidates.iter().any(|c| c.address == candidate.address) {
             return;
         }

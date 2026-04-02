@@ -5,7 +5,7 @@ use crate::stats::{StatsEntry, StatsId, StatsKind, StatsProvider};
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 #[derive(Debug, Clone)]
 struct RemoteInboundStats {
@@ -96,7 +96,7 @@ impl StatsCollector {
 
     fn handle_sr(&self, sr: &SenderReport) {
         {
-            let mut outbound = self.remote_outbound.lock().unwrap();
+            let mut outbound = self.remote_outbound.lock();
             let stats = outbound.entry(sr.sender_ssrc).or_default();
             stats.packets_sent = sr.packet_count;
             stats.bytes_sent = sr.octet_count;
@@ -105,7 +105,7 @@ impl StatsCollector {
 
         // SR also contains report blocks for our streams
         for block in &sr.report_blocks {
-            let mut inbound = self.remote_inbound.lock().unwrap();
+            let mut inbound = self.remote_inbound.lock();
             let stats = inbound.entry(block.ssrc).or_default();
             stats.packets_lost = block.packets_lost;
             stats.fraction_lost = block.fraction_lost;
@@ -115,7 +115,7 @@ impl StatsCollector {
 
     fn handle_rr(&self, rr: &ReceiverReport) {
         for block in &rr.report_blocks {
-            let mut inbound = self.remote_inbound.lock().unwrap();
+            let mut inbound = self.remote_inbound.lock();
             let stats = inbound.entry(block.ssrc).or_default();
             stats.packets_lost = block.packets_lost;
             stats.fraction_lost = block.fraction_lost;
@@ -146,7 +146,7 @@ impl StatsCollector {
 impl RtpSenderInterceptor for StatsCollector {
     async fn on_packet_sent(&self, packet: &RtpPacket) {
         let size = Self::packet_size(packet);
-        let mut outbound = self.local_outbound.lock().unwrap();
+        let mut outbound = self.local_outbound.lock();
         let stats = outbound.entry(packet.header.ssrc).or_default();
         stats.packets_sent += 1;
         stats.bytes_sent += size;
@@ -157,7 +157,7 @@ impl RtpSenderInterceptor for StatsCollector {
 impl RtpReceiverInterceptor for StatsCollector {
     async fn on_packet_received(&self, packet: &RtpPacket) -> Option<RtcpPacket> {
         let size = Self::packet_size(packet);
-        let mut inbound = self.local_inbound.lock().unwrap();
+        let mut inbound = self.local_inbound.lock();
         let stats = inbound.entry(packet.header.ssrc).or_default();
         stats.packets_received += 1;
         stats.bytes_received += size;
@@ -171,7 +171,7 @@ impl StatsProvider for StatsCollector {
         let mut entries = Vec::new();
 
         {
-            let inbound = self.remote_inbound.lock().unwrap();
+            let inbound = self.remote_inbound.lock();
             for (ssrc, stats) in inbound.iter() {
                 let id = StatsId::new(format!("remote-inbound-rtp-{}", ssrc));
                 let mut entry = StatsEntry::new(id, StatsKind::RemoteInboundRtp);
@@ -190,7 +190,7 @@ impl StatsProvider for StatsCollector {
         }
 
         {
-            let outbound = self.remote_outbound.lock().unwrap();
+            let outbound = self.remote_outbound.lock();
             for (ssrc, stats) in outbound.iter() {
                 let id = StatsId::new(format!("remote-outbound-rtp-{}", ssrc));
                 let mut entry = StatsEntry::new(id, StatsKind::RemoteOutboundRtp);
@@ -204,7 +204,7 @@ impl StatsProvider for StatsCollector {
         }
 
         {
-            let inbound = self.local_inbound.lock().unwrap();
+            let inbound = self.local_inbound.lock();
             for (ssrc, stats) in inbound.iter() {
                 let id = StatsId::new(format!("inbound-rtp-{}", ssrc));
                 let mut entry = StatsEntry::new(id, StatsKind::InboundRtp);
@@ -218,7 +218,7 @@ impl StatsProvider for StatsCollector {
         }
 
         {
-            let outbound = self.local_outbound.lock().unwrap();
+            let outbound = self.local_outbound.lock();
             for (ssrc, stats) in outbound.iter() {
                 let id = StatsId::new(format!("outbound-rtp-{}", ssrc));
                 let mut entry = StatsEntry::new(id, StatsKind::OutboundRtp);

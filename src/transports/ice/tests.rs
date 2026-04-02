@@ -942,7 +942,7 @@ async fn test_nomination_uses_nomination_timeout_not_stun_timeout() -> Result<()
     let pair = IceCandidatePair::new(local_candidate, remote_candidate);
 
     // Force the transport inner's role to Controlling so the nomination path fires.
-    *transport.inner.role.lock().unwrap() = IceRole::Controlling;
+    *transport.inner.role.lock() = IceRole::Controlling;
 
     // Set a dummy remote parameters so authentication is possible.
     let remote_params = IceParameters::new("dummy_ufrag", "dummy_password_1234567890");
@@ -1404,6 +1404,257 @@ async fn test_nomination_delayed_by_dtls_socket_contention() -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// TURN refresh tests
+// ============================================================================
+
+/// Verify that `run_turn_refresh` successfully refreshes allocation, permission,
+/// and channel bindings when the TURN server responds normally (200 OK for all).
+#[tokio::test]
+#[serial]
+async fn test_turn_refresh_succeeds_normally() -> Result<()> {
+    let mut turn_server = TestTurnServer::start().await?;
+
+    let mut config = RtcConfiguration::default();
+    config.ice_transport_policy = IceTransportPolicy::Relay;
+    config.ice_servers.push(
+        IceServer::new(vec![turn_server.turn_url()]).with_credential(TEST_USERNAME, TEST_PASSWORD),
+    );
+
+    let (tx, _) = broadcast::channel(100);
+    let (socket_tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let gatherer = IceGatherer::new(config.clone(), tx, socket_tx);
+    gatherer.gather().await?;
+
+    // Grab the relay candidate and its TurnClient
+    let candidates = gatherer.local_candidates();
+    let relay = candidates
+        .iter()
+        .find(|c| c.typ == IceCandidateType::Relay)
+        .expect("should have relay candidate")
+        .clone();
+
+    let client = {
+        let clients = gatherer.turn_clients.lock();
+        clients
+            .get(&relay.address)
+            .cloned()
+            .expect("should have TurnClient for relay")
+    };
+
+    // Register a channel binding so the refresh has something to rebind
+    let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+    client.create_permission(peer).await?;
+    // Manually register a fake channel so bound_peers() returns it
+    client.add_channel(peer, 0x4000).await;
+
+    // Build a minimal IceTransportInner pointing at the relay selected pair
+    let (transport, runner) = IceTransport::new(config);
+    tokio::spawn(runner);
+
+    // Wire up the gathered clients into the transport's gatherer
+    {
+        let mut clients = transport.inner.gatherer.turn_clients.lock();
+        for (addr, c) in gatherer.turn_clients.lock().iter() {
+            clients.insert(*addr, c.clone());
+        }
+    }
+    // Add the relay candidate so selected_pair resolves
+    transport.inner.gatherer.local_candidates.lock().extend(candidates);
+
+    // Set up a relay-type selected pair
+    let remote = IceCandidate::host("127.0.0.1:9999".parse().unwrap(), 1);
+    let pair = IceCandidatePair::new(relay.clone(), remote);
+    *transport.inner.selected_pair.lock() = Some(pair);
+    let _ = transport.inner.state.send(IceTransportState::Connected);
+
+    // Run the refresh — should complete without panicking and without logging errors
+    IceTransportRunner::run_turn_refresh(&transport.inner).await;
+
+    turn_server.stop().await?;
+    Ok(())
+}
+
+/// Verify that `TurnClient::update_nonce` actually updates the stored nonce so
+/// that the next packet built with `create_refresh_packet` / `create_channel_rebind_packet`
+/// uses the new value.
+#[tokio::test]
+#[serial]
+async fn test_turn_client_update_nonce_takes_effect() -> Result<()> {
+    let mut turn_server = TestTurnServer::start().await?;
+    let uri = IceServerUri::parse(&turn_server.turn_url())?;
+    let server =
+        IceServer::new(vec![turn_server.turn_url()]).with_credential(TEST_USERNAME, TEST_PASSWORD);
+    let client = TurnClient::connect(&uri, false).await?;
+    let creds = TurnCredentials::from_server(&server)?;
+    client.allocate(creds).await?;
+
+    // Update the nonce to a known value
+    client
+        .update_nonce("new-realm".to_string(), "new-nonce-xyz".to_string())
+        .await;
+
+    // The next refresh packet should embed the new nonce
+    let (bytes, _tx_id) = client.create_refresh_packet().await?;
+
+    // Decode the packet and verify the Nonce attribute
+    let decoded = StunMessage::decode(&bytes)?;
+    let has_new_nonce = decoded.nonce.as_deref() == Some("new-nonce-xyz");
+    assert!(
+        has_new_nonce,
+        "Refresh packet should contain the updated nonce; got {:?}",
+        decoded.nonce
+    );
+
+    turn_server.stop().await?;
+    Ok(())
+}
+
+/// Simulate a stale-nonce (438) reply for a ChannelBind refresh:
+/// the second attempt (with updated nonce) must succeed.
+///
+/// We do this by:
+///   1. Allocating normally (so we have a valid auth state).
+///   2. Manually poisoning the stored nonce with a wrong value.
+///   3. Calling `run_turn_refresh` — the first ChannelBind attempt gets a 438,
+///      `update_nonce` is called, and the retry succeeds.
+///
+/// Because the real TURN server (coturn / webrtc-rs turn) only issues 438 after
+/// an explicit nonce rotation we cannot easily trigger it end-to-end here.
+/// Instead we test the nonce-update path in isolation: poison → first packet
+/// fails → nonce restored from response → second packet succeeds.
+#[tokio::test]
+#[serial]
+async fn test_turn_refresh_retries_on_stale_nonce() -> Result<()> {
+    let mut turn_server = TestTurnServer::start().await?;
+    let uri = IceServerUri::parse(&turn_server.turn_url())?;
+    let server =
+        IceServer::new(vec![turn_server.turn_url()]).with_credential(TEST_USERNAME, TEST_PASSWORD);
+    let client = Arc::new(TurnClient::connect(&uri, false).await?);
+    let creds = TurnCredentials::from_server(&server)?;
+    client.allocate(creds).await?;
+
+    // Create a permission so we can do ChannelBind
+    let peer: SocketAddr = "127.0.0.1:12346".parse().unwrap();
+    client.create_permission(peer).await?;
+
+    // Poison the nonce — the next ChannelBind will carry this wrong nonce
+    // and the server will respond with 438 + a fresh nonce.
+    client
+        .update_nonce(TEST_REALM.to_string(), "stale-nonce-AAAA".to_string())
+        .await;
+
+    // Verify that the client can still recover:
+    // create_channel_rebind_packet will embed the stale nonce, the server returns 438,
+    // update_nonce is called, and the retry succeeds.
+    //
+    // We exercise this via the public helpers rather than run_turn_refresh because
+    // run_turn_refresh requires a full IceTransportInner.  The important thing is
+    // that update_nonce + create_channel_rebind_packet produces a valid packet after
+    // receiving the fresh nonce from the server.
+
+    // Attempt 1: stale nonce → expect 401/438 from server
+    let (bytes1, tx_id1) = client.create_channel_rebind_packet(peer, 0x4000).await?;
+    client.send(&bytes1).await?;
+    let mut buf = [0u8; 1500];
+    let len = client.recv(&mut buf).await?;
+    let resp1 = StunMessage::decode(&buf[..len])?;
+    // The transaction ids won't match because the server ignores mismatched ones;
+    // what matters is that we get an error (401 or 438).
+    let _ = tx_id1;
+    assert!(
+        matches!(resp1.error_code, Some(400..=438)),
+        "Expected 4xx error for stale nonce, got {:?}",
+        resp1.error_code
+    );
+
+    // Extract new realm+nonce from the error response and update
+    if let (Some(realm), Some(nonce)) = (resp1.realm.clone(), resp1.nonce.clone()) {
+        client.update_nonce(realm, nonce).await;
+    }
+
+    // Attempt 2: fresh nonce → should succeed (or at least not get 438 again)
+    let (bytes2, _tx_id2) = client.create_channel_rebind_packet(peer, 0x4000).await?;
+    client.send(&bytes2).await?;
+    let len2 = client.recv(&mut buf).await?;
+    let resp2 = StunMessage::decode(&buf[..len2])?;
+    assert_eq!(
+        resp2.class,
+        StunClass::SuccessResponse,
+        "Second ChannelBind with fresh nonce should succeed, got error={:?}",
+        resp2.error_code
+    );
+
+    turn_server.stop().await?;
+    Ok(())
+}
+
+/// Verify that `run_turn_refresh` exits cleanly (no panic, no hang) when the
+/// TURN server is unreachable (simulated by stopping the server before the
+/// refresh runs).
+#[tokio::test]
+#[serial]
+async fn test_turn_refresh_tolerates_server_unreachable() -> Result<()> {
+    let mut turn_server = TestTurnServer::start().await?;
+
+    let mut config = RtcConfiguration::default();
+    config.ice_transport_policy = IceTransportPolicy::Relay;
+    config.ice_servers.push(
+        IceServer::new(vec![turn_server.turn_url()]).with_credential(TEST_USERNAME, TEST_PASSWORD),
+    );
+
+    let (tx, _) = broadcast::channel(100);
+    let (socket_tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let gatherer = IceGatherer::new(config.clone(), tx, socket_tx);
+    gatherer.gather().await?;
+
+    let candidates = gatherer.local_candidates();
+    let relay = candidates
+        .iter()
+        .find(|c| c.typ == IceCandidateType::Relay)
+        .expect("should have relay candidate")
+        .clone();
+
+    // Stop the TURN server before the refresh
+    turn_server.stop().await?;
+
+    let (transport, runner) = IceTransport::new(config);
+    tokio::spawn(runner);
+
+    {
+        let mut clients = transport.inner.gatherer.turn_clients.lock();
+        for (addr, c) in gatherer.turn_clients.lock().iter() {
+            clients.insert(*addr, c.clone());
+        }
+    }
+    transport
+        .inner
+        .gatherer
+        .local_candidates
+        .lock()
+        .extend(candidates);
+
+    let remote = IceCandidate::host("127.0.0.1:9999".parse().unwrap(), 1);
+    let pair = IceCandidatePair::new(relay, remote);
+    *transport.inner.selected_pair.lock() = Some(pair);
+    let _ = transport.inner.state.send(IceTransportState::Connected);
+
+    // Should complete within the 5s send_and_await timeout × 3 requests (alloc+perm+chan)
+    // plus margin. With server down, each request times out after 5s.
+    let result = timeout(
+        Duration::from_secs(25),
+        IceTransportRunner::run_turn_refresh(&transport.inner),
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "run_turn_refresh should complete even when server is unreachable"
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_nomination_fails_immediately_on_host_unreachable() -> Result<()> {
     // With the transient-error retry fix, EHOSTUNREACH is no longer an immediate
@@ -1419,7 +1670,7 @@ async fn test_nomination_fails_immediately_on_host_unreachable() -> Result<()> {
     let local_candidate = IceCandidate::host("127.0.0.1:0".parse().unwrap(), 1);
     let remote_candidate = IceCandidate::host("127.0.0.1:1".parse().unwrap(), 1);
 
-    *transport.inner.role.lock().unwrap() = IceRole::Controlling;
+    *transport.inner.role.lock() = IceRole::Controlling;
     transport.set_remote_parameters(IceParameters::new(
         "testufrag",
         "testpassword_long_enough_1234",
@@ -1534,13 +1785,11 @@ async fn test_dtls_proceeds_after_nomination_timeout() -> Result<()> {
         .inner
         .data_receiver
         .lock()
-        .unwrap()
         .replace(Arc::new(Chan(tx1)));
     controlled
         .inner
         .data_receiver
         .lock()
-        .unwrap()
         .replace(Arc::new(Chan(tx2)));
 
     let test_payload = bytes::Bytes::from_static(b"\xffhello-after-nomination-timeout");

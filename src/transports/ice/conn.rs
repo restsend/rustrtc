@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Weak};
+use parking_lot::RwLock;
 use tokio::sync::watch;
 use tracing::debug;
 
@@ -42,16 +43,16 @@ impl IceConn {
     }
 
     pub fn set_remote_rtcp_addr(&self, addr: Option<SocketAddr>) {
-        *self.remote_rtcp_addr.write().unwrap() = addr;
+        *self.remote_rtcp_addr.write() = addr;
         self.rtcp_latched.store(false, Ordering::Relaxed);
     }
 
     pub fn set_dtls_receiver(&self, receiver: Arc<dyn PacketReceiver>) {
-        *self.dtls_receiver.write().unwrap() = Some(Arc::downgrade(&receiver));
+        *self.dtls_receiver.write() = Some(Arc::downgrade(&receiver));
     }
 
     pub fn set_rtp_receiver(&self, receiver: Arc<dyn PacketReceiver>) {
-        *self.rtp_receiver.write().unwrap() = Some(Arc::downgrade(&receiver));
+        *self.rtp_receiver.write() = Some(Arc::downgrade(&receiver));
     }
 
     pub async fn send(&self, buf: &[u8]) -> Result<usize> {
@@ -62,7 +63,7 @@ impl IceConn {
         let socket_opt = socket_rx.borrow().clone();
 
         if let Some(socket) = socket_opt {
-            let remote = *self.remote_addr.read().unwrap();
+            let remote = *self.remote_addr.read();
             if remote.port() == 0 {
                 return Err(anyhow::anyhow!("Remote address not set"));
             }
@@ -73,7 +74,7 @@ impl IceConn {
             let mut socket_rx = self.socket_rx.clone();
             let socket_opt = socket_rx.borrow_and_update().clone();
             if let Some(socket) = socket_opt {
-                let remote = *self.remote_addr.read().unwrap();
+                let remote = *self.remote_addr.read();
                 if remote.port() == 0 {
                     return Err(anyhow::anyhow!("Remote address not set"));
                 }
@@ -91,10 +92,10 @@ impl IceConn {
         let socket_opt = socket_rx.borrow().clone();
 
         if let Some(socket) = socket_opt {
-            let remote = if let Some(rtcp_addr) = *self.remote_rtcp_addr.read().unwrap() {
+            let remote = if let Some(rtcp_addr) = *self.remote_rtcp_addr.read() {
                 rtcp_addr
             } else {
-                *self.remote_addr.read().unwrap()
+                *self.remote_addr.read()
             };
 
             if remote.port() == 0 {
@@ -106,10 +107,10 @@ impl IceConn {
             let mut socket_rx = self.socket_rx.clone();
             let socket_opt = socket_rx.borrow_and_update().clone();
             if let Some(socket) = socket_opt {
-                let remote = if let Some(rtcp_addr) = *self.remote_rtcp_addr.read().unwrap() {
+                let remote = if let Some(rtcp_addr) = *self.remote_rtcp_addr.read() {
                     rtcp_addr
                 } else {
-                    *self.remote_addr.read().unwrap()
+                    *self.remote_addr.read()
                 };
 
                 if remote.port() == 0 {
@@ -133,11 +134,11 @@ impl PacketReceiver for IceConn {
 
         let first_byte = packet[0];
         // Scope for read lock
-        let current_remote = *self.remote_addr.read().unwrap();
+        let current_remote = *self.remote_addr.read();
 
         // If remote_addr is unspecified (port 0), accept and update
         if current_remote.port() == 0 {
-            *self.remote_addr.write().unwrap() = addr;
+            *self.remote_addr.write() = addr;
         } else if addr != current_remote {
             // Note: We no longer automatically switch the remote address just by receiving
             // a packet from a new source (e.g. DTLS). This prevents "path flapping"
@@ -153,7 +154,7 @@ impl PacketReceiver for IceConn {
         if (20..64).contains(&first_byte) {
             // DTLS
             let receiver = {
-                let rx_lock = self.dtls_receiver.read().unwrap();
+                let rx_lock = self.dtls_receiver.read();
                 if let Some(rx) = &*rx_lock {
                     rx.upgrade()
                 } else {
@@ -175,7 +176,7 @@ impl PacketReceiver for IceConn {
                 if is_rtcp {
                     // RTCP may teach the RTCP destination in non-mux mode, but it must
                     // never override the RTP remote address.
-                    let mut remote_rtcp_addr = self.remote_rtcp_addr.write().unwrap();
+                    let mut remote_rtcp_addr = self.remote_rtcp_addr.write();
                     if let Some(current_rtcp_remote) = *remote_rtcp_addr
                         && addr != current_rtcp_remote
                         && !self.rtcp_latched.load(Ordering::Relaxed)
@@ -184,12 +185,12 @@ impl PacketReceiver for IceConn {
                         self.rtcp_latched.store(true, Ordering::Relaxed);
                     }
                 } else if addr != current_remote && !self.rtp_latched.load(Ordering::Relaxed) {
-                    *self.remote_addr.write().unwrap() = addr;
+                    *self.remote_addr.write() = addr;
                     self.rtp_latched.store(true, Ordering::Relaxed);
                 }
             }
             let receiver = {
-                let rx_lock = self.rtp_receiver.read().unwrap();
+                let rx_lock = self.rtp_receiver.read();
                 if let Some(rx) = &*rx_lock {
                     rx.upgrade()
                 } else {
@@ -282,7 +283,7 @@ mod tests {
         conn.receive(Bytes::from_static(&[0x80, 0x00, 0x00, 0x00]), latched_addr)
             .await;
 
-        assert_eq!(*conn.remote_addr.read().unwrap(), latched_addr);
+        assert_eq!(*conn.remote_addr.read(), latched_addr);
     }
 
     #[tokio::test]
@@ -298,7 +299,7 @@ mod tests {
         let rtp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
         conn.receive(Bytes::from_static(&[0x80, 0x60, 0x00, 0x00]), rtp_src)
             .await;
-        assert_eq!(*conn.remote_addr.read().unwrap(), rtp_src);
+        assert_eq!(*conn.remote_addr.read(), rtp_src);
         assert!(conn.rtp_latched.load(Ordering::Relaxed));
 
         let rtcp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5001);
@@ -306,7 +307,7 @@ mod tests {
             .await;
 
         assert_eq!(
-            *conn.remote_addr.read().unwrap(),
+            *conn.remote_addr.read(),
             rtp_src,
             "RTCP should not override RTP remote address"
         );
@@ -331,7 +332,7 @@ mod tests {
             .await;
 
         assert_eq!(
-            *conn.remote_rtcp_addr.read().unwrap(),
+            *conn.remote_rtcp_addr.read(),
             Some(rtcp_src),
             "RTCP should latch its own destination"
         );
@@ -357,14 +358,14 @@ mod tests {
         let rtcp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5001);
         conn.receive(Bytes::from_static(&[0x80, 0xC8, 0x00, 0x00]), rtcp_src)
             .await;
-        assert_eq!(*conn.remote_rtcp_addr.read().unwrap(), Some(rtcp_src));
+        assert_eq!(*conn.remote_rtcp_addr.read(), Some(rtcp_src));
 
         let rogue_rtcp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6001);
         conn.receive(Bytes::from_static(&[0x80, 0xC8, 0x00, 0x00]), rogue_rtcp_src)
             .await;
 
         assert_eq!(
-            *conn.remote_rtcp_addr.read().unwrap(),
+            *conn.remote_rtcp_addr.read(),
             Some(rtcp_src),
             "RTCP should not re-latch after already latched"
         );
@@ -381,13 +382,13 @@ mod tests {
         let rtp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
         conn.receive(Bytes::from_static(&[0x80, 0x60, 0x00, 0x00]), rtp_src)
             .await;
-        assert_eq!(*conn.remote_addr.read().unwrap(), rtp_src);
+        assert_eq!(*conn.remote_addr.read(), rtp_src);
 
         conn.receive(Bytes::from_static(&[0x80, 0xC8, 0x00, 0x00]), rtp_src)
             .await;
-        assert_eq!(*conn.remote_addr.read().unwrap(), rtp_src);
+        assert_eq!(*conn.remote_addr.read(), rtp_src);
         assert!(
-            conn.remote_rtcp_addr.read().unwrap().is_none(),
+            conn.remote_rtcp_addr.read().is_none(),
             "RTCP address should remain None in mux mode"
         );
     }
@@ -414,7 +415,7 @@ mod tests {
             conn.receive(packet, rtcp_src).await;
 
             assert_eq!(
-                *conn.remote_addr.read().unwrap(),
+                *conn.remote_addr.read(),
                 rtp_src,
                 "RTP address changed for RTCP PT={}",
                 pt

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU16, AtomicUsize};
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 
@@ -185,12 +185,12 @@ impl DataChannel {
     }
 
     pub(crate) fn send_event(&self, event: DataChannelEvent) {
-        if let Some(tx) = &*self.tx.lock().unwrap() {
+        if let Some(tx) = &*self.tx.lock() {
             let _ = tx.send(event);
         }
     }
 
     pub(crate) fn close_channel(&self) {
-        *self.tx.lock().unwrap() = None;
+        *self.tx.lock() = None;
     }
 }

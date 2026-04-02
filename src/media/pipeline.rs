@@ -1,6 +1,7 @@
 use crate::{
     media::error::{MediaError, MediaResult},
     media::frame::{MediaKind, MediaSample},
+    media::spsc::SpscRing,
     media::track::{MediaStreamTrack, SampleStreamSource, SampleStreamTrack, sample_track},
 };
 use async_trait::async_trait;
@@ -8,7 +9,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{sync::Notify, task::JoinHandle};
 
 #[async_trait]
 pub trait MediaSource: Send + Sync {
@@ -53,31 +54,144 @@ impl MediaSource for TrackMediaSource {
 
 pub struct ChannelMediaSink {
     kind: MediaKind,
-    sender: mpsc::Sender<MediaSample>,
+    sender: SampleQueueSender,
 }
 
 pub struct ChannelMediaSource {
     id: Arc<str>,
     kind: MediaKind,
-    receiver: mpsc::Receiver<MediaSample>,
+    receiver: SampleQueueReceiver,
     ended: bool,
+}
+
+pub struct SampleQueueSender {
+    queue: Arc<SpscRing<MediaSample>>,
+    notify: Arc<Notify>,
+    pop_lock: Arc<parking_lot::Mutex<()>>,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+pub struct SampleQueueReceiver {
+    queue: Arc<SpscRing<MediaSample>>,
+    notify: Arc<Notify>,
+    pop_lock: Arc<parking_lot::Mutex<()>>,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+fn sample_queue_channel(capacity: usize) -> (SampleQueueSender, SampleQueueReceiver) {
+    let queue = Arc::new(SpscRing::with_capacity(capacity));
+    let notify = Arc::new(Notify::new());
+    let pop_lock = Arc::new(parking_lot::Mutex::new(()));
+    let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    (
+        SampleQueueSender {
+            queue: queue.clone(),
+            notify: notify.clone(),
+            pop_lock: pop_lock.clone(),
+            closed: closed.clone(),
+        },
+        SampleQueueReceiver {
+            queue,
+            notify,
+            pop_lock,
+            closed,
+        },
+    )
+}
+
+impl SampleQueueSender {
+    pub async fn send(&self, sample: MediaSample) -> Result<(), ()> {
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(());
+        }
+
+        let sample = match self.queue.push(sample) {
+            Ok(()) => {
+                self.notify.notify_one();
+                return Ok(());
+            }
+            Err(sample) => sample,
+        };
+
+        let _guard = match self.pop_lock.try_lock() {
+            Some(g) => g,
+            None => return Ok(()),
+        };
+
+        let _ = self.queue.pop();
+        if self.queue.push(sample).is_ok() {
+            self.notify.notify_one();
+        }
+        Ok(())
+    }
+
+    pub fn try_send(&self, sample: MediaSample) -> Result<(), MediaSample> {
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(sample);
+        }
+
+        match self.queue.push(sample) {
+            Ok(()) => {
+                self.notify.notify_one();
+                Ok(())
+            }
+            Err(sample) => Err(sample),
+        }
+    }
+}
+
+impl Drop for SampleQueueSender {
+    fn drop(&mut self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
+}
+
+impl SampleQueueReceiver {
+    pub async fn recv(&mut self) -> Option<MediaSample> {
+        loop {
+            {
+                let _guard = self.pop_lock.lock();
+                if let Some(sample) = self.queue.pop() {
+                    return Some(sample);
+                }
+                if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+                    return None;
+                }
+            }
+
+            let notified = self.notify.notified();
+            if self.queue.is_empty() && !self.closed.load(std::sync::atomic::Ordering::Acquire) {
+                notified.await;
+            }
+        }
+    }
+}
+
+impl Drop for SampleQueueReceiver {
+    fn drop(&mut self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
 }
 
 static CHANNEL_SOURCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 impl ChannelMediaSink {
-    pub fn new(kind: MediaKind, sender: mpsc::Sender<MediaSample>) -> Self {
+    pub fn new(kind: MediaKind, sender: SampleQueueSender) -> Self {
         Self { kind, sender }
     }
 
-    pub fn channel(kind: MediaKind, capacity: usize) -> (Self, mpsc::Receiver<MediaSample>) {
-        let (sender, receiver) = mpsc::channel(capacity);
+    pub fn channel(kind: MediaKind, capacity: usize) -> (Self, SampleQueueReceiver) {
+        let (sender, receiver) = sample_queue_channel(capacity);
         (Self::new(kind, sender), receiver)
     }
 }
 
 impl ChannelMediaSource {
-    pub fn new(id: Arc<str>, kind: MediaKind, receiver: mpsc::Receiver<MediaSample>) -> Self {
+    pub fn new(id: Arc<str>, kind: MediaKind, receiver: SampleQueueReceiver) -> Self {
         Self {
             id,
             kind,
@@ -86,8 +200,8 @@ impl ChannelMediaSource {
         }
     }
 
-    pub fn channel(kind: MediaKind, capacity: usize) -> (mpsc::Sender<MediaSample>, Self) {
-        let (sender, receiver) = mpsc::channel(capacity);
+    pub fn channel(kind: MediaKind, capacity: usize) -> (SampleQueueSender, Self) {
+        let (sender, receiver) = sample_queue_channel(capacity);
         let id = next_channel_source_id();
         (sender, Self::new(id, kind, receiver))
     }
@@ -111,15 +225,10 @@ impl MediaSink for ChannelMediaSink {
                 actual: sample.kind(),
             });
         }
-        match self.sender.try_send(sample) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(sample)) => self
-                .sender
-                .send(sample)
-                .await
-                .map_err(|_| MediaError::Closed),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(MediaError::Closed),
-        }
+        self.sender
+            .send(sample)
+            .await
+            .map_err(|_| MediaError::Closed)
     }
 }
 

@@ -273,6 +273,14 @@ impl TurnClient {
         Ok((bytes, tx_id))
     }
 
+    /// Update the stored nonce (and realm) after receiving a 401/438 from the TURN server.
+    /// Must be called before retrying the request that triggered the stale-nonce error.
+    pub(crate) async fn update_nonce(&self, realm: String, nonce: String) {
+        if let Some(state) = self.auth.lock().await.as_mut() {
+            state.update_nonce(realm, nonce);
+        }
+    }
+
     pub(crate) async fn bound_peers(&self) -> Vec<SocketAddr> {
         self.channels.lock().await.keys().cloned().collect()
     }

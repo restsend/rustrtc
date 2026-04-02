@@ -2,17 +2,18 @@ use crate::{
     media::{
         error::{MediaError, MediaResult},
         frame::{AudioFrame, MediaKind, MediaSample, VideoFrame},
+        spsc::SpscRing,
     },
     transports::ice::stun::random_u64,
 };
 use async_trait::async_trait;
+use parking_lot::Mutex as SyncMutex;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::broadcast::error::TryRecvError as BroadcastTryRecvError;
-use tokio::sync::mpsc::error::TryRecvError as MpscTryRecvError;
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, Notify, broadcast, mpsc};
 use tracing::{debug, warn};
 
 #[derive(Debug, Clone)]
@@ -64,7 +65,10 @@ pub trait VideoStreamTrack: MediaStreamTrack {
 pub struct SampleStreamTrack {
     id: Arc<str>,
     kind: MediaKind,
-    receiver: Mutex<mpsc::Receiver<MediaSample>>,
+    queue: Arc<SpscRing<MediaSample>>,
+    notify: Arc<Notify>,
+    pop_lock: Arc<SyncMutex<()>>,
+    source_closed: Arc<AtomicBool>,
     ended: AtomicBool,
     feedback_tx: mpsc::Sender<FeedbackEvent>,
 }
@@ -77,14 +81,18 @@ impl SampleStreamTrack {
     /// Stop this track by marking it as ended
     pub fn stop(&self) {
         self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.notify.notify_waiters();
     }
 }
 
-#[derive(Clone)]
 pub struct SampleStreamSource {
     id: Arc<str>,
     kind: MediaKind,
-    sender: mpsc::Sender<MediaSample>,
+    queue: Arc<SpscRing<MediaSample>>,
+    notify: Arc<Notify>,
+    pop_lock: Arc<SyncMutex<()>>,
+    source_closed: Arc<AtomicBool>,
+    active_senders: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 fn next_track_id() -> Arc<str> {
@@ -105,21 +113,79 @@ pub fn sample_track(
     Arc<SampleStreamTrack>,
     mpsc::Receiver<FeedbackEvent>,
 ) {
-    let (sender, receiver) = mpsc::channel(capacity);
+    let queue = Arc::new(SpscRing::with_capacity(capacity));
+    let notify = Arc::new(Notify::new());
+    let pop_lock = Arc::new(SyncMutex::new(()));
+    let source_closed = Arc::new(AtomicBool::new(false));
+    let active_senders = Arc::new(std::sync::atomic::AtomicUsize::new(1));
     let (feedback_tx, feedback_rx) = mpsc::channel(10);
     let id = next_track_id();
     let track = Arc::new(SampleStreamTrack {
         id: id.clone(),
         kind,
-        receiver: Mutex::new(receiver),
+        queue: queue.clone(),
+        notify: notify.clone(),
+        pop_lock: pop_lock.clone(),
+        source_closed: source_closed.clone(),
         ended: AtomicBool::new(false),
         feedback_tx,
     });
-    let source = SampleStreamSource { id, kind, sender };
+    let source = SampleStreamSource {
+        id,
+        kind,
+        queue,
+        notify,
+        pop_lock,
+        source_closed,
+        active_senders,
+    };
     (source, track, feedback_rx)
 }
 
+impl Clone for SampleStreamSource {
+    fn clone(&self) -> Self {
+        self.active_senders
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self {
+            id: self.id.clone(),
+            kind: self.kind,
+            queue: self.queue.clone(),
+            notify: self.notify.clone(),
+            pop_lock: self.pop_lock.clone(),
+            source_closed: self.source_closed.clone(),
+            active_senders: self.active_senders.clone(),
+        }
+    }
+}
+
 impl SampleStreamSource {
+    fn try_send_drop_oldest(&self, sample: MediaSample) -> MediaResult<()> {
+        if self.source_closed.load(Ordering::Acquire) {
+            return Err(MediaError::Closed);
+        }
+
+        let sample = match self.queue.push(sample) {
+            Ok(()) => {
+                self.notify.notify_one();
+                return Ok(());
+            }
+            Err(sample) => sample,
+        };
+
+        // Queue full: try drop-oldest under a short critical section.
+        let _pop_guard = match self.pop_lock.try_lock() {
+            Some(guard) => guard,
+            None => return Ok(()),
+        };
+
+        let _ = self.queue.pop();
+        if self.queue.push(sample).is_ok() {
+            self.notify.notify_one();
+        }
+
+        Ok(())
+    }
+
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -143,15 +209,7 @@ impl SampleStreamSource {
                 actual: sample.kind(),
             });
         }
-        match self.sender.try_send(sample) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(sample)) => self
-                .sender
-                .send(sample)
-                .await
-                .map_err(|_| MediaError::Closed),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(MediaError::Closed),
-        }
+        self.try_send_drop_oldest(sample)
     }
 
     pub async fn send_many<I>(&self, samples: I) -> MediaResult<()>
@@ -166,16 +224,7 @@ impl SampleStreamSource {
                 });
             }
 
-            match self.sender.try_send(sample) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(sample)) => {
-                    self.sender
-                        .send(sample)
-                        .await
-                        .map_err(|_| MediaError::Closed)?;
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => return Err(MediaError::Closed),
-            }
+            self.try_send_drop_oldest(sample)?;
         }
 
         Ok(())
@@ -196,10 +245,28 @@ impl SampleStreamSource {
                 actual: sample.kind(),
             });
         }
-        self.sender.try_send(sample).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => MediaError::WouldBlock,
-            mpsc::error::TrySendError::Closed(_) => MediaError::Closed,
-        })
+        if self.source_closed.load(Ordering::Acquire) {
+            return Err(MediaError::Closed);
+        }
+
+        self.queue
+            .push(sample)
+            .map_err(|_| MediaError::WouldBlock)?;
+        self.notify.notify_one();
+        Ok(())
+    }
+}
+
+impl Drop for SampleStreamSource {
+    fn drop(&mut self) {
+        if self
+            .active_senders
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.source_closed.store(true, Ordering::Release);
+            self.notify.notify_waiters();
+        }
     }
 }
 
@@ -224,7 +291,7 @@ struct RelayInner {
     started: AtomicBool,
     ended: AtomicBool,
     feedback_tx: mpsc::Sender<FeedbackEvent>,
-    feedback_rx: std::sync::Mutex<Option<mpsc::Receiver<FeedbackEvent>>>,
+    feedback_rx: SyncMutex<Option<mpsc::Receiver<FeedbackEvent>>>,
 }
 
 impl MediaRelay {
@@ -257,7 +324,7 @@ impl MediaRelay {
                 started: AtomicBool::new(false),
                 ended: AtomicBool::new(false),
                 feedback_tx,
-                feedback_rx: std::sync::Mutex::new(Some(feedback_rx)),
+                feedback_rx: SyncMutex::new(Some(feedback_rx)),
             }),
         }
     }
@@ -282,7 +349,7 @@ impl RelayInner {
             .is_ok()
         {
             let this = Arc::clone(self);
-            let mut rx_guard = self.feedback_rx.lock().unwrap();
+            let mut rx_guard = self.feedback_rx.lock();
             let mut feedback_rx = rx_guard.take().unwrap();
 
             tokio::spawn(async move {
@@ -376,22 +443,27 @@ impl MediaStreamTrack for SampleStreamTrack {
     }
 
     async fn recv(&self) -> MediaResult<MediaSample> {
-        let mut rx = self.receiver.lock().await;
-
-        match rx.try_recv() {
-            Ok(sample) => return Ok(sample),
-            Err(MpscTryRecvError::Empty) => {}
-            Err(MpscTryRecvError::Disconnected) => {
-                self.ended.store(true, Ordering::SeqCst);
+        loop {
+            if self.ended.load(Ordering::SeqCst) {
                 return Err(MediaError::EndOfStream);
             }
-        }
 
-        match rx.recv().await {
-            Some(sample) => Ok(sample),
-            None => {
+            {
+                let _pop_guard = self.pop_lock.lock();
+                if let Some(sample) = self.queue.pop() {
+                    return Ok(sample);
+                }
+
+                if self.source_closed.load(Ordering::Acquire) {
+                    self.ended.store(true, Ordering::SeqCst);
+                    return Err(MediaError::EndOfStream);
+                }
+            }
+
+            self.notify.notified().await;
+            if self.source_closed.load(Ordering::Acquire) && self.queue.is_empty() {
                 self.ended.store(true, Ordering::SeqCst);
-                Err(MediaError::EndOfStream)
+                return Err(MediaError::EndOfStream);
             }
         }
     }
@@ -668,6 +740,47 @@ mod tests {
         source.send_audio(frame.clone()).await.unwrap();
         let output = track.recv_audio().await.unwrap();
         assert_eq!(output.payload_type, frame.payload_type);
+    }
+
+    #[tokio::test]
+    async fn send_drops_when_queue_is_full() {
+        let (source, _track, _) = sample_track(MediaKind::Audio, 1);
+        source.send_audio(AudioFrame::default()).await.unwrap();
+        source.send_audio(AudioFrame::default()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_full_queue_drops_oldest_sample() {
+        let (source, track, _) = sample_track(MediaKind::Audio, 1);
+        let first = AudioFrame {
+            data: Bytes::from_static(&[1u8]),
+            ..Default::default()
+        };
+        let second = AudioFrame {
+            data: Bytes::from_static(&[2u8]),
+            ..Default::default()
+        };
+
+        source.send_audio(first).await.unwrap();
+        source.send_audio(second.clone()).await.unwrap();
+
+        let recv = track.recv_audio().await.unwrap();
+        assert_eq!(recv.data, second.data);
+    }
+
+    #[tokio::test]
+    async fn send_does_not_block_when_receiver_lock_is_held() {
+        let (source, _track, _) = sample_track(MediaKind::Audio, 1);
+        source.send_audio(AudioFrame::default()).await.unwrap();
+
+        let _pop_lock = source.pop_lock.lock();
+        tokio::time::timeout(
+            tokio::time::Duration::from_millis(20),
+            source.send_audio(AudioFrame::default()),
+        )
+        .await
+        .expect("send should not block while receiver lock is held")
+        .unwrap();
     }
 
     #[tokio::test]

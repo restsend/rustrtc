@@ -32,4 +32,5 @@ pub use transports::ice::{
     IceCandidate, IceCandidatePair, IceCandidateType, IceGathererState, IceRole, IceTransport,
     IceTransportState,
 };
+pub use transports::rtp::RtpRewriteBridgeParams;
 pub use transports::sctp::{DataChannelEvent, DataChannelState};

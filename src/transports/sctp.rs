@@ -8,7 +8,8 @@ use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, trace};
@@ -611,9 +612,9 @@ fn apply_sack_to_sent_queue(
 
 impl<'a> Drop for SctpCleanupGuard<'a> {
     fn drop(&mut self) {
-        *self.inner.state.lock().unwrap() = SctpState::Closed;
+        *self.inner.state.lock() = SctpState::Closed;
 
-        let channels = self.inner.data_channels.lock().unwrap();
+        let channels = self.inner.data_channels.lock();
         for weak_dc in channels.iter() {
             if let Some(dc) = weak_dc.upgrade() {
                 let old_state = dc
@@ -779,19 +780,19 @@ impl SctpTransport {
 
     /// Returns the reason why the SCTP association closed, if available.
     pub fn close_reason(&self) -> Option<String> {
-        self.inner.close_reason.lock().unwrap().clone()
+        self.inner.close_reason.lock().clone()
     }
 
     /// Returns a diagnostic summary of the SCTP transport state.
     /// Useful for understanding connection health when the close reason is unknown.
     pub fn diagnostic_info(&self) -> String {
-        let state = self.inner.state.lock().unwrap().clone();
-        let rto = self.inner.rto_state.lock().unwrap().rto;
+        let state = self.inner.state.lock().clone();
+        let rto = self.inner.rto_state.lock().rto;
         let error_count = self.inner.association_error_count.load(Ordering::SeqCst);
         let max_retransmits = self.inner.max_association_retransmits;
         let retransmissions = self.inner.stats_retransmissions.load(Ordering::SeqCst);
         let flight_size = self.inner.flight_size.load(Ordering::SeqCst);
-        let sent_queue_len = self.inner.sent_queue.lock().unwrap().len();
+        let sent_queue_len = self.inner.sent_queue.lock().len();
         let consecutive_hb_failures = self
             .inner
             .consecutive_heartbeat_failures
@@ -799,7 +800,7 @@ impl SctpTransport {
         let duration = self.inner.stats_created_time.elapsed();
         let bytes_sent = self.inner.stats_bytes_sent.load(Ordering::SeqCst);
         let bytes_received = self.inner.stats_bytes_received.load(Ordering::SeqCst);
-        let close_reason = self.inner.close_reason.lock().unwrap().clone();
+        let close_reason = self.inner.close_reason.lock().clone();
 
         format!(
             "state={:?}, duration={:.0}s, rto={:.1}s, errors={}/{}, hb_failures={}, retransmits={}, \
@@ -839,7 +840,7 @@ impl SctpInner {
         mut incoming_data_rx: mpsc::UnboundedReceiver<Bytes>,
     ) {
         debug!("SctpTransport run_loop started");
-        *self.state.lock().unwrap() = SctpState::Connecting;
+        *self.state.lock() = SctpState::Connecting;
 
         // Guard to ensure cleanup happens on drop (cancellation)
         let _guard = SctpCleanupGuard { inner: self };
@@ -873,7 +874,7 @@ impl SctpInner {
         loop {
             // Check if state was changed to Closed by timeout handler
             {
-                let state = self.state.lock().unwrap();
+                let state = self.state.lock();
                 if *state == SctpState::Closed {
                     debug!("SctpTransport run_loop exiting (state is Closed)");
                     break;
@@ -884,7 +885,7 @@ impl SctpInner {
 
             // 1. Calculate RTO Timeout
             let rto_timeout_cached = {
-                let cached = self.cached_rto_timeout.lock().unwrap();
+                let cached = self.cached_rto_timeout.lock();
                 if let Some((last_calc, timeout)) = *cached {
                     if now.duration_since(last_calc) < Duration::from_millis(10) {
                         Some(timeout)
@@ -900,8 +901,8 @@ impl SctpInner {
                 t
             } else {
                 let t = {
-                    let sent_queue = self.sent_queue.lock().unwrap();
-                    let rto = self.rto_state.lock().unwrap().rto;
+                    let sent_queue = self.sent_queue.lock();
+                    let rto = self.rto_state.lock().rto;
                     let mut soonest_expiry = None;
                     let mut soonest_tsn = None;
 
@@ -939,7 +940,7 @@ impl SctpInner {
                         Duration::from_secs(3600)
                     }
                 };
-                let mut cached = self.cached_rto_timeout.lock().unwrap();
+                let mut cached = self.cached_rto_timeout.lock();
                 *cached = Some((now, t));
                 t
             };
@@ -953,9 +954,9 @@ impl SctpInner {
 
             // 3. Calculate T1 Timeout (only when T1 is active during connection setup)
             let t1_timeout = if self.t1_active.load(Ordering::Relaxed) {
-                let t1_sent = self.t1_sent_time.lock().unwrap();
+                let t1_sent = self.t1_sent_time.lock();
                 if let Some(sent) = *t1_sent {
-                    let rto = self.rto_state.lock().unwrap().rto;
+                    let rto = self.rto_state.lock().rto;
                     let expiry = sent + Duration::from_secs_f64(rto);
                     if expiry > now {
                         expiry - now
@@ -974,7 +975,7 @@ impl SctpInner {
             tokio::select! {
                 _ = close_rx.notified() => {
                     debug!("SctpTransport run_loop exiting (closed)");
-                    *self.close_reason.lock().unwrap() = Some("LOCAL_CLOSE".into());
+                    *self.close_reason.lock() = Some("LOCAL_CLOSE".into());
                     break;
                 },
                 res = dtls_state_rx.changed() => {
@@ -987,13 +988,13 @@ impl SctpInner {
                                     DtlsState::Failed => "DTLS_FAILED",
                                     _ => "DTLS_CLOSED",
                                 };
-                                *self.close_reason.lock().unwrap() = Some(reason.into());
+                                *self.close_reason.lock() = Some(reason.into());
                                 break;
                             }
                         }
                         Err(_) => {
                             debug!("SctpTransport run_loop exiting (DTLS state channel closed)");
-                            *self.close_reason.lock().unwrap() = Some("DTLS_CHANNEL_CLOSED".into());
+                            *self.close_reason.lock() = Some("DTLS_CHANNEL_CLOSED".into());
                             break;
                         }
                     }
@@ -1045,7 +1046,7 @@ impl SctpInner {
                         }
                         None => {
                             debug!("SCTP loop error: Channel closed");
-                            *self.close_reason.lock().unwrap() = Some("INCOMING_CHANNEL_CLOSED".into());
+                            *self.close_reason.lock() = Some("INCOMING_CHANNEL_CLOSED".into());
                             break;
                         }
                     }
@@ -1055,7 +1056,7 @@ impl SctpInner {
         debug!("SctpTransport run_loop finished");
 
         // Print stats on loop exit if connection was established
-        let final_state = *self.state.lock().unwrap();
+        let final_state = *self.state.lock();
         if final_state == SctpState::Closed {
             self.print_stats("LOOP_EXIT");
         }
@@ -1064,9 +1065,9 @@ impl SctpInner {
     async fn handle_t1_timeout(&self) -> Result<()> {
         let now = Instant::now();
         let should_fire = {
-            let sent = self.t1_sent_time.lock().unwrap();
+            let sent = self.t1_sent_time.lock();
             if let Some(t) = *sent {
-                let rto = self.rto_state.lock().unwrap().rto;
+                let rto = self.rto_state.lock().rto;
                 now >= t + Duration::from_secs_f64(rto)
             } else {
                 false
@@ -1082,36 +1083,36 @@ impl SctpInner {
         if failures > SCTP_MAX_INIT_RETRANS {
             debug!("SCTP T1 max retransmissions exceeded, closing");
             self.t1_cancel();
-            *self.close_reason.lock().unwrap() = Some("INIT_TIMEOUT".into());
+            *self.close_reason.lock() = Some("INIT_TIMEOUT".into());
             self.set_state(SctpState::Closed);
             return Ok(());
         }
 
-        self.rto_state.lock().unwrap().backoff();
+        self.rto_state.lock().backoff();
 
         let chunk_to_send = {
-            let t1 = self.t1_chunk.lock().unwrap();
+            let t1 = self.t1_chunk.lock();
             t1.clone()
         };
 
         if let Some((chunk_type, chunk_body, vtag)) = chunk_to_send {
-            *self.t1_sent_time.lock().unwrap() = Some(now);
+            *self.t1_sent_time.lock() = Some(now);
             self.send_chunk(chunk_type, 0, chunk_body, vtag).await?;
         }
         Ok(())
     }
 
     fn t1_start(&self, chunk_type: u8, chunk_body: Bytes, vtag: u32) {
-        *self.t1_chunk.lock().unwrap() = Some((chunk_type, chunk_body, vtag));
+        *self.t1_chunk.lock() = Some((chunk_type, chunk_body, vtag));
         self.t1_failures.store(0, Ordering::SeqCst);
-        *self.t1_sent_time.lock().unwrap() = Some(Instant::now());
+        *self.t1_sent_time.lock() = Some(Instant::now());
         self.t1_active.store(true, Ordering::SeqCst);
     }
 
     fn t1_cancel(&self) {
         self.t1_active.store(false, Ordering::SeqCst);
-        *self.t1_chunk.lock().unwrap() = None;
-        *self.t1_sent_time.lock().unwrap() = None;
+        *self.t1_chunk.lock() = None;
+        *self.t1_sent_time.lock() = None;
         self.t1_failures.store(0, Ordering::SeqCst);
     }
 
@@ -1159,10 +1160,10 @@ impl SctpInner {
     // aiortc-style T3 expiry logic
     async fn handle_timeout(&self) -> Result<()> {
         let now = Instant::now();
-        let rto = { self.rto_state.lock().unwrap().rto };
+        let rto = { self.rto_state.lock().rto };
         let rto_dur = Duration::from_secs_f64(rto);
         {
-            let last_fire = self.last_t3_fire_time.lock().unwrap();
+            let last_fire = self.last_t3_fire_time.lock();
             if let Some(last) = *last_fire {
                 let since_last = now.duration_since(last);
                 // Must wait at least half the current RTO before re-firing
@@ -1175,7 +1176,7 @@ impl SctpInner {
 
         let mut t3_expired = false;
         {
-            let sent_queue = self.sent_queue.lock().unwrap();
+            let sent_queue = self.sent_queue.lock();
             for (_, record) in sent_queue.iter() {
                 if !record.acked && !record.abandoned && now >= record.sent_time + rto_dur {
                     t3_expired = true;
@@ -1189,10 +1190,10 @@ impl SctpInner {
         }
 
         // Record T3 fire time BEFORE backoff
-        *self.last_t3_fire_time.lock().unwrap() = Some(now);
+        *self.last_t3_fire_time.lock() = Some(now);
 
         let new_rto = {
-            let mut rto_state = self.rto_state.lock().unwrap();
+            let mut rto_state = self.rto_state.lock();
             rto_state.backoff();
             rto_state.rto
         };
@@ -1211,7 +1212,7 @@ impl SctpInner {
         const MAX_PER_TSN_T3_RETRANSMITS: u32 = 8;
 
         {
-            let mut sent_queue = self.sent_queue.lock().unwrap();
+            let mut sent_queue = self.sent_queue.lock();
             let mut retransmitted_tsn = None;
 
             for (tsn, record) in sent_queue.iter_mut() {
@@ -1269,7 +1270,7 @@ impl SctpInner {
     }
 
     fn update_rto(&self, rtt: f64) {
-        let mut rto_state = self.rto_state.lock().unwrap();
+        let mut rto_state = self.rto_state.lock();
         rto_state.update(rtt);
         trace!(
             "RTT update: rtt={} srtt={} rttvar={} rto={}",
@@ -1320,7 +1321,7 @@ impl SctpInner {
     }
 
     fn set_state(&self, new_state: SctpState) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if *state != new_state {
             debug!("SCTP state transition: {:?} -> {:?}", *state, new_state);
             *state = new_state;
@@ -1399,7 +1400,7 @@ impl SctpInner {
                     self.association_error_count.store(0, Ordering::SeqCst);
                     self.consecutive_heartbeat_failures
                         .store(0, Ordering::SeqCst);
-                    let mut sent_time = self.heartbeat_sent_time.lock().unwrap();
+                    let mut sent_time = self.heartbeat_sent_time.lock();
                     if let Some(start) = *sent_time {
                         let rtt = now.duration_since(start).as_secs_f64();
                         trace!("SCTP Heartbeat RTT: {:.3}s", rtt);
@@ -1416,7 +1417,7 @@ impl SctpInner {
                         error_count, self.max_association_retransmits
                     );
                     self.print_stats("REMOTE_ABORT");
-                    *self.close_reason.lock().unwrap() = Some("REMOTE_ABORT".into());
+                    *self.close_reason.lock() = Some("REMOTE_ABORT".into());
                     self.set_state(SctpState::Closed);
                 }
                 CT_SHUTDOWN => {
@@ -1428,7 +1429,7 @@ impl SctpInner {
                 CT_SHUTDOWN_ACK => {
                     debug!("SCTP SHUTDOWN ACK received, closing connection");
                     self.print_stats("REMOTE_SHUTDOWN");
-                    *self.close_reason.lock().unwrap() = Some("REMOTE_SHUTDOWN".into());
+                    *self.close_reason.lock() = Some("REMOTE_SHUTDOWN".into());
                     self.set_state(SctpState::Closed);
                 }
                 _ => {
@@ -1564,14 +1565,14 @@ impl SctpInner {
 
     async fn handle_cookie_ack(&self, _chunk: Bytes) -> Result<()> {
         self.t1_cancel();
-        *self.state.lock().unwrap() = SctpState::Connected;
+        *self.state.lock() = SctpState::Connected;
         self.advanced_peer_ack_tsn.store(
             self.next_tsn.load(Ordering::SeqCst).wrapping_sub(1),
             Ordering::SeqCst,
         );
 
         let channels_to_process = {
-            let mut channels = self.data_channels.lock().unwrap();
+            let mut channels = self.data_channels.lock();
             let mut to_process = Vec::new();
             channels.retain(|weak_dc| {
                 if let Some(dc) = weak_dc.upgrade() {
@@ -1607,7 +1608,7 @@ impl SctpInner {
         if chunk.len() >= 12 {
             // Record that we received a SACK - peer is alive
             {
-                let mut last_sack = self.last_sack_time.lock().unwrap();
+                let mut last_sack = self.last_sack_time.lock();
                 *last_sack = Some(Instant::now());
             }
 
@@ -1658,7 +1659,7 @@ impl SctpInner {
 
             let now = Instant::now();
             let outcome = {
-                let mut sent_queue = self.sent_queue.lock().unwrap();
+                let mut sent_queue = self.sent_queue.lock();
 
                 // Log SACK receipt with flight size and queue info (inside same lock)
                 let current_flight = self.flight_size.load(Ordering::SeqCst);
@@ -1699,7 +1700,7 @@ impl SctpInner {
             if outcome.bytes_acked_by_cum_tsn > 0 || !outcome.rtt_samples.is_empty() {
                 self.association_error_count.store(0, Ordering::SeqCst);
                 // Reset T3 fire guard on successful SACK progress
-                *self.last_t3_fire_time.lock().unwrap() = None;
+                *self.last_t3_fire_time.lock() = None;
 
                 let ssthresh = self.ssthresh.load(Ordering::SeqCst);
                 if ssthresh <= SSTHRESH_MIN && outcome.bytes_acked_by_cum_tsn > 0 {
@@ -1747,7 +1748,7 @@ impl SctpInner {
             if outcome.rtt_samples.is_empty()
                 && (outcome.bytes_acked_by_cum_tsn > 0 || outcome.bytes_acked_by_gap > 0)
             {
-                let mut rto_state = self.rto_state.lock().unwrap();
+                let mut rto_state = self.rto_state.lock();
                 if rto_state.srtt > 0.0 {
                     let computed_rto = (rto_state.srtt + 4.0 * rto_state.rttvar)
                         .clamp(rto_state.min, rto_state.max);
@@ -1837,7 +1838,7 @@ impl SctpInner {
 
             if outcome.head_moved || outcome.flight_reduction > 0 {
                 self.timer_notify.notify_one();
-                let mut cached = self.cached_rto_timeout.lock().unwrap();
+                let mut cached = self.cached_rto_timeout.lock();
                 *cached = None;
             }
 
@@ -1850,7 +1851,7 @@ impl SctpInner {
 
                 if !in_fast_recovery {
                     let now_fr = Instant::now();
-                    let last_entry = *self.last_fast_recovery_entry.lock().unwrap();
+                    let last_entry = *self.last_fast_recovery_entry.lock();
                     let since_last = now_fr.duration_since(last_entry);
 
                     // Cooldown: if we just exited Fast Recovery very recently, don't
@@ -1896,7 +1897,7 @@ impl SctpInner {
                         self.fast_recovery_exit_tsn
                             .store(highest_tsn, Ordering::SeqCst);
 
-                        *self.last_fast_recovery_entry.lock().unwrap() = now_fr;
+                        *self.last_fast_recovery_entry.lock() = now_fr;
 
                         debug!(
                             "Entering Fast Recovery! cwnd_tx {} -> {}, cwnd_rx {} -> {}, ssthresh: {}, exit_tsn: {}, retransmitting {} chunks{}",
@@ -1929,14 +1930,14 @@ impl SctpInner {
         let tag = self.remote_verification_tag.load(Ordering::SeqCst);
         self.send_chunk(CT_COOKIE_ACK, 0, Bytes::new(), tag).await?;
 
-        *self.state.lock().unwrap() = SctpState::Connected;
+        *self.state.lock() = SctpState::Connected;
         self.advanced_peer_ack_tsn.store(
             self.next_tsn.load(Ordering::SeqCst).wrapping_sub(1),
             Ordering::SeqCst,
         );
 
         let channels_to_process = {
-            let mut channels = self.data_channels.lock().unwrap();
+            let mut channels = self.data_channels.lock();
             let mut to_process = Vec::new();
             channels.retain(|weak_dc| {
                 if let Some(dc) = weak_dc.upgrade() {
@@ -1992,20 +1993,20 @@ impl SctpInner {
                 .store(new_cumulative_tsn, Ordering::SeqCst);
 
             {
-                let mut received_queue = self.received_queue.lock().unwrap();
+                let mut received_queue = self.received_queue.lock();
                 received_queue.retain(|&tsn, _| tsn > new_cumulative_tsn);
             }
 
             // Advance SSNs for ordered streams
             if !stream_ssn_pairs.is_empty() {
-                let mut streams = self.inbound_streams.lock().unwrap();
+                let mut streams = self.inbound_streams.lock();
                 for (sid, ssn) in &stream_ssn_pairs {
                     if let Some(stream) = streams.get_mut(sid) {
                         stream.advance_ssn_to(*ssn);
                         // Deliver any messages that are now ready
                         let ready = stream.drain_ready();
                         if !ready.is_empty() {
-                            let channels = self.data_channels.lock().unwrap();
+                            let channels = self.data_channels.lock();
                             for weak_dc in channels.iter() {
                                 if let Some(dc) = weak_dc.upgrade() {
                                     if dc.id == *sid {
@@ -2084,7 +2085,7 @@ impl SctpInner {
         }
 
         {
-            let channels = self.data_channels.lock().unwrap();
+            let channels = self.data_channels.lock();
             for weak_dc in channels.iter() {
                 if let Some(dc) = weak_dc.upgrade() {
                     if streams.is_empty() || streams.contains(&dc.id) {
@@ -2097,7 +2098,7 @@ impl SctpInner {
 
         // Reset inbound stream state for affected streams
         {
-            let mut inbound = self.inbound_streams.lock().unwrap();
+            let mut inbound = self.inbound_streams.lock();
             if streams.is_empty() {
                 inbound.clear();
             } else {
@@ -2178,7 +2179,7 @@ impl SctpInner {
     pub async fn close_data_channel(&self, channel_id: u16) -> Result<()> {
         // 1. Find the channel and set state to Closing
         {
-            let channels = self.data_channels.lock().unwrap();
+            let channels = self.data_channels.lock();
             if let Some(dc) = channels
                 .iter()
                 .find_map(|w| w.upgrade().filter(|d| d.id == channel_id))
@@ -2193,13 +2194,13 @@ impl SctpInner {
 
         // 3. Clean up inbound stream state
         {
-            let mut streams = self.inbound_streams.lock().unwrap();
+            let mut streams = self.inbound_streams.lock();
             streams.remove(&channel_id);
         }
 
         // 4. Set state to Closed
         {
-            let channels = self.data_channels.lock().unwrap();
+            let channels = self.data_channels.lock();
             if let Some(dc) = channels
                 .iter()
                 .find_map(|w| w.upgrade().filter(|d| d.id == channel_id))
@@ -2216,15 +2217,15 @@ impl SctpInner {
     async fn send_heartbeat(&self) -> Result<()> {
         let now = Instant::now();
         {
-            let mut sent_time = self.heartbeat_sent_time.lock().unwrap();
+            let mut sent_time = self.heartbeat_sent_time.lock();
             if sent_time.is_some() {
-                let rto = self.rto_state.lock().unwrap().rto;
+                let rto = self.rto_state.lock().rto;
                 let is_rto_backing_off = rto > 2.0;
 
                 // Check if a SACK was received recently — proves the peer is alive
                 // even if HEARTBEAT_ACKs are being dropped (e.g. TURN rate limiting).
                 let peer_alive_via_sack = {
-                    let last_sack = self.last_sack_time.lock().unwrap();
+                    let last_sack = self.last_sack_time.lock();
                     if let Some(t) = *last_sack {
                         // Consider peer alive if SACK received within 2× heartbeat interval (30s)
                         now.duration_since(t) < Duration::from_secs(30)
@@ -2255,7 +2256,7 @@ impl SctpInner {
                     if !is_rto_backing_off {
                         let error_count =
                             self.association_error_count.fetch_add(1, Ordering::SeqCst) + 1;
-                        let sent_queue_len = self.sent_queue.lock().unwrap().len();
+                        let sent_queue_len = self.sent_queue.lock().len();
                         debug!(
                             "SCTP Heartbeat timeout! Error count: {}/{}, consecutive failures: {}, pending chunks: {}",
                             error_count,
@@ -2266,14 +2267,14 @@ impl SctpInner {
                         if error_count >= self.max_association_retransmits
                             && self.max_association_retransmits > 0
                         {
-                            let rto_state = self.rto_state.lock().unwrap();
+                            let rto_state = self.rto_state.lock();
                             debug!(
                                 "SCTP Association heartbeat timeout limit reached ({}/{}), RTO={:.1}s, closing connection",
                                 error_count, self.max_association_retransmits, rto_state.rto
                             );
                             drop(rto_state);
                             self.print_stats("HEARTBEAT_TIMEOUT");
-                            *self.close_reason.lock().unwrap() = Some("HEARTBEAT_TIMEOUT".into());
+                            *self.close_reason.lock() = Some("HEARTBEAT_TIMEOUT".into());
                             self.set_state(SctpState::Closed);
                             return Ok(());
                         }
@@ -2292,7 +2293,7 @@ impl SctpInner {
                                 consecutive_failures, rto
                             );
                             self.print_stats("HEARTBEAT_DEAD");
-                            *self.close_reason.lock().unwrap() = Some("HEARTBEAT_DEAD".into());
+                            *self.close_reason.lock() = Some("HEARTBEAT_DEAD".into());
                             self.set_state(SctpState::Closed);
                             return Ok(());
                         }
@@ -2344,7 +2345,7 @@ impl SctpInner {
         if diff == 0 || diff > 0x80000000 {
             // Duplicate or Old: record duplicate and schedule fast SACK
             {
-                let mut dups = self.dups_buffer.lock().unwrap();
+                let mut dups = self.dups_buffer.lock();
                 if dups.len() < MAX_DUPS_BUFFER_SIZE {
                     dups.push(tsn);
                 }
@@ -2356,7 +2357,7 @@ impl SctpInner {
         // Fast path: if this is the very next expected TSN and queue is empty,
         // process immediately without touching received_queue at all.
         if diff == 1 {
-            let is_queue_empty = self.received_queue.lock().unwrap().is_empty();
+            let is_queue_empty = self.received_queue.lock().is_empty();
             if is_queue_empty {
                 self.process_data_payload(flags, chunk).await?;
                 self.cumulative_tsn_ack.store(tsn, Ordering::Relaxed);
@@ -2369,7 +2370,7 @@ impl SctpInner {
         // Store in received_queue and process in order under one lock
         let mut to_process = Vec::new();
         {
-            let mut received_queue = self.received_queue.lock().unwrap();
+            let mut received_queue = self.received_queue.lock();
             if !received_queue.contains_key(&tsn) {
                 // Limit received_queue size to prevent memory bloat
                 if received_queue.len() >= MAX_RECEIVED_QUEUE_SIZE {
@@ -2438,7 +2439,7 @@ impl SctpInner {
             // sender side when sent ordered.
             let unordered = (flags & 0x04) != 0;
             if !unordered {
-                let mut streams = self.inbound_streams.lock().unwrap();
+                let mut streams = self.inbound_streams.lock();
                 let stream = streams.entry(stream_id).or_insert_with(InboundStream::new);
                 // Treat it like a delivered message: enqueue and discard the
                 // result (DCEP payload is handled separately below).
@@ -2454,7 +2455,7 @@ impl SctpInner {
 
         // Direct lookup: find the channel by stream_id without building a HashMap
         let dc = {
-            let channels = self.data_channels.lock().unwrap();
+            let channels = self.data_channels.lock();
             channels
                 .iter()
                 .find_map(|w| w.upgrade().filter(|d| d.id == stream_id))
@@ -2465,7 +2466,7 @@ impl SctpInner {
             let e_bit = (flags & 0x01) != 0;
             let unordered = (flags & 0x04) != 0;
 
-            let mut buffer = dc.reassembly_buffer.lock().unwrap();
+            let mut buffer = dc.reassembly_buffer.lock();
             if b_bit {
                 if !buffer.is_empty() {
                     debug!(
@@ -2483,7 +2484,7 @@ impl SctpInner {
                 if unordered || !dc.ordered {
                     dc.send_event(DataChannelEvent::Message(msg));
                 } else {
-                    let mut streams = self.inbound_streams.lock().unwrap();
+                    let mut streams = self.inbound_streams.lock();
                     let stream = streams.entry(stream_id).or_insert_with(InboundStream::new);
                     let ready = stream.enqueue(stream_seq, msg);
                     for m in ready {
@@ -2510,7 +2511,7 @@ impl SctpInner {
 
                 let mut found = false;
                 {
-                    let channels = self.data_channels.lock().unwrap();
+                    let channels = self.data_channels.lock();
                     for weak_dc in channels.iter() {
                         if let Some(dc) = weak_dc.upgrade() {
                             if dc.id == stream_id {
@@ -2551,7 +2552,7 @@ impl SctpInner {
                     dc.send_event(DataChannelEvent::Open);
 
                     {
-                        let mut channels = self.data_channels.lock().unwrap();
+                        let mut channels = self.data_channels.lock();
                         channels.push(Arc::downgrade(&dc));
                     }
 
@@ -2570,7 +2571,7 @@ impl SctpInner {
             }
             DCEP_TYPE_ACK => {
                 trace!("Received DCEP ACK for stream {}", stream_id);
-                let channels = self.data_channels.lock().unwrap();
+                let channels = self.data_channels.lock();
                 for weak_dc in channels.iter() {
                     if let Some(dc) = weak_dc.upgrade() {
                         if dc.id == stream_id {
@@ -2603,7 +2604,7 @@ impl SctpInner {
     /// the number of blocks to keep the SACK compact and stay within 16-bit
     /// offsets.
     fn build_gap_ack_blocks(&self, cumulative_tsn_ack: u32) -> Vec<(u16, u16)> {
-        let received = self.received_queue.lock().unwrap();
+        let received = self.received_queue.lock();
         build_gap_ack_blocks_from_map(&received, cumulative_tsn_ack)
     }
 
@@ -2703,7 +2704,7 @@ impl SctpInner {
 
         if let Err(_) = self.outgoing_packet_tx.send(buf.freeze()) {
             debug!("Failed to send SCTP packet to transport: channel closed");
-            *self.close_reason.lock().unwrap() = Some("TRANSPORT_CLOSED".into());
+            *self.close_reason.lock() = Some("TRANSPORT_CLOSED".into());
             self.set_state(SctpState::Closed);
             return Err(anyhow::anyhow!("Transport channel closed"));
         }
@@ -2726,7 +2727,7 @@ impl SctpInner {
 
     pub async fn send_data_raw(&self, channel_id: u16, ppid: u32, data: &[u8]) -> Result<()> {
         let dc_opt = {
-            let channels = self.data_channels.lock().unwrap();
+            let channels = self.data_channels.lock();
             channels
                 .iter()
                 .find_map(|weak_dc| weak_dc.upgrade().filter(|dc| dc.id == channel_id))
@@ -2806,7 +2807,7 @@ impl SctpInner {
                 max_retransmits,
                 expiry,
             };
-            self.outbound_queue.lock().unwrap().push_back(chunk);
+            self.outbound_queue.lock().push_back(chunk);
             self.timer_notify.notify_one();
             return Ok(());
         }
@@ -2814,7 +2815,7 @@ impl SctpInner {
         // Create a single Bytes from the input and use .slice() to avoid per-fragment copies
         let data_bytes = Bytes::copy_from_slice(data);
         let mut offset = 0;
-        let mut queue = self.outbound_queue.lock().unwrap();
+        let mut queue = self.outbound_queue.lock();
 
         while offset < total_len {
             let remaining = total_len - offset;
@@ -2882,7 +2883,7 @@ impl SctpInner {
 
         // 2. Retransmit Phase (Priority)
         {
-            let mut sent = self.sent_queue.lock().unwrap();
+            let mut sent = self.sent_queue.lock();
             let mut recovery_tx = self.fast_recovery_transmit.load(Ordering::Relaxed);
 
             for (_, record) in sent.iter_mut() {
@@ -2915,7 +2916,7 @@ impl SctpInner {
             let mut batch: Vec<OutboundChunk> = Vec::new();
             let mut dequeued_bytes = 0usize;
             {
-                let mut outbound = self.outbound_queue.lock().unwrap();
+                let mut outbound = self.outbound_queue.lock();
                 while budget > 0 && batch.len() < 1000 {
                     if let Some(chunk_info) = outbound.pop_front() {
                         let chunk_wire_size = CHUNK_HEADER_SIZE + 12 + chunk_info.payload.len();
@@ -2934,7 +2935,7 @@ impl SctpInner {
             }
 
             let now = Instant::now();
-            let mut sent = self.sent_queue.lock().unwrap();
+            let mut sent = self.sent_queue.lock();
             for chunk_info in batch {
                 let tsn = self.next_tsn.fetch_add(1, Ordering::Relaxed);
                 let wire_chunk = self.create_data_chunk(
@@ -3007,7 +3008,7 @@ impl SctpInner {
     }
 
     fn update_advanced_peer_ack_point(&self) {
-        let mut sent_queue = self.sent_queue.lock().unwrap();
+        let mut sent_queue = self.sent_queue.lock();
 
         // First: check all unacked chunks for abandonment
         let mut abandon_messages: Vec<(u16, u16)> = Vec::new();
@@ -3088,7 +3089,7 @@ impl SctpInner {
                 }
             }
             {
-                let mut fwd = self.forward_tsn_streams.lock().unwrap();
+                let mut fwd = self.forward_tsn_streams.lock();
                 *fwd = stream_ssn.into_iter().collect();
             }
             for t in remove {
@@ -3109,7 +3110,7 @@ impl SctpInner {
         }
 
         let stream_ssn_pairs: Vec<(u16, u16)> = {
-            let mut fwd = self.forward_tsn_streams.lock().unwrap();
+            let mut fwd = self.forward_tsn_streams.lock();
             std::mem::take(&mut *fwd)
         };
 
@@ -3182,7 +3183,7 @@ impl SctpInner {
 
         let gap_blocks = self.build_gap_ack_blocks(cumulative_tsn_ack);
         let dups = {
-            let mut d = self.dups_buffer.lock().unwrap();
+            let mut d = self.dups_buffer.lock();
             let take = d.len().min(32);
             let out: Vec<u32> = d.drain(..take).collect();
             out
@@ -3280,8 +3281,8 @@ impl SctpInner {
         let ssthresh = self.ssthresh.load(Ordering::SeqCst);
         let flight_size = self.flight_size.load(Ordering::SeqCst);
         let peer_rwnd = self.peer_rwnd.load(Ordering::SeqCst);
-        let sent_queue_len = self.sent_queue.lock().unwrap().len();
-        let rto = self.rto_state.lock().unwrap().rto;
+        let sent_queue_len = self.sent_queue.lock().len();
+        let rto = self.rto_state.lock().rto;
 
         debug!(
             "\n==================== SCTP CONNECTION CLOSED ====================\n\
@@ -3613,11 +3614,11 @@ mod tests {
         tokio::spawn(runner);
 
         // Set state to Connecting
-        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        *sctp.inner.state.lock() = SctpState::Connecting;
 
         // Add a chunk to sent queue with transmit_count already at 8 (the limit)
         {
-            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let mut sent_queue = sctp.inner.sent_queue.lock();
             sent_queue.insert(
                 100,
                 ChunkRecord {
@@ -3645,7 +3646,7 @@ mod tests {
 
         // Check that the chunk is now abandoned
         {
-            let sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let sent_queue = sctp.inner.sent_queue.lock();
             let record = sent_queue.get(&100).unwrap();
             assert!(
                 record.abandoned,
@@ -3654,7 +3655,7 @@ mod tests {
         }
 
         // Connection should NOT be closed - aiortc behavior is to keep connection alive
-        let state_after = sctp.inner.state.lock().unwrap().clone();
+        let state_after = sctp.inner.state.lock().clone();
         assert_eq!(
             state_after,
             SctpState::Connecting,
@@ -3700,7 +3701,7 @@ mod tests {
 
         tokio::spawn(runner);
 
-        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
             .remote_verification_tag
             .store(12345, Ordering::SeqCst);
@@ -3708,7 +3709,7 @@ mod tests {
         // Simulate scenario: TSN 100-104 sent, TSN 100 lost, others received
         // This creates Gap ACK blocks without cumulative TSN advancing
         {
-            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let mut sent_queue = sctp.inner.sent_queue.lock();
             // TSN 100 - lost, will timeout
             sent_queue.insert(
                 100,
@@ -3774,7 +3775,7 @@ mod tests {
             // Add new packets for this iteration (TSN 100+i*10 to 104+i*10)
             let base_tsn = 100 + (iteration - 1) * 10;
             {
-                let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+                let mut sent_queue = sctp.inner.sent_queue.lock();
                 // Lost packet
                 sent_queue.insert(
                     base_tsn,
@@ -3835,7 +3836,7 @@ mod tests {
             max_error_count_seen = max_error_count_seen.max(error_count_after_timeout);
 
             // Check if connection closed
-            let state = sctp.inner.state.lock().unwrap().clone();
+            let state = sctp.inner.state.lock().clone();
             if state == SctpState::Closed {
                 println!("\n!!! Connection CLOSED at iteration {} !!!", iteration);
                 panic!(
@@ -3882,7 +3883,7 @@ mod tests {
         }
 
         // Final verification
-        let final_state = sctp.inner.state.lock().unwrap().clone();
+        let final_state = sctp.inner.state.lock().clone();
         let final_error_count = sctp.inner.association_error_count.load(Ordering::SeqCst);
 
         println!("\n=== Final State (After Fix) ===");
@@ -3969,7 +3970,7 @@ mod tests {
 
         tokio::spawn(runner);
 
-        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
             .remote_verification_tag
             .store(12345, Ordering::SeqCst);
@@ -3996,7 +3997,7 @@ mod tests {
 
             // Add packets to sent queue
             {
-                let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+                let mut sent_queue = sctp.inner.sent_queue.lock();
                 for i in 0..10 {
                     let tsn = (batch * 10 + i) as u32;
                     let is_lost = lost_packets.contains(&(tsn as i32));
@@ -4046,7 +4047,7 @@ mod tests {
                 println!("Error count after timeout: {}", error_count);
 
                 // Check if connection closed
-                let state = sctp.inner.state.lock().unwrap().clone();
+                let state = sctp.inner.state.lock().clone();
                 if state == SctpState::Closed {
                     println!("\n!!! CONNECTION CLOSED after {} batches !!!", batch + 1);
                     println!(
@@ -4107,7 +4108,7 @@ mod tests {
         println!("\n=== Summary ===");
         println!("Error count history: {:?}", error_count_history);
 
-        let final_state = sctp.inner.state.lock().unwrap().clone();
+        let final_state = sctp.inner.state.lock().clone();
         let final_error_count = sctp.inner.association_error_count.load(Ordering::SeqCst);
 
         if final_state == SctpState::Closed {
@@ -4158,14 +4159,14 @@ mod tests {
 
         tokio::spawn(runner);
 
-        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
             .remote_verification_tag
             .store(12345, Ordering::SeqCst);
 
         // Add a packet to sent queue
         {
-            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let mut sent_queue = sctp.inner.sent_queue.lock();
             sent_queue.insert(
                 100,
                 ChunkRecord {
@@ -4244,7 +4245,7 @@ mod tests {
 
         tokio::spawn(runner);
 
-        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
             .remote_verification_tag
             .store(12345, Ordering::SeqCst);
@@ -4256,7 +4257,7 @@ mod tests {
         println!("- Dynamic retransmission should help drain the queue\n");
 
         // Simulate a large backlog of unacked packets
-        let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+        let mut sent_queue = sctp.inner.sent_queue.lock();
         for i in 0..60 {
             sent_queue.insert(
                 100 + i,
@@ -4287,7 +4288,7 @@ mod tests {
         // Trigger timeout - should use aggressive retransmission strategy
         sctp.inner.handle_timeout().await.unwrap();
 
-        let state = sctp.inner.state.lock().unwrap().clone();
+        let state = sctp.inner.state.lock().clone();
         println!("After timeout, connection state: {:?}", state);
 
         // With the improved strategy, we should see a debuging about large queue
@@ -4327,7 +4328,7 @@ mod tests {
 
         tokio::spawn(runner);
 
-        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
             .remote_verification_tag
             .store(12345, Ordering::SeqCst);
@@ -4340,7 +4341,7 @@ mod tests {
         let payload_len = payload.len();
 
         {
-            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let mut sent_queue = sctp.inner.sent_queue.lock();
             sent_queue.insert(
                 tsn,
                 ChunkRecord {
@@ -4379,7 +4380,7 @@ mod tests {
 
         let flight_after_timeout = sctp.inner.flight_size.load(Ordering::SeqCst);
         let (in_flight_after_timeout, transmit_count) = {
-            let sq = sctp.inner.sent_queue.lock().unwrap();
+            let sq = sctp.inner.sent_queue.lock();
             sq.get(&tsn)
                 .map(|r| (r.in_flight, r.transmit_count))
                 .unwrap_or((false, 0))
@@ -4399,7 +4400,7 @@ mod tests {
         sctp.inner.handle_sack(sack).await.unwrap();
 
         let flight_after_sack = sctp.inner.flight_size.load(Ordering::SeqCst);
-        let tsn_exists = sctp.inner.sent_queue.lock().unwrap().contains_key(&tsn);
+        let tsn_exists = sctp.inner.sent_queue.lock().contains_key(&tsn);
         println!("  After: flight_size={}", flight_after_sack);
         println!("  TSN {} in queue: {}", tsn, tsn_exists);
 
@@ -4482,7 +4483,7 @@ mod tests {
 
         // Insert two packets, both in_flight
         {
-            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let mut sent_queue = sctp.inner.sent_queue.lock();
             sent_queue.insert(
                 tsn1,
                 ChunkRecord {
@@ -4535,7 +4536,7 @@ mod tests {
         // Simulate handle_timeout() behavior
         println!("\n⏱️  Step 1: RTO timeout occurs");
         {
-            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let mut sent_queue = sctp.inner.sent_queue.lock();
 
             // First: timeout decrements ALL in_flight packets
             println!("  → Phase 1: Decrementing ALL in_flight packets");
@@ -4570,7 +4571,7 @@ mod tests {
         );
 
         let (in_flight_100, in_flight_101) = {
-            let sq = sctp.inner.sent_queue.lock().unwrap();
+            let sq = sctp.inner.sent_queue.lock();
             (
                 sq.get(&tsn1).map(|r| r.in_flight).unwrap_or(false),
                 sq.get(&tsn2).map(|r| r.in_flight).unwrap_or(false),
@@ -4598,7 +4599,7 @@ mod tests {
 
         // Check TSN states
         let (tsn100_exists, tsn100_acked, tsn100_in_flight) = {
-            let sq = sctp.inner.sent_queue.lock().unwrap();
+            let sq = sctp.inner.sent_queue.lock();
             if let Some(r) = sq.get(&tsn1) {
                 (true, r.acked, r.in_flight)
             } else {
@@ -4606,7 +4607,7 @@ mod tests {
             }
         };
         let (tsn101_exists, tsn101_acked, tsn101_in_flight) = {
-            let sq = sctp.inner.sent_queue.lock().unwrap();
+            let sq = sctp.inner.sent_queue.lock();
             if let Some(r) = sq.get(&tsn2) {
                 (true, r.acked, r.in_flight)
             } else {
@@ -4657,7 +4658,7 @@ mod tests {
         // After SACK: TSN 100 acked (in_flight was set true for retransmit, but now cleared)
         //             TSN 101 may be added via drain_retransmissions
         // The key is that we don't have negative or unreasonably high flight_size
-        let queue_len = sctp.inner.sent_queue.lock().unwrap().len();
+        let queue_len = sctp.inner.sent_queue.lock().len();
         if fs_after_sack <= len2 * 2 {
             println!("\n✅ FIX VERIFIED: flight_size is reasonable!");
             println!("  • TSN 100 acked, flight correctly accounted");
@@ -5014,14 +5015,14 @@ mod tests {
 
         tokio::spawn(runner);
 
-        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
             .remote_verification_tag
             .store(12345, Ordering::SeqCst);
 
         // Add a timed-out chunk
         {
-            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let mut sent_queue = sctp.inner.sent_queue.lock();
             sent_queue.insert(
                 100,
                 ChunkRecord {
@@ -5047,7 +5048,7 @@ mod tests {
         // Trigger multiple timeouts to cause backoff
         for i in 0..10 {
             sctp.inner.handle_timeout().await.unwrap();
-            let rto = sctp.inner.rto_state.lock().unwrap().rto;
+            let rto = sctp.inner.rto_state.lock().rto;
             println!("✓ Iteration {}: RTO = {:.1}s", i + 1, rto);
 
             // FIX验证: After several backoffs, RTO should be capped at 4s
@@ -5057,7 +5058,7 @@ mod tests {
 
             // Reset sent_time for next iteration
             {
-                let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+                let mut sent_queue = sctp.inner.sent_queue.lock();
                 if let Some(record) = sent_queue.get_mut(&100) {
                     record.sent_time = Instant::now() - Duration::from_secs(10);
                 }
@@ -5096,7 +5097,7 @@ mod tests {
 
         tokio::spawn(runner);
 
-        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
             .remote_verification_tag
             .store(12345, Ordering::SeqCst);
@@ -5111,7 +5112,7 @@ mod tests {
 
         // Add a timed-out chunk
         {
-            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let mut sent_queue = sctp.inner.sent_queue.lock();
             sent_queue.insert(
                 100,
                 ChunkRecord {
@@ -5179,7 +5180,7 @@ mod tests {
         tokio::spawn(runner);
 
         // Set initial state
-        *sctp.inner.state.lock().unwrap() = SctpState::Connected;
+        *sctp.inner.state.lock() = SctpState::Connected;
         sctp.inner
             .remote_verification_tag
             .store(12345, Ordering::SeqCst);
@@ -5192,7 +5193,7 @@ mod tests {
 
         // Add multiple packets to sent_queue (simulating in-flight data)
         {
-            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let mut sent_queue = sctp.inner.sent_queue.lock();
             for i in 0..10 {
                 sent_queue.insert(
                     101 + i,
@@ -5279,7 +5280,7 @@ mod tests {
 
         tokio::spawn(runner);
 
-        *sctp.inner.state.lock().unwrap() = SctpState::Connected;
+        *sctp.inner.state.lock() = SctpState::Connected;
         sctp.inner
             .remote_verification_tag
             .store(12345, Ordering::SeqCst);
@@ -5287,7 +5288,7 @@ mod tests {
 
         // Simulate a packet that has been retransmitted but cooldown has passed
         {
-            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let mut sent_queue = sctp.inner.sent_queue.lock();
             sent_queue.insert(
                 101,
                 ChunkRecord {
@@ -5350,7 +5351,7 @@ mod tests {
 
             sctp.inner.handle_sack(sack.freeze()).await.unwrap();
 
-            let sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let sent_queue = sctp.inner.sent_queue.lock();
             if let Some(record) = sent_queue.get(&101) {
                 println!(
                     "✓ Iteration {}: transmit_count={}, missing_reports={}, fast_retransmit={}",
@@ -5406,7 +5407,7 @@ mod tests {
 
         tokio::spawn(runner);
 
-        *sctp.inner.state.lock().unwrap() = SctpState::Connected;
+        *sctp.inner.state.lock() = SctpState::Connected;
         sctp.inner
             .remote_verification_tag
             .store(12345, Ordering::SeqCst);
@@ -5414,7 +5415,7 @@ mod tests {
 
         // Simulate a packet that has been fast retransmitted 5 times (at the limit)
         {
-            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let mut sent_queue = sctp.inner.sent_queue.lock();
             sent_queue.insert(
                 101,
                 ChunkRecord {
@@ -5472,7 +5473,7 @@ mod tests {
 
         // Process many SACKs - fast retransmit should NOT trigger because we're at the limit
         let initial_transmit_count = {
-            let sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let sent_queue = sctp.inner.sent_queue.lock();
             sent_queue.get(&101).unwrap().transmit_count
         };
 
@@ -5481,7 +5482,7 @@ mod tests {
         }
 
         let final_transmit_count = {
-            let sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let sent_queue = sctp.inner.sent_queue.lock();
             sent_queue.get(&101).unwrap().transmit_count
         };
 
@@ -5534,12 +5535,12 @@ mod tests {
         );
 
         tokio::spawn(runner);
-        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner.next_tsn.store(101, Ordering::SeqCst);
 
         // Inject many unacked packets
         {
-            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let mut sent_queue = sctp.inner.sent_queue.lock();
             for i in 100..150 {
                 sent_queue.insert(
                     i,
@@ -5587,7 +5588,7 @@ mod tests {
             // Second: simulate RTO timeout
             // Reset sent_time to trigger timeout
             {
-                let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+                let mut sent_queue = sctp.inner.sent_queue.lock();
                 for record in sent_queue.values_mut() {
                     if !record.acked {
                         record.sent_time = Instant::now() - Duration::from_secs(5);
@@ -5607,7 +5608,7 @@ mod tests {
             );
 
             // Check state
-            let state = sctp.inner.state.lock().unwrap().clone();
+            let state = sctp.inner.state.lock().clone();
             if state == SctpState::Closed {
                 panic!(
                     "Connection closed at iteration {} - error_count reached max!",
@@ -5616,7 +5617,7 @@ mod tests {
             }
         }
 
-        let final_state = sctp.inner.state.lock().unwrap().clone();
+        let final_state = sctp.inner.state.lock().clone();
         let final_error_count = sctp.inner.association_error_count.load(Ordering::SeqCst);
 
         println!("\n=== Final State ===");
@@ -5904,26 +5905,26 @@ mod tests {
         let t1_failures = AtomicU32::new(0);
         let t1_sent_time: Mutex<Option<Instant>> = Mutex::new(None);
 
-        assert!(t1_chunk.lock().unwrap().is_none());
-        assert!(t1_sent_time.lock().unwrap().is_none());
+        assert!(t1_chunk.lock().is_none());
+        assert!(t1_sent_time.lock().is_none());
         assert_eq!(t1_failures.load(Ordering::SeqCst), 0);
 
         // Simulate t1_start
         let chunk = Bytes::from_static(b"INIT");
-        *t1_chunk.lock().unwrap() = Some((1, chunk.clone(), 0));
-        *t1_sent_time.lock().unwrap() = Some(Instant::now());
+        *t1_chunk.lock() = Some((1, chunk.clone(), 0));
+        *t1_sent_time.lock() = Some(Instant::now());
 
-        assert!(t1_chunk.lock().unwrap().is_some());
-        let (ctype, data, _tag) = t1_chunk.lock().unwrap().clone().unwrap();
+        assert!(t1_chunk.lock().is_some());
+        let (ctype, data, _tag) = t1_chunk.lock().clone().unwrap();
         assert_eq!(ctype, 1);
         assert_eq!(data, chunk);
 
         // Simulate t1_cancel
-        *t1_chunk.lock().unwrap() = None;
-        *t1_sent_time.lock().unwrap() = None;
+        *t1_chunk.lock() = None;
+        *t1_sent_time.lock() = None;
         t1_failures.store(0, Ordering::SeqCst);
 
-        assert!(t1_chunk.lock().unwrap().is_none());
+        assert!(t1_chunk.lock().is_none());
     }
 
     #[test]
@@ -6378,7 +6379,7 @@ mod tests {
 
         tokio::spawn(runner);
 
-        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
             .remote_verification_tag
             .store(12345, Ordering::SeqCst);
@@ -6414,7 +6415,7 @@ mod tests {
 
         // Check received_queue should contain TSN 101
         {
-            let received = sctp.inner.received_queue.lock().unwrap();
+            let received = sctp.inner.received_queue.lock();
             assert!(
                 received.contains_key(&101),
                 "TSN 101 should be in received_queue"
@@ -6528,15 +6529,15 @@ mod tests {
 
         tokio::spawn(runner);
 
-        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
             .remote_verification_tag
             .store(12345, Ordering::SeqCst);
-        sctp.inner.rto_state.lock().unwrap().rto = 0.4; // Start with 400ms RTO like in the bug
+        sctp.inner.rto_state.lock().rto = 0.4; // Start with 400ms RTO like in the bug
 
         // Add a packet that needs retransmission
         {
-            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let mut sent_queue = sctp.inner.sent_queue.lock();
             sent_queue.insert(
                 1000,
                 ChunkRecord {
@@ -6564,11 +6565,11 @@ mod tests {
         for i in 1..=5 {
             println!("--- Retransmission attempt {} ---", i);
 
-            let current_rto = sctp.inner.rto_state.lock().unwrap().rto;
+            let current_rto = sctp.inner.rto_state.lock().rto;
 
             // Reset sent_time to be older than current RTO to trigger timeout
             {
-                let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+                let mut sent_queue = sctp.inner.sent_queue.lock();
                 if let Some(record) = sent_queue.get_mut(&1000) {
                     // Make sent_time at least RTO + 1 second in the past
                     record.sent_time = Instant::now() - Duration::from_secs_f64(current_rto + 1.0);
@@ -6576,15 +6577,15 @@ mod tests {
             }
 
             // Clear the rate limiting guard to simulate RTO timeout
-            *sctp.inner.last_t3_fire_time.lock().unwrap() = None;
+            *sctp.inner.last_t3_fire_time.lock() = None;
 
             // Trigger timeout
             sctp.inner.handle_timeout().await.unwrap();
 
             // Check state
-            let state = sctp.inner.state.lock().unwrap().clone();
+            let state = sctp.inner.state.lock().clone();
             let error_count = sctp.inner.association_error_count.load(Ordering::SeqCst);
-            let rto = sctp.inner.rto_state.lock().unwrap().rto;
+            let rto = sctp.inner.rto_state.lock().rto;
 
             println!(
                 "After timeout {}: state={:?}, error_count={}, rto={:.3}s",
@@ -6593,7 +6594,7 @@ mod tests {
 
             // Check transmit_count
             {
-                let sent_queue = sctp.inner.sent_queue.lock().unwrap();
+                let sent_queue = sctp.inner.sent_queue.lock();
                 if let Some(record) = sent_queue.get(&1000) {
                     println!("TSN 1000 transmit_count: {}", record.transmit_count);
                     assert_eq!(
@@ -6613,7 +6614,7 @@ mod tests {
         }
 
         // Verify connection state after 5 retransmissions
-        let final_state = sctp.inner.state.lock().unwrap().clone();
+        let final_state = sctp.inner.state.lock().clone();
         let final_error_count = sctp.inner.association_error_count.load(Ordering::SeqCst);
 
         println!("\n=== Final State ===");
@@ -6668,7 +6669,7 @@ mod tests {
 
         tokio::spawn(runner);
 
-        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
             .remote_verification_tag
             .store(12345, Ordering::SeqCst);
@@ -6712,7 +6713,7 @@ mod tests {
 
         // Verify duplicate was recorded
         {
-            let dups = sctp.inner.dups_buffer.lock().unwrap();
+            let dups = sctp.inner.dups_buffer.lock();
             assert!(
                 dups.contains(&100),
                 "TSN 100 should be in duplicates buffer"
@@ -6765,7 +6766,7 @@ mod tests {
 
         tokio::spawn(runner);
 
-        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
             .remote_verification_tag
             .store(12345, Ordering::SeqCst);
@@ -6773,7 +6774,7 @@ mod tests {
         // Phase 1: Normal operation - send some packets and receive SACKs
         println!("\n--- Phase 1: Normal operation ---");
         {
-            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let mut sent_queue = sctp.inner.sent_queue.lock();
             for tsn in 100..110 {
                 sent_queue.insert(
                     tsn,
@@ -6802,7 +6803,7 @@ mod tests {
         let sack = build_sack_packet(109, 1024 * 1024, vec![], vec![]);
         sctp.inner.handle_sack(sack).await.unwrap();
 
-        let queue_len = sctp.inner.sent_queue.lock().unwrap().len();
+        let queue_len = sctp.inner.sent_queue.lock().len();
         println!("After SACK: sent_queue len = {} (should be 0)", queue_len);
         assert_eq!(queue_len, 0, "All packets should be acknowledged");
 
@@ -6813,7 +6814,7 @@ mod tests {
         // Phase 3: Send a new packet that will be "lost"
         println!("\n--- Phase 3: Send packet that gets lost ---");
         {
-            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let mut sent_queue = sctp.inner.sent_queue.lock();
             sent_queue.insert(
                 200,
                 ChunkRecord {
@@ -6840,24 +6841,24 @@ mod tests {
         println!("\n--- Phase 4: Repeated timeouts without SACK ---");
         let last_error_count = 0;
         for i in 1..=5 {
-            let current_rto = sctp.inner.rto_state.lock().unwrap().rto;
+            let current_rto = sctp.inner.rto_state.lock().rto;
 
             // Make sent_time old enough
             {
-                let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+                let mut sent_queue = sctp.inner.sent_queue.lock();
                 if let Some(record) = sent_queue.get_mut(&200) {
                     record.sent_time = Instant::now() - Duration::from_secs_f64(current_rto + 1.0);
                 }
             }
 
             // Clear rate limit guard
-            *sctp.inner.last_t3_fire_time.lock().unwrap() = None;
+            *sctp.inner.last_t3_fire_time.lock() = None;
 
             sctp.inner.handle_timeout().await.unwrap();
 
             let error_count = sctp.inner.association_error_count.load(Ordering::SeqCst);
-            let state = sctp.inner.state.lock().unwrap().clone();
-            let rto = sctp.inner.rto_state.lock().unwrap().rto;
+            let state = sctp.inner.state.lock().clone();
+            let rto = sctp.inner.rto_state.lock().rto;
 
             println!(
                 "Timeout {}: error_count={} (was {}), rto={:.3}s, state={:?}",
@@ -6875,7 +6876,7 @@ mod tests {
         }
 
         // Check final state - connection should still be open
-        let final_state = sctp.inner.state.lock().unwrap().clone();
+        let final_state = sctp.inner.state.lock().clone();
         let final_error_count = sctp.inner.association_error_count.load(Ordering::SeqCst);
 
         println!("\n=== Final State ===");
@@ -6936,7 +6937,7 @@ mod tests {
 
         tokio::spawn(runner);
 
-        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
             .remote_verification_tag
             .store(12345, Ordering::SeqCst);
@@ -6963,7 +6964,7 @@ mod tests {
 
         // Verify received_queue has TSN 101
         {
-            let received = sctp.inner.received_queue.lock().unwrap();
+            let received = sctp.inner.received_queue.lock();
             assert!(
                 received.contains_key(&101),
                 "TSN 101 should be in received_queue"
@@ -7024,7 +7025,7 @@ mod tests {
 
         // Verify received_queue is now empty
         {
-            let received = sctp.inner.received_queue.lock().unwrap();
+            let received = sctp.inner.received_queue.lock();
             println!(
                 "  received_queue now contains: {:?}",
                 received.keys().collect::<Vec<_>>()
@@ -7087,7 +7088,7 @@ mod tests {
 
         tokio::spawn(runner);
 
-        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
             .remote_verification_tag
             .store(12345, Ordering::SeqCst);
@@ -7174,7 +7175,7 @@ mod tests {
 
         tokio::spawn(runner);
 
-        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
             .remote_verification_tag
             .store(12345, Ordering::SeqCst);
@@ -7182,7 +7183,7 @@ mod tests {
         // Add unacked packets to sent_queue
         // TSN 100 is unacked (lost), TSN 101-104 are in flight but not acked yet
         {
-            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let mut sent_queue = sctp.inner.sent_queue.lock();
             for tsn in 100..105 {
                 sent_queue.insert(
                     tsn,
@@ -7225,7 +7226,7 @@ mod tests {
 
         // Verify TSN 101-104 are now acked
         {
-            let sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let sent_queue = sctp.inner.sent_queue.lock();
             for tsn in 101..105 {
                 if let Some(record) = sent_queue.get(&tsn) {
                     println!("  TSN {}: acked={}", tsn, record.acked);
@@ -7292,14 +7293,14 @@ mod tests {
         tokio::spawn(runner);
 
         // Set up a connected state with RTO backed off (simulates TURN loss)
-        *sctp.inner.state.lock().unwrap() = SctpState::Connected;
+        *sctp.inner.state.lock() = SctpState::Connected;
         sctp.inner
             .remote_verification_tag
             .store(12345, Ordering::SeqCst);
 
         // Simulate RTO backoff past 2.0s threshold (TURN packet loss causes T3 timeouts)
         {
-            let mut rto = sctp.inner.rto_state.lock().unwrap();
+            let mut rto = sctp.inner.rto_state.lock();
             rto.rto = 6.0; // Backed off RTO — triggers is_rto_backing_off branch
             // srtt stays 0.0 — no fresh RTT samples due to Karn's algorithm
         }
@@ -7319,7 +7320,7 @@ mod tests {
             // algorithm won't update RTT, so RTO stays backed off.
             let base_tsn = 100 + (round - 1) * 10;
             {
-                let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+                let mut sent_queue = sctp.inner.sent_queue.lock();
                 for i in 0..5u32 {
                     sent_queue.insert(
                         base_tsn + i,
@@ -7355,7 +7356,7 @@ mod tests {
 
             // Verify last_sack_time was updated
             {
-                let last_sack = sctp.inner.last_sack_time.lock().unwrap();
+                let last_sack = sctp.inner.last_sack_time.lock();
                 assert!(
                     last_sack.is_some(),
                     "last_sack_time should be set after SACK"
@@ -7363,7 +7364,7 @@ mod tests {
             }
 
             // Verify RTO is still backed off (Karn's algorithm prevented update)
-            let rto_after_sack = sctp.inner.rto_state.lock().unwrap().rto;
+            let rto_after_sack = sctp.inner.rto_state.lock().rto;
             println!(
                 "  RTO after SACK: {:.1}s (should still be >2.0)",
                 rto_after_sack
@@ -7375,7 +7376,7 @@ mod tests {
 
             // Now simulate heartbeat timeout (HEARTBEAT_ACK dropped by TURN)
             {
-                let mut sent_time = sctp.inner.heartbeat_sent_time.lock().unwrap();
+                let mut sent_time = sctp.inner.heartbeat_sent_time.lock();
                 *sent_time = Some(Instant::now() - Duration::from_secs(15));
             }
 
@@ -7386,7 +7387,7 @@ mod tests {
                 .inner
                 .consecutive_heartbeat_failures
                 .load(Ordering::SeqCst);
-            let state = sctp.inner.state.lock().unwrap().clone();
+            let state = sctp.inner.state.lock().clone();
             println!(
                 "  consecutive_heartbeat_failures: {}, state: {:?}",
                 failures, state
@@ -7403,7 +7404,6 @@ mod tests {
                     .last_sack_time
                     .lock()
                     .unwrap()
-                    .unwrap()
                     .elapsed()
                     .as_secs_f64(),
                 failures,
@@ -7412,7 +7412,7 @@ mod tests {
         }
 
         // If we reach here, the fix is applied — connection survived all rounds
-        let final_state = sctp.inner.state.lock().unwrap().clone();
+        let final_state = sctp.inner.state.lock().clone();
         assert_eq!(
             final_state,
             SctpState::Connected,
@@ -7453,14 +7453,14 @@ mod tests {
         );
         tokio::spawn(runner);
 
-        *sctp.inner.state.lock().unwrap() = SctpState::Connected;
+        *sctp.inner.state.lock() = SctpState::Connected;
         sctp.inner
             .remote_verification_tag
             .store(12345, Ordering::SeqCst);
 
         // RTO backed off
         {
-            let mut rto = sctp.inner.rto_state.lock().unwrap();
+            let mut rto = sctp.inner.rto_state.lock();
             rto.rto = 6.0;
         }
 
@@ -7468,13 +7468,13 @@ mod tests {
         // 4 consecutive heartbeat failures should close the connection.
         for round in 1..=5 {
             {
-                let mut sent_time = sctp.inner.heartbeat_sent_time.lock().unwrap();
+                let mut sent_time = sctp.inner.heartbeat_sent_time.lock();
                 *sent_time = Some(Instant::now() - Duration::from_secs(15));
             }
 
             let _ = sctp.inner.send_heartbeat().await;
 
-            let state = sctp.inner.state.lock().unwrap().clone();
+            let state = sctp.inner.state.lock().clone();
             if state == SctpState::Closed {
                 println!(
                     "✅ Connection correctly closed at round {} (peer is dead)",
@@ -7524,7 +7524,7 @@ mod tests {
         );
         tokio::spawn(runner);
 
-        *sctp.inner.state.lock().unwrap() = SctpState::Connected;
+        *sctp.inner.state.lock() = SctpState::Connected;
         sctp.inner
             .remote_verification_tag
             .store(12345, Ordering::SeqCst);
@@ -7534,7 +7534,7 @@ mod tests {
         for i in 0..5 {
             // Add a chunk that will timeout
             {
-                let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+                let mut sent_queue = sctp.inner.sent_queue.lock();
                 sent_queue.insert(
                     200 + i,
                     ChunkRecord {
@@ -7561,7 +7561,7 @@ mod tests {
 
             let cwnd = sctp.inner.cwnd_tx.load(Ordering::SeqCst);
             let ssthresh = sctp.inner.ssthresh.load(Ordering::SeqCst);
-            let rto = sctp.inner.rto_state.lock().unwrap().rto;
+            let rto = sctp.inner.rto_state.lock().rto;
 
             println!(
                 "T3 timeout #{}: cwnd={}, ssthresh={}, rto={:.1}s",
@@ -7574,7 +7574,7 @@ mod tests {
 
         let final_cwnd = sctp.inner.cwnd_tx.load(Ordering::SeqCst);
         let final_ssthresh = sctp.inner.ssthresh.load(Ordering::SeqCst);
-        let final_rto = sctp.inner.rto_state.lock().unwrap().rto;
+        let final_rto = sctp.inner.rto_state.lock().rto;
 
         println!("\n=== After 5 T3 timeouts (simulating TURN rate limit) ===");
         println!("cwnd: {} (min={})", final_cwnd, CWND_MIN_AFTER_RTO);
@@ -7600,7 +7600,7 @@ mod tests {
         // (full utilization), so we must fill the window.
 
         // Clear old chunks
-        sctp.inner.sent_queue.lock().unwrap().clear();
+        sctp.inner.sent_queue.lock().clear();
         sctp.inner.flight_size.store(0, Ordering::SeqCst);
 
         // Add new chunks that fill the cwnd and simulate successful transmission + SACK
@@ -7610,7 +7610,7 @@ mod tests {
             // Use packet size that fills cwnd to trigger slow start growth
             let pkt_size = cwnd.max(1);
             {
-                let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+                let mut sent_queue = sctp.inner.sent_queue.lock();
                 sent_queue.insert(
                     tsn,
                     ChunkRecord {
@@ -7822,7 +7822,7 @@ mod tests {
         );
 
         tokio::spawn(_runner);
-        *sctp.inner.state.lock().unwrap() = SctpState::Connected;
+        *sctp.inner.state.lock() = SctpState::Connected;
         sctp.inner
             .remote_verification_tag
             .store(1, Ordering::SeqCst);
@@ -7843,7 +7843,7 @@ mod tests {
 
         let payload_size = 1024;
         {
-            let mut sent = sctp.inner.sent_queue.lock().unwrap();
+            let mut sent = sctp.inner.sent_queue.lock();
             sent.insert(
                 base_tsn,
                 ChunkRecord {
@@ -7953,7 +7953,7 @@ mod tests {
             &config,
         );
 
-        let rto_state = sctp.inner.rto_state.lock().unwrap();
+        let rto_state = sctp.inner.rto_state.lock();
         assert!(
             (rto_state.rto - 0.5).abs() < 0.01,
             "Initial RTO should be 0.5s, got {}",
@@ -8132,7 +8132,7 @@ mod tests {
             &config,
         );
         tokio::spawn(_runner);
-        *sctp.inner.state.lock().unwrap() = SctpState::Connected;
+        *sctp.inner.state.lock() = SctpState::Connected;
         sctp.inner
             .remote_verification_tag
             .store(1, Ordering::SeqCst);
@@ -8140,19 +8140,19 @@ mod tests {
         // Simulate consecutive heartbeat failures during RTO backoff
         // (RTO > 2.0 means is_rto_backing_off = true)
         {
-            let mut rto_state = sctp.inner.rto_state.lock().unwrap();
+            let mut rto_state = sctp.inner.rto_state.lock();
             rto_state.rto = 5.0; // Force RTO backing off
         }
 
         // Set heartbeat_sent_time so the failure path is triggered
-        *sctp.inner.heartbeat_sent_time.lock().unwrap() =
+        *sctp.inner.heartbeat_sent_time.lock() =
             Some(Instant::now() - Duration::from_secs(30));
 
         // With default config (max_heartbeat_failures=4), the connection would close after 4 failures.
         // With our config (max_heartbeat_failures=8), it should survive through 7 failures.
         for i in 1..=7 {
             sctp.inner.send_heartbeat().await.unwrap();
-            let state = *sctp.inner.state.lock().unwrap();
+            let state = *sctp.inner.state.lock();
             assert_ne!(
                 state,
                 SctpState::Closed,
@@ -8168,20 +8168,20 @@ mod tests {
                 i, failures, state
             );
             // Re-set heartbeat_sent_time for next iteration
-            *sctp.inner.heartbeat_sent_time.lock().unwrap() =
+            *sctp.inner.heartbeat_sent_time.lock() =
                 Some(Instant::now() - Duration::from_secs(30));
         }
 
         // The 8th failure should close the connection
         sctp.inner.send_heartbeat().await.unwrap();
-        let final_state = *sctp.inner.state.lock().unwrap();
+        let final_state = *sctp.inner.state.lock();
         assert_eq!(
             final_state,
             SctpState::Closed,
             "Connection should close at heartbeat failure #8 (max=8)"
         );
 
-        let close_reason = sctp.inner.close_reason.lock().unwrap().clone();
+        let close_reason = sctp.inner.close_reason.lock().clone();
         assert_eq!(close_reason, Some("HEARTBEAT_DEAD".to_string()));
     }
 
@@ -8215,7 +8215,7 @@ mod tests {
             &config,
         );
         tokio::spawn(_runner);
-        *sctp.inner.state.lock().unwrap() = SctpState::Connected;
+        *sctp.inner.state.lock() = SctpState::Connected;
         sctp.inner
             .remote_verification_tag
             .store(1, Ordering::SeqCst);
@@ -8228,7 +8228,7 @@ mod tests {
 
         // Add a chunk that will be acked by cum_tsn
         {
-            let mut sent = sctp.inner.sent_queue.lock().unwrap();
+            let mut sent = sctp.inner.sent_queue.lock();
             sent.insert(
                 100,
                 ChunkRecord {
@@ -8387,7 +8387,7 @@ mod tests {
         );
 
         tokio::spawn(runner);
-        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
             .remote_verification_tag
             .store(12345, Ordering::SeqCst);
@@ -8399,14 +8399,14 @@ mod tests {
         sctp.inner
             .fast_recovery_exit_tsn
             .store(200, Ordering::SeqCst);
-        *sctp.inner.last_fast_recovery_entry.lock().unwrap() = Instant::now();
+        *sctp.inner.last_fast_recovery_entry.lock() = Instant::now();
 
         // Verify cooldown constant exists and has correct value
         let _cooldown_ms = FAST_RECOVERY_REENTRY_COOLDOWN.as_millis();
         assert_eq!(_cooldown_ms, 200, "Fast recovery cooldown should be 200ms");
 
         // Verify that last_fast_recovery_entry is tracked
-        let entry_time = *sctp.inner.last_fast_recovery_entry.lock().unwrap();
+        let entry_time = *sctp.inner.last_fast_recovery_entry.lock();
         let elapsed = Instant::now().duration_since(entry_time);
 
         // Entry time should be very recent (within this test)
@@ -8444,14 +8444,14 @@ mod tests {
         );
 
         tokio::spawn(runner);
-        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
             .remote_verification_tag
             .store(12345, Ordering::SeqCst);
 
         // Add a packet marked for retransmit
         {
-            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let mut sent_queue = sctp.inner.sent_queue.lock();
             sent_queue.insert(
                 100,
                 ChunkRecord {
@@ -8535,14 +8535,14 @@ mod tests {
         );
 
         tokio::spawn(runner);
-        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
             .remote_verification_tag
             .store(12345, Ordering::SeqCst);
 
         // Manually backoff RTO to a high value
         {
-            let mut rto = sctp.inner.rto_state.lock().unwrap();
+            let mut rto = sctp.inner.rto_state.lock();
             rto.srtt = 1.0;
             rto.rttvar = 0.25;
             rto.rto = 10.0; // Backed off to 10s
@@ -8550,7 +8550,7 @@ mod tests {
 
         // Add packet and ack it (with no fresh RTT sample)
         {
-            let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let mut sent_queue = sctp.inner.sent_queue.lock();
             sent_queue.insert(
                 100,
                 ChunkRecord {
@@ -8573,13 +8573,13 @@ mod tests {
             );
         }
 
-        let rto_before = sctp.inner.rto_state.lock().unwrap().rto;
+        let rto_before = sctp.inner.rto_state.lock().rto;
 
         // SACK with cumulative ack (no fresh RTT sample, but makes progress)
         let sack = build_sack_packet(100, 1024 * 1024, vec![], vec![]);
         sctp.inner.handle_sack(sack).await.unwrap();
 
-        let rto_after = sctp.inner.rto_state.lock().unwrap().rto;
+        let rto_after = sctp.inner.rto_state.lock().rto;
 
         // RTO should have decayed towards computed value (srtt + 4*rttvar = 2.0)
         assert!(
@@ -8732,7 +8732,7 @@ mod tests {
         );
 
         tokio::spawn(runner);
-        *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
+        *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
             .remote_verification_tag
             .store(12345, Ordering::SeqCst);
@@ -8742,7 +8742,6 @@ mod tests {
             sctp.inner
                 .outbound_queue
                 .lock()
-                .unwrap()
                 .push_back(OutboundChunk {
                     stream_id: 0,
                     ppid: 53,
@@ -8764,10 +8763,10 @@ mod tests {
         sctp.inner.transmit().await.unwrap();
 
         // Check sent queue
-        let sent_count = sctp.inner.sent_queue.lock().unwrap().len();
+        let sent_count = sctp.inner.sent_queue.lock().len();
 
         // Outbound queue should have remaining
-        let remaining = sctp.inner.outbound_queue.lock().unwrap().len();
+        let remaining = sctp.inner.outbound_queue.lock().len();
 
         // With cwnd=500, should send at most 4-5 chunks (500/116 ≈ 4.3)
         assert!(

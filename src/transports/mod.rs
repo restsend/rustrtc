@@ -6,8 +6,9 @@ pub mod sctp;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use parking_lot::Mutex;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 const DEFAULT_LOCAL_IP_CACHE_TTL: Duration = Duration::from_secs(5);
@@ -35,9 +36,7 @@ pub fn get_local_ip() -> Result<IpAddr, anyhow::Error> {
     let cache = LOCAL_IP_CACHE.get_or_init(|| Mutex::new(None));
 
     {
-        let cache_guard = cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cache_guard = cache.lock();
         if let Some(entry) = *cache_guard
             && Instant::now() < entry.expires_at
         {
@@ -48,9 +47,7 @@ pub fn get_local_ip() -> Result<IpAddr, anyhow::Error> {
     let ip = resolve_local_ip_uncached()?;
 
     {
-        let mut cache_guard = cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cache_guard = cache.lock();
         *cache_guard = Some(LocalIpCacheEntry {
             ip,
             expires_at: Instant::now() + ttl,
