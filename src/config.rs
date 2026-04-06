@@ -272,6 +272,14 @@ fn default_buffer_stats_log_interval() -> std::time::Duration {
     std::time::Duration::from_secs(10)
 }
 
+fn default_enable_upnp() -> bool {
+    false
+}
+
+fn default_upnp_lease_duration() -> u32 {
+    3600
+}
+
 /// Primary configuration for a `PeerConnection`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RtcConfiguration {
@@ -307,6 +315,12 @@ pub struct RtcConfiguration {
     pub rtp_end_port: Option<u16>,
     pub enable_latching: bool,
     pub enable_ice_lite: bool,
+    /// Enable UPnP IGD for automatic port mapping
+    #[serde(default = "default_enable_upnp")]
+    pub enable_upnp: bool,
+    /// UPnP port mapping lease duration in seconds
+    #[serde(default = "default_upnp_lease_duration")]
+    pub upnp_lease_duration: u32,
     #[serde(skip, default)]
     pub depacketizer_strategy: DepacketizerStrategy,
     #[serde(default = "default_rtp_buffer_capacity")]
@@ -349,6 +363,8 @@ impl Default for RtcConfiguration {
             rtp_end_port: None,
             enable_latching: false,
             enable_ice_lite: false,
+            enable_upnp: default_enable_upnp(),
+            upnp_lease_duration: default_upnp_lease_duration(),
             depacketizer_strategy: DepacketizerStrategy::default(),
             rtp_buffer_capacity: default_rtp_buffer_capacity(),
             buffer_drop_strategy: BufferDropStrategy::default(),
@@ -381,6 +397,16 @@ impl RtcConfigurationBuilder {
 
     pub fn enable_ice_lite(mut self, enable: bool) -> Self {
         self.inner.enable_ice_lite = enable;
+        self
+    }
+
+    pub fn enable_upnp(mut self, enable: bool) -> Self {
+        self.inner.enable_upnp = enable;
+        self
+    }
+
+    pub fn upnp_lease_duration(mut self, duration_secs: u32) -> Self {
+        self.inner.upnp_lease_duration = duration_secs;
         self
     }
 
@@ -637,5 +663,37 @@ mod tests {
         );
         assert!(config.sctp_max_heartbeat_failures > defaults.sctp_max_heartbeat_failures);
         assert!(config.sctp_max_burst > 0); // Explicit burst limit vs. heuristic
+    }
+
+    #[test]
+    fn test_upnp_defaults() {
+        let config = RtcConfiguration::default();
+        assert!(!config.enable_upnp, "UPnP should be disabled by default");
+        assert_eq!(config.upnp_lease_duration, 3600);
+    }
+
+    #[test]
+    fn test_upnp_builder_methods() {
+        let config = RtcConfigurationBuilder::new()
+            .enable_upnp(false)
+            .upnp_lease_duration(7200)
+            .build();
+        assert!(!config.enable_upnp);
+        assert_eq!(config.upnp_lease_duration, 7200);
+    }
+
+    #[test]
+    fn test_upnp_optimized_config() {
+        let config = RtcConfigurationBuilder::new()
+            .enable_upnp(true)
+            .upnp_lease_duration(1800)
+            .build();
+
+        assert!(config.enable_upnp);
+        assert_eq!(config.upnp_lease_duration, 1800);
+
+        // Verify defaults remain for other options
+        let defaults = RtcConfiguration::default();
+        assert_eq!(config.ice_connection_timeout, defaults.ice_connection_timeout);
     }
 }

@@ -3,6 +3,13 @@ pub mod stun;
 #[cfg(test)]
 mod tests;
 pub mod turn;
+pub mod upnp;
+
+// Re-export UPnP types
+pub use upnp::{
+    UpnpPortMapper, DEFAULT_LEASE_DURATION, DEFAULT_UPNP_DISCOVERY_TIMEOUT, MAX_LEASE_DURATION,
+    MIN_LEASE_DURATION,
+};
 
 use crate::config::{BufferDropStrategy, IceServer, IceTransportPolicy, RtcConfiguration};
 use crate::transports::ice::turn::{TurnClient, TurnCredentials};
@@ -876,15 +883,39 @@ impl IceTransport {
 
         // Build a local candidate for SDP generation
         let mut cand_addr = local_addr;
-        if let Some(ext_ip) = &self.inner.config.external_ip {
-            if let Ok(parsed_ip) = ext_ip.parse::<IpAddr>() {
-                if !bind_ip.is_loopback() {
-                    cand_addr.set_ip(parsed_ip);
-                }
+        let mut upnp_external_addr = None;
+
+        // Try UPnP if enabled (for RTP mode behind NAT)
+        if self.inner.config.enable_upnp && !local_addr.ip().is_loopback() && !local_addr.is_ipv6() {
+            let mut mapper = UpnpPortMapper::with_lease_duration(
+                local_addr,
+                self.inner.config.upnp_lease_duration,
+            );
+            if let Err(e) = mapper.discover().await {
+                trace!("UPnP discovery failed for RTP mode: {}", e);
+            } else if let Ok(ext_addr) = mapper.add_mapping(0).await {
+                debug!("UPnP mapping created for RTP mode: {} -> {}", local_addr, ext_addr);
+                cand_addr.set_ip(ext_addr.ip());
+                cand_addr.set_port(ext_addr.port());
+                upnp_external_addr = Some(ext_addr);
+                self.inner.gatherer.upnp_mappers.lock().push(mapper);
+            } else {
+                debug!("UPnP mapping failed for RTP mode, using local address");
             }
-        } else if bind_ip.is_unspecified() {
-            if let Ok(local_ip) = get_local_ip() {
-                cand_addr.set_ip(local_ip);
+        }
+
+        // Fall back to external_ip config if UPnP not available
+        if upnp_external_addr.is_none() {
+            if let Some(ext_ip) = &self.inner.config.external_ip {
+                if let Ok(parsed_ip) = ext_ip.parse::<IpAddr>() {
+                    if !bind_ip.is_loopback() {
+                        cand_addr.set_ip(parsed_ip);
+                    }
+                }
+            } else if bind_ip.is_unspecified() {
+                if let Ok(local_ip) = get_local_ip() {
+                    cand_addr.set_ip(local_ip);
+                }
             }
         }
         let mut local_candidate = IceCandidate::host(cand_addr, 1);
@@ -941,15 +972,39 @@ impl IceTransport {
             .send(IceSocketWrapper::Udp(socket));
 
         let mut cand_addr = local_addr;
-        if let Some(ext_ip) = &self.inner.config.external_ip {
-            if let Ok(parsed_ip) = ext_ip.parse::<IpAddr>() {
-                if !bind_ip.is_loopback() {
-                    cand_addr.set_ip(parsed_ip);
-                }
+        let mut upnp_external_addr = None;
+
+        // Try UPnP if enabled (for RTP mode behind NAT)
+        if self.inner.config.enable_upnp && !local_addr.ip().is_loopback() && !local_addr.is_ipv6() {
+            let mut mapper = UpnpPortMapper::with_lease_duration(
+                local_addr,
+                self.inner.config.upnp_lease_duration,
+            );
+            if let Err(e) = mapper.discover().await {
+                trace!("UPnP discovery failed for RTP offer mode: {}", e);
+            } else if let Ok(ext_addr) = mapper.add_mapping(0).await {
+                debug!("UPnP mapping created for RTP offer mode: {} -> {}", local_addr, ext_addr);
+                cand_addr.set_ip(ext_addr.ip());
+                cand_addr.set_port(ext_addr.port());
+                upnp_external_addr = Some(ext_addr);
+                self.inner.gatherer.upnp_mappers.lock().push(mapper);
+            } else {
+                debug!("UPnP mapping failed for RTP offer mode, using local address");
             }
-        } else if bind_ip.is_unspecified() {
-            if let Ok(local_ip) = get_local_ip() {
-                cand_addr.set_ip(local_ip);
+        }
+
+        // Fall back to external_ip config if UPnP not available
+        if upnp_external_addr.is_none() {
+            if let Some(ext_ip) = &self.inner.config.external_ip {
+                if let Ok(parsed_ip) = ext_ip.parse::<IpAddr>() {
+                    if !bind_ip.is_loopback() {
+                        cand_addr.set_ip(parsed_ip);
+                    }
+                }
+            } else if bind_ip.is_unspecified() {
+                if let Ok(local_ip) = get_local_ip() {
+                    cand_addr.set_ip(local_ip);
+                }
             }
         }
         let mut local_candidate = IceCandidate::host(cand_addr, 1);
@@ -2091,6 +2146,7 @@ struct IceGatherer {
     local_candidates: Arc<parking_lot::Mutex<Vec<IceCandidate>>>,
     sockets: Arc<parking_lot::Mutex<Vec<Arc<UdpSocket>>>>,
     turn_clients: Arc<parking_lot::Mutex<HashMap<SocketAddr, Arc<TurnClient>>>>,
+    upnp_mappers: Arc<parking_lot::Mutex<Vec<UpnpPortMapper>>>,
     config: RtcConfiguration,
     candidate_tx: broadcast::Sender<IceCandidate>,
     socket_tx: tokio::sync::mpsc::UnboundedSender<IceSocketWrapper>,
@@ -2107,10 +2163,29 @@ impl IceGatherer {
             local_candidates: Arc::new(parking_lot::Mutex::new(Vec::new())),
             sockets: Arc::new(parking_lot::Mutex::new(Vec::new())),
             turn_clients: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            upnp_mappers: Arc::new(parking_lot::Mutex::new(Vec::new())),
             config,
             candidate_tx,
             socket_tx,
         }
+    }
+
+    /// Get the UPnP mappers for manual cleanup
+    #[allow(dead_code)]
+    pub fn upnp_mappers(&self) -> Arc<parking_lot::Mutex<Vec<UpnpPortMapper>>> {
+        self.upnp_mappers.clone()
+    }
+
+    /// Clean up all UPnP port mappings
+    #[allow(dead_code)]
+    pub async fn cleanup_upnp_mappings(&self) {
+        let mappers = self.upnp_mappers.lock().clone();
+        for mapper in mappers {
+            if let Err(e) = mapper.cleanup().await {
+                trace!("Failed to clean up UPnP mappings: {}", e);
+            }
+        }
+        self.upnp_mappers.lock().clear();
     }
 
     fn state(&self) -> IceGathererState {
@@ -2191,10 +2266,21 @@ impl IceGatherer {
             *state = IceGathererState::Gathering;
         }
 
+        // Host gathering must complete first (creates sockets)
         let host_fut = async {
             if self.config.ice_transport_policy == IceTransportPolicy::All {
                 if let Err(e) = self.gather_host_candidates().await {
                     debug!("Host gathering failed: {}", e);
+                }
+            }
+        };
+
+        // UPnP depends on host sockets, so run after host_fut
+        let upnp_fut = async {
+            if self.config.enable_upnp && self.config.ice_transport_policy == IceTransportPolicy::All
+            {
+                if let Err(e) = self.gather_upnp_candidates().await {
+                    debug!("UPnP gathering failed: {}", e);
                 }
             }
         };
@@ -2205,7 +2291,9 @@ impl IceGatherer {
             }
         };
 
-        tokio::join!(host_fut, server_fut);
+        // Run host first, then UPnP and servers in parallel
+        host_fut.await;
+        tokio::join!(upnp_fut, server_fut);
 
         *self.state.lock() = IceGathererState::Complete;
         Ok(())
@@ -2292,6 +2380,63 @@ impl IceGatherer {
                     } else if !ip.is_loopback() && !ip.is_unspecified() {
                         debug!("Failed to bind socket on {}: {}", ip, e);
                     }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn gather_upnp_candidates(&self) -> Result<()> {
+        let sockets = self.sockets.lock().clone();
+
+        for socket in sockets {
+            let local_addr = match socket.local_addr() {
+                Ok(addr) => addr,
+                Err(_) => continue,
+            };
+
+            // Skip loopback addresses
+            if local_addr.ip().is_loopback() {
+                continue;
+            }
+
+            // Skip IPv6 (UPnP IGD doesn't support IPv6 well)
+            if local_addr.is_ipv6() {
+                continue;
+            }
+
+            // Create mapper with configured lease duration
+            let mut mapper =
+                UpnpPortMapper::with_lease_duration(local_addr, self.config.upnp_lease_duration);
+
+            // Try to discover gateway
+            if let Err(e) = mapper.discover().await {
+                trace!(
+                    "UPnP discovery failed for {}: {}",
+                    local_addr, e
+                );
+                continue;
+            }
+
+            // Try to add port mapping (0 = use same port as local)
+            match mapper.add_mapping(0).await {
+                Ok(external_addr) => {
+                    // Create server reflexive candidate for the mapping
+                    let candidate =
+                        IceCandidate::server_reflexive(local_addr, external_addr, 1);
+                    self.push_candidate(candidate);
+
+                    // Store mapper for later cleanup
+                    self.upnp_mappers.lock().push(mapper);
+
+                    debug!(
+                        "UPnP candidate gathered: {} -> {}",
+                        local_addr, external_addr
+                    );
+                }
+                Err(e) => {
+                    debug!("UPnP mapping failed for {}: {}", local_addr, e);
                 }
             }
         }

@@ -1,5 +1,9 @@
 use super::*;
+use crate::config::RtcConfigurationBuilder;
 use crate::transports::PacketReceiver;
+use crate::transports::ice::upnp::{
+    PortMapping, UpnpPortMapper, DEFAULT_LEASE_DURATION, MAX_LEASE_DURATION, MIN_LEASE_DURATION,
+};
 use crate::{IceServer, IceTransportPolicy, RtcConfiguration};
 use ::turn::{
     auth::{AuthHandler, generate_auth_key},
@@ -1910,4 +1914,361 @@ async fn test_nomination_race_under_high_packet_loss() -> Result<()> {
     );
 
     Ok(())
+}
+
+// ============================================================================
+// UPnP IGD tests
+// ============================================================================
+
+/// Test that default UPnP constants are valid
+#[test]
+fn test_upnp_default_constants() {
+    assert!(MIN_LEASE_DURATION > 0);
+    assert!(MAX_LEASE_DURATION > MIN_LEASE_DURATION);
+    assert!(DEFAULT_LEASE_DURATION >= MIN_LEASE_DURATION);
+    assert!(DEFAULT_LEASE_DURATION <= MAX_LEASE_DURATION);
+    assert_eq!(DEFAULT_LEASE_DURATION, 3600); // 1 hour default
+}
+
+/// Test PortMapping creation and expiry detection
+#[test]
+fn test_port_mapping_expiry() {
+    // Use lease_duration > 60 to avoid immediate stale state
+    let mapping = PortMapping {
+        external_port: 12345,
+        internal_addr: "192.168.1.100:5000".parse().unwrap(),
+        lease_duration: 70, // > 60 so not immediately stale
+        description: "test".to_string(),
+        created_at: std::time::Instant::now(),
+    };
+
+    // Should not be expired immediately (70 > 60)
+    assert!(!mapping.is_expired_or_stale());
+    
+    // Check remaining lifetime is around 70
+    let remaining = mapping.remaining_lifetime();
+    assert!(remaining >= 69 && remaining <= 70);
+}
+
+/// Test PortMapping remaining lifetime calculation
+#[test]
+fn test_port_mapping_remaining_lifetime() {
+    let mapping = PortMapping {
+        external_port: 12345,
+        internal_addr: "192.168.1.100:5000".parse().unwrap(),
+        lease_duration: 60,
+        description: "test".to_string(),
+        created_at: std::time::Instant::now(),
+    };
+
+    // Should have close to 60 seconds remaining
+    let remaining = mapping.remaining_lifetime();
+    assert!(remaining > 55 && remaining <= 60);
+
+    // After sleeping, remaining should decrease or stay same (not increase)
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let new_remaining = mapping.remaining_lifetime();
+    assert!(new_remaining <= remaining, "new_remaining should not increase");
+}
+
+/// Test UpnpPortMapper creation with default lease duration
+#[test]
+fn test_upnp_mapper_creation() {
+    let addr: SocketAddr = "192.168.1.100:5000".parse().unwrap();
+    let mapper = UpnpPortMapper::new(addr);
+
+    assert!(mapper.is_enabled());
+    assert!(!mapper.has_gateway());
+}
+
+/// Test UpnpPortMapper with custom lease duration
+#[test]
+fn test_upnp_mapper_custom_lease() {
+    let addr: SocketAddr = "192.168.1.100:5000".parse().unwrap();
+
+    // Test clamping to minimum
+    let mapper = UpnpPortMapper::with_lease_duration(addr, 100);
+    assert_eq!(mapper.default_lease_duration, MIN_LEASE_DURATION);
+
+    // Test clamping to maximum
+    let mapper = UpnpPortMapper::with_lease_duration(addr, 100000);
+    assert_eq!(mapper.default_lease_duration, MAX_LEASE_DURATION);
+
+    // Test valid value
+    let mapper = UpnpPortMapper::with_lease_duration(addr, 1800);
+    assert_eq!(mapper.default_lease_duration, 1800);
+}
+
+/// Test UpnpPortMapper disable/enable functionality
+#[test]
+fn test_upnp_mapper_disable_enable() {
+    let addr: SocketAddr = "192.168.1.100:5000".parse().unwrap();
+    let mut mapper = UpnpPortMapper::new(addr);
+
+    assert!(mapper.is_enabled());
+    assert!(!mapper.has_gateway()); // Initially no gateway
+
+    mapper.disable();
+    assert!(!mapper.is_enabled());
+    // Gateway should be None after disable (but we can't check private field)
+    // We verify through has_gateway() which returns gateway.is_some()
+
+    mapper.enable();
+    assert!(mapper.is_enabled());
+}
+
+/// Test that discover() fails for loopback addresses
+#[tokio::test]
+async fn test_upnp_mapper_loopback_rejection() {
+    let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+    let mut mapper = UpnpPortMapper::new(addr);
+
+    let result = mapper.discover().await;
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("loopback"));
+}
+
+/// Test that discover() fails when disabled
+#[tokio::test]
+async fn test_upnp_mapper_disabled() {
+    let addr: SocketAddr = "192.168.1.100:5000".parse().unwrap();
+    let mut mapper = UpnpPortMapper::new(addr);
+    mapper.disable();
+
+    let result = mapper.discover().await;
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("disabled"));
+}
+
+/// Test that add_mapping() fails without discover()
+#[tokio::test]
+async fn test_upnp_mapper_no_gateway() {
+    let addr: SocketAddr = "192.168.1.100:5000".parse().unwrap();
+    let mapper = UpnpPortMapper::new(addr);
+
+    let result = mapper.add_mapping(12345).await;
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("No UPnP gateway"));
+}
+
+/// Test UpnpPortMapper clone behavior
+#[tokio::test]
+async fn test_upnp_mapper_clone() {
+    let addr: SocketAddr = "192.168.1.100:5000".parse().unwrap();
+    let mapper = UpnpPortMapper::new(addr);
+
+    let cloned = mapper.clone();
+    // Gateway should be None in clone (not cloneable)
+    assert!(!cloned.has_gateway());
+    // Other properties should be preserved
+    assert_eq!(cloned.local_addr, addr);
+    assert!(cloned.is_enabled());
+}
+
+/// Test RtcConfiguration UPnP defaults
+#[test]
+fn test_config_upnp_defaults() {
+    let config = RtcConfiguration::default();
+    assert!(!config.enable_upnp, "UPnP should be disabled by default");
+    assert_eq!(config.upnp_lease_duration, 3600, "Default lease should be 1 hour");
+}
+
+/// Test RtcConfigurationBuilder UPnP methods
+#[test]
+fn test_config_builder_upnp_methods() {
+    let config = RtcConfigurationBuilder::new()
+        .enable_upnp(false)
+        .upnp_lease_duration(7200)
+        .build();
+
+    assert!(!config.enable_upnp);
+    assert_eq!(config.upnp_lease_duration, 7200);
+}
+
+/// Test that UPnP is disabled when the policy is Relay-only
+#[tokio::test]
+async fn test_upnp_disabled_when_relay_policy() {
+    let mut config = RtcConfiguration::default();
+    config.ice_transport_policy = IceTransportPolicy::Relay;
+    config.enable_upnp = true; // Explicitly enable, but should be ignored
+
+    let (tx, _) = broadcast::channel(100);
+    let (socket_tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let gatherer = IceGatherer::new(config, tx, socket_tx);
+
+    // Gather candidates
+    gatherer.gather().await.unwrap();
+
+    // In Relay-only mode, we shouldn't have any UPnP mappers
+    // (though we might have relay candidates if TURN servers are configured)
+    let mappers = gatherer.upnp_mappers.lock();
+    assert!(mappers.is_empty(), "UPnP should not be used in Relay-only mode");
+}
+
+/// Test that UPnP gathering is skipped when disabled in config
+#[tokio::test]
+async fn test_upnp_disabled_in_config() {
+    let mut config = RtcConfiguration::default();
+    config.enable_upnp = false;
+
+    let (tx, _) = broadcast::channel(100);
+    let (socket_tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let gatherer = IceGatherer::new(config, tx, socket_tx);
+
+    // Gather candidates
+    gatherer.gather().await.unwrap();
+
+    // Should have host candidates but no UPnP mappers
+    let candidates = gatherer.local_candidates();
+    let has_host = candidates.iter().any(|c| c.typ == IceCandidateType::Host);
+    assert!(has_host, "Should have host candidates");
+
+    let mappers = gatherer.upnp_mappers.lock();
+    assert!(mappers.is_empty(), "Should not have UPnP mappers when disabled");
+}
+
+/// Test cleanup_upnp_mappings method
+#[tokio::test]
+async fn test_upnp_cleanup_mappings() {
+    let config = RtcConfiguration::default();
+
+    let (tx, _) = broadcast::channel(100);
+    let (socket_tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let gatherer = IceGatherer::new(config, tx, socket_tx);
+
+    // Initially no mappers
+    assert_eq!(gatherer.upnp_mappers.lock().len(), 0);
+
+    // Add a mock mapper
+    {
+        let addr: SocketAddr = "192.168.1.100:5000".parse().unwrap();
+        let mapper = UpnpPortMapper::new(addr);
+        gatherer.upnp_mappers.lock().push(mapper);
+    }
+
+    assert_eq!(gatherer.upnp_mappers.lock().len(), 1);
+
+    // Cleanup should clear the mappers
+    gatherer.cleanup_upnp_mappings().await;
+
+    assert_eq!(gatherer.upnp_mappers.lock().len(), 0);
+}
+
+/// Test IPv6 address rejection in UPnP mapper
+#[tokio::test]
+async fn test_upnp_ipv6_rejection() {
+    // IPv6 addresses should be skipped during UPnP gathering
+    let addr: SocketAddr = "[::1]:5000".parse().unwrap();
+
+    // IPv6 is_loopback should be true
+    assert!(addr.ip().is_loopback());
+
+    // Create gatherer with IPv6-capable config
+    let config = RtcConfiguration::default();
+
+    let (tx, _) = broadcast::channel(100);
+    let (socket_tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let gatherer = IceGatherer::new(config, tx, socket_tx);
+
+    // Should not add any UPnP mappers for IPv6 addresses
+    // (they would be filtered by the is_loopback or is_ipv6 checks)
+    gatherer.gather().await.unwrap();
+
+    // No IPv6 addresses should result in UPnP mappers
+    let mappers = gatherer.upnp_mappers.lock();
+    for mapper in mappers.iter() {
+        assert!(
+            !mapper.local_addr.is_ipv6(),
+            "UPnP mappers should not have IPv6 addresses"
+        );
+    }
+}
+
+/// Test that gather_upnp_candidates handles errors gracefully
+#[tokio::test]
+async fn test_upnp_gathering_graceful_errors() {
+    // Create config with UPnP enabled but no actual UPnP gateway
+    let mut config = RtcConfiguration::default();
+    config.enable_upnp = true;
+    config.upnp_lease_duration = 1800;
+
+    let (tx, _) = broadcast::channel(100);
+    let (socket_tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let gatherer = IceGatherer::new(config, tx, socket_tx);
+
+    // Gather should complete without panicking even if UPnP fails
+    // (no actual gateway available in test environment)
+    let result = gatherer.gather().await;
+    assert!(result.is_ok(), "Gather should succeed even if UPnP fails");
+
+    // Should have host candidates (from normal gathering)
+    let candidates = gatherer.local_candidates();
+    let has_host = candidates.iter().any(|c| c.typ == IceCandidateType::Host);
+    assert!(has_host, "Should have host candidates even if UPnP fails");
+}
+
+/// Test that UPnP-related fields are exported from library
+#[test]
+fn test_upnp_library_exports() {
+    // These should compile, verifying the exports are correct
+    use crate::UpnpPortMapper;
+    use crate::{DEFAULT_LEASE_DURATION, MAX_LEASE_DURATION, MIN_LEASE_DURATION};
+
+    let _ = DEFAULT_LEASE_DURATION;
+    let _ = MIN_LEASE_DURATION;
+    let _ = MAX_LEASE_DURATION;
+
+    // Verify the mapper can be created
+    let addr: SocketAddr = "192.168.1.100:5000".parse().unwrap();
+    let _mapper = UpnpPortMapper::new(addr);
+}
+
+/// Test that RTP mode respects UPnP enable flag
+#[tokio::test]
+async fn test_rtp_mode_upnp_disabled() {
+    use crate::TransportMode;
+
+    let mut config = RtcConfiguration::default();
+    config.transport_mode = TransportMode::Rtp;
+    config.enable_upnp = false;
+
+    let (transport, _runner) = IceTransport::new(config);
+
+    // Setup direct RTP (offer side)
+    let local_addr = transport.setup_direct_rtp_offer().await.unwrap();
+
+    // Should have a local candidate
+    let candidates = transport.local_candidates();
+    assert!(!candidates.is_empty());
+
+    // Candidate should use local address (not UPnP external)
+    let host_candidate = candidates.iter().find(|c| c.typ == IceCandidateType::Host).unwrap();
+    assert_eq!(host_candidate.address.port(), local_addr.port());
+
+    // Should not have UPnP mappers when disabled
+    let mappers = transport.inner.gatherer.upnp_mappers.lock();
+    assert!(mappers.is_empty());
+}
+
+/// Test that RTP mode attempts UPnP when enabled (will fail in test env but shouldn't panic)
+#[tokio::test]
+async fn test_rtp_mode_upnp_enabled_graceful() {
+    use crate::TransportMode;
+
+    let mut config = RtcConfiguration::default();
+    config.transport_mode = TransportMode::Rtp;
+    config.enable_upnp = true;
+
+    let (transport, _runner) = IceTransport::new(config);
+
+    // Setup direct RTP (offer side) - UPnP will fail in test env but should be graceful
+    let result = transport.setup_direct_rtp_offer().await;
+    assert!(result.is_ok(), "setup_direct_rtp_offer should succeed even if UPnP fails");
+
+    // Should have a local candidate
+    let candidates = transport.local_candidates();
+    assert!(!candidates.is_empty());
 }

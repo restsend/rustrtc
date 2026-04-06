@@ -30,7 +30,8 @@ pub use stats::{
 };
 pub use transports::ice::{
     IceCandidate, IceCandidatePair, IceCandidateType, IceGathererState, IceRole, IceTransport,
-    IceTransportState,
+    IceTransportState, UpnpPortMapper, DEFAULT_LEASE_DURATION, DEFAULT_UPNP_DISCOVERY_TIMEOUT,
+    MAX_LEASE_DURATION, MIN_LEASE_DURATION,
 };
 pub use transports::rtp::RtpRewriteBridgeParams;
 pub use transports::sctp::{DataChannelEvent, DataChannelState};
