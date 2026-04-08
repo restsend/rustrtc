@@ -11,8 +11,8 @@ pub mod transports;
 
 pub use config::{
     AudioCapability, BundlePolicy, CertificateConfig, IceCredentialType, IceServer,
-    IceTransportPolicy, RtcConfiguration, RtcConfigurationBuilder, RtcpMuxPolicy, TransportMode,
-    VideoCapability,
+    IceTransportPolicy, RtcConfiguration, RtcConfigurationBuilder, RtcpMuxPolicy,
+    SdpCompatibilityMode, TransportMode, VideoCapability,
 };
 pub use errors::{RtcError, RtcResult, SdpError, SdpResult};
 pub use peer_connection::{

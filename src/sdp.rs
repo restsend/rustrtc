@@ -728,7 +728,9 @@ impl MediaSection {
         };
 
         self.formats = caps.iter().map(|c| c.payload_type.to_string()).collect();
-        if config.rtcp_mux_policy == crate::config::RtcpMuxPolicy::Require {
+        if config.rtcp_mux_policy == crate::config::RtcpMuxPolicy::Require
+            && config.sdp_compatibility != crate::config::SdpCompatibilityMode::LegacySip
+        {
             self.attributes.push(Attribute::new("rtcp-mux", None));
         }
         for audio in &caps {
@@ -774,7 +776,9 @@ impl MediaSection {
         };
 
         self.formats = caps.iter().map(|c| c.payload_type.to_string()).collect();
-        if config.rtcp_mux_policy == crate::config::RtcpMuxPolicy::Require {
+        if config.rtcp_mux_policy == crate::config::RtcpMuxPolicy::Require
+            && config.sdp_compatibility != crate::config::SdpCompatibilityMode::LegacySip
+        {
             self.attributes.push(Attribute::new("rtcp-mux", None));
         }
         for video in &caps {
@@ -785,6 +789,12 @@ impl MediaSection {
                     video.payload_type, video.codec_name, video.clock_rate
                 )),
             ));
+            if let Some(fmtp) = &video.fmtp {
+                self.attributes.push(Attribute::new(
+                    "fmtp",
+                    Some(format!("{} {}", video.payload_type, fmtp)),
+                ));
+            }
             for fb in &video.rtcp_fbs {
                 self.attributes.push(Attribute::new(
                     "rtcp-fb",
@@ -956,6 +966,234 @@ a=fingerprint:sha-256 AA:BB:CC:EE\r\n";
         assert_eq!(
             err,
             SdpError::Parse("conflicting DTLS fingerprint attributes in SDP".into())
+        );
+    }
+
+    /// Helper: build a minimal RtcConfiguration with the given media capabilities.
+    fn make_config(
+        caps: crate::config::MediaCapabilities,
+        compat: crate::config::SdpCompatibilityMode,
+    ) -> RtcConfiguration {
+        let mut c = RtcConfiguration::default();
+        c.media_capabilities = Some(caps);
+        c.sdp_compatibility = compat;
+        c
+    }
+
+    // ── VideoCapability::fmtp passthrough ────────────────────────────────────
+
+    #[test]
+    fn video_fmtp_is_emitted_when_set() {
+        use crate::config::{MediaCapabilities, SdpCompatibilityMode, VideoCapability};
+
+        let video = VideoCapability {
+            payload_type: 96,
+            codec_name: "H264".to_string(),
+            clock_rate: 90000,
+            fmtp: Some("packetization-mode=1;profile-level-id=42e01f".to_string()),
+            rtcp_fbs: vec![],
+        };
+
+        let caps = MediaCapabilities {
+            audio: vec![],
+            video: vec![video],
+            application: None,
+        };
+
+        let mut section = MediaSection::new(MediaKind::Video, "0");
+        section.apply_config(&make_config(caps, SdpCompatibilityMode::Standard));
+
+        let fmtp = section
+            .attributes
+            .iter()
+            .find(|a| a.key == "fmtp")
+            .expect("a=fmtp should be present for H264");
+
+        assert_eq!(
+            fmtp.value.as_deref().unwrap(),
+            "96 packetization-mode=1;profile-level-id=42e01f"
+        );
+    }
+
+    #[test]
+    fn video_fmtp_absent_when_not_set() {
+        use crate::config::{MediaCapabilities, SdpCompatibilityMode, VideoCapability};
+
+        let video = VideoCapability {
+            fmtp: None,
+            ..VideoCapability::default()
+        };
+        let caps = MediaCapabilities {
+            audio: vec![],
+            video: vec![video],
+            application: None,
+        };
+
+        let mut section = MediaSection::new(MediaKind::Video, "0");
+        section.apply_config(&make_config(caps, SdpCompatibilityMode::Standard));
+
+        assert!(
+            section.attributes.iter().all(|a| a.key != "fmtp"),
+            "a=fmtp should not be emitted when fmtp is None"
+        );
+    }
+
+    #[test]
+    fn video_h264_constructor_emits_fmtp() {
+        use crate::config::{MediaCapabilities, SdpCompatibilityMode, VideoCapability};
+
+        let caps = MediaCapabilities {
+            audio: vec![],
+            video: vec![VideoCapability::h264()],
+            application: None,
+        };
+
+        let mut section = MediaSection::new(MediaKind::Video, "0");
+        section.apply_config(&make_config(caps, SdpCompatibilityMode::Standard));
+
+        let fmtp = section
+            .attributes
+            .iter()
+            .find(|a| a.key == "fmtp")
+            .expect("VideoCapability::h264() should produce a=fmtp");
+        assert!(
+            fmtp.value
+                .as_deref()
+                .unwrap()
+                .contains("packetization-mode"),
+            "fmtp should contain packetization-mode"
+        );
+    }
+
+    // ── rtcp-fb passthrough ─────────────────────────────────────────────────
+
+    #[test]
+    fn video_rtcp_fb_emitted_for_each_entry() {
+        use crate::config::{MediaCapabilities, SdpCompatibilityMode, VideoCapability};
+
+        let video = VideoCapability {
+            payload_type: 96,
+            codec_name: "H264".to_string(),
+            clock_rate: 90000,
+            fmtp: None,
+            rtcp_fbs: vec!["nack pli".to_string(), "ccm fir".to_string()],
+        };
+        let caps = MediaCapabilities {
+            audio: vec![],
+            video: vec![video],
+            application: None,
+        };
+
+        let mut section = MediaSection::new(MediaKind::Video, "0");
+        section.apply_config(&make_config(caps, SdpCompatibilityMode::Standard));
+
+        let fbs: Vec<&str> = section
+            .attributes
+            .iter()
+            .filter(|a| a.key == "rtcp-fb")
+            .filter_map(|a| a.value.as_deref())
+            .collect();
+        assert!(
+            fbs.contains(&"96 nack pli"),
+            "should contain rtcp-fb nack pli, got: {fbs:?}"
+        );
+        assert!(
+            fbs.contains(&"96 ccm fir"),
+            "should contain rtcp-fb ccm fir, got: {fbs:?}"
+        );
+    }
+
+    #[test]
+    fn audio_rtcp_fb_emitted_for_each_entry() {
+        use crate::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode};
+
+        let audio = AudioCapability {
+            payload_type: 111,
+            codec_name: "opus".to_string(),
+            clock_rate: 48000,
+            channels: 2,
+            fmtp: None,
+            rtcp_fbs: vec!["nack".to_string()],
+        };
+        let caps = MediaCapabilities {
+            audio: vec![audio],
+            video: vec![],
+            application: None,
+        };
+
+        let mut section = MediaSection::new(MediaKind::Audio, "0");
+        section.apply_config(&make_config(caps, SdpCompatibilityMode::Standard));
+
+        let fb = section
+            .attributes
+            .iter()
+            .find(|a| a.key == "rtcp-fb")
+            .expect("should have rtcp-fb for audio");
+        assert_eq!(fb.value.as_deref().unwrap(), "111 nack");
+    }
+
+    // ── SdpCompatibilityMode::LegacySip ─────────────────────────────────────
+
+    #[test]
+    fn legacy_sip_mode_omits_rtcp_mux_on_audio() {
+        use crate::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode};
+
+        let caps = MediaCapabilities {
+            audio: vec![AudioCapability::pcma()],
+            video: vec![],
+            application: None,
+        };
+        let mut config = make_config(caps, SdpCompatibilityMode::LegacySip);
+        config.rtcp_mux_policy = crate::config::RtcpMuxPolicy::Require;
+
+        let mut section = MediaSection::new(MediaKind::Audio, "0");
+        section.apply_config(&config);
+
+        assert!(
+            section.attributes.iter().all(|a| a.key != "rtcp-mux"),
+            "LegacySip mode must not emit a=rtcp-mux"
+        );
+    }
+
+    #[test]
+    fn legacy_sip_mode_omits_rtcp_mux_on_video() {
+        use crate::config::{MediaCapabilities, SdpCompatibilityMode, VideoCapability};
+
+        let caps = MediaCapabilities {
+            audio: vec![],
+            video: vec![VideoCapability::default()],
+            application: None,
+        };
+        let mut config = make_config(caps, SdpCompatibilityMode::LegacySip);
+        config.rtcp_mux_policy = crate::config::RtcpMuxPolicy::Require;
+
+        let mut section = MediaSection::new(MediaKind::Video, "0");
+        section.apply_config(&config);
+
+        assert!(
+            section.attributes.iter().all(|a| a.key != "rtcp-mux"),
+            "LegacySip mode must not emit a=rtcp-mux for video"
+        );
+    }
+
+    #[test]
+    fn standard_mode_emits_rtcp_mux() {
+        use crate::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode};
+
+        let caps = MediaCapabilities {
+            audio: vec![AudioCapability::pcma()],
+            video: vec![],
+            application: None,
+        };
+        let mut config = make_config(caps, SdpCompatibilityMode::Standard);
+        config.rtcp_mux_policy = crate::config::RtcpMuxPolicy::Require;
+
+        let mut section = MediaSection::new(MediaKind::Audio, "0");
+        section.apply_config(&config);
+
+        assert!(
+            section.attributes.iter().any(|a| a.key == "rtcp-mux"),
+            "Standard mode with Require policy must emit a=rtcp-mux"
         );
     }
 }

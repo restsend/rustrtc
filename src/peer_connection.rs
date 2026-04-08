@@ -3214,7 +3214,11 @@ impl PeerConnectionInner {
                 _ => false,
             };
 
-            let should_bundle = should_bundle && desc.media_sections.len() > 1;
+            // In LegacySip mode, never BUNDLE (SIP endpoints typically don't support it).
+            let should_bundle = should_bundle
+                && desc.media_sections.len() > 1
+                && self.config.sdp_compatibility
+                    != crate::config::SdpCompatibilityMode::LegacySip;
 
             if should_bundle {
                 let mids: Vec<String> = desc.media_sections.iter().map(|m| m.mid.clone()).collect();
@@ -3222,6 +3226,25 @@ impl PeerConnectionInner {
                 desc.session
                     .attributes
                     .push(Attribute::new("group", Some(value)));
+            }
+
+            // In LegacySip mode, omit a=mid entirely: legacy SIP endpoints confuse
+            // a=mid without a matching a=group:BUNDLE.
+            if self.config.sdp_compatibility == crate::config::SdpCompatibilityMode::LegacySip {
+                for section in &mut desc.media_sections {
+                    section.mid = String::new();
+                }
+            } else if !should_bundle {
+                // In Standard mode with no BUNDLE, still clear mids from sections
+                // that have no group association to avoid confusing endpoints that
+                // interpret a=mid as requiring BUNDLE.
+                // Exception: single-section SDP keeps its mid (it's harmless and
+                // allows endpoints to identify the stream).
+                if desc.media_sections.len() > 1 {
+                    for section in &mut desc.media_sections {
+                        section.mid = String::new();
+                    }
+                }
             }
         }
 
@@ -6634,5 +6657,259 @@ a=mid:0
                 e
             );
         }
+    }
+
+    // ── VideoCapability::fmtp passthrough ────────────────────────────────────
+
+    /// H264 fmtp (profile-level-id, packetization-mode) must appear in the offer SDP.
+    #[tokio::test]
+    async fn offer_h264_emits_fmtp_in_sdp() {
+        use crate::config::{MediaCapabilities, VideoCapability};
+        use crate::TransportMode;
+
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+        config.media_capabilities = Some(MediaCapabilities {
+            audio: vec![],
+            video: vec![VideoCapability::h264()],
+            application: None,
+        });
+        let pc = PeerConnection::new(config);
+        pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
+
+        let offer = pc.create_offer().await.unwrap();
+        let section = &offer.media_sections[0];
+        assert_eq!(section.kind, MediaKind::Video);
+
+        let fmtp = section
+            .attributes
+            .iter()
+            .find(|a| a.key == "fmtp")
+            .expect("H264 offer must contain a=fmtp");
+        assert!(
+            fmtp.value.as_deref().unwrap_or("").contains("packetization-mode"),
+            "a=fmtp must contain packetization-mode, got: {:?}",
+            fmtp.value
+        );
+        assert!(
+            fmtp.value.as_deref().unwrap_or("").contains("profile-level-id"),
+            "a=fmtp must contain profile-level-id, got: {:?}",
+            fmtp.value
+        );
+    }
+
+    /// When fmtp is None, no a=fmtp line should appear in the video section.
+    #[tokio::test]
+    async fn offer_vp8_no_fmtp_in_sdp() {
+        use crate::config::{MediaCapabilities, VideoCapability};
+        use crate::TransportMode;
+
+        let vp8 = VideoCapability {
+            fmtp: None,
+            ..VideoCapability::default()
+        };
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+        config.media_capabilities = Some(MediaCapabilities {
+            audio: vec![],
+            video: vec![vp8],
+            application: None,
+        });
+        let pc = PeerConnection::new(config);
+        pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
+
+        let offer = pc.create_offer().await.unwrap();
+        let section = &offer.media_sections[0];
+        assert!(
+            section.attributes.iter().all(|a| a.key != "fmtp"),
+            "VP8 with no fmtp must not emit a=fmtp"
+        );
+    }
+
+    // ── rtcp-fb passthrough in generated SDP ─────────────────────────────────
+
+    /// H264 rtcp-fb entries (nack pli, ccm fir) must appear in the offer SDP.
+    #[tokio::test]
+    async fn offer_h264_emits_rtcp_fb_in_sdp() {
+        use crate::config::{MediaCapabilities, VideoCapability};
+        use crate::TransportMode;
+
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+        config.media_capabilities = Some(MediaCapabilities {
+            audio: vec![],
+            video: vec![VideoCapability::h264()],
+            application: None,
+        });
+        let pc = PeerConnection::new(config);
+        pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
+
+        let offer = pc.create_offer().await.unwrap();
+        let section = &offer.media_sections[0];
+
+        let fbs: Vec<&str> = section
+            .attributes
+            .iter()
+            .filter(|a| a.key == "rtcp-fb")
+            .filter_map(|a| a.value.as_deref())
+            .collect();
+        assert!(
+            fbs.iter().any(|v| v.contains("nack pli")),
+            "should emit rtcp-fb nack pli, got: {fbs:?}"
+        );
+        assert!(
+            fbs.iter().any(|v| v.contains("ccm fir")),
+            "should emit rtcp-fb ccm fir, got: {fbs:?}"
+        );
+    }
+
+    // ── SdpCompatibilityMode::LegacySip / a=mid and BUNDLE ───────────────────
+
+    /// In LegacySip mode the generated offer must not contain any a=mid or a=rtcp-mux.
+    #[tokio::test]
+    async fn legacy_sip_offer_omits_mid_and_rtcp_mux() {
+        use crate::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode};
+        use crate::TransportMode;
+
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+        config.sdp_compatibility = SdpCompatibilityMode::LegacySip;
+        config.media_capabilities = Some(MediaCapabilities {
+            audio: vec![AudioCapability::pcma()],
+            video: vec![],
+            application: None,
+        });
+        let pc = PeerConnection::new(config);
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+
+        let offer = pc.create_offer().await.unwrap();
+        let sdp = offer.to_sdp_string();
+
+        assert!(
+            !sdp.contains("a=mid:"),
+            "LegacySip offer must not contain a=mid, got SDP:\n{sdp}"
+        );
+        assert!(
+            !sdp.contains("a=rtcp-mux"),
+            "LegacySip offer must not contain a=rtcp-mux, got SDP:\n{sdp}"
+        );
+        assert!(
+            !sdp.contains("a=group:BUNDLE"),
+            "LegacySip offer must not contain a=group:BUNDLE, got SDP:\n{sdp}"
+        );
+    }
+
+    /// Standard mode with two media sections MUST produce a=group:BUNDLE and a=mid.
+    #[tokio::test]
+    async fn standard_mode_multi_section_includes_bundle_and_mid() {
+        use crate::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode};
+        use crate::TransportMode;
+
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+        config.sdp_compatibility = SdpCompatibilityMode::Standard;
+        config.media_capabilities = Some(MediaCapabilities {
+            audio: vec![AudioCapability::pcma()],
+            video: vec![crate::config::VideoCapability::default()],
+            application: None,
+        });
+        let pc = PeerConnection::new(config);
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
+
+        let offer = pc.create_offer().await.unwrap();
+        let sdp = offer.to_sdp_string();
+
+        assert!(
+            sdp.contains("a=group:BUNDLE"),
+            "Standard mode with two sections must emit a=group:BUNDLE, got:\n{sdp}"
+        );
+        assert!(
+            sdp.contains("a=mid:"),
+            "Standard mode must emit a=mid for each section, got:\n{sdp}"
+        );
+    }
+
+    /// In LegacySip mode with two media sections, no BUNDLE and no a=mid.
+    #[tokio::test]
+    async fn legacy_sip_multi_section_no_bundle_no_mid() {
+        use crate::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode};
+        use crate::TransportMode;
+
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+        config.sdp_compatibility = SdpCompatibilityMode::LegacySip;
+        config.media_capabilities = Some(MediaCapabilities {
+            audio: vec![AudioCapability::pcma()],
+            video: vec![crate::config::VideoCapability::h264()],
+            application: None,
+        });
+        let pc = PeerConnection::new(config);
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
+
+        let offer = pc.create_offer().await.unwrap();
+        assert_eq!(offer.media_sections.len(), 2, "should have audio+video");
+
+        let sdp = offer.to_sdp_string();
+        assert!(
+            !sdp.contains("a=group:BUNDLE"),
+            "LegacySip must not emit a=group:BUNDLE, got:\n{sdp}"
+        );
+        assert!(
+            !sdp.contains("a=mid:"),
+            "LegacySip must not emit a=mid, got:\n{sdp}"
+        );
+    }
+
+    /// When answering a non-BUNDLE offer (e.g. Linphone), the answer must not
+    /// contain a=mid in the sections (Standard mode).
+    #[tokio::test]
+    async fn answer_to_non_bundle_offer_omits_mid_in_sections() {
+        use crate::config::{AudioCapability, MediaCapabilities};
+        use crate::TransportMode;
+
+        // No a=group:BUNDLE in this remote offer (traditional SIP style)
+        let remote_sdp = "v=0\r\n\
+                          o=- 1 1 IN IP4 192.168.1.100\r\n\
+                          s=-\r\n\
+                          t=0 0\r\n\
+                          c=IN IP4 192.168.1.100\r\n\
+                          m=audio 5000 RTP/AVP 8\r\n\
+                          a=mid:as\r\n\
+                          a=sendrecv\r\n\
+                          a=rtpmap:8 PCMA/8000\r\n\
+                          m=video 5002 RTP/AVP 96\r\n\
+                          a=mid:vs\r\n\
+                          a=sendrecv\r\n\
+                          a=rtpmap:96 H264/90000\r\n\
+                          a=fmtp:96 packetization-mode=0;profile-level-id=42801F\r\n";
+
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+        config.media_capabilities = Some(MediaCapabilities {
+            audio: vec![AudioCapability::pcma()],
+            video: vec![crate::config::VideoCapability::h264()],
+            application: None,
+        });
+        let pc = PeerConnection::new(config);
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
+
+        let remote = SessionDescription::parse(SdpType::Offer, remote_sdp).unwrap();
+        pc.set_remote_description(remote).await.unwrap();
+
+        let answer = pc.create_answer().await.unwrap();
+        let sdp = answer.to_sdp_string();
+
+        assert!(
+            !sdp.contains("a=group:BUNDLE"),
+            "answer to non-BUNDLE offer must not have a=group:BUNDLE, got:\n{sdp}"
+        );
+        // Neither section should have a=mid since there is no BUNDLE group
+        assert!(
+            !sdp.contains("a=mid:"),
+            "answer to non-BUNDLE offer must not have a=mid in any section, got:\n{sdp}"
+        );
     }
 }

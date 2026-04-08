@@ -189,6 +189,7 @@ pub struct VideoCapability {
     pub payload_type: u8,
     pub codec_name: String,
     pub clock_rate: u32,
+    pub fmtp: Option<String>,
     pub rtcp_fbs: Vec<String>,
 }
 
@@ -198,6 +199,7 @@ impl Default for VideoCapability {
             payload_type: 96,
             codec_name: "VP8".to_string(),
             clock_rate: 90000,
+            fmtp: None,
             rtcp_fbs: vec![
                 "nack".to_string(),
                 "nack pli".to_string(),
@@ -205,6 +207,18 @@ impl Default for VideoCapability {
                 "goog-remb".to_string(),
                 "transport-cc".to_string(),
             ],
+        }
+    }
+}
+
+impl VideoCapability {
+    pub fn h264() -> Self {
+        Self {
+            payload_type: 96,
+            codec_name: "H264".to_string(),
+            clock_rate: 90000,
+            fmtp: Some("packetization-mode=1;profile-level-id=42e01f".to_string()),
+            rtcp_fbs: vec!["nack pli".to_string(), "ccm fir".to_string()],
         }
     }
 }
@@ -272,6 +286,18 @@ fn default_buffer_stats_log_interval() -> std::time::Duration {
     std::time::Duration::from_secs(10)
 }
 
+/// Controls SDP generation compatibility for interoperability with legacy SIP endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SdpCompatibilityMode {
+    /// Standard WebRTC / RFC-compliant SDP output (default).
+    #[default]
+    Standard,
+    /// Compatibility mode for legacy SIP endpoints (e.g. Linphone):
+    /// omits `a=mid` unless BUNDLE is active, omits `a=rtcp-mux`.
+    LegacySip,
+}
+
 fn default_enable_upnp() -> bool {
     false
 }
@@ -329,6 +355,9 @@ pub struct RtcConfiguration {
     pub buffer_drop_strategy: BufferDropStrategy,
     #[serde(default = "default_buffer_stats_log_interval")]
     pub buffer_stats_log_interval: std::time::Duration,
+    /// SDP generation compatibility mode.
+    #[serde(default)]
+    pub sdp_compatibility: SdpCompatibilityMode,
 }
 
 impl Default for RtcConfiguration {
@@ -369,6 +398,7 @@ impl Default for RtcConfiguration {
             rtp_buffer_capacity: default_rtp_buffer_capacity(),
             buffer_drop_strategy: BufferDropStrategy::default(),
             buffer_stats_log_interval: default_buffer_stats_log_interval(),
+            sdp_compatibility: SdpCompatibilityMode::default(),
         }
     }
 }
@@ -557,6 +587,11 @@ impl RtcConfigurationBuilder {
         self
     }
 
+    pub fn sdp_compatibility(mut self, mode: SdpCompatibilityMode) -> Self {
+        self.inner.sdp_compatibility = mode;
+        self
+    }
+
     pub fn build(self) -> RtcConfiguration {
         self.inner
     }
@@ -694,6 +729,9 @@ mod tests {
 
         // Verify defaults remain for other options
         let defaults = RtcConfiguration::default();
-        assert_eq!(config.ice_connection_timeout, defaults.ice_connection_timeout);
+        assert_eq!(
+            config.ice_connection_timeout,
+            defaults.ice_connection_timeout
+        );
     }
 }
