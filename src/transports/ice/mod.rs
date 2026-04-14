@@ -441,23 +441,32 @@ impl IceTransportRunner {
             return;
         }
 
-        let pair_opt = inner.selected_pair.lock().clone();
-        let pair = match pair_opt {
-            Some(p) if p.local.typ == IceCandidateType::Relay => p,
-            _ => return, // Not using TURN relay, nothing to refresh
-        };
-
-        let client = {
+        let all_clients: Vec<(SocketAddr, Arc<TurnClient>)> = {
             let clients = inner.gatherer.turn_clients.lock();
-            match clients.get(&pair.local.address) {
-                Some(c) => c.clone(),
-                None => return,
-            }
+            clients.iter().map(|(k, v)| (*k, v.clone())).collect()
         };
 
-        // Helper: send a pre-built STUN packet, await the response, and return it.
-        // Cleans up pending_transactions on timeout or error.
-        async fn send_and_await(
+        if all_clients.is_empty() {
+            return;
+        }
+
+        let pair_opt = inner.selected_pair.lock().clone();
+
+        let remote_addr_for_perm = pair_opt.as_ref().map(|p| p.remote.address);
+
+        for (relay_local_addr, client) in all_clients {
+            Self::refresh_one_turn_client(inner, relay_local_addr, &client, remote_addr_for_perm)
+                .await;
+        }
+    }
+
+    async fn refresh_one_turn_client(
+        inner: &Arc<IceTransportInner>,
+        _relay_local_addr: SocketAddr,
+        client: &Arc<TurnClient>,
+        remote_addr_opt: Option<SocketAddr>,
+    ) {
+        async fn send_and_await_inner(
             client: &Arc<TurnClient>,
             inner: &Arc<IceTransportInner>,
             bytes: Vec<u8>,
@@ -465,13 +474,11 @@ impl IceTransportRunner {
         ) -> Option<StunDecoded> {
             let (tx, rx) = oneshot::channel();
             inner.pending_transactions.lock().insert(tx_id, tx);
-
             if let Err(e) = client.send(&bytes).await {
                 debug!("TURN refresh send failed: {}", e);
                 inner.pending_transactions.lock().remove(&tx_id);
                 return None;
             }
-
             match timeout(Duration::from_secs(5), rx).await {
                 Ok(Ok(msg)) => Some(msg),
                 _ => {
@@ -481,12 +488,14 @@ impl IceTransportRunner {
             }
         }
 
+        let client = client;
+
         // 1. Refresh the allocation (extends lifetime).
         //    On 401/438 update the nonce and retry once.
         'alloc: for attempt in 0..2u8 {
             match client.create_refresh_packet().await {
                 Ok((bytes, tx_id)) => {
-                    match send_and_await(&client, inner, bytes, tx_id).await {
+                    match send_and_await_inner(client, inner, bytes, tx_id).await {
                         Some(msg) if msg.class == StunClass::SuccessResponse => {
                             trace!("TURN allocation refreshed successfully");
                             break 'alloc;
@@ -517,41 +526,46 @@ impl IceTransportRunner {
             break;
         }
 
-        // 2. Refresh permission for the remote peer.
-        //    On 401/438 update the nonce and retry once.
-        let remote_addr = pair.remote.address;
-        'perm: for attempt in 0..2u8 {
-            match client.create_permission_packet(remote_addr).await {
-                Ok((bytes, tx_id)) => match send_and_await(&client, inner, bytes, tx_id).await {
-                    Some(msg) if msg.class == StunClass::SuccessResponse => {
-                        trace!("TURN permission refreshed for {}", remote_addr);
-                        break 'perm;
-                    }
-                    Some(msg)
-                        if matches!(msg.error_code, Some(401) | Some(438)) && attempt == 0 =>
-                    {
-                        if let (Some(realm), Some(nonce)) = (msg.realm, msg.nonce) {
-                            debug!(
-                                "TURN CreatePermission got {}: updating nonce, retrying",
-                                msg.error_code.unwrap()
-                            );
-                            client.update_nonce(realm, nonce).await;
+        // 2. Refresh permission for the remote peer (if known).
+        //    This keeps the relay→peer path warm even when the selected pair uses a
+        //    host/srflx candidate, so that the relay path is available as a fallback.
+        if let Some(remote_addr) = remote_addr_opt {
+            'perm: for attempt in 0..2u8 {
+                match client.create_permission_packet(remote_addr).await {
+                    Ok((bytes, tx_id)) => {
+                        match send_and_await_inner(client, inner, bytes, tx_id).await {
+                            Some(msg) if msg.class == StunClass::SuccessResponse => {
+                                trace!("TURN permission refreshed for {}", remote_addr);
+                                break 'perm;
+                            }
+                            Some(msg)
+                                if matches!(msg.error_code, Some(401) | Some(438))
+                                    && attempt == 0 =>
+                            {
+                                if let (Some(realm), Some(nonce)) = (msg.realm, msg.nonce) {
+                                    debug!(
+                                        "TURN CreatePermission got {}: updating nonce, retrying",
+                                        msg.error_code.unwrap()
+                                    );
+                                    client.update_nonce(realm, nonce).await;
+                                }
+                                continue 'perm;
+                            }
+                            Some(msg) => {
+                                debug!(
+                                    "TURN CreatePermission refresh failed: error={:?}",
+                                    msg.error_code
+                                );
+                            }
+                            None => {
+                                debug!("TURN CreatePermission refresh timeout or send error");
+                            }
                         }
-                        continue 'perm;
                     }
-                    Some(msg) => {
-                        debug!(
-                            "TURN CreatePermission refresh failed: error={:?}",
-                            msg.error_code
-                        );
-                    }
-                    None => {
-                        debug!("TURN CreatePermission refresh timeout or send error");
-                    }
-                },
-                Err(e) => debug!("TURN CreatePermission packet creation failed: {}", e),
+                    Err(e) => debug!("TURN CreatePermission packet creation failed: {}", e),
+                }
+                break;
             }
-            break;
         }
 
         // 3. Refresh channel bindings for all bound peers.
@@ -563,7 +577,7 @@ impl IceTransportRunner {
                 'chan: for attempt in 0..2u8 {
                     match client.create_channel_rebind_packet(peer, channel).await {
                         Ok((bytes, tx_id)) => {
-                            match send_and_await(&client, inner, bytes, tx_id).await {
+                            match send_and_await_inner(client, inner, bytes, tx_id).await {
                                 Some(msg) if msg.class == StunClass::SuccessResponse => {
                                     trace!(
                                         "TURN ChannelBind refreshed: {} -> ch {}",
@@ -609,8 +623,9 @@ impl IceTransportRunner {
         }
 
         debug!(
-            "TURN refresh done: allocation + permission({}) + {} channel bindings",
-            remote_addr, num_bindings
+            "TURN refresh done: allocation + {} permission + {} channel bindings",
+            if remote_addr_opt.is_some() { 1 } else { 0 },
+            num_bindings
         );
     }
 }
@@ -1555,10 +1570,21 @@ async fn handle_stun_request(
             // USE-CANDIDATE (e.g. keepalives from other candidates) must not
             // trigger re-nomination.  Guard here to prevent pair_monitor churn.
             if inner.selected_pair.lock().is_some() {
-                trace!(
-                    "Controlled agent ignoring UseCandidate from {} – pair already nominated",
-                    addr
-                );
+                // Pair was selected via connectivity checks before USE-CANDIDATE arrived.
+                // Still need to signal nomination_complete if not done yet — otherwise
+                // peer_connection waits the full nomination_timeout (10 s) before DTLS.
+                if inner.nomination_complete.borrow().is_none() {
+                    trace!(
+                        "Controlled agent: pair already selected, signalling nomination_complete via UseCandidate from {}",
+                        addr
+                    );
+                    let _ = inner.nomination_complete.send(Some(true));
+                } else {
+                    trace!(
+                        "Controlled agent ignoring UseCandidate from {} – pair already nominated",
+                        addr
+                    );
+                }
             } else {
                 let local_addr = match sender {
                     IceSocketWrapper::Udp(s) => s

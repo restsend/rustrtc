@@ -3311,6 +3311,9 @@ impl PeerConnectionInner {
         sdp_type: SdpType,
     ) {
         section.apply_config(&self.config);
+        if let Some(caps) = self.reinvite_answer_audio_capabilities(&section.mid, kind, sdp_type) {
+            Self::apply_audio_capabilities(section, &caps);
+        }
 
         // Add extmap for Video
         if kind == MediaKind::Video {
@@ -3374,6 +3377,117 @@ impl PeerConnectionInner {
                 _ => "actpass",
             };
             section.add_dtls_attributes(&self.dtls_fingerprint, setup_value);
+        }
+    }
+
+    fn audio_capability_matches(local: &AudioCapability, remote: &AudioCapability) -> bool {
+        local.codec_name.eq_ignore_ascii_case(&remote.codec_name)
+            && local.clock_rate == remote.clock_rate
+            && local.channels == remote.channels
+    }
+
+    fn configured_audio_capabilities(config: &RtcConfiguration) -> Vec<AudioCapability> {
+        let default_caps = AudioCapability::default();
+        config
+            .media_capabilities
+            .as_ref()
+            .map(|caps| {
+                if caps.audio.is_empty() {
+                    vec![default_caps.clone()]
+                } else {
+                    caps.audio.clone()
+                }
+            })
+            .unwrap_or_else(|| vec![default_caps])
+    }
+
+    fn reinvite_answer_audio_capabilities(
+        &self,
+        mid: &str,
+        kind: MediaKind,
+        sdp_type: SdpType,
+    ) -> Option<Vec<AudioCapability>> {
+        if kind != MediaKind::Audio || sdp_type != SdpType::Answer {
+            return None;
+        }
+
+        if self.local_description.lock().is_none() {
+            return None;
+        }
+
+        let remote = self.remote_description.lock();
+        let remote_desc = remote.as_ref()?;
+        let remote_section = remote_desc
+            .media_sections
+            .iter()
+            .find(|section| section.mid == mid)
+            .or_else(|| remote_desc.media_sections.iter().find(|section| section.kind == kind))?;
+
+        let local_caps = Self::configured_audio_capabilities(&self.config);
+        let caps = Self::derive_answer_audio_capabilities(remote_section, &local_caps);
+        if caps.is_empty() { None } else { Some(caps) }
+    }
+
+    fn derive_answer_audio_capabilities(
+        remote_section: &MediaSection,
+        local_caps: &[AudioCapability],
+    ) -> Vec<AudioCapability> {
+        remote_section
+            .to_audio_capabilities()
+            .into_iter()
+            .filter_map(|remote_cap| {
+                local_caps
+                    .iter()
+                    .find(|local_cap| Self::audio_capability_matches(local_cap, &remote_cap))
+                    .map(|local_cap| {
+                        let mut cap = local_cap.clone();
+                        cap.payload_type = remote_cap.payload_type;
+                        cap.codec_name = remote_cap.codec_name.clone();
+                        cap.clock_rate = remote_cap.clock_rate;
+                        cap.channels = remote_cap.channels;
+                        if remote_cap.codec_name.eq_ignore_ascii_case("telephone-event") {
+                            cap.fmtp = remote_cap.fmtp.clone().or(cap.fmtp);
+                        }
+                        cap
+                    })
+            })
+            .collect()
+    }
+
+    fn apply_audio_capabilities(section: &mut MediaSection, caps: &[AudioCapability]) {
+        section.formats = caps.iter().map(|c| c.payload_type.to_string()).collect();
+        section
+            .attributes
+            .retain(|attr| attr.key != "rtpmap" && attr.key != "fmtp" && attr.key != "rtcp-fb");
+
+        for audio in caps {
+            let rtpmap_value = if audio.channels == 1 {
+                format!(
+                    "{} {}/{}",
+                    audio.payload_type, audio.codec_name, audio.clock_rate
+                )
+            } else {
+                format!(
+                    "{} {}/{}/{}",
+                    audio.payload_type, audio.codec_name, audio.clock_rate, audio.channels
+                )
+            };
+
+            section
+                .attributes
+                .push(Attribute::new("rtpmap", Some(rtpmap_value)));
+            if let Some(fmtp) = &audio.fmtp {
+                section.attributes.push(Attribute::new(
+                    "fmtp",
+                    Some(format!("{} {}", audio.payload_type, fmtp)),
+                ));
+            }
+            for fb in &audio.rtcp_fbs {
+                section.attributes.push(Attribute::new(
+                    "rtcp-fb",
+                    Some(format!("{} {}", audio.payload_type, fb)),
+                ));
+            }
         }
     }
 
@@ -6332,6 +6446,78 @@ a=mid:0
             !sdp.contains("a=rtcp-mux"),
             "Answer must not advertise rtcp-mux when the remote offer omitted it, got:\n{}",
             sdp
+        );
+    }
+
+    #[tokio::test]
+    async fn reinvite_answer_audio_codecs_follow_remote_offer_subset() {
+        use crate::config::{MediaCapabilities, RtcpMuxPolicy};
+        use crate::TransportMode;
+
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+        config.rtcp_mux_policy = RtcpMuxPolicy::Require;
+        config.media_capabilities = Some(MediaCapabilities {
+            audio: vec![
+                AudioCapability::opus(),
+                AudioCapability::g722(),
+                AudioCapability::telephone_event(),
+            ],
+            video: vec![],
+            application: None,
+        });
+
+        let pc = PeerConnection::new(config);
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+
+        let local_offer = pc.create_offer().await.unwrap();
+        pc.set_local_description(local_offer).unwrap();
+
+        let remote_answer = "v=0\r\n\
+            o=- 1 1 IN IP4 10.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 10.0.0.1\r\n\
+            m=audio 8000 RTP/AVP 111 101\r\n\
+            a=rtpmap:111 opus/48000/2\r\n\
+            a=fmtp:111 minptime=10;useinbandfec=1\r\n\
+            a=rtpmap:101 telephone-event/8000\r\n\
+            a=fmtp:101 0-16\r\n\
+            a=sendrecv\r\n";
+
+        let remote_answer_desc = SessionDescription::parse(SdpType::Answer, remote_answer).unwrap();
+        pc.set_remote_description(remote_answer_desc).await.unwrap();
+
+        let remote_offer = "v=0\r\n\
+            o=- 1 1 IN IP4 10.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 10.0.0.1\r\n\
+            m=audio 8000 RTP/AVP 9 101\r\n\
+            a=rtpmap:9 G722/8000\r\n\
+            a=rtpmap:101 telephone-event/8000\r\n\
+            a=fmtp:101 0-16\r\n\
+            a=sendrecv\r\n";
+
+        let desc = SessionDescription::parse(SdpType::Offer, remote_offer).unwrap();
+        pc.set_remote_description(desc).await.unwrap();
+
+        let answer = pc.create_answer().await.unwrap();
+        let audio = answer.first_audio_section().expect("answer audio section");
+
+        assert_eq!(audio.formats, vec!["9".to_string(), "101".to_string()]);
+        assert!(
+            audio.attributes.iter().any(|attr| attr.key == "rtpmap"
+                && attr.value.as_deref() == Some("9 G722/8000")),
+            "answer should keep remote-offered G722 payload, got:\n{}",
+            answer.to_sdp_string()
+        );
+        assert!(
+            audio.attributes.iter().all(|attr| {
+                attr.key != "rtpmap" || attr.value.as_deref() != Some("111 opus/48000/2")
+            }),
+            "answer must not advertise opus when it was not offered, got:\n{}",
+            answer.to_sdp_string()
         );
     }
 
