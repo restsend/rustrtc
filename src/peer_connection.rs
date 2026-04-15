@@ -2185,6 +2185,35 @@ impl PeerConnection {
             }
         }
 
+        if self.config().transport_mode != TransportMode::WebRtc {
+            if let Some(section) = new_desc.media_sections.first() {
+                let conn_opt = section
+                    .connection
+                    .as_ref()
+                    .or(new_desc.session.connection.as_ref());
+                if let Some(conn) = conn_opt {
+                    let parts: Vec<&str> = conn.split_whitespace().collect();
+                    if parts.len() >= 3
+                        && parts[0] == "IN"
+                        && parts[1] == "IP4"
+                        && let Ok(ip) = parts[2].parse::<std::net::IpAddr>()
+                    {
+                        let remote_addr = std::net::SocketAddr::new(ip, section.port);
+                        if self.config().transport_mode == TransportMode::Rtp {
+                            self.inner.ice_transport.complete_direct_rtp(remote_addr);
+                            debug!("Updated RTP remote address to {}", remote_addr);
+                        } else if self.config().transport_mode == TransportMode::Srtp {
+                            if let Some(transport) = self.inner.rtp_transport.lock().as_ref() {
+                                *transport.ice_conn().remote_addr.write() = remote_addr;
+                                debug!("Updated SRTP remote address to {}", remote_addr);
+                            }
+                        }
+                    }
+                }
+            }
+            self.update_rtcp_mux_from_remote();
+        }
+
         // Update remote description
         *self.inner.remote_description.lock() = Some(new_desc.clone());
 
@@ -3421,7 +3450,12 @@ impl PeerConnectionInner {
             .media_sections
             .iter()
             .find(|section| section.mid == mid)
-            .or_else(|| remote_desc.media_sections.iter().find(|section| section.kind == kind))?;
+            .or_else(|| {
+                remote_desc
+                    .media_sections
+                    .iter()
+                    .find(|section| section.kind == kind)
+            })?;
 
         let local_caps = Self::configured_audio_capabilities(&self.config);
         let caps = Self::derive_answer_audio_capabilities(remote_section, &local_caps);
@@ -3445,7 +3479,10 @@ impl PeerConnectionInner {
                         cap.codec_name = remote_cap.codec_name.clone();
                         cap.clock_rate = remote_cap.clock_rate;
                         cap.channels = remote_cap.channels;
-                        if remote_cap.codec_name.eq_ignore_ascii_case("telephone-event") {
+                        if remote_cap
+                            .codec_name
+                            .eq_ignore_ascii_case("telephone-event")
+                        {
                             cap.fmtp = remote_cap.fmtp.clone().or(cap.fmtp);
                         }
                         cap
@@ -6451,8 +6488,8 @@ a=mid:0
 
     #[tokio::test]
     async fn reinvite_answer_audio_codecs_follow_remote_offer_subset() {
-        use crate::config::{MediaCapabilities, RtcpMuxPolicy};
         use crate::TransportMode;
+        use crate::config::{MediaCapabilities, RtcpMuxPolicy};
 
         let mut config = RtcConfiguration::default();
         config.transport_mode = TransportMode::Rtp;
@@ -6507,8 +6544,10 @@ a=mid:0
 
         assert_eq!(audio.formats, vec!["9".to_string(), "101".to_string()]);
         assert!(
-            audio.attributes.iter().any(|attr| attr.key == "rtpmap"
-                && attr.value.as_deref() == Some("9 G722/8000")),
+            audio
+                .attributes
+                .iter()
+                .any(|attr| attr.key == "rtpmap" && attr.value.as_deref() == Some("9 G722/8000")),
             "answer should keep remote-offered G722 payload, got:\n{}",
             answer.to_sdp_string()
         );
@@ -6518,6 +6557,77 @@ a=mid:0
             }),
             "answer must not advertise opus when it was not offered, got:\n{}",
             answer.to_sdp_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn reinvite_updates_remote_addr_in_rtp_mode() {
+        use crate::{SdpType, SessionDescription, TransportMode};
+
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+        let pc = PeerConnection::new(config);
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+
+        // Initial negotiation
+        let offer = pc.create_offer().await.unwrap();
+        pc.set_local_description(offer).unwrap();
+
+        let remote_answer = "v=0\r\n\
+            o=- 1 1 IN IP4 10.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 10.0.0.1\r\n\
+            m=audio 8000 RTP/AVP 0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=sendrecv\r\n";
+
+        let remote_answer_desc = SessionDescription::parse(SdpType::Answer, remote_answer).unwrap();
+        pc.set_remote_description(remote_answer_desc).await.unwrap();
+
+        // Verify initial remote address via selected pair
+        let initial_pair = pc.inner.ice_transport.get_selected_pair().await;
+        assert!(
+            initial_pair.is_some(),
+            "selected_pair should exist after initial negotiation"
+        );
+        assert_eq!(
+            initial_pair.unwrap().remote.address,
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+                8000
+            )
+        );
+
+        // Reinvite with changed address
+        let reinvite_offer = "v=0\r\n\
+            o=- 1 2 IN IP4 192.168.1.50\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 192.168.1.50\r\n\
+            m=audio 9000 RTP/AVP 0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=sendrecv\r\n";
+
+        let reinvite_desc = SessionDescription::parse(SdpType::Offer, reinvite_offer).unwrap();
+        pc.set_remote_description(reinvite_desc).await.unwrap();
+
+        let answer = pc.create_answer().await.unwrap();
+        pc.set_local_description(answer).unwrap();
+
+        // Verify selected_pair reflects new remote address after reinvite
+        let updated_pair = pc.inner.ice_transport.get_selected_pair().await;
+        assert!(
+            updated_pair.is_some(),
+            "selected_pair should exist after reinvite"
+        );
+        assert_eq!(
+            updated_pair.unwrap().remote.address,
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 50)),
+                9000
+            ),
+            "reinvite should update RTP remote address"
         );
     }
 

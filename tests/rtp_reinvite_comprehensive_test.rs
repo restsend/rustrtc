@@ -485,3 +485,63 @@ async fn test_extmap_changes_in_reinvite() {
         "Should contain new extmap ID 7"
     );
 }
+
+/// Test 11: Reinvite updates RTP remote address
+#[tokio::test]
+async fn test_reinvite_updates_remote_addr() {
+    let mut config = RtcConfiguration::default();
+    config.transport_mode = TransportMode::Rtp;
+    let pc = PeerConnection::new(config);
+
+    // Initial negotiation as answerer
+    let initial_offer = "v=0\r\n\
+        o=- 1 1 IN IP4 10.0.0.1\r\n\
+        s=-\r\n\
+        t=0 0\r\n\
+        c=IN IP4 10.0.0.1\r\n\
+        m=audio 8000 RTP/AVP 0\r\n\
+        a=rtpmap:0 PCMU/8000\r\n\
+        a=sendrecv\r\n";
+
+    let initial_offer_desc =
+        SessionDescription::parse(SdpType::Offer, initial_offer).unwrap();
+    pc.set_remote_description(initial_offer_desc).await.unwrap();
+
+    let initial_answer = pc.create_answer().await.unwrap();
+    pc.set_local_description(initial_answer).unwrap();
+
+    // Verify initial remote address
+    let initial_pair: Option<rustrtc::transports::ice::IceCandidatePair> =
+        pc.ice_transport().get_selected_pair().await;
+    assert!(initial_pair.is_some());
+    assert_eq!(
+        initial_pair.unwrap().remote.address,
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)), 8000)
+    );
+
+    // Reinvite with changed address
+    let reinvite_offer = "v=0\r\n\
+        o=- 1 2 IN IP4 192.168.1.50\r\n\
+        s=-\r\n\
+        t=0 0\r\n\
+        c=IN IP4 192.168.1.50\r\n\
+        m=audio 9000 RTP/AVP 0\r\n\
+        a=rtpmap:0 PCMU/8000\r\n\
+        a=sendrecv\r\n";
+
+    let reinvite_desc = SessionDescription::parse(SdpType::Offer, reinvite_offer).unwrap();
+    pc.set_remote_description(reinvite_desc).await.unwrap();
+
+    let answer = pc.create_answer().await.unwrap();
+    pc.set_local_description(answer).unwrap();
+
+    // Verify selected_pair reflects new remote address after reinvite
+    let updated_pair: Option<rustrtc::transports::ice::IceCandidatePair> =
+        pc.ice_transport().get_selected_pair().await;
+    assert!(updated_pair.is_some());
+    assert_eq!(
+        updated_pair.unwrap().remote.address,
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 50)), 9000),
+        "reinvite should update RTP remote address"
+    );
+}
