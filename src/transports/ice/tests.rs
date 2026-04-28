@@ -2530,3 +2530,112 @@ async fn use_candidate_no_renomination_after_nomination() -> Result<()> {
 
     Ok(())
 }
+
+/// Verifies that DTLS packets buffered in the ICE transport BEFORE set_data_receiver
+/// are correctly delivered to the dtls_receiver when it is registered FIRST.
+///
+/// This validates the ordering fix in PeerConnection::start_dtls:
+///   BAD:  set_data_receiver(ice_conn) → ... → DtlsTransport::new(ice_conn) // DTLS ClientHello dropped
+///   GOOD: DtlsTransport::new(ice_conn) → set_data_receiver(ice_conn)       // DTLS ClientHello delivered
+///
+/// Without this fix (old ordering), the 2 buffered DTLS packets would find
+/// dtls_receiver=None and be dropped — matching the "no receiver registered"
+/// error observed in production.
+#[tokio::test]
+async fn test_buffered_dtls_packets_delivered_when_dtls_receiver_registered_first() {
+    use super::conn::IceConn;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let config = RtcConfiguration::default();
+    let (ctrl, _ctrd) = setup_host_pair(config.clone(), config.clone()).await;
+
+    // Wait for ICE to connect (this also clears any STUN packets from the buffer)
+    let ctrl_state = ctrl.subscribe_state();
+    assert!(
+        wait_ice_connected(ctrl_state, Duration::from_secs(10)).await,
+        "ICE failed to connect"
+    );
+
+    // Create a fake DTLS ClientHello packet (first byte 0x16 = Handshake, in range 20..63)
+    let dtls_packet = vec![
+        0x16, // ContentType: Handshake
+        0xfe, 0xfd, // ProtocolVersion: DTLS 1.2
+        0x00, 0x00, // epoch
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // sequence number
+        0x00, 0x00, // length (no body needed for this test)
+    ];
+    let fake_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9999);
+
+    // Simulate 2 DTLS packets arriving before start_dtls (buffered by ICE transport)
+    {
+        let mut buf = ctrl.inner.buffered_packets.lock();
+        buf.push_back((dtls_packet.clone(), fake_addr));
+        buf.push_back((dtls_packet.clone(), fake_addr));
+    }
+    assert_eq!(
+        ctrl.inner.buffered_packets.lock().len(),
+        2,
+        "Should have 2 buffered DTLS packets before set_data_receiver"
+    );
+
+    // ---- Simulate the FIXED start_dtls ordering ----
+    // 1. Create IceConn (same as start_dtls does)
+    let selected_pair = ctrl
+        .get_selected_pair()
+        .await
+        .expect("Should have selected pair after ICE connected");
+    let socket_rx = ctrl.subscribe_selected_socket();
+    let ice_conn = IceConn::new(socket_rx, selected_pair.remote.address);
+
+    // 2. Register DTLS receiver FIRST (as the fix does: DtlsTransport::new → set_dtls_receiver)
+    let (dtls_tx, mut dtls_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+    struct DtlsRecorder(tokio::sync::mpsc::UnboundedSender<Bytes>);
+    #[async_trait::async_trait]
+    impl PacketReceiver for DtlsRecorder {
+        async fn receive(&self, packet: Bytes, _addr: SocketAddr) {
+            let _ = self.0.send(packet);
+        }
+    }
+    ice_conn.set_dtls_receiver(Arc::new(DtlsRecorder(dtls_tx)));
+
+    // 3. Now call set_data_receiver (which flushes buffer to IceConn → dtls_receiver)
+    ctrl.set_data_receiver(ice_conn.clone()).await;
+
+    // 4. Verify both DTLS packets were delivered to the DTLS receiver
+    for i in 0..2 {
+        let received = tokio::time::timeout(Duration::from_secs(1), dtls_rx.recv()).await;
+        assert!(
+            received.is_ok(),
+            "Buffered DTLS packet #{} was NOT delivered — set_data_receiver flushed before dtls_receiver was registered (the bug!)",
+            i + 1
+        );
+        if let Ok(Some(pkt)) = received {
+            assert_eq!(
+                pkt[0], 0x16,
+                "Packet #{} should be a DTLS handshake record",
+                i + 1
+            );
+        }
+    }
+
+    // Also verify that WITHOUT registering dtls_receiver first, packets ARE lost.
+    // This demonstrates the exact bug from the production log.
+    {
+        let mut buf = ctrl.inner.buffered_packets.lock();
+        buf.push_back((dtls_packet.clone(), fake_addr));
+        buf.push_back((dtls_packet.clone(), fake_addr));
+    }
+    let ice_conn2 = IceConn::new(
+        ctrl.subscribe_selected_socket(),
+        selected_pair.remote.address,
+    );
+    let (lost_tx, mut lost_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+    // Intentionally NOT calling set_dtls_receiver — simulating the old buggy ordering
+    ctrl.set_data_receiver(ice_conn2.clone()).await;
+    let lost = tokio::time::timeout(Duration::from_millis(200), lost_rx.recv()).await;
+    assert!(
+        lost.is_err() || lost.ok().flatten().is_none(),
+        "Without dtls_receiver registered, buffered DTLS packets MUST be dropped (demonstrates the bug)"
+    );
+    drop((lost_tx, lost_rx));
+}

@@ -1393,12 +1393,11 @@ impl PeerConnection {
             }
         }
 
-        self.inner
-            .ice_transport
-            .set_data_receiver(ice_conn.clone())
-            .await;
-
         if self.config().transport_mode == TransportMode::Srtp {
+            self.inner
+                .ice_transport
+                .set_data_receiver(ice_conn.clone())
+                .await;
             self.setup_sdes(&rtp_transport)?;
             let rtcp_loop = Self::create_rtcp_loop(
                 rtp_transport.clone(),
@@ -1416,6 +1415,10 @@ impl PeerConnection {
         }
 
         if self.config().transport_mode == TransportMode::Rtp {
+            self.inner
+                .ice_transport
+                .set_data_receiver(ice_conn.clone())
+                .await;
             let rtcp_loop = Self::create_rtcp_loop(
                 rtp_transport.clone(),
                 Arc::downgrade(&self.inner),
@@ -1456,6 +1459,7 @@ impl PeerConnection {
         }
 
         let remote_dtls_fingerprint = self.inner.remote_dtls_fingerprint.lock().clone();
+        let ice_conn_for_data = ice_conn.clone();
         let (dtls, incoming_data_rx, dtls_runner) = DtlsTransport::new(
             ice_conn,
             self.inner.certificate.as_ref().clone(),
@@ -1465,6 +1469,13 @@ impl PeerConnection {
         )
         .await
         .map_err(|e| RtcError::Internal(format!("DTLS failed: {}", e)))?;
+
+        // DTLS receiver is now registered (inside DtlsTransport::new),
+        // safe to set data receiver and flush buffered packets.
+        self.inner
+            .ice_transport
+            .set_data_receiver(ice_conn_for_data)
+            .await;
 
         let sctp_port = if let Some(caps) = &self.config().media_capabilities {
             if let Some(app) = &caps.application {
