@@ -4938,8 +4938,13 @@ impl RtpReceiver {
                                             let params = this.codec_params_for_payload_type(packet.header.payload_type);
                                             let clock_rate = params.clock_rate;
 
+                                            // Track depacketizer drop count changes
+                                            let prev_drop = depacketizer.drop_count();
                                             // Fix: Use Depacketizer to handle frames correctly
                                             if let Ok(samples) = depacketizer.push(packet, clock_rate, addr, source.kind()) {
+                                                if depacketizer.drop_count() > prev_drop {
+                                                    source.increment_drop_count();
+                                                }
                                                 if let Err(e) = source.send_many(samples).await {
                                                     tracing::warn!("Failed to send media sample batch: {}", e);
                                                 }

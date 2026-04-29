@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex as SyncMutex;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tokio::sync::broadcast::error::TryRecvError as BroadcastTryRecvError;
 use tokio::sync::{Mutex, Notify, broadcast, mpsc};
@@ -34,6 +34,9 @@ pub trait MediaStreamTrack: Send + Sync {
     fn state(&self) -> TrackState;
     async fn recv(&self) -> MediaResult<MediaSample>;
     async fn request_key_frame(&self) -> MediaResult<()>;
+    fn drop_count(&self) -> u64 {
+        0
+    }
 }
 
 #[async_trait]
@@ -71,6 +74,7 @@ pub struct SampleStreamTrack {
     source_closed: Arc<AtomicBool>,
     ended: AtomicBool,
     feedback_tx: mpsc::Sender<FeedbackEvent>,
+    drop_count: Arc<AtomicU64>,
 }
 
 impl SampleStreamTrack {
@@ -93,6 +97,7 @@ pub struct SampleStreamSource {
     pop_lock: Arc<SyncMutex<()>>,
     source_closed: Arc<AtomicBool>,
     active_senders: Arc<std::sync::atomic::AtomicUsize>,
+    drop_count: Arc<AtomicU64>,
 }
 
 fn next_track_id() -> Arc<str> {
@@ -118,6 +123,7 @@ pub fn sample_track(
     let pop_lock = Arc::new(SyncMutex::new(()));
     let source_closed = Arc::new(AtomicBool::new(false));
     let active_senders = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let drop_count = Arc::new(AtomicU64::new(0));
     let (feedback_tx, feedback_rx) = mpsc::channel(10);
     let id = next_track_id();
     let track = Arc::new(SampleStreamTrack {
@@ -129,6 +135,7 @@ pub fn sample_track(
         source_closed: source_closed.clone(),
         ended: AtomicBool::new(false),
         feedback_tx,
+        drop_count: drop_count.clone(),
     });
     let source = SampleStreamSource {
         id,
@@ -138,6 +145,7 @@ pub fn sample_track(
         pop_lock,
         source_closed,
         active_senders,
+        drop_count,
     };
     (source, track, feedback_rx)
 }
@@ -154,6 +162,7 @@ impl Clone for SampleStreamSource {
             pop_lock: self.pop_lock.clone(),
             source_closed: self.source_closed.clone(),
             active_senders: self.active_senders.clone(),
+            drop_count: self.drop_count.clone(),
         }
     }
 }
@@ -254,6 +263,16 @@ impl SampleStreamSource {
             .map_err(|_| MediaError::WouldBlock)?;
         self.notify.notify_one();
         Ok(())
+    }
+
+    /// Increments the drop count (called by RtpReceiver when depacketizer drops frames).
+    pub fn increment_drop_count(&self) {
+        self.drop_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Returns the current drop count.
+    pub fn drop_count(&self) -> u64 {
+        self.drop_count.load(Ordering::Relaxed)
     }
 }
 
@@ -473,6 +492,10 @@ impl MediaStreamTrack for SampleStreamTrack {
             .send(FeedbackEvent::RequestKeyFrame)
             .await
             .map_err(|_| MediaError::Closed)
+    }
+
+    fn drop_count(&self) -> u64 {
+        self.drop_count.load(Ordering::Relaxed)
     }
 }
 

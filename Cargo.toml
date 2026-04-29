@@ -26,8 +26,8 @@ tokio = { version = "1", features = [
 tracing = "0.1"
 async-trait = "0.1"
 bytes = { version = "1", features = ["serde"] }
-aes = "0.8"
-ctr = "0.9"
+aes = "0.9.0"
+ctr = "0.10.0"
 hmac = "0.13.0"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
@@ -50,17 +50,15 @@ rcgen = { version = "0.14.7", default-features = false, features = [
 
 [dev-dependencies]
 axum = { version = "0.8", features = ["multipart"] }
-tower = { version = "0.5", features = ["util", "timeout"] }
-tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }
 turn = "0.17.1"
 webrtc = "0.17.1"
-reqwest = { version = "0.13.2", features = ["json"] }
+reqwest = { version = "0.13.3", features = ["json"] }
 webrtc-util = "0.17.1"
 env_logger = "0.11.10"
 dtls = "0.17.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 indicatif = "0.18.4"
-rustls = { version = "0.23.37" }
+rustls = { version = "0.23.40" }
 serial_test = "3"
 
 [features]

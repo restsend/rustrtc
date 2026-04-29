@@ -7,7 +7,7 @@ use aes_gcm::{
     Aes128Gcm, Nonce,
     aead::{Aead, KeyInit, Payload},
 };
-use ctr::cipher::{KeyIvInit, StreamCipher, generic_array::GenericArray};
+use ctr::cipher::{KeyIvInit, StreamCipher};
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use std::collections::HashMap;
@@ -312,10 +312,8 @@ impl SrtpContext {
 
         // Run AES-CM
         let mut out = vec![0u8; len];
-        let mut cipher = Aes128Ctr::new(
-            GenericArray::from_slice(&master_key[..16]),
-            GenericArray::from_slice(&iv),
-        );
+        let mut cipher = Aes128Ctr::new_from_slices(&master_key[..16], &iv)
+            .map_err(|_| SrtpError::UnsupportedProfile)?;
         cipher.apply_keystream(&mut out);
 
         Ok(out)
@@ -485,10 +483,8 @@ impl SrtpContext {
         }
 
         // Keystream
-        let mut cipher = Aes128Ctr::new(
-            GenericArray::from_slice(&self.rtcp_keys.cipher_key[..16]),
-            GenericArray::from_slice(&iv),
-        );
+        let mut cipher = Aes128Ctr::new_from_slices(&self.rtcp_keys.cipher_key[..16], &iv)
+            .map_err(|_| SrtpError::UnsupportedProfile)?;
 
         // Encrypt/Decrypt payload (offset 8)
         cipher.apply_keystream(&mut packet[8..]);
@@ -597,10 +593,8 @@ impl SrtpContext {
             SrtpProfile::NullCipherHmac => Ok(()),
             SrtpProfile::Aes128Sha1_80 | SrtpProfile::Aes128Sha1_32 => {
                 let iv = self.build_iv(packet.header.sequence_number, roc);
-                let mut cipher = Aes128Ctr::new(
-                    GenericArray::from_slice(&self.rtp_keys.cipher_key[..16]),
-                    GenericArray::from_slice(&iv),
-                );
+                let mut cipher = Aes128Ctr::new_from_slices(&self.rtp_keys.cipher_key[..16], &iv)
+                    .map_err(|_| SrtpError::UnsupportedProfile)?;
                 cipher.apply_keystream(&mut packet.payload);
                 Ok(())
             }
