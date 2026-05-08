@@ -248,7 +248,7 @@ pub struct DefaultDepacketizerFactory;
 impl DepacketizerFactory for DefaultDepacketizerFactory {
     fn create(&self, kind: MediaKind) -> Box<dyn Depacketizer> {
         match kind {
-            MediaKind::Video => Box::new(H264Depacketizer::new()),
+            MediaKind::Video => Box::new(PassThroughDepacketizer),
             _ => Box::new(PassThroughDepacketizer),
         }
     }
@@ -397,16 +397,23 @@ mod tests {
     fn test_default_factory() {
         let factory = DefaultDepacketizerFactory;
 
-        // Video should produce H264Depacketizer
-        // Verify it's not passthrough by sending a partitioned H264 packet (FU-A Start).
+        // Video defaults to RTP payload passthrough. Codec-specific depacketizers
+        // are still available through a custom DepacketizerFactory.
         let mut depacketizer = factory.create(MediaKind::Video);
         let timestamp = 12345;
-        // FU-A Start: Indicator 0x7C (Avg seq), Header 0x85 (S=1)
         let packet1 = create_packet(vec![0x7C, 0x85, 0x01], 10, timestamp, false);
         let res = depacketizer
             .push(packet1, 90000, dummy_addr(), MediaKind::Video)
             .unwrap();
-        assert_eq!(res.len(), 0, "H264 depacketizer should buffer FU-A start");
+        assert_eq!(res.len(), 1, "default video depacketizer should pass RTP payload through");
+        match &res[0] {
+            MediaSample::Video(v) => {
+                assert_eq!(v.data, Bytes::from_static(&[0x7C, 0x85, 0x01]));
+                assert_eq!(v.sequence_number, Some(10));
+                assert_eq!(v.payload_type, Some(96));
+            }
+            _ => panic!("Expected Video sample"),
+        }
 
         // Audio should produce PassThrough
         let mut depacketizer = factory.create(MediaKind::Audio);
