@@ -135,8 +135,120 @@ impl RewriteBridge {
 struct ListenerRegistry {
     by_ssrc: HashMap<u32, mpsc::Sender<(RtpPacket, SocketAddr)>>,
     by_rid: HashMap<String, mpsc::Sender<(RtpPacket, SocketAddr)>>,
-    by_pt: HashMap<u8, mpsc::Sender<(RtpPacket, SocketAddr)>>,
-    provisional: Option<mpsc::Sender<(RtpPacket, SocketAddr)>>,
+    routes: Vec<ListenerRoute>,
+}
+
+#[derive(Clone)]
+struct ListenerRoute {
+    mid: Option<String>,
+    payload_types: Vec<u8>,
+    tx: mpsc::Sender<(RtpPacket, SocketAddr)>,
+    provisional: bool,
+}
+
+impl ListenerRegistry {
+    fn route_for_sender_mut(
+        &mut self,
+        tx: &mpsc::Sender<(RtpPacket, SocketAddr)>,
+    ) -> &mut ListenerRoute {
+        if let Some(index) = self
+            .routes
+            .iter()
+            .position(|route| route.tx.same_channel(tx))
+        {
+            return &mut self.routes[index];
+        }
+
+        self.routes.push(ListenerRoute {
+            mid: None,
+            payload_types: Vec::new(),
+            tx: tx.clone(),
+            provisional: false,
+        });
+        self.routes.last_mut().unwrap()
+    }
+
+    fn register_mid(&mut self, mid: String, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
+        self.route_for_sender_mut(&tx).mid = Some(mid);
+    }
+
+    fn register_payload_types(
+        &mut self,
+        payload_types: Vec<u8>,
+        tx: mpsc::Sender<(RtpPacket, SocketAddr)>,
+    ) {
+        let route = self.route_for_sender_mut(&tx);
+        route.payload_types.clear();
+        for pt in payload_types {
+            if !route.payload_types.contains(&pt) {
+                route.payload_types.push(pt);
+            }
+        }
+    }
+
+    fn register_payload_type(&mut self, pt: u8, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
+        let route = self.route_for_sender_mut(&tx);
+        if !route.payload_types.contains(&pt) {
+            route.payload_types.push(pt);
+        }
+    }
+
+    fn register_provisional(&mut self, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
+        self.route_for_sender_mut(&tx).provisional = true;
+    }
+
+    fn by_mid(&self, mid: &str) -> Option<mpsc::Sender<(RtpPacket, SocketAddr)>> {
+        self.routes
+            .iter()
+            .find(|route| route.mid.as_deref() == Some(mid))
+            .map(|route| route.tx.clone())
+    }
+
+    fn unique_by_pt(&self, pt: u8) -> Option<mpsc::Sender<(RtpPacket, SocketAddr)>> {
+        let mut selected: Option<&mpsc::Sender<(RtpPacket, SocketAddr)>> = None;
+
+        for route in self
+            .routes
+            .iter()
+            .filter(|route| route.payload_types.contains(&pt))
+        {
+            if let Some(existing) = selected {
+                if !existing.same_channel(&route.tx) {
+                    return None;
+                }
+            } else {
+                selected = Some(&route.tx);
+            }
+        }
+
+        selected.cloned()
+    }
+
+    fn single_provisional(&self) -> Option<mpsc::Sender<(RtpPacket, SocketAddr)>> {
+        let mut selected: Option<&mpsc::Sender<(RtpPacket, SocketAddr)>> = None;
+
+        for route in self.routes.iter().filter(|route| route.provisional) {
+            if let Some(existing) = selected {
+                if !existing.same_channel(&route.tx) {
+                    return None;
+                }
+            } else {
+                selected = Some(&route.tx);
+            }
+        }
+
+        selected.cloned()
+    }
+
+    fn bind_ssrc_route(&mut self, ssrc: u32, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
+        self.by_ssrc.insert(ssrc, tx);
+    }
+
+    fn remove_sender(&mut self, tx: &mpsc::Sender<(RtpPacket, SocketAddr)>) {
+        self.by_ssrc.retain(|_, existing| !existing.same_channel(tx));
+        self.by_rid.retain(|_, existing| !existing.same_channel(tx));
+        self.routes.retain(|route| !route.tx.same_channel(tx));
+    }
 }
 
 pub struct RtpTransport {
@@ -145,6 +257,7 @@ pub struct RtpTransport {
     listeners: Mutex<ListenerRegistry>,
     rtcp_listener: Mutex<Option<mpsc::Sender<Vec<RtcpPacket>>>>,
     rid_extension_id: AtomicU8,
+    sdes_mid_extension_id: AtomicU8,
     abs_send_time_extension_id: AtomicU8,
     rewrite_bridge: Mutex<Option<Arc<RewriteBridge>>>,
     srtp_required: bool,
@@ -166,6 +279,7 @@ impl RtpTransport {
             listeners: Mutex::new(ListenerRegistry::default()),
             rtcp_listener: Mutex::new(None),
             rid_extension_id: AtomicU8::new(EXT_ID_NONE),
+            sdes_mid_extension_id: AtomicU8::new(EXT_ID_NONE),
             abs_send_time_extension_id: AtomicU8::new(EXT_ID_NONE),
             rewrite_bridge: Mutex::new(None),
             srtp_required,
@@ -199,18 +313,37 @@ impl RtpTransport {
         listeners.by_rid.insert(rid, tx);
     }
 
+    pub fn register_mid_listener(&self, mid: String, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
+        let mut listeners = self.listeners.lock();
+        listeners.register_mid(mid, tx);
+    }
+
     pub fn register_pt_listener(&self, pt: u8, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
         let mut listeners = self.listeners.lock();
-        listeners.by_pt.insert(pt, tx);
+        listeners.register_payload_type(pt, tx);
+    }
+
+    pub fn register_payload_list_listener(
+        &self,
+        payload_types: Vec<u8>,
+        tx: mpsc::Sender<(RtpPacket, SocketAddr)>,
+    ) {
+        let mut listeners = self.listeners.lock();
+        listeners.register_payload_types(payload_types, tx);
     }
 
     pub fn register_provisional_listener(&self, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
         let mut listeners = self.listeners.lock();
-        listeners.provisional = Some(tx);
+        listeners.register_provisional(tx);
     }
 
     pub fn set_rid_extension_id(&self, id: Option<u8>) {
         self.rid_extension_id
+            .store(encode_ext_id(id), Ordering::Relaxed);
+    }
+
+    pub fn set_sdes_mid_extension_id(&self, id: Option<u8>) {
+        self.sdes_mid_extension_id
             .store(encode_ext_id(id), Ordering::Relaxed);
     }
 
@@ -333,11 +466,8 @@ impl RtpTransport {
             listeners.by_ssrc.clear();
             count += listeners.by_rid.len();
             listeners.by_rid.clear();
-            count += listeners.by_pt.len();
-            listeners.by_pt.clear();
-            if listeners.provisional.take().is_some() {
-                count += 1;
-            }
+            count += listeners.routes.len();
+            listeners.routes.clear();
         }
 
         // Clear RTCP listener
@@ -440,27 +570,50 @@ impl PacketReceiver for RtpTransport {
 
             let listener = {
                 let rid_id = decode_ext_id(self.rid_extension_id.load(Ordering::Relaxed));
-                let listeners = self.listeners.lock();
+                let mid_id = decode_ext_id(self.sdes_mid_extension_id.load(Ordering::Relaxed));
+                let mut listeners = self.listeners.lock();
                 let mut selected = None;
+                let mut bind_ssrc = false;
 
                 if let Some(id) = rid_id {
                     if let Some(rid) = rtp_packet.header.get_extension(id) {
                         if let Ok(rid_str) = std::str::from_utf8(&rid) {
                             selected = listeners.by_rid.get(rid_str).cloned();
+                            bind_ssrc = selected.is_some();
+                        }
+                    }
+                }
+
+                if selected.is_none() {
+                    if let Some(id) = mid_id {
+                        if let Some(mid) = rtp_packet.header.get_extension(id) {
+                            if let Ok(mid_str) = std::str::from_utf8(&mid) {
+                                selected = listeners.by_mid(mid_str);
+                                bind_ssrc = selected.is_some();
+                            }
                         }
                     }
                 }
 
                 if selected.is_none() {
                     selected = listeners.by_ssrc.get(&ssrc).cloned();
+                    bind_ssrc = false;
                 }
 
                 if selected.is_none() {
-                    selected = listeners.by_pt.get(&pt).cloned();
+                    selected = listeners.unique_by_pt(pt);
+                    bind_ssrc = selected.is_some();
                 }
 
                 if selected.is_none() {
-                    selected = listeners.provisional.clone();
+                    selected = listeners.single_provisional();
+                    bind_ssrc = false;
+                }
+
+                if let Some(tx) = selected.as_ref()
+                    && bind_ssrc
+                {
+                    listeners.bind_ssrc_route(ssrc, tx.clone());
                 }
 
                 selected
@@ -473,6 +626,7 @@ impl PacketReceiver for RtpTransport {
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         let mut listeners = self.listeners.lock();
                         listeners.by_ssrc.remove(&ssrc);
+                        listeners.remove_sender(&tx);
                     }
                 }
             } else {
@@ -596,6 +750,150 @@ mod tests {
             .expect("Should receive packet 3 (New PT/SSRC)");
         assert_eq!(received3.0.header.ssrc, ssrc3);
         assert_eq!(received3.0.header.payload_type, 8);
+    }
+
+    #[tokio::test]
+    async fn test_ambiguous_payload_type_without_mid_or_ssrc_is_dropped() {
+        use crate::transports::ice::IceSocketWrapper;
+        use bytes::Bytes;
+        use tokio::sync::watch;
+
+        let (_ice_tx, ice_rx) = watch::channel(None::<IceSocketWrapper>);
+        let ice_conn = IceConn::new(ice_rx, "127.0.0.1:1234".parse().unwrap());
+        let transport = RtpTransport::new(ice_conn, false);
+
+        let (audio_tx, mut audio_rx) = mpsc::channel(10);
+        transport.register_provisional_listener(audio_tx.clone());
+        transport.register_payload_list_listener(vec![96], audio_tx);
+
+        let (video_tx, mut video_rx) = mpsc::channel(10);
+        transport.register_provisional_listener(video_tx.clone());
+        transport.register_payload_list_listener(vec![96], video_tx);
+
+        let header = crate::rtp::RtpHeader::new(96, 1, 0, 4444);
+        let packet = crate::rtp::RtpPacket::new(header, vec![0u8; 160]);
+        transport
+            .receive(
+                Bytes::from(packet.marshal().unwrap()),
+                "127.0.0.1:5000".parse().unwrap(),
+            )
+            .await;
+
+        tokio::time::timeout(tokio::time::Duration::from_millis(50), audio_rx.recv())
+            .await
+            .expect_err("ambiguous packet should not be routed to audio");
+        tokio::time::timeout(tokio::time::Duration::from_millis(50), video_rx.recv())
+            .await
+            .expect_err("ambiguous packet should not be routed to video");
+        assert!(!transport.has_listener(4444));
+    }
+
+    #[tokio::test]
+    async fn test_mid_routes_and_binds_ssrc_when_payload_type_is_ambiguous() {
+        use crate::transports::ice::IceSocketWrapper;
+        use bytes::Bytes;
+        use tokio::sync::watch;
+
+        let (_ice_tx, ice_rx) = watch::channel(None::<IceSocketWrapper>);
+        let ice_conn = IceConn::new(ice_rx, "127.0.0.1:1234".parse().unwrap());
+        let transport = RtpTransport::new(ice_conn, false);
+        transport.set_sdes_mid_extension_id(Some(1));
+
+        let (audio_tx, mut audio_rx) = mpsc::channel(10);
+        transport.register_mid_listener("as".to_string(), audio_tx.clone());
+        transport.register_payload_list_listener(vec![96], audio_tx);
+
+        let (video_tx, mut video_rx) = mpsc::channel(10);
+        transport.register_mid_listener("vs".to_string(), video_tx.clone());
+        transport.register_payload_list_listener(vec![96], video_tx);
+
+        let mut header = crate::rtp::RtpHeader::new(96, 1, 0, 5555);
+        header.set_extension(1, b"vs").unwrap();
+        let packet = crate::rtp::RtpPacket::new(header, vec![0u8; 160]);
+        transport
+            .receive(
+                Bytes::from(packet.marshal().unwrap()),
+                "127.0.0.1:5000".parse().unwrap(),
+            )
+            .await;
+
+        let received = video_rx
+            .recv()
+            .await
+            .expect("packet with video MID should route to video");
+        assert_eq!(received.0.header.ssrc, 5555);
+        tokio::time::timeout(tokio::time::Duration::from_millis(50), audio_rx.recv())
+            .await
+            .expect_err("packet with video MID should not route to audio");
+        assert!(transport.has_listener(5555));
+
+        let header = crate::rtp::RtpHeader::new(96, 2, 160, 5555);
+        let packet = crate::rtp::RtpPacket::new(header, vec![1u8; 160]);
+        transport
+            .receive(
+                Bytes::from(packet.marshal().unwrap()),
+                "127.0.0.1:5000".parse().unwrap(),
+            )
+            .await;
+
+        let received = video_rx
+            .recv()
+            .await
+            .expect("bound SSRC should route without MID");
+        assert_eq!(received.0.header.sequence_number, 2);
+    }
+
+    #[tokio::test]
+    async fn test_mid_route_overrides_existing_ssrc_mapping() {
+        use crate::transports::ice::IceSocketWrapper;
+        use bytes::Bytes;
+        use tokio::sync::watch;
+
+        let (_ice_tx, ice_rx) = watch::channel(None::<IceSocketWrapper>);
+        let ice_conn = IceConn::new(ice_rx, "127.0.0.1:1234".parse().unwrap());
+        let transport = RtpTransport::new(ice_conn, false);
+        transport.set_sdes_mid_extension_id(Some(1));
+
+        let (audio_tx, mut audio_rx) = mpsc::channel(10);
+        transport.register_listener_sync(6666, audio_tx.clone());
+        transport.register_mid_listener("as".to_string(), audio_tx);
+
+        let (video_tx, mut video_rx) = mpsc::channel(10);
+        transport.register_mid_listener("vs".to_string(), video_tx);
+
+        let mut header = crate::rtp::RtpHeader::new(96, 1, 0, 6666);
+        header.set_extension(1, b"vs").unwrap();
+        let packet = crate::rtp::RtpPacket::new(header, vec![0u8; 160]);
+        transport
+            .receive(
+                Bytes::from(packet.marshal().unwrap()),
+                "127.0.0.1:5000".parse().unwrap(),
+            )
+            .await;
+
+        let received = video_rx
+            .recv()
+            .await
+            .expect("MID should override stale SSRC mapping");
+        assert_eq!(received.0.header.ssrc, 6666);
+        tokio::time::timeout(tokio::time::Duration::from_millis(50), audio_rx.recv())
+            .await
+            .expect_err("stale SSRC mapping should not receive the MID packet");
+
+        let header = crate::rtp::RtpHeader::new(96, 2, 160, 6666);
+        let packet = crate::rtp::RtpPacket::new(header, vec![1u8; 160]);
+        transport
+            .receive(
+                Bytes::from(packet.marshal().unwrap()),
+                "127.0.0.1:5000".parse().unwrap(),
+            )
+            .await;
+
+        let received = video_rx
+            .recv()
+            .await
+            .expect("corrected SSRC mapping should receive packets without MID");
+        assert_eq!(received.0.header.sequence_number, 2);
     }
 
     #[tokio::test]

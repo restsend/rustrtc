@@ -495,10 +495,8 @@ impl PeerConnection {
         kind: MediaKind,
         direction: TransceiverDirection,
     ) -> Arc<RtpTransceiver> {
-        let index = self.inner.transceivers.lock().len();
-        let ssrc = 2000 + index as u32;
         let transceiver = Arc::new(RtpTransceiver::new(kind, direction));
-        let mut builder = RtpReceiverBuilder::new(kind, ssrc)
+        let mut builder = RtpReceiverBuilder::new(kind, 0)
             .payload_map(transceiver.payload_map.clone())
             .interceptor(self.inner.stats_collector.clone())
             .depacketizer_factory(self.inner.config.depacketizer_strategy.factory.clone());
@@ -1175,7 +1173,7 @@ impl PeerConnection {
                     let t = Arc::new(RtpTransceiver::new(kind, direction));
                     t.set_mid(mid.clone());
 
-                    let receiver_ssrc = ssrc.unwrap_or_else(|| 2000 + transceivers.len() as u32);
+                    let receiver_ssrc = ssrc.unwrap_or(0);
 
                     let mut builder = RtpReceiverBuilder::new(kind, receiver_ssrc)
                         .payload_map(t.payload_map.clone())
@@ -3935,7 +3933,20 @@ impl RtpTransceiver {
     }
 
     fn set_mid(&self, mid: String) {
-        *self.mid.lock() = Some(mid);
+        *self.mid.lock() = Some(mid.clone());
+
+        let transport = self
+            .rtp_transport
+            .lock()
+            .as_ref()
+            .and_then(|transport| transport.upgrade());
+        let receiver = self.receiver.lock().clone();
+        if let Some(transport) = transport
+            && let Some(receiver) = receiver
+            && let Some(tx) = receiver.packet_tx()
+        {
+            transport.register_mid_listener(mid, tx);
+        }
     }
 
     pub fn sender(&self) -> Option<Arc<RtpSender>> {
@@ -4002,9 +4013,10 @@ impl RtpTransceiver {
             if let Some(transport_weak) = self.rtp_transport.lock().clone() {
                 if let Some(transport) = transport_weak.upgrade() {
                     if let Some(tx) = receiver.packet_tx() {
-                        for (&pt, _) in &new_map {
-                            transport.register_pt_listener(pt, tx.clone());
-                        }
+                        transport.register_payload_list_listener(
+                            new_map.keys().copied().collect(),
+                            tx.clone(),
+                        );
                     }
                 }
             }
@@ -4040,6 +4052,12 @@ impl RtpTransceiver {
                     .find(|(_, uri)| uri.contains("rtp-stream-id"))
                     .map(|(id, _)| *id);
                 transport.set_rid_extension_id(id);
+
+                let id = extmap
+                    .iter()
+                    .find(|(_, uri)| uri.as_str() == crate::sdp::SDES_MID_URI)
+                    .map(|(id, _)| *id);
+                transport.set_sdes_mid_extension_id(id);
             }
         }
 
@@ -4719,6 +4737,7 @@ impl RtpReceiver {
 
         if let Some(transport) = transport
             && let Some(tx) = packet_tx
+            && ssrc != 0
         {
             transport.register_listener_sync(ssrc, tx);
         }
@@ -4745,6 +4764,7 @@ impl RtpReceiver {
         event_tx: Option<mpsc::UnboundedSender<PeerConnectionEvent>>,
         transceiver: Option<Weak<RtpTransceiver>>,
     ) {
+        let route_transceiver = transceiver.clone().and_then(|t| t.upgrade());
         *self.transport.lock() = Some(transport.clone());
         *self.track_ready_event_tx.lock() = event_tx;
         *self.track_ready_transceiver.lock() = transceiver;
@@ -4757,20 +4777,32 @@ impl RtpReceiver {
         // Main track
         let (tx, rx) = mpsc::channel(RTP_RECEIVER_PACKET_CAPACITY);
         let ssrc = *self.ssrc.lock();
-        transport.register_listener_sync(ssrc, tx.clone());
+        if ssrc != 0 {
+            transport.register_listener_sync(ssrc, tx.clone());
+        }
         transport.register_provisional_listener(tx.clone());
+        if let Some(transceiver) = &route_transceiver {
+            if let Some(mid) = transceiver.mid() {
+                transport.register_mid_listener(mid, tx.clone());
+            }
+            let extmap = transceiver.get_extmap();
+            let sdes_mid_id = extmap
+                .iter()
+                .find(|(_, uri)| uri.as_str() == crate::sdp::SDES_MID_URI)
+                .map(|(id, _)| *id);
+            transport.set_sdes_mid_extension_id(sdes_mid_id);
+        }
 
         // Register the negotiated payload types when available, keeping the
         // default PT as a fallback before negotiation completes.
         let default_pt = self.params.lock().payload_type;
-        transport.register_pt_listener(default_pt, tx.clone());
-
-        let payload_types: Vec<u8> = self.payload_map.read().keys().copied().collect();
-        for pt in payload_types {
-            if pt != default_pt {
-                transport.register_pt_listener(pt, tx.clone());
+        let mut payload_types = vec![default_pt];
+        for pt in self.payload_map.read().keys().copied() {
+            if !payload_types.contains(&pt) {
+                payload_types.push(pt);
             }
         }
+        transport.register_payload_list_listener(payload_types, tx.clone());
 
         *self.packet_tx.lock() = Some(tx);
 
@@ -4898,9 +4930,8 @@ impl RtpReceiver {
                                                     );
                                                     *s = packet.header.ssrc;
 
-                                                    // Send Track event after SSRC latching (RTP mode)
-                                                    // Only send if we're using provisional SSRC and haven't sent before
-                                                    if old_ssrc >= 2000 && old_ssrc < 3000 {
+                                                    // Send Track event after learning the first real SSRC.
+                                                    if old_ssrc == 0 {
                                                         // Use swap to atomically check and set the flag
                                                         if !this.track_event_sent.swap(true, Ordering::SeqCst) {
                                                             if let Some(ref event_tx) = *this.track_ready_event_tx.lock() {
@@ -5715,15 +5746,13 @@ a=mid:0
         let receiver = transceiver.receiver().unwrap();
         let initial_ssrc = receiver.ssrc();
 
-        // In RTP mode, initial SSRC should be provisional (2000-2999 range)
-        assert!(
-            initial_ssrc >= 2000 && initial_ssrc < 3000,
-            "Initial SSRC should be provisional, got {}",
-            initial_ssrc
+        assert_eq!(
+            initial_ssrc, 0,
+            "Initial SSRC should be unknown until real RTP arrives"
         );
 
         println!(
-            "✓ RTP mode test setup complete, initial provisional SSRC: {}",
+            "✓ RTP mode test setup complete, initial unknown SSRC: {}",
             initial_ssrc
         );
         println!("✓ When real RTP packets arrive with actual SSRC, Track event will be sent");
@@ -6340,8 +6369,7 @@ a=mid:0
         config.transport_mode = TransportMode::Rtp;
         let pc = PeerConnection::new(config);
 
-        // Remote offer with SSRC → should create receiver with provisional SSRC
-        // until real RTP arrives
+        // Remote offer without SSRC should keep receiver SSRC unknown until real RTP arrives.
         let remote_sdp = "v=0\r\n\
                           o=- 1 1 IN IP4 10.0.0.1\r\n\
                           s=-\r\n\
@@ -6358,11 +6386,9 @@ a=mid:0
 
         let receiver = transceivers[0].receiver().unwrap();
         let ssrc = receiver.ssrc();
-        // Provisional SSRC range is 2000..3000
-        assert!(
-            ssrc >= 2000 && ssrc < 3000,
-            "In RTP mode without SSRC in SDP, receiver should get a provisional SSRC, got {}",
-            ssrc
+        assert_eq!(
+            ssrc, 0,
+            "In RTP mode without SSRC in SDP, receiver SSRC should stay unknown"
         );
     }
 
