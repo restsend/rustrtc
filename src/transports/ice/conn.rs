@@ -12,7 +12,7 @@ use tracing::debug;
 
 pub struct IceConn {
     pub socket_rx: watch::Receiver<Option<IceSocketWrapper>>,
-    pub rtcp_socket_rx: watch::Receiver<Option<IceSocketWrapper>>,
+    rtcp_socket_rx: watch::Receiver<Option<IceSocketWrapper>>,
     pub remote_addr: RwLock<SocketAddr>,
     pub remote_rtcp_addr: RwLock<Option<SocketAddr>>,
     pub dtls_receiver: RwLock<Option<Weak<dyn PacketReceiver>>>,
@@ -30,7 +30,7 @@ impl IceConn {
         Self::new_with_rtcp(socket_rx.clone(), socket_rx, remote_addr)
     }
 
-    pub fn new_with_rtcp(
+    pub(crate) fn new_with_rtcp(
         socket_rx: watch::Receiver<Option<IceSocketWrapper>>,
         rtcp_socket_rx: watch::Receiver<Option<IceSocketWrapper>>,
         remote_addr: SocketAddr,

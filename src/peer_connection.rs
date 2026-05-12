@@ -19,7 +19,7 @@ use crate::{
 use base64::prelude::*;
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::{
     sync::{
         Arc,
@@ -708,9 +708,25 @@ impl PeerConnection {
                 .ice_transport
                 .set_role(crate::transports::ice::IceRole::Controlling);
         }
-        self.inner
+        let desc = self
+            .inner
             .build_description(SdpType::Offer, |dir| dir)
-            .await
+            .await?;
+        if self.inner.config.transport_mode == TransportMode::Rtp && !Self::sdp_has_bundle(&desc) {
+            for (media_index, (transceiver, _)) in
+                self.matched_rtp_media_sections(&desc).into_iter().enumerate()
+            {
+                if media_index == 0 {
+                    continue;
+                }
+                let ice_transport = self
+                    .inner
+                    .direct_rtp_ice_transport(transceiver.id(), false);
+                self.ensure_direct_rtp_media_transport(&transceiver, &ice_transport, None, None)
+                    .await;
+            }
+        }
+        Ok(desc)
     }
 
     pub async fn create_answer(&self) -> RtcResult<SessionDescription> {
@@ -1242,8 +1258,10 @@ impl PeerConnection {
                         receiver.set_rtx_ssrc(rtx);
                     }
 
-                    // If transport is already active (renegotiation), attach it to the new receiver
-                    {
+                    // If transport is already active (renegotiation), attach it to the new receiver.
+                    // Direct RTP attaches after media sections are matched so non-BUNDLE video
+                    // does not briefly register on the primary audio transport.
+                    if self.inner.config.transport_mode != TransportMode::Rtp {
                         let transport_guard = self.inner.rtp_transport.lock();
                         if let Some(transport) = &*transport_guard {
                             receiver.set_transport(
@@ -2009,12 +2027,6 @@ impl PeerConnection {
                 .await
                 .map_err(|e| crate::RtcError::Internal(format!("RTP direct error: {}", e)))?;
         } else {
-            if needs_rtcp_socket && ice_transport.local_rtcp_addr().is_none() {
-                ice_transport
-                    .ensure_direct_rtcp_socket()
-                    .await
-                    .map_err(|e| crate::RtcError::Internal(format!("RTCP direct error: {}", e)))?;
-            }
             ice_transport.complete_direct_rtp(remote_addr);
         }
 
@@ -2032,7 +2044,12 @@ impl PeerConnection {
         }
 
         let transport = self
-            .ensure_direct_rtp_media_transport(transceiver, &ice_transport, section, remote_addr)
+            .ensure_direct_rtp_media_transport(
+                transceiver,
+                &ice_transport,
+                Some(section),
+                Some(remote_addr),
+            )
             .await;
         self.attach_rtp_transport_to_transceiver(transceiver, transport);
         Ok(())
@@ -2042,8 +2059,8 @@ impl PeerConnection {
         &self,
         transceiver: &Arc<RtpTransceiver>,
         ice_transport: &IceTransport,
-        section: &MediaSection,
-        remote_addr: std::net::SocketAddr,
+        section: Option<&MediaSection>,
+        remote_addr: Option<std::net::SocketAddr>,
     ) -> Arc<RtpTransport> {
         if let Some(transport) = self
             .inner
@@ -2052,25 +2069,31 @@ impl PeerConnection {
             .get(&transceiver.id())
             .cloned()
         {
-            let ice_conn = transport.ice_conn();
-            *ice_conn.remote_addr.write() = remote_addr;
-            ice_conn.set_remote_rtcp_addr(Self::remote_rtcp_addr_from_media_section(
-                section,
-                remote_addr,
-            ));
+            if let Some(remote_addr) = remote_addr {
+                let ice_conn = transport.ice_conn();
+                *ice_conn.remote_addr.write() = remote_addr;
+                ice_conn.set_remote_rtcp_addr(
+                    section.and_then(|section| {
+                        Self::remote_rtcp_addr_from_media_section(section, remote_addr)
+                    }),
+                );
+            }
             return transport;
         }
 
         let socket_rx = ice_transport.subscribe_selected_socket();
         let rtcp_socket_rx = ice_transport.subscribe_selected_rtcp_socket();
+        let remote_addr = remote_addr.unwrap_or_else(|| {
+            std::net::SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
+        });
         let ice_conn = IceConn::new_with_rtcp(socket_rx, rtcp_socket_rx, remote_addr);
         if self.config().enable_latching {
             ice_conn.enable_latch_on_rtp();
         }
-        ice_conn.set_remote_rtcp_addr(Self::remote_rtcp_addr_from_media_section(
-            section,
-            remote_addr,
-        ));
+        ice_conn.set_remote_rtcp_addr(
+            section
+                .and_then(|section| Self::remote_rtcp_addr_from_media_section(section, remote_addr)),
+        );
 
         let rtp_transport = Arc::new(RtpTransport::new_with_ssrc_change(
             ice_conn.clone(),
@@ -3362,30 +3385,7 @@ impl PeerConnectionInner {
             == crate::config::RtcpMuxPolicy::Require
             && self.config.sdp_compatibility != crate::config::SdpCompatibilityMode::LegacySip;
 
-        if mode == TransportMode::Rtp {
-            // RTP mode: bind a direct socket without ICE gathering.
-            // If we don't have candidates yet, bind now via setup_direct_rtp_offer.
-            let primary_needs_rtcp = match sdp_type {
-                SdpType::Answer => ordered_transceivers
-                    .first()
-                    .map(|(_, remote_offered_rtcp_mux)| !*remote_offered_rtcp_mux)
-                    .unwrap_or(!local_offers_rtcp_mux),
-                _ => !local_offers_rtcp_mux,
-            };
-            if self.ice_transport.local_candidates().is_empty() {
-                self.ice_transport
-                    .setup_direct_rtp_offer_with_rtcp(primary_needs_rtcp)
-                    .await
-                    .map_err(|err| RtcError::Internal(format!("RTP socket bind failed: {err}")))?;
-            } else if primary_needs_rtcp && self.ice_transport.local_rtcp_addr().is_none() {
-                self.ice_transport
-                    .ensure_direct_rtcp_socket()
-                    .await
-                    .map_err(|err| RtcError::Internal(format!("RTCP socket bind failed: {err}")))?;
-            }
-            // Since we skip run_gathering_loop in RTP mode, update gathering state directly.
-            let _ = self.ice_gathering_state.send(IceGatheringState::Complete);
-        } else {
+        if mode != TransportMode::Rtp {
             self.ice_transport
                 .start_gathering()
                 .map_err(|err| RtcError::InvalidState(format!("ICE gathering failed: {err}")))?;
@@ -3441,15 +3441,8 @@ impl PeerConnectionInner {
         let mode = self.config.transport_mode.clone();
 
         if mode == TransportMode::Rtp || mode == TransportMode::Srtp {
-            let local_ip = if let Some(ext_ip) = &self.config.external_ip {
-                ext_ip
-                    .parse()
-                    .unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
-            } else {
-                get_local_ip().unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
-            };
-            if desc.session.connection.is_none() {
-                desc.session.connection = Some(format!("IN IP4 {}", local_ip));
+            if let Some(ext_ip) = &self.config.external_ip {
+                desc.session.connection = Some(format!("IN IP4 {}", ext_ip));
             }
         }
 
@@ -3536,33 +3529,33 @@ impl PeerConnectionInner {
             } else {
                 // For RTP/SRTP, use the first candidate's address for c= and m= port
                 // Prefer non-loopback candidates
-                let section_ice_transport =
-                    if mode == TransportMode::Rtp && !will_bundle && media_index > 0 {
+                let section_ice_transport = if mode == TransportMode::Rtp {
+                    let ice_transport = if !will_bundle && media_index > 0 {
                         let ice_transport =
                             self.direct_rtp_ice_transport(transceiver.id(), false);
-                        let needs_rtcp = match sdp_type {
-                            SdpType::Answer => !remote_offered_rtcp_mux,
-                            _ => !local_offers_rtcp_mux,
-                        };
-                        if ice_transport.local_candidates().is_empty() {
-                            ice_transport
-                                .setup_direct_rtp_offer_with_rtcp(needs_rtcp)
-                                .await
-                                .map_err(|err| {
-                                    RtcError::Internal(format!("RTP socket bind failed: {err}"))
-                                })?;
-                        } else if needs_rtcp && ice_transport.local_rtcp_addr().is_none() {
-                            ice_transport
-                                .ensure_direct_rtcp_socket()
-                                .await
-                                .map_err(|err| {
-                                    RtcError::Internal(format!("RTCP socket bind failed: {err}"))
-                                })?;
-                        }
                         ice_transport
                     } else {
                         self.ice_transport.clone()
                     };
+                    let needs_rtcp = match sdp_type {
+                        SdpType::Answer => !remote_offered_rtcp_mux,
+                        _ => !local_offers_rtcp_mux,
+                    };
+                    if ice_transport.local_candidates().is_empty() {
+                        ice_transport
+                            .setup_direct_rtp_offer_with_rtcp(needs_rtcp)
+                            .await
+                            .map_err(|err| {
+                                RtcError::Internal(format!("RTP socket bind failed: {err}"))
+                            })?;
+                    }
+                    // RTP mode skips the ICE gathering loop; section-driven direct socket
+                    // setup publishes candidates synchronously.
+                    let _ = self.ice_gathering_state.send(IceGatheringState::Complete);
+                    ice_transport
+                } else {
+                    self.ice_transport.clone()
+                };
                 let candidates = section_ice_transport.local_candidates();
                 local_rtcp_addr = section_ice_transport.local_rtcp_addr();
                 if let Some(cand) = candidates
@@ -3573,6 +3566,9 @@ impl PeerConnectionInner {
                 {
                     section.port = cand.address.port();
                     let conn = format!("IN IP4 {}", cand.address.ip());
+                    if desc.session.connection.is_none() {
+                        desc.session.connection = Some(conn.clone());
+                    }
                     if Some(&conn) != desc.session.connection.as_ref() {
                         section.connection = Some(conn);
                     }

@@ -9,7 +9,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
 use tokio::sync::mpsc;
 
@@ -259,7 +259,6 @@ pub struct RtpTransport {
     rid_extension_id: AtomicU8,
     sdes_mid_extension_id: AtomicU8,
     abs_send_time_extension_id: AtomicU8,
-    diagnostic_packet_count: AtomicU64,
     rewrite_bridge: Mutex<Option<Arc<RewriteBridge>>>,
     srtp_required: bool,
 }
@@ -282,7 +281,6 @@ impl RtpTransport {
             rid_extension_id: AtomicU8::new(EXT_ID_NONE),
             sdes_mid_extension_id: AtomicU8::new(EXT_ID_NONE),
             abs_send_time_extension_id: AtomicU8::new(EXT_ID_NONE),
-            diagnostic_packet_count: AtomicU64::new(0),
             rewrite_bridge: Mutex::new(None),
             srtp_required,
             // allow_ssrc_change,
@@ -303,12 +301,6 @@ impl RtpTransport {
     pub fn register_listener_sync(&self, ssrc: u32, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
         let mut listeners = self.listeners.lock();
         listeners.by_ssrc.insert(ssrc, tx);
-        tracing::info!(
-            transport_id = format_args!("{:p}", Arc::as_ptr(&self.transport)),
-            ssrc,
-            ssrc_routes = listeners.by_ssrc.len(),
-            "RTP listener registered by SSRC"
-        );
     }
 
     pub fn has_listener(&self, ssrc: u32) -> bool {
@@ -318,40 +310,17 @@ impl RtpTransport {
 
     pub fn register_rid_listener(&self, rid: String, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
         let mut listeners = self.listeners.lock();
-        listeners.by_rid.insert(rid.clone(), tx);
-        tracing::info!(
-            transport_id = format_args!("{:p}", Arc::as_ptr(&self.transport)),
-            rid = %rid,
-            rid_routes = listeners.by_rid.len(),
-            "RTP listener registered by RID"
-        );
+        listeners.by_rid.insert(rid, tx);
     }
 
     pub fn register_mid_listener(&self, mid: String, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
         let mut listeners = self.listeners.lock();
-        listeners.register_mid(mid.clone(), tx);
-        tracing::info!(
-            transport_id = format_args!("{:p}", Arc::as_ptr(&self.transport)),
-            mid = %mid,
-            route_count = listeners.routes.len(),
-            "RTP listener registered by MID"
-        );
+        listeners.register_mid(mid, tx);
     }
 
     pub fn register_pt_listener(&self, pt: u8, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
         let mut listeners = self.listeners.lock();
         listeners.register_payload_type(pt, tx);
-        tracing::info!(
-            transport_id = format_args!("{:p}", Arc::as_ptr(&self.transport)),
-            pt,
-            route_count = listeners.routes.len(),
-            pt_route_count = listeners
-                .routes
-                .iter()
-                .filter(|route| route.payload_types.contains(&pt))
-                .count(),
-            "RTP listener registered by payload type"
-        );
     }
 
     pub fn register_payload_list_listener(
@@ -360,24 +329,12 @@ impl RtpTransport {
         tx: mpsc::Sender<(RtpPacket, SocketAddr)>,
     ) {
         let mut listeners = self.listeners.lock();
-        listeners.register_payload_types(payload_types.clone(), tx);
-        tracing::info!(
-            transport_id = format_args!("{:p}", Arc::as_ptr(&self.transport)),
-            payload_types = ?payload_types,
-            route_count = listeners.routes.len(),
-            "RTP listener registered by payload list"
-        );
+        listeners.register_payload_types(payload_types, tx);
     }
 
     pub fn register_provisional_listener(&self, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
         let mut listeners = self.listeners.lock();
         listeners.register_provisional(tx);
-        tracing::info!(
-            transport_id = format_args!("{:p}", Arc::as_ptr(&self.transport)),
-            route_count = listeners.routes.len(),
-            provisional_route_count = listeners.routes.iter().filter(|route| route.provisional).count(),
-            "RTP provisional listener registered"
-        );
     }
 
     pub fn set_rid_extension_id(&self, id: Option<u8>) {
@@ -610,44 +567,19 @@ impl PacketReceiver for RtpTransport {
 
             let ssrc = rtp_packet.header.ssrc;
             let pt = rtp_packet.header.payload_type;
-            let sequence_number = rtp_packet.header.sequence_number;
-            let timestamp = rtp_packet.header.timestamp;
-            let marker = rtp_packet.header.marker;
-            let payload_len = rtp_packet.payload.len();
 
-            let (
-                listener,
-                selected_reason,
-                selected_mid,
-                selected_payload_types,
-                selected_provisional,
-                rid_value,
-                mid_value,
-                route_count,
-                ssrc_route_count,
-                rid_route_count,
-                pt_route_count,
-                provisional_route_count,
-                bound_ssrc,
-            ) = {
+            let listener = {
                 let rid_id = decode_ext_id(self.rid_extension_id.load(Ordering::Relaxed));
                 let mid_id = decode_ext_id(self.sdes_mid_extension_id.load(Ordering::Relaxed));
                 let mut listeners = self.listeners.lock();
                 let mut selected = None;
                 let mut bind_ssrc = false;
-                let mut selected_reason = "none";
-                let mut rid_value = None;
-                let mut mid_value = None;
 
                 if let Some(id) = rid_id {
                     if let Some(rid) = rtp_packet.header.get_extension(id) {
                         if let Ok(rid_str) = std::str::from_utf8(&rid) {
-                            rid_value = Some(rid_str.to_string());
                             selected = listeners.by_rid.get(rid_str).cloned();
                             bind_ssrc = selected.is_some();
-                            if selected.is_some() {
-                                selected_reason = "rid";
-                            }
                         }
                     }
                 }
@@ -656,12 +588,8 @@ impl PacketReceiver for RtpTransport {
                     if let Some(id) = mid_id {
                         if let Some(mid) = rtp_packet.header.get_extension(id) {
                             if let Ok(mid_str) = std::str::from_utf8(&mid) {
-                                mid_value = Some(mid_str.to_string());
                                 selected = listeners.by_mid(mid_str);
                                 bind_ssrc = selected.is_some();
-                                if selected.is_some() {
-                                    selected_reason = "mid";
-                                }
                             }
                         }
                     }
@@ -670,52 +598,17 @@ impl PacketReceiver for RtpTransport {
                 if selected.is_none() {
                     selected = listeners.by_ssrc.get(&ssrc).cloned();
                     bind_ssrc = false;
-                    if selected.is_some() {
-                        selected_reason = "ssrc";
-                    }
                 }
 
                 if selected.is_none() {
                     selected = listeners.unique_by_pt(pt);
                     bind_ssrc = selected.is_some();
-                    if selected.is_some() {
-                        selected_reason = "unique_pt";
-                    }
                 }
 
                 if selected.is_none() {
                     selected = listeners.single_provisional();
                     bind_ssrc = false;
-                    if selected.is_some() {
-                        selected_reason = "single_provisional";
-                    }
                 }
-
-                let route_count = listeners.routes.len();
-                let ssrc_route_count = listeners.by_ssrc.len();
-                let rid_route_count = listeners.by_rid.len();
-                let pt_route_count = listeners
-                    .routes
-                    .iter()
-                    .filter(|route| route.payload_types.contains(&pt))
-                    .count();
-                let provisional_route_count = listeners
-                    .routes
-                    .iter()
-                    .filter(|route| route.provisional)
-                    .count();
-                let selected_route = selected.as_ref().and_then(|tx| {
-                    listeners
-                        .routes
-                        .iter()
-                        .find(|route| route.tx.same_channel(tx))
-                });
-                let selected_mid = selected_route.and_then(|route| route.mid.clone());
-                let selected_payload_types = selected_route
-                    .map(|route| route.payload_types.clone())
-                    .unwrap_or_default();
-                let selected_provisional =
-                    selected_route.map(|route| route.provisional).unwrap_or(false);
 
                 if let Some(tx) = selected.as_ref()
                     && bind_ssrc
@@ -723,51 +616,8 @@ impl PacketReceiver for RtpTransport {
                     listeners.bind_ssrc_route(ssrc, tx.clone());
                 }
 
-                (
-                    selected,
-                    selected_reason,
-                    selected_mid,
-                    selected_payload_types,
-                    selected_provisional,
-                    rid_value,
-                    mid_value,
-                    route_count,
-                    ssrc_route_count,
-                    rid_route_count,
-                    pt_route_count,
-                    provisional_route_count,
-                    bind_ssrc,
-                )
+                selected
             };
-
-            let packet_index = self
-                .diagnostic_packet_count
-                .fetch_add(1, Ordering::Relaxed);
-            if listener.is_some() && (packet_index < 120 || selected_reason != "ssrc") {
-                tracing::info!(
-                    transport_id = format_args!("{:p}", Arc::as_ptr(&self.transport)),
-                    remote_addr = %addr,
-                    pt,
-                    ssrc,
-                    sequence_number,
-                    timestamp,
-                    marker,
-                    payload_len,
-                    selected_reason,
-                    selected_mid = ?selected_mid,
-                    selected_payload_types = ?selected_payload_types,
-                    selected_provisional,
-                    rid = ?rid_value,
-                    mid = ?mid_value,
-                    route_count,
-                    ssrc_route_count,
-                    rid_route_count,
-                    pt_route_count,
-                    provisional_route_count,
-                    bound_ssrc,
-                    "RTP dispatch selected receiver"
-                );
-            }
 
             if let Some(tx) = listener {
                 match try_send_dropping(&tx, (rtp_packet, addr)) {
@@ -780,24 +630,7 @@ impl PacketReceiver for RtpTransport {
                     }
                 }
             } else {
-                tracing::info!(
-                    transport_id = format_args!("{:p}", Arc::as_ptr(&self.transport)),
-                    remote_addr = %addr,
-                    pt,
-                    ssrc,
-                    sequence_number,
-                    timestamp,
-                    marker,
-                    payload_len,
-                    route_count,
-                    ssrc_route_count,
-                    rid_route_count,
-                    pt_route_count,
-                    provisional_route_count,
-                    rid = ?rid_value,
-                    mid = ?mid_value,
-                    "No RTP listener found for packet"
-                );
+                tracing::debug!("No listener found for packet SSRC: {} PT: {}", ssrc, pt);
             }
         }
     }

@@ -710,7 +710,9 @@ impl IceTransport {
         self.inner.selected_socket.subscribe()
     }
 
-    pub fn subscribe_selected_rtcp_socket(&self) -> watch::Receiver<Option<IceSocketWrapper>> {
+    pub(crate) fn subscribe_selected_rtcp_socket(
+        &self,
+    ) -> watch::Receiver<Option<IceSocketWrapper>> {
         self.inner.selected_rtcp_socket.subscribe()
     }
 
@@ -736,36 +738,13 @@ impl IceTransport {
         self.inner.gatherer.local_candidates()
     }
 
-    pub fn local_rtcp_addr(&self) -> Option<SocketAddr> {
+    pub(crate) fn local_rtcp_addr(&self) -> Option<SocketAddr> {
         self.inner
             .gatherer
             .local_candidates()
             .into_iter()
             .find(|candidate| candidate.component == 2)
             .map(|candidate| candidate.address)
-    }
-
-    pub async fn ensure_direct_rtcp_socket(&self) -> Result<()> {
-        if self.local_rtcp_addr().is_some() {
-            return Ok(());
-        }
-
-        let rtp_candidate = self
-            .inner
-            .gatherer
-            .local_candidates()
-            .into_iter()
-            .find(|candidate| candidate.component == 1)
-            .ok_or_else(|| anyhow!("No RTP candidate available for RTCP socket"))?;
-        let rtp_base = rtp_candidate.base_address();
-        let (rtcp, candidate) =
-            bind_direct_rtcp_socket(&self.inner, rtp_base, rtp_candidate.address.ip()).await?;
-        self.inner.gatherer.push_candidate(candidate);
-        let _ = self
-            .inner
-            .selected_rtcp_socket
-            .send(Some(IceSocketWrapper::Udp(rtcp)));
-        Ok(())
     }
 
     pub fn remote_candidates(&self) -> Vec<IceCandidate> {
@@ -893,7 +872,7 @@ impl IceTransport {
         self.setup_direct_rtp_with_rtcp(remote_addr, false).await
     }
 
-    pub async fn setup_direct_rtp_with_rtcp(
+    pub(crate) async fn setup_direct_rtp_with_rtcp(
         &self,
         remote_addr: SocketAddr,
         bind_rtcp: bool,
@@ -1010,7 +989,10 @@ impl IceTransport {
         self.setup_direct_rtp_offer_with_rtcp(false).await
     }
 
-    pub async fn setup_direct_rtp_offer_with_rtcp(&self, bind_rtcp: bool) -> Result<SocketAddr> {
+    pub(crate) async fn setup_direct_rtp_offer_with_rtcp(
+        &self,
+        bind_rtcp: bool,
+    ) -> Result<SocketAddr> {
         let bind_ip = if let Some(bind_ip_str) = &self.inner.config.bind_ip {
             bind_ip_str.parse::<IpAddr>().unwrap_or_else(|_| {
                 get_local_ip().unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
