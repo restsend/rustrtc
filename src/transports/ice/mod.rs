@@ -1121,6 +1121,15 @@ impl IceTransport {
         self.inner.gatherer.turn_clients.lock().clear();
     }
 
+    /// Force the ICE transport into a specific state (test-only).
+    ///
+    /// Used to simulate ICE reconnect cycles in unit tests without running a
+    /// full ICE stack.  Production code must never call this.
+    #[cfg(test)]
+    pub fn force_state_for_test(&self, state: IceTransportState) {
+        let _ = self.inner.state.send(state);
+    }
+
     pub fn set_role(&self, role: IceRole) {
         *self.inner.role.lock() = role;
     }
@@ -1176,7 +1185,7 @@ impl IceTransport {
             if buffer.is_empty() {
                 return;
             }
-            debug!("Flushing {} buffered packets", buffer.len());
+            tracing::info!(count = buffer.len(), "Flushing buffered RTP packets to newly registered data_receiver");
             buffer.drain(..).collect()
         };
 
@@ -1583,7 +1592,7 @@ async fn handle_packet(
                         buffer.push_back((packet.to_vec(), addr));
                     }
                     BufferDropStrategy::DropNew => {
-                        debug!("Buffer full, dropping packet from {}", addr);
+                        tracing::warn!(src = %addr, capacity, "RTP buffer full — dropping inbound packet (DropNew strategy)");
                     }
                 }
                 stats.packets_dropped.fetch_add(1, Ordering::Relaxed);

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::RwLock;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use tokio::sync::watch;
 use tracing::{debug, warn};
@@ -21,6 +21,7 @@ pub struct IceConn {
     pub rtp_latched: AtomicBool,
     pub rtcp_latched: AtomicBool,
     pub expected_ssrc: AtomicU32,
+    pub rtp_rx_count: AtomicU64,
 }
 
 impl IceConn {
@@ -47,6 +48,7 @@ impl IceConn {
             rtp_latched: AtomicBool::new(false),
             rtcp_latched: AtomicBool::new(false),
             expected_ssrc: AtomicU32::new(0),
+            rtp_rx_count: AtomicU64::new(0),
         })
     }
 
@@ -254,9 +256,19 @@ impl PacketReceiver for IceConn {
             };
 
             if let Some(strong_rx) = receiver {
+                // Log once per connection when the first RTP packet arrives.
+                let prev = self.rtp_rx_count.fetch_add(1, Ordering::Relaxed);
+                if prev == 0 {
+                    tracing::debug!(
+                        "IceConn: first {} packet ({} bytes) from {} — forwarding to RTP receiver",
+                        if is_rtcp { "RTCP" } else { "RTP" },
+                        packet.len(),
+                        addr,
+                    );
+                }
                 strong_rx.receive(packet, addr).await;
             } else {
-                tracing::warn!(
+                tracing::debug!(
                     "IceConn: No RTP receiver registered for packet from {}",
                     addr
                 );
