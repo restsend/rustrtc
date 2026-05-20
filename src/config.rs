@@ -340,6 +340,7 @@ pub struct RtcConfiguration {
     pub rtp_start_port: Option<u16>,
     pub rtp_end_port: Option<u16>,
     pub enable_latching: bool,
+    pub probation_max_packets: Option<u8>,
     pub enable_ice_lite: bool,
     /// Enable UPnP IGD for automatic port mapping
     #[serde(default = "default_enable_upnp")]
@@ -393,6 +394,7 @@ impl Default for RtcConfiguration {
             rtp_start_port: None,
             rtp_end_port: None,
             enable_latching: false,
+            probation_max_packets: None,
             enable_ice_lite: false,
             enable_upnp: default_enable_upnp(),
             upnp_lease_duration: default_upnp_lease_duration(),
@@ -425,6 +427,11 @@ impl RtcConfigurationBuilder {
 
     pub fn enable_latching(mut self, enable: bool) -> Self {
         self.inner.enable_latching = enable;
+        self
+    }
+
+    pub fn probation_max_packets(mut self, max: Option<u8>) -> Self {
+        self.inner.probation_max_packets = max;
         self
     }
 

@@ -1415,6 +1415,7 @@ impl PeerConnection {
             rtcp_socket_rx,
             pair.remote.address,
             self.config().label.clone(),
+            self.config().probation_max_packets,
         );
         if self.config().transport_mode == TransportMode::Rtp && self.config().enable_latching {
             ice_conn.enable_latch_on_rtp();
@@ -2142,6 +2143,7 @@ impl PeerConnection {
             rtcp_socket_rx,
             remote_addr,
             self.config().label.clone(),
+            self.config().probation_max_packets,
         );
         if self.config().enable_latching {
             ice_conn.enable_latch_on_rtp();
@@ -5817,7 +5819,12 @@ mod tests {
         conn.enable_latch_on_rtp();
 
         conn.receive(
-            bytes::Bytes::from_static(&[0x80, 0x00, 0x00, 0x00]),
+            bytes::Bytes::from_static(&[
+                0x80, 0x80, // V=2, marker=true
+                0x00, 0x01, // seq=1
+                0x00, 0x00, 0x00, 0x01, // ts=1
+                0x00, 0x00, 0x00, 0x01, // ssrc=1
+            ]),
             rtp_src,
         )
         .await;

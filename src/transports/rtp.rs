@@ -9,7 +9,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
 use tokio::sync::mpsc;
 
@@ -262,6 +262,7 @@ pub struct RtpTransport {
     abs_send_time_extension_id: AtomicU8,
     rewrite_bridge: Mutex<Option<Arc<RewriteBridge>>>,
     srtp_required: bool,
+    has_sent_first_packet: AtomicBool,
 }
 
 impl RtpTransport {
@@ -284,9 +285,7 @@ impl RtpTransport {
             abs_send_time_extension_id: AtomicU8::new(EXT_ID_NONE),
             rewrite_bridge: Mutex::new(None),
             srtp_required,
-            // allow_ssrc_change,
-            // pt_to_ssrc: Mutex::new(HashMap::new()),
-            // latched_listener: Mutex::new(None),
+            has_sent_first_packet: AtomicBool::new(false),
         }
     }
 
@@ -396,6 +395,11 @@ impl RtpTransport {
     }
 
     pub async fn send_rtp(&self, mut packet: RtpPacket) -> Result<usize> {
+        if !self.has_sent_first_packet.load(Ordering::Relaxed) {
+            self.has_sent_first_packet.store(true, Ordering::Relaxed);
+            packet.header.marker = true;
+        }
+
         // Inject abs-send-time if enabled
         if let Some(id) = decode_ext_id(self.abs_send_time_extension_id.load(Ordering::Relaxed)) {
             let abs_send_time = crate::rtp::calculate_abs_send_time(std::time::SystemTime::now());
