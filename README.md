@@ -11,7 +11,7 @@ A high-performance, full-featured real-time communication library — **WebRTC, 
 - ** High performance** — ~2.8x faster than `pion` (Go) and ~2.8x faster than `webrtc-rs` in throughput benchmarks. ~48% less memory than `webrtc-rs`.
 - ** WebRTC Compliant** — Full compliance with Chrome/WebRTC. Supports offer/answer, renegotiation, and all standard SDP attributes.
 - ** Media Support** — RTP/SRTP handling for audio and video with packetizer, depacketizer, jitter buffer, NACK/FIR/PLI, TWCC, and REMB.
-- ** ICE/STUN/TURN** — Full ICE implementation with STUN, TURN (UDP + TCP), ICE Lite, and nominated pair management.
+- ** ICE/STUN/TURN** — Full ICE implementation with STUN, TURN (UDP + TCP), ICE Lite, ICE TCP (RFC 6544), and nominated pair management.
 - ** T.38 Fax** — Fax over IP via T.38 (UDPTL, IFP ASN.1 PER encoding, T.30 state machine). Gated behind `features = ["t38"]`.
 - ** RTP Latching** — Dynamic remote address detection for RTP-only NAT traversal. Probation-based candidate selection with configurable observation window.
 - ** Transport Modes** — `TransportMode::WebRtc` (full ICE/DTLS), `TransportMode::Srtp` (SRTP without ICE), `TransportMode::Rtp` (raw RTP without encryption).
@@ -126,6 +126,7 @@ All configuration goes through `RtcConfiguration` (or its builder `RtcConfigurat
 - **`bind_ip`** — Bind to a specific local IP.
 - **`disable_ipv6`** — Disable IPv6 candidate gathering.
 - **`enable_ice_lite`** — Enable ICE Lite mode.
+- **`ice_tcp_policy`** — `IceTcpPolicy::Disabled` (default), `IceTcpPolicy::Enabled`, or `IceTcpPolicy::PassiveOnly`. Controls ICE TCP candidate support per RFC 6544.
 
 ### UPnP
 - **`enable_upnp`** — Auto-map ports via UPnP IGD.
@@ -159,6 +160,7 @@ let config = RtcConfigurationBuilder::new()
     .probation_max_packets(Some(5))
     .rtp_port_range(50000, 50100)
     .enable_upnp(true)
+    .ice_tcp_policy(config::IceTcpPolicy::Enabled)
     .ice_server(IceServer::new(vec!["stun:stun.l.google.com:19302"]))
     .build();
 

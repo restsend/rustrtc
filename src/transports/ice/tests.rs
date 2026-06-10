@@ -2641,3 +2641,201 @@ async fn test_buffered_dtls_packets_delivered_when_dtls_receiver_registered_firs
     );
     drop((lost_tx, lost_rx));
 }
+
+/// Test that TCP candidates are correctly serialized to and from SDP.
+#[test]
+fn test_ice_tcp_candidate_sdp_roundtrip() {
+    let addr: SocketAddr = "192.168.1.100:3478".parse().unwrap();
+    let cand = IceCandidate::host_tcp(addr, 1, TcpType::Passive);
+    let sdp = cand.to_sdp();
+    assert!(sdp.contains("tcptype passive"), "SDP should contain tcptype passive");
+    assert!(sdp.contains("tcp"), "SDP transport should be tcp");
+    assert!(sdp.contains("host"), "SDP type should be host");
+
+    // Parse back
+    let parsed = IceCandidate::from_sdp(&sdp).unwrap();
+    assert_eq!(parsed.transport, "tcp");
+    assert_eq!(parsed.tcp_type, Some(TcpType::Passive));
+    assert_eq!(parsed.address, addr);
+    assert_eq!(parsed.typ, IceCandidateType::Host);
+
+    // Active type
+    let active = IceCandidate::host_tcp(addr, 1, TcpType::Active);
+    let sdp_active = active.to_sdp();
+    assert!(sdp_active.contains("tcptype active"));
+    let parsed_active = IceCandidate::from_sdp(&sdp_active).unwrap();
+    assert_eq!(parsed_active.tcp_type, Some(TcpType::Active));
+
+    // SO type
+    let so = IceCandidate::host_tcp(addr, 1, TcpType::So);
+    let parsed_so = IceCandidate::from_sdp(&so.to_sdp()).unwrap();
+    assert_eq!(parsed_so.tcp_type, Some(TcpType::So));
+}
+
+/// Test that TCP candidates get higher local preference for passive type.
+#[test]
+fn test_ice_tcp_priority_ordering() {
+    let addr: SocketAddr = "192.168.1.100:3478".parse().unwrap();
+    let passive = IceCandidate::host_tcp(addr, 1, TcpType::Passive);
+    let active = IceCandidate::host_tcp(addr, 1, TcpType::Active);
+    let so = IceCandidate::host_tcp(addr, 1, TcpType::So);
+
+    // Passive should have highest priority among TCP, then Active, then SO
+    assert!(
+        passive.priority > active.priority,
+        "Passive TCP priority ({}) should be > Active ({})",
+        passive.priority,
+        active.priority
+    );
+    assert!(
+        active.priority > so.priority,
+        "Active TCP priority ({}) should be > SO ({})",
+        active.priority,
+        so.priority
+    );
+
+    // UDP host should have same priority as TCP passive (both use full local pref)
+    let udp = IceCandidate::host(addr, 1);
+    assert_eq!(
+        udp.priority, passive.priority,
+        "UDP and TCP passive host candidates should have same priority"
+    );
+}
+
+/// Test that paired TCP candidates are handled correctly during pair formation.
+#[tokio::test]
+#[serial]
+async fn test_ice_tcp_pair_formation() -> Result<()> {
+    let mut config1 = RtcConfiguration::default();
+    config1.ice_tcp_policy = crate::config::IceTcpPolicy::Enabled;
+
+    let mut config2 = RtcConfiguration::default();
+    config2.ice_tcp_policy = crate::config::IceTcpPolicy::Enabled;
+
+    let (t1, r1) = IceTransportBuilder::new(config1)
+        .role(IceRole::Controlling)
+        .build();
+    tokio::spawn(r1);
+
+    let (t2, r2) = IceTransportBuilder::new(config2)
+        .role(IceRole::Controlled)
+        .build();
+    tokio::spawn(r2);
+
+    // Wait for gathering
+    let mut g1 = t1.subscribe_gathering_state();
+    let mut g2 = t2.subscribe_gathering_state();
+    wait_ice_connected_or_timeout(&mut g1, Duration::from_secs(2), IceGathererState::Complete).await;
+    wait_ice_connected_or_timeout(&mut g2, Duration::from_secs(2), IceGathererState::Complete).await;
+
+    let locals1 = t1.local_candidates();
+    let locals2 = t2.local_candidates();
+
+    // Both sides should have TCP candidates
+    assert!(locals1.iter().any(|c| c.transport == "tcp"), "t1 should have TCP candidates");
+    assert!(locals2.iter().any(|c| c.transport == "tcp"), "t2 should have TCP candidates");
+
+    // Add TCP candidates as remote
+    for c in locals1.iter().filter(|c| c.transport == "tcp") {
+        t2.add_remote_candidate(c.clone());
+    }
+    for c in locals2.iter().filter(|c| c.transport == "tcp") {
+        t1.add_remote_candidate(c.clone());
+    }
+
+    let remote1 = t1.remote_candidates();
+    let remote2 = t2.remote_candidates();
+
+    assert!(!remote1.is_empty(), "t1 should have remote TCP candidates");
+    assert!(!remote2.is_empty(), "t2 should have remote TCP candidates");
+    assert!(remote1.iter().all(|c| c.transport == "tcp"), "t1 remotes should all be TCP");
+    assert!(remote2.iter().all(|c| c.transport == "tcp"), "t2 remotes should all be TCP");
+
+    // Verify that forming pairs using ICE pair logic would work
+    for local in &locals1 {
+        for remote in &remote1 {
+            if local.transport == remote.transport {
+                let pair = IceCandidatePair::new(local.clone(), remote.clone());
+                assert!(
+                    pair.priority(IceRole::Controlling) > 0,
+                    "TCP pair priority should be > 0"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn wait_ice_connected_or_timeout(
+    rx: &mut watch::Receiver<IceGathererState>,
+    deadline: Duration,
+    target: IceGathererState,
+) {
+    let _ = tokio::time::timeout(deadline, async {
+        loop {
+            if *rx.borrow_and_update() == target {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    })
+    .await;
+}
+
+/// Verify that when TCP is disabled (default), only UDP candidates are gathered.
+#[tokio::test]
+#[serial]
+async fn test_ice_tcp_disabled_gathers_udp_only() -> Result<()> {
+    let config = RtcConfiguration::default();
+    assert_eq!(config.ice_tcp_policy, crate::config::IceTcpPolicy::Disabled);
+
+    let (transport, runner) = IceTransportBuilder::new(config).build();
+    tokio::spawn(runner);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    for candidate in transport.local_candidates() {
+        assert_eq!(
+            candidate.transport, "udp",
+            "With TCP disabled, all candidates should be UDP, got {:?} at {}",
+            candidate.transport, candidate.address
+        );
+        assert!(candidate.tcp_type.is_none(), "TCP candidates should not exist when TCP is disabled");
+    }
+
+    Ok(())
+}
+
+/// Verify that when TCP is enabled, TCP candidates are gathered alongside UDP candidates.
+#[tokio::test]
+#[serial]
+async fn test_ice_tcp_gathers_tcp_candidates() -> Result<()> {
+    let mut config = RtcConfiguration::default();
+    config.ice_tcp_policy = crate::config::IceTcpPolicy::Enabled;
+
+    let (transport, runner) = IceTransportBuilder::new(config).build();
+    tokio::spawn(runner);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let candidates = transport.local_candidates();
+    let has_udp = candidates.iter().any(|c| c.transport == "udp");
+    let has_tcp = candidates.iter().any(|c| c.transport == "tcp");
+
+    assert!(has_udp, "Should have UDP candidates");
+    assert!(has_tcp, "Should have TCP candidates when TCP is enabled");
+
+    for candidate in &candidates {
+        if candidate.transport == "tcp" {
+            assert!(candidate.tcp_type.is_some(), "TCP candidate should have tcptype set");
+            assert_eq!(
+                candidate.tcp_type,
+                Some(TcpType::Passive),
+                "Default TCP candidate should be passive"
+            );
+        }
+    }
+
+    Ok(())
+}

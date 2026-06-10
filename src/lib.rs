@@ -12,10 +12,10 @@ pub mod t38;
 pub mod transports;
 
 pub use config::{
-    AudioCapability, BundlePolicy, CertificateConfig, IceCredentialType, IceServer,
-    IceTransportPolicy, RtcConfiguration, RtcConfigurationBuilder, RtcpMuxPolicy,
-    SdpCompatibilityMode, T38Capability, T38FaxRateManagement, T38UdpEC, TransportMode,
-    VideoCapability,
+    ApplicationCapability, AudioCapability, BundlePolicy, CertificateConfig, IceCredentialType,
+    IceServer, IceTcpPolicy, IceTransportPolicy, MediaCapabilities, RtcConfiguration,
+    RtcConfigurationBuilder, RtcpMuxPolicy, SdpCompatibilityMode, T38Capability,
+    T38FaxRateManagement, T38UdpEC, TransportMode, VideoCapability,
 };
 pub use errors::{RtcError, RtcResult, SdpError, SdpResult};
 pub use peer_connection::{
@@ -35,7 +35,7 @@ pub use stats::{
 pub use transports::ice::{
     DEFAULT_LEASE_DURATION, DEFAULT_UPNP_DISCOVERY_TIMEOUT, IceCandidate, IceCandidatePair,
     IceCandidateType, IceGathererState, IceRole, IceTransport, IceTransportState,
-    MAX_LEASE_DURATION, MIN_LEASE_DURATION, UpnpPortMapper,
+    MAX_LEASE_DURATION, MIN_LEASE_DURATION, TcpType, UpnpPortMapper,
 };
 pub use transports::rtp::RtpRewriteBridgeParams;
 pub use transports::sctp::{DataChannelEvent, DataChannelState};

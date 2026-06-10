@@ -61,6 +61,18 @@ pub enum IceTransportPolicy {
     Relay,
 }
 
+/// Controls ICE TCP candidate support (RFC 6544).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum IceTcpPolicy {
+    /// Do not gather or use TCP candidates.
+    #[default]
+    Disabled,
+    /// Gather and use TCP candidates (both active and passive).
+    Enabled,
+    /// Only gather and use passive TCP candidates.
+    PassiveOnly,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum BundlePolicy {
     #[default]
@@ -460,6 +472,10 @@ pub struct RtcConfiguration {
     pub buffer_drop_strategy: BufferDropStrategy,
     #[serde(default = "default_buffer_stats_log_interval")]
     pub buffer_stats_log_interval: std::time::Duration,
+    /// Controls ICE TCP candidate support (RFC 6544).
+    /// Default: Disabled — only UDP candidates are gathered and used.
+    #[serde(default)]
+    pub ice_tcp_policy: IceTcpPolicy,
     /// SDP generation compatibility mode.
     #[serde(default)]
     pub sdp_compatibility: SdpCompatibilityMode,
@@ -510,6 +526,7 @@ impl Default for RtcConfiguration {
             rtp_buffer_capacity: default_rtp_buffer_capacity(),
             buffer_drop_strategy: BufferDropStrategy::default(),
             buffer_stats_log_interval: default_buffer_stats_log_interval(),
+            ice_tcp_policy: IceTcpPolicy::default(),
             sdp_compatibility: SdpCompatibilityMode::default(),
             label: None,
             cname: None,
@@ -708,6 +725,11 @@ impl RtcConfigurationBuilder {
 
     pub fn buffer_stats_log_interval(mut self, interval: std::time::Duration) -> Self {
         self.inner.buffer_stats_log_interval = interval;
+        self
+    }
+
+    pub fn ice_tcp_policy(mut self, policy: IceTcpPolicy) -> Self {
+        self.inner.ice_tcp_policy = policy;
         self
     }
 
