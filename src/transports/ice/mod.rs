@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use tokio::net::{UdpSocket, lookup_host};
+use tokio::net::{TcpListener, TcpStream, UdpSocket, lookup_host};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio::time::timeout;
 use tracing::{debug, instrument, trace};
@@ -208,6 +208,12 @@ impl IceTransportRunner {
                             IceSocketWrapper::Udp(s) => {
                                 read_futures.push(Box::pin(Self::run_udp_read_loop(s, self.inner.clone())));
                             }
+                            IceSocketWrapper::TcpListener(l) => {
+                                read_futures.push(Box::pin(Self::run_tcp_listen_loop(l, self.inner.clone())));
+                            }
+                            IceSocketWrapper::TcpStream(s, peer) => {
+                                read_futures.push(Box::pin(Self::run_tcp_read_loop(s, peer, self.inner.clone())));
+                            }
                             IceSocketWrapper::Turn(c, addr) => {
                                 read_futures.push(Box::pin(Self::run_turn_read_loop(c, addr, self.inner.clone())));
                             }
@@ -356,6 +362,86 @@ impl IceTransportRunner {
                 res = state_rx.changed() => {
                     if res.is_err() || matches!(*state_rx.borrow(), IceTransportState::Closed | IceTransportState::Failed) {
                         debug!("TURN Read loop stopping (IceTransport Closed or Failed)");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn run_tcp_listen_loop(
+        listener: Arc<TcpListener>,
+        inner: Arc<IceTransportInner>,
+    ) {
+        let mut state_rx = inner.state.subscribe();
+        trace!("TCP listen loop started for {:?}", listener.local_addr());
+        loop {
+            tokio::select! {
+                accept = listener.accept() => {
+                    match accept {
+                        Ok((stream, peer_addr)) => {
+                            trace!("TCP accepted connection from {}", peer_addr);
+                            stream.set_nodelay(true).ok();
+                            let stream = Arc::new(tokio::sync::Mutex::new(stream));
+                            let _ = inner.gatherer.socket_tx.send(
+                                IceSocketWrapper::TcpStream(stream, peer_addr)
+                            );
+                        }
+                        Err(e) => {
+                            debug!("TCP accept error: {}", e);
+                            break;
+                        }
+                    }
+                }
+                res = state_rx.changed() => {
+                    if res.is_err() || matches!(*state_rx.borrow(), IceTransportState::Closed | IceTransportState::Failed) {
+                        debug!("TCP listen loop stopping (IceTransport Closed or Failed)");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn run_tcp_read_loop(
+        stream: Arc<tokio::sync::Mutex<TcpStream>>,
+        peer: SocketAddr,
+        inner: Arc<IceTransportInner>,
+    ) {
+        let mut buf = [0u8; 1500];
+        let mut state_rx = inner.state.subscribe();
+        let sender = IceSocketWrapper::TcpStream(stream.clone(), peer);
+        trace!("TCP read loop started for peer {}", peer);
+        loop {
+            tokio::select! {
+                res = async {
+                    use tokio::io::AsyncReadExt;
+                    let stream = stream.clone();
+                    let mut stream = stream.lock().await;
+                    let mut len_buf = [0u8; 2];
+                    stream.read_exact(&mut len_buf).await?;
+                    let len = u16::from_be_bytes(len_buf) as usize;
+                    if len > buf.len() {
+                        anyhow::bail!("TCP message too large: {}", len);
+                    }
+                    stream.read_exact(&mut buf[..len]).await?;
+                    Ok::<usize, anyhow::Error>(len)
+                } => {
+                    match res {
+                        Ok(len) => {
+                            if len > 0 {
+                                handle_packet(&buf[..len], peer, inner.clone(), sender.clone()).await;
+                            }
+                        }
+                        Err(e) => {
+                            debug!("TCP read error from {}: {}", peer, e);
+                            break;
+                        }
+                    }
+                }
+                res = state_rx.changed() => {
+                    if res.is_err() || matches!(*state_rx.borrow(), IceTransportState::Closed | IceTransportState::Failed) {
+                        debug!("TCP read loop stopping (IceTransport Closed or Failed)");
                         break;
                     }
                 }
@@ -1306,6 +1392,35 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     // Sort by priority
     pairs.sort_by(|a, b| b.priority(role).cmp(&a.priority(role)));
 
+    // If configured, demote host candidate pairs behind NAT so that srflx
+    // pairs are checked first.  A host behind NAT may pass a single STUN
+    // binding check but then fail the DTLS handshake, whereas the srflx
+    // candidate (mapped public IP) works reliably.
+    // Only demote when the remote is NOT also a private host — same-LAN pairs
+    // (e.g. 192.168.1.x ↔ 192.168.1.y) keep their high priority.
+    if inner.config.prefer_srflx_over_natted_host {
+        let is_private_ip = |ip: std::net::IpAddr| -> bool {
+            match ip {
+                std::net::IpAddr::V4(v4) => v4.is_private(),
+                std::net::IpAddr::V6(v6) => v6.is_unique_local(),
+            }
+        };
+        let is_behind_nat = |pair: &IceCandidatePair| -> bool {
+            pair.local.typ == IceCandidateType::Host
+                && is_private_ip(pair.local.address.ip())
+                && !(pair.remote.typ == IceCandidateType::Host
+                    && is_private_ip(pair.remote.address.ip()))
+        };
+        pairs.sort_by(|a, b| {
+            let a_natted = is_behind_nat(a);
+            let b_natted = is_behind_nat(b);
+            if a_natted != b_natted {
+                return a_natted.cmp(&b_natted);
+            }
+            b.priority(role).cmp(&a.priority(role))
+        });
+    }
+
     let mut pairs_to_check = Vec::new();
     {
         let mut checking = inner.checking_pairs.lock().await;
@@ -1437,6 +1552,11 @@ fn resolve_socket(inner: &IceTransportInner, pair: &IceCandidatePair) -> Option<
         clients
             .get(&pair.local.address)
             .map(|c| IceSocketWrapper::Turn(c.clone(), pair.local.address))
+    } else if pair.local.transport == "tcp" {
+        // For TCP transport, look for a matching TcpStream in the gatherer's socket list
+        // This is primarily used by the Controlled (passive) side where the remote
+        // has already connected to us.
+        None
     } else {
         let socket = inner.gatherer.get_socket(pair.local.base_address());
         if socket.is_none() {
@@ -1756,6 +1876,13 @@ async fn handle_stun_request(
                     IceSocketWrapper::Udp(s) => s
                         .local_addr()
                         .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
+                    IceSocketWrapper::TcpListener(l) => l
+                        .local_addr()
+                        .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
+                    IceSocketWrapper::TcpStream(s, _) => {
+                        let guard = s.lock().await;
+                        guard.local_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
+                    }
                     IceSocketWrapper::Turn(_, addr) => *addr,
                 };
 
@@ -1823,8 +1950,16 @@ async fn perform_binding_check(
     role: IceRole,
     nominated: bool,
 ) -> Result<()> {
-    if remote.transport != "udp" {
-        bail!("only UDP connectivity checks are supported");
+    if remote.transport != "udp" && remote.transport != "tcp" {
+        bail!("only UDP and TCP connectivity checks are supported");
+    }
+
+    // For Controlled role with TCP passive candidates, don't initiate outbound checks
+    if role == IceRole::Controlled
+        && local.transport == "tcp"
+        && local.tcptype.as_deref() == Some("passive")
+    {
+        return Ok(());
     }
 
     let local_params = inner.local_parameters.lock().clone();
@@ -1973,6 +2108,43 @@ async fn perform_binding_check(
                 debug!("TURN send failed: {}", e);
                 return Err(e);
             }
+        } else if local.transport == "tcp" {
+            // For TCP transport (active side): connect to remote and send STUN
+            let tcp_stream = match TcpStream::connect(remote.address).await {
+                Ok(stream) => {
+                    stream.set_nodelay(true).ok();
+                    stream
+                }
+                Err(e) => {
+                    debug!("TCP connect to {} failed: {}", remote.address, e);
+                    return Err(e.into());
+                }
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut tcp_stream = tcp_stream;
+            let mut framed = Vec::with_capacity(2 + bytes.len());
+            let flen = bytes.len() as u16;
+            framed.extend_from_slice(&flen.to_be_bytes());
+            framed.extend_from_slice(&bytes);
+            tcp_stream.write_all(&framed).await?;
+            // Read STUN response with TCP framing
+            match timeout(inner.config.stun_timeout, async {
+                let mut len_buf = [0u8; 2];
+                tcp_stream.read_exact(&mut len_buf).await?;
+                let resp_len = u16::from_be_bytes(len_buf) as usize;
+                let mut resp_buf = vec![0u8; resp_len];
+                tcp_stream.read_exact(&mut resp_buf).await?;
+                StunMessage::decode(&resp_buf).map_err(|e| anyhow!(e))
+            }).await {
+                Ok(Ok(parsed)) => {
+                    if parsed.class == StunClass::SuccessResponse {
+                        return Ok(());
+                    }
+                    return Err(anyhow!("TCP binding check failed: unexpected response"));
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err(anyhow!("TCP binding check timeout")),
+            }
         } else if let Some(socket) = &socket {
             if let Err(e) = socket.send_to(&bytes, remote.address).await {
                 let is_fatal = matches!(
@@ -2065,6 +2237,8 @@ pub struct IceCandidate {
     pub transport: String,
     pub related_address: Option<SocketAddr>,
     pub component: u16,
+    /// TCP candidate type: "active", "passive", or "so" (for TCP candidates only)
+    pub tcptype: Option<String>,
 }
 
 impl IceCandidate {
@@ -2088,6 +2262,21 @@ impl IceCandidate {
             transport: "udp".into(),
             related_address: None,
             component,
+            tcptype: None,
+        }
+    }
+
+    pub fn tcp(address: SocketAddr, component: u16, tcptype: &str) -> Self {
+        let transport = "tcp";
+        Self {
+            foundation: Self::compute_foundation(IceCandidateType::Host, address, transport),
+            priority: IceCandidate::priority_for_tcp(component),
+            address,
+            typ: IceCandidateType::Host,
+            transport: transport.into(),
+            related_address: None,
+            component,
+            tcptype: Some(tcptype.to_string()),
         }
     }
 
@@ -2108,6 +2297,7 @@ impl IceCandidate {
             transport: "udp".into(),
             related_address: Some(base),
             component,
+            tcptype: None,
         }
     }
 
@@ -2120,6 +2310,7 @@ impl IceCandidate {
             transport: transport.into(),
             related_address: None,
             component,
+            tcptype: None,
         }
     }
 
@@ -2130,6 +2321,14 @@ impl IceCandidate {
             IceCandidateType::ServerReflexive => 100u32,
             IceCandidateType::Relay => 0u32,
         };
+        let local_pref = 65_535u32;
+        let component = component.min(256) as u32;
+        (type_pref << 24) | (local_pref << 8) | (256 - component)
+    }
+
+    /// TCP host candidates have lower type preference than UDP (110 vs 126 per RFC 6544).
+    fn priority_for_tcp(component: u16) -> u32 {
+        let type_pref = 110u32;
         let local_pref = 65_535u32;
         let component = component.min(256) as u32;
         (type_pref << 24) | (local_pref << 8) | (256 - component)
@@ -2146,6 +2345,10 @@ impl IceCandidate {
             "typ".into(),
             self.typ.as_str().into(),
         ];
+        if let Some(tcptype) = &self.tcptype {
+            parts.push("tcptype".into());
+            parts.push(tcptype.clone());
+        }
         if let Some(addr) = self.related_address {
             if self.typ != IceCandidateType::Host {
                 parts.push("raddr".into());
@@ -2190,6 +2393,20 @@ impl IceCandidate {
             _ => bail!("unknown type"),
         };
 
+        let tcptype = if transport == "tcp" {
+            // Look for "tcptype" keyword in remaining parts
+            let mut tcptype = None;
+            for i in 8..parts.len().saturating_sub(1) {
+                if parts[i] == "tcptype" {
+                    tcptype = Some(parts[i + 1].to_string());
+                    break;
+                }
+            }
+            tcptype
+        } else {
+            None
+        };
+
         Ok(Self {
             foundation,
             priority,
@@ -2198,6 +2415,7 @@ impl IceCandidate {
             transport,
             related_address: None,
             component,
+            tcptype,
         })
     }
 }
@@ -2445,13 +2663,24 @@ impl IceGatherer {
         // Host gathering must complete first (creates sockets)
         let host_fut = async {
             if self.config.ice_transport_policy == IceTransportPolicy::All {
-                if let Err(e) = self.gather_host_candidates().await {
-                    debug!("Host gathering failed: {}", e);
+                if self.config.ice_gather_udp_hosts {
+                    if let Err(e) = self.gather_host_candidates().await {
+                        debug!("Host gathering failed: {}", e);
+                    }
                 }
             }
         };
 
         host_fut.await;
+
+        // TCP host candidate gathering
+        if self.config.tcp_port_range_start.is_some()
+            || self.config.tcp_port_range_end.is_some()
+        {
+            if let Err(e) = self.gather_tcp_host_candidates().await {
+                debug!("TCP host gathering failed: {}", e);
+            }
+        }
 
         // STUN must complete before UPnP so we can detect double-NAT
         // and use STUN's public IP for UPnP candidates
@@ -2556,6 +2785,88 @@ impl IceGatherer {
                     } else if !ip.is_loopback() && !ip.is_unspecified() {
                         debug!("Failed to bind socket on {}: {}", ip, e);
                     }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn gather_tcp_host_candidates(&self) -> Result<()> {
+        let start = self.config.tcp_port_range_start.unwrap_or(0);
+        let end = self.config.tcp_port_range_end.unwrap_or(0);
+
+        if start == 0 || end == 0 || start > end {
+            return Ok(());
+        }
+
+        let bind_ips = if let Some(bind_ip_str) = &self.config.bind_ip {
+            if let Ok(ip) = bind_ip_str.parse::<IpAddr>() {
+                vec![ip]
+            } else {
+                return Ok(());
+            }
+        } else {
+            let mut ips = Vec::new();
+            ips.push(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+            use local_ip_address::list_afinet_netifas;
+            if let Ok(interfaces) = list_afinet_netifas() {
+                for (name, addr) in interfaces {
+                    if let IpAddr::V4(ip) = addr {
+                        if !ip.is_loopback() && !ips.contains(&IpAddr::V4(ip)) {
+                            if name.starts_with("utun")
+                                || name.starts_with("gif")
+                                || name.starts_with("stf")
+                                || name.starts_with("awdl")
+                                || name.starts_with("llw")
+                            {
+                                continue;
+                            }
+                            ips.push(IpAddr::V4(ip));
+                        }
+                    }
+                }
+            }
+            ips
+        };
+
+        for ip in bind_ips {
+            for port in start..=end {
+                let addr = SocketAddr::new(ip, port);
+                match TcpListener::bind(addr).await {
+                    Ok(listener) => {
+                        let local_addr = match listener.local_addr() {
+                            Ok(a) => a,
+                            Err(_) => continue,
+                        };
+                        let listener = Arc::new(listener);
+                        let _ = self.socket_tx.send(IceSocketWrapper::TcpListener(listener.clone()));
+
+                        if let Some(ext_ip) = &self.config.external_ip
+                            && let Ok(parsed_ip) = ext_ip.parse::<IpAddr>()
+                        {
+                            if !ip.is_loopback() {
+                                let mut ext_addr = local_addr;
+                                ext_addr.set_ip(parsed_ip);
+                                let mut cand = IceCandidate::tcp(ext_addr, 1, "passive");
+                                cand.related_address = Some(local_addr);
+                                self.push_candidate(cand);
+                            } else {
+                                self.push_candidate(IceCandidate::tcp(local_addr, 1, "passive"));
+                            }
+                        } else if ip.is_unspecified() {
+                            let mut cand_addr = local_addr;
+                            if let Ok(local_ip) = get_local_ip() {
+                                cand_addr.set_ip(local_ip);
+                            }
+                            let mut cand = IceCandidate::tcp(cand_addr, 1, "passive");
+                            cand.related_address = Some(local_addr);
+                            self.push_candidate(cand);
+                        } else {
+                            self.push_candidate(IceCandidate::tcp(local_addr, 1, "passive"));
+                        }
+                    }
+                    Err(_) => continue,
                 }
             }
         }
@@ -2996,14 +3307,16 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[derive(Debug, Clone)]
 pub enum IceSocketWrapper {
     Udp(Arc<UdpSocket>),
+    TcpListener(Arc<TcpListener>),
+    TcpStream(Arc<tokio::sync::Mutex<TcpStream>>, SocketAddr),
     Turn(Arc<TurnClient>, SocketAddr),
 }
 
 impl IceSocketWrapper {
     pub async fn send_to(&self, data: &[u8], addr: SocketAddr) -> Result<usize> {
-        loop {
-            match self {
-                IceSocketWrapper::Udp(s) => match s.try_send_to(data, addr) {
+        match self {
+            IceSocketWrapper::Udp(s) => loop {
+                match s.try_send_to(data, addr) {
                     Ok(len) => return Ok(len),
                     Err(e) if e.kind() == ErrorKind::WouldBlock => {
                         s.writable().await?;
@@ -3013,22 +3326,53 @@ impl IceSocketWrapper {
                         if let Some(code) = e.raw_os_error()
                             && code == 55
                         {
-                            // ENOBUFS on macOS, wait for writable and retry.
                             s.writable().await?;
                             continue;
                         }
                         let reason = anyhow!("UDP {} -> {} failed: {}", s.local_addr()?, addr, e);
                         return Err(reason);
                     }
-                },
-                IceSocketWrapper::Turn(c, _) => {
-                    if let Some(channel) = c.get_channel(addr).await {
-                        c.send_channel_data(channel, data).await?;
-                    } else {
-                        c.send_indication(addr, data).await?;
-                    }
-                    return Ok(data.len());
                 }
+            },
+            IceSocketWrapper::TcpListener(_) => {
+                bail!("send_to not supported on TcpListener")
+            }
+            IceSocketWrapper::TcpStream(s, _) => {
+                let stream = s.lock().await;
+                let len = data.len();
+                if len > 0xFFFF {
+                    bail!("STUN message too large for TCP framing");
+                }
+                let header = (len as u16).to_be_bytes();
+                let mut framed = Vec::with_capacity(2 + len);
+                framed.extend_from_slice(&header);
+                framed.extend_from_slice(data);
+                loop {
+                    match (&*stream).try_write(&framed) {
+                        Ok(n) => {
+                            if n < framed.len() {
+                                framed = framed.split_off(n);
+                                continue;
+                            }
+                            return Ok(data.len());
+                        }
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                            stream.writable().await?;
+                            continue;
+                        }
+                        Err(e) => {
+                            return Err(anyhow!("TCP send failed: {}", e));
+                        }
+                    }
+                }
+            }
+            IceSocketWrapper::Turn(c, _) => {
+                if let Some(channel) = c.get_channel(addr).await {
+                    c.send_channel_data(channel, data).await?;
+                } else {
+                    c.send_indication(addr, data).await?;
+                }
+                Ok(data.len())
             }
         }
     }
@@ -3036,6 +3380,25 @@ impl IceSocketWrapper {
     pub async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
         match self {
             IceSocketWrapper::Udp(s) => s.recv_from(buf).await.map_err(|e| e.into()),
+            IceSocketWrapper::TcpListener(_) => {
+                Err(anyhow::anyhow!("recv_from not supported on TcpListener"))
+            }
+            IceSocketWrapper::TcpStream(s, peer) => {
+                use tokio::io::AsyncReadExt;
+                let mut stream = s.lock().await;
+                let mut len_buf = [0u8; 2];
+                stream.read_exact(&mut len_buf).await?;
+                let len = u16::from_be_bytes(len_buf) as usize;
+                if len > buf.len() {
+                    return Err(anyhow::anyhow!(
+                        "TCP STUN message too large: {} > {}",
+                        len,
+                        buf.len()
+                    ));
+                }
+                stream.read_exact(&mut buf[..len]).await?;
+                Ok((len, *peer))
+            }
             IceSocketWrapper::Turn(_, _) => Err(anyhow::anyhow!(
                 "recv_from not supported on TURN wrapper directly"
             )),

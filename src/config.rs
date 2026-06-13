@@ -426,9 +426,20 @@ pub struct RtcConfiguration {
     pub dtls_buffer_size: usize,
     pub rtp_start_port: Option<u16>,
     pub rtp_end_port: Option<u16>,
+    pub ice_gather_udp_hosts: bool,
+    pub tcp_port_range_start: Option<u16>,
+    pub tcp_port_range_end: Option<u16>,
     pub enable_latching: bool,
     pub probation_max_packets: Option<u8>,
     pub enable_ice_lite: bool,
+    /// When true, demote host candidates with private (RFC 1918) local IPs
+    /// below server-reflexive candidates in the connectivity check ordering.
+    /// This avoids DTLS handshake failures behind NATs where a host candidate
+    /// can pass a single STUN binding check but cannot sustain bidirectional
+    /// DTLS traffic.  Same-LAN pairs (both sides private) are not affected.
+    /// Default: false (standard RFC 5245 behavior).
+    #[serde(default)]
+    pub prefer_srflx_over_natted_host: bool,
     /// Enable UPnP IGD for automatic port mapping
     #[serde(default = "default_enable_upnp")]
     pub enable_upnp: bool,
@@ -482,9 +493,13 @@ impl Default for RtcConfiguration {
             dtls_buffer_size: 2048,
             rtp_start_port: None,
             rtp_end_port: None,
+            ice_gather_udp_hosts: true,
+            tcp_port_range_start: None,
+            tcp_port_range_end: None,
             enable_latching: false,
             probation_max_packets: None,
             enable_ice_lite: false,
+            prefer_srflx_over_natted_host: false,
             enable_upnp: default_enable_upnp(),
             upnp_lease_duration: default_upnp_lease_duration(),
             depacketizer_strategy: DepacketizerStrategy::default(),
@@ -527,6 +542,11 @@ impl RtcConfigurationBuilder {
 
     pub fn enable_ice_lite(mut self, enable: bool) -> Self {
         self.inner.enable_ice_lite = enable;
+        self
+    }
+
+    pub fn prefer_srflx_over_natted_host(mut self, enable: bool) -> Self {
+        self.inner.prefer_srflx_over_natted_host = enable;
         self
     }
 
@@ -608,6 +628,17 @@ impl RtcConfigurationBuilder {
     pub fn rtp_port_range(mut self, start: u16, end: u16) -> Self {
         self.inner.rtp_start_port = Some(start);
         self.inner.rtp_end_port = Some(end);
+        self
+    }
+
+    pub fn ice_gather_udp_hosts(mut self, enable: bool) -> Self {
+        self.inner.ice_gather_udp_hosts = enable;
+        self
+    }
+
+    pub fn tcp_port_range(mut self, start: u16, end: u16) -> Self {
+        self.inner.tcp_port_range_start = Some(start);
+        self.inner.tcp_port_range_end = Some(end);
         self
     }
 
