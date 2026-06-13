@@ -18,10 +18,10 @@ type HmacSha1 = Hmac<Sha1>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SrtpProfile {
+    #[default]
     Aes128Sha1_80,
     Aes128Sha1_32,
     AeadAes128Gcm,
-    #[default]
     NullCipherHmac,
 }
 
@@ -836,4 +836,73 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+    use crate::rtp::{RtpHeader, RtpPacket};
+
+    fn sample_packet(seq: u16) -> RtpPacket {
+        let header = RtpHeader::new(96, seq, 1234, 0xdead_beef);
+        RtpPacket::new(header, vec![1, 2, 3])
+    }
+
+    #[test]
+    fn default_profile_is_encrypting_not_null() {
+        // Security: default must be an encrypting profile, never NullCipherHmac
+        let default_profile = SrtpProfile::default();
+        assert_eq!(
+            default_profile,
+            SrtpProfile::Aes128Sha1_80,
+            "Default SRTP profile must be Aes128Sha1_80 (encrypting), not NullCipherHmac"
+        );
+    }
+
+    #[test]
+    fn null_cipher_must_be_explicit() {
+        // NullCipherHmac should never be selected accidentally
+        let profiles = [
+            SrtpProfile::default(),
+            SrtpProfile::Aes128Sha1_80,
+            SrtpProfile::Aes128Sha1_32,
+            SrtpProfile::AeadAes128Gcm,
+        ];
+        for p in &profiles {
+            assert_ne!(
+                *p,
+                SrtpProfile::NullCipherHmac,
+                "Production profiles must exclude NullCipherHmac: {:?}",
+                p
+            );
+        }
+    }
+
+    #[test]
+    fn null_cipher_protect_is_transparent_but_authenticates() {
+        // NullCipherHmac adds auth tag but doesn't encrypt payload
+        let mut ctx = SrtpContext::new(
+            42,
+            SrtpProfile::NullCipherHmac,
+            SrtpKeyingMaterial::new(vec![0; 16], vec![0; 14]),
+            SrtpDirection::Sender,
+        )
+        .unwrap();
+        let mut packet = sample_packet(100);
+        let original_payload = packet.payload.clone();
+        ctx.protect(&mut packet).unwrap();
+        // Payload should be unchanged + 10 bytes auth tag appended
+        assert_eq!(packet.payload.len(), original_payload.len() + 10);
+        assert_eq!(&packet.payload[..original_payload.len()], &original_payload[..]);
+        // Must still verify
+        let mut rx_ctx = SrtpContext::new(
+            42,
+            SrtpProfile::NullCipherHmac,
+            SrtpKeyingMaterial::new(vec![0; 16], vec![0; 14]),
+            SrtpDirection::Receiver,
+        )
+        .unwrap();
+        rx_ctx.unprotect(&mut packet).unwrap();
+        assert_eq!(packet.payload, original_payload);
+    }
 }

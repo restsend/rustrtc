@@ -3,6 +3,8 @@ pub mod handshake;
 mod interop_tests;
 pub mod record;
 #[cfg(test)]
+mod security_tests;
+#[cfg(test)]
 mod tests;
 
 use aes_gcm::{
@@ -395,8 +397,12 @@ impl Drop for DtlsTransport {
 
 impl DtlsInner {
     async fn handle_retransmit(&self, ctx: &HandshakeContext, _is_client: bool) {
-        if *self.state.lock() != DtlsState::Handshaking {
-            return;
+        // Scope the lock to avoid holding it across the async send
+        {
+            let state = self.state.lock();
+            if *state != DtlsState::Handshaking {
+                return;
+            }
         }
         if let Some(buf) = &ctx.last_flight_buffer {
             if let Err(e) = self.conn.send(buf).await {
@@ -549,8 +555,7 @@ impl DtlsInner {
     ) -> Result<()> {
         match content_type {
             ContentType::ChangeCipherSpec => {
-                trace!("Received ChangeCipherSpec");
-                // TODO: Switch to encrypted mode
+                trace!("Received ChangeCipherSpec — encryption is handled per-record via epoch field. Epoch increments post-CCS by sender; try_decrypt_record auto-detects based on epoch > 0.");
             }
             ContentType::ApplicationData => {
                 let _ = incoming_data_tx.send(payload);

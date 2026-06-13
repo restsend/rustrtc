@@ -313,25 +313,30 @@ struct PeerConnectionInner {
     _disconnect_reason_rx: watch::Receiver<Option<DisconnectReason>>,
 }
 
-fn generate_sdes_key_params() -> String {
+pub(crate) fn generate_sdes_key_params() -> String {
     let mut key_salt = [0u8; 30];
     rand::fill(&mut key_salt);
     let encoded = BASE64_STANDARD.encode(&key_salt);
     format!("inline:{}", encoded)
 }
 
-fn parse_sdes_key_params(params: &str) -> RtcResult<Vec<u8>> {
+pub(crate) fn parse_sdes_key_params(params: &str) -> RtcResult<Vec<u8>> {
     if !params.starts_with("inline:") {
         return Err(RtcError::Internal("Unsupported key params".into()));
     }
     let key_salt_base64 = &params[7..];
-    let key_salt_base64 = key_salt_base64.split('|').next().unwrap();
+    let key_salt_base64 = key_salt_base64.split('|').next().ok_or_else(|| {
+        RtcError::Internal("Empty key params after 'inline:' prefix".into())
+    })?;
+    if key_salt_base64.is_empty() {
+        return Err(RtcError::Internal("Empty key params after 'inline:' prefix".into()));
+    }
     BASE64_STANDARD
         .decode(key_salt_base64)
         .map_err(|e| RtcError::Internal(format!("Invalid base64 key: {}", e)))
 }
 
-fn map_crypto_suite(suite: &str) -> RtcResult<crate::srtp::SrtpProfile> {
+pub(crate) fn map_crypto_suite(suite: &str) -> RtcResult<crate::srtp::SrtpProfile> {
     match suite {
         "AES_CM_128_HMAC_SHA1_80" => Ok(crate::srtp::SrtpProfile::Aes128Sha1_80),
         "AES_CM_128_HMAC_SHA1_32" => Ok(crate::srtp::SrtpProfile::Aes128Sha1_32),
