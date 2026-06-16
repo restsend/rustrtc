@@ -1511,23 +1511,62 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
 
     use futures::stream::StreamExt;
     let mut successful_pairs: Vec<IceCandidatePair> = Vec::new();
+    let mut nominated = false;
 
     while let Some(res) = checks.next().await {
+        if nominated {
+            continue;
+        }
+
+        // Guard: another concurrent task may have already nominated
+        if *inner.nomination_complete.borrow() == Some(true) {
+            nominated = true;
+            continue;
+        }
+
         if let Some(pair) = res {
-            // Skip duplicates (same local+remote already collected)
             let key = (pair.local.address, pair.remote.address);
             if successful_pairs.iter().any(|p| (p.local.address, p.remote.address) == key) {
                 continue;
             }
-            successful_pairs.push(pair);
+
+            // Early nomination: try as soon as any pair check succeeds.
+            // On the same LAN, host:host completes in <1ms, but the old code
+            // waited for ALL checks (including slow relay/srflx timeouts)
+            // before starting nomination, causing ~5s delays.
+            if role == IceRole::Controlling {
+                *inner.selected_pair.lock() = Some(pair.clone());
+                let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
+                if let Some(socket) = resolve_socket(&inner, &pair) {
+                    let _ = inner.selected_socket.send(Some(socket.clone()));
+                    publish_selected_rtcp_socket(&inner, Some(socket));
+                }
+                let _ = inner.state.send(IceTransportState::Connected);
+
+                match perform_binding_check(&pair.local, &pair.remote, &inner, role, true).await {
+                    Ok(_) => {
+                        nominated = true;
+                        let _ = inner.nomination_complete.send(Some(true));
+                    }
+                    Err(_e) => {
+                        successful_pairs.push(pair);
+                    }
+                }
+            } else {
+                successful_pairs.push(pair);
+            }
         }
     }
 
     if successful_pairs.is_empty() {
-        let state = *inner.state.borrow();
-        let has_selected_pair = inner.selected_pair.lock().is_some();
-        if state != IceTransportState::Connected && !has_selected_pair {
-            let _ = inner.state.send(IceTransportState::Failed);
+        // All checks failed.  If we were NOT nominated externally (e.g. USE-CANDIDATE
+        // on the controlled side), transition to Failed.
+        if !nominated {
+            let state = *inner.state.borrow();
+            let has_selected_pair = inner.selected_pair.lock().is_some();
+            if state != IceTransportState::Connected && !has_selected_pair {
+                let _ = inner.state.send(IceTransportState::Failed);
+            }
         }
         return;
     }
@@ -1536,54 +1575,32 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     successful_pairs.sort_by(|a, b| b.priority(role).cmp(&a.priority(role)));
 
     if role == IceRole::Controlling {
-        // Try nomination on each successful pair in priority order.
-        // First successful nomination wins; fall through to next pair on failure.
-        let mut nominated = false;
-        for pair in &successful_pairs {
-            *inner.selected_pair.lock() = Some(pair.clone());
-            let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
-            if let Some(socket) = resolve_socket(&inner, pair) {
-                let _ = inner.selected_socket.send(Some(socket.clone()));
-                publish_selected_rtcp_socket(&inner, Some(socket));
-            }
-            let _ = inner.state.send(IceTransportState::Connected);
-            debug!(
-                "ICE checks complete. Selected pair: {} -> {}",
-                pair.local.address, pair.remote.address
-            );
-            debug!(
-                "Controlling agent nominating pair: {} -> {}",
-                pair.local.address, pair.remote.address
-            );
-
-            let result =
-                perform_binding_check(&pair.local, &pair.remote, &inner, role, true).await;
-            match &result {
-                Ok(_) => {
-                    debug!(
-                        "Nomination succeeded: {} -> {}",
-                        pair.local.address, pair.remote.address
-                    );
-                    let _ = inner.nomination_complete.send(Some(true));
-                    nominated = true;
-                    break;
-                }
-                Err(e) => {
-                    debug!(
-                        "Failed to send nomination for {} -> {}: {}",
-                        pair.local.address, pair.remote.address, e
-                    );
-                    // Fall through to next pair
-                }
-            }
-        }
         if !nominated {
-            debug!(
-                "All nomination attempts failed ({} pairs tried)",
-                successful_pairs.len()
-            );
-            let _ = inner.nomination_complete.send(Some(false));
-            let _ = inner.state.send(IceTransportState::Failed);
+            // Try nomination on each successful pair in priority order.
+            // First successful nomination wins; fall through to next pair on failure.
+            for pair in &successful_pairs {
+                *inner.selected_pair.lock() = Some(pair.clone());
+                let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
+                if let Some(socket) = resolve_socket(&inner, pair) {
+                    let _ = inner.selected_socket.send(Some(socket.clone()));
+                    publish_selected_rtcp_socket(&inner, Some(socket));
+                }
+                let _ = inner.state.send(IceTransportState::Connected);
+
+                match perform_binding_check(&pair.local, &pair.remote, &inner, role, true).await
+                {
+                    Ok(_) => {
+                        nominated = true;
+                        let _ = inner.nomination_complete.send(Some(true));
+                        break;
+                    }
+                    Err(_e) => {}
+                }
+            }
+            if !nominated {
+                let _ = inner.nomination_complete.send(Some(false));
+                let _ = inner.state.send(IceTransportState::Failed);
+            }
         }
     } else {
         // Controlled side: select best pair but don't nominate.
@@ -1597,10 +1614,6 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
             publish_selected_rtcp_socket(&inner, Some(socket));
         }
         let _ = inner.state.send(IceTransportState::Connected);
-        debug!(
-            "ICE checks complete. Selected pair: {} -> {}",
-            pair.local.address, pair.remote.address
-        );
     }
 }
 

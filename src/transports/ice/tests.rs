@@ -1919,7 +1919,7 @@ async fn test_nomination_fallback_all_pairs_fail() -> Result<()> {
     let (controlling, _controlled) = setup_host_pair(config1, config2).await;
 
     let mut ctrl_state = controlling.subscribe_state();
-    let ctrl_nom_rx = controlling.subscribe_nomination_complete();
+    let mut ctrl_nom_rx = controlling.subscribe_nomination_complete();
 
     // Wait for ICE Connected (connectivity check succeeds)
     assert!(
@@ -1934,11 +1934,15 @@ async fn test_nomination_fallback_all_pairs_fail() -> Result<()> {
             return;
         }
         loop {
-            if ctrl_state.changed().await.is_err() {
-                return;
-            }
-            if ctrl_nom_rx.borrow().is_some() {
-                return;
+            tokio::select! {
+                _ = ctrl_nom_rx.changed() => {
+                    return;
+                }
+                _ = ctrl_state.changed() => {
+                    if ctrl_nom_rx.borrow().is_some() {
+                        return;
+                    }
+                }
             }
         }
     })
