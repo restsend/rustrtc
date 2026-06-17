@@ -325,11 +325,14 @@ pub(crate) fn parse_sdes_key_params(params: &str) -> RtcResult<Vec<u8>> {
         return Err(RtcError::Internal("Unsupported key params".into()));
     }
     let key_salt_base64 = &params[7..];
-    let key_salt_base64 = key_salt_base64.split('|').next().ok_or_else(|| {
-        RtcError::Internal("Empty key params after 'inline:' prefix".into())
-    })?;
+    let key_salt_base64 = key_salt_base64
+        .split('|')
+        .next()
+        .ok_or_else(|| RtcError::Internal("Empty key params after 'inline:' prefix".into()))?;
     if key_salt_base64.is_empty() {
-        return Err(RtcError::Internal("Empty key params after 'inline:' prefix".into()));
+        return Err(RtcError::Internal(
+            "Empty key params after 'inline:' prefix".into(),
+        ));
     }
     BASE64_STANDARD
         .decode(key_salt_base64)
@@ -3621,11 +3624,17 @@ impl PeerConnectionInner {
 
         let mode = self.config.transport_mode.clone();
         let will_bundle = match sdp_type {
-            SdpType::Offer => true,
+            // When we offer, only advertise BUNDLE if there is more than one
+            // media section to actually bundle together.
+            SdpType::Offer => ordered_transceivers.len() > 1,
+            // When we answer, we MUST mirror the offerer's BUNDLE group exactly
+            // (RFC 8843). The offerer may bundle even a single m= section; failing
+            // to echo it makes the remote think we removed the section from the
+            // already-established BUNDLE group and rejects the answer.
             SdpType::Answer => remote_offered_bundle,
             _ => false,
-        } && ordered_transceivers.len() > 1
-            && self.config.sdp_compatibility != crate::config::SdpCompatibilityMode::LegacySip;
+        } && self.config.sdp_compatibility
+            != crate::config::SdpCompatibilityMode::LegacySip;
         let local_offers_rtcp_mux = self.config.rtcp_mux_policy
             == crate::config::RtcpMuxPolicy::Require
             && self.config.sdp_compatibility != crate::config::SdpCompatibilityMode::LegacySip;
@@ -4936,9 +4945,8 @@ impl RtpSender {
         let track_label = track.id().to_string();
         let track_id = Arc::<str>::from(track_label.clone());
         let stream_id = Arc::<str>::from(stream_id);
-        let cname = Arc::<str>::from(
-            cname_override.unwrap_or_else(|| format!("rustrtc-cname-{ssrc}")),
-        );
+        let cname =
+            Arc::<str>::from(cname_override.unwrap_or_else(|| format!("rustrtc-cname-{ssrc}")));
         let (rtcp_tx, _) = broadcast::channel(100);
         let (transport_change_tx, _) = watch::channel(0);
 
@@ -8753,6 +8761,64 @@ a=mid:0
         assert!(
             !sdp.contains("a=mid:"),
             "answer to non-BUNDLE offer must not have a=mid in any section, got:\n{sdp}"
+        );
+    }
+
+    /// Regression: answering a single-section offer that declares a BUNDLE group
+    /// (e.g. Chrome's audio-only offer with `a=group:BUNDLE 0`) MUST echo the
+    /// BUNDLE group, even though there is only one m= section. Otherwise Chrome
+    /// rejects the answer with "Answer cannot remove m= section with mid='0' from
+    /// already-established BUNDLE group".
+    #[tokio::test]
+    async fn answer_to_single_section_bundle_offer_echoes_bundle_group() {
+        use crate::TransportMode;
+        use crate::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode};
+
+        // Single audio m= section, but with a session-level BUNDLE group (Chrome).
+        let remote_sdp = "v=0\r\n\
+                          o=- 1 1 IN IP4 192.168.1.100\r\n\
+                          s=-\r\n\
+                          t=0 0\r\n\
+                          a=group:BUNDLE 0\r\n\
+                          a=msid-semantic: WMS *\r\n\
+                          m=audio 9 UDP/TLS/RTP/SAVPF 8 0\r\n\
+                          c=IN IP4 0.0.0.0\r\n\
+                          a=mid:0\r\n\
+                          a=sendrecv\r\n\
+                          a=rtcp-mux\r\n\
+                          a=rtpmap:8 PCMA/8000\r\n\
+                          a=rtpmap:0 PCMU/8000\r\n\
+                          a=fingerprint:sha-256 7F:A8:1C:FB:B0:20:83:5F:2A:C7:DB:BC:3D:C4:A1:17:70:3A:B0:A6:E4:46:01:3E:75:CA:84:F0:8A:CE:DC:21\r\n\
+                          a=setup:actpass\r\n\
+                          a=ice-ufrag:ESOA\r\n\
+                          a=ice-pwd:CHsDQgUOgkOXQAhdbCphoXKK\r\n";
+
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::WebRtc;
+        config.sdp_compatibility = SdpCompatibilityMode::Standard;
+        config.media_capabilities = Some(MediaCapabilities {
+            audio: vec![AudioCapability::pcma()],
+            video: vec![],
+            application: None,
+            image: vec![],
+        });
+        let pc = PeerConnection::new(config);
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+
+        let remote = SessionDescription::parse(SdpType::Offer, remote_sdp).unwrap();
+        pc.set_remote_description(remote).await.unwrap();
+
+        let answer = pc.create_answer().await.unwrap();
+        assert_eq!(answer.media_sections.len(), 1, "single audio section");
+
+        let sdp = answer.to_sdp_string();
+        assert!(
+            sdp.contains("a=group:BUNDLE 0"),
+            "answer to single-section BUNDLE offer must echo a=group:BUNDLE 0, got:\n{sdp}"
+        );
+        assert!(
+            sdp.contains("a=mid:0"),
+            "bundled section must keep its a=mid, got:\n{sdp}"
         );
     }
 
