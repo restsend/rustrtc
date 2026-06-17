@@ -33,7 +33,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{broadcast, mpsc, watch};
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -625,8 +625,25 @@ impl PeerConnection {
             crate::media::frame::MediaKind::Audio => MediaKind::Audio,
             crate::media::frame::MediaKind::Video => MediaKind::Video,
         };
-        // Track-based transceivers always use Audio or Video media kinds
-        let transceiver = self.add_transceiver(kind, TransceiverDirection::SendRecv);
+        // Reuse a transceiver created from the remote offer (WHEP/answerer path).
+        // Otherwise add_track would create a second same-kind transceiver without the
+        // offer MID, and create_answer would bind the offer m-line to the empty one.
+        let transceiver = {
+            let list = self.inner.transceivers.lock();
+            if let Some(existing) = list.iter().find(|t| {
+                t.kind() == kind && t.mid().is_some() && t.sender.lock().is_none()
+            }) {
+                info!(
+                    "add_track: reusing offer transceiver kind={:?} mid={:?}",
+                    kind,
+                    existing.mid()
+                );
+                existing.clone()
+            } else {
+                drop(list);
+                self.add_transceiver(kind, TransceiverDirection::SendRecv)
+            }
+        };
         let ssrc = (*transceiver.sender_ssrc.lock())
             .unwrap_or_else(|| self.inner.ssrc_generator.fetch_add(1, Ordering::Relaxed));
 
@@ -1558,6 +1575,10 @@ impl PeerConnection {
         .await
         .map_err(|e| RtcError::Internal(format!("DTLS failed: {}", e)))?;
 
+        // Start the handshake loop before flushing buffered packets so inbound
+        // DTLS records are not dropped on the try_send race.
+        let mut dtls_runner_task = tokio::spawn(dtls_runner);
+
         // DTLS receiver is now registered (inside DtlsTransport::new),
         // safe to set data receiver and flush buffered packets.
         self.inner
@@ -1615,8 +1636,6 @@ impl PeerConnection {
         let inner_weak = Arc::downgrade(&self.inner);
         let stats_collector = self.inner.stats_collector.clone();
 
-        let mut dtls_runner: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(dtls_runner);
-
         let inner_weak_dc = inner_weak.clone();
         let dc_listener = async move {
             while let Some(dc) = dc_rx.recv().await {
@@ -1652,7 +1671,6 @@ impl PeerConnection {
                     let combined: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
                         tokio::select! {
                             _ = rtcp_loop => {},
-                            _ = dtls_runner => {},
                             _ = sctp_runner => {},
                             _ = dc_listener => {},
                             _ = pair_monitor => {},
@@ -1667,8 +1685,10 @@ impl PeerConnection {
             }
 
             tokio::select! {
-                _ = &mut dtls_runner => {
-                     return Err(RtcError::Internal("DTLS runner stopped unexpectedly".into()));
+                res = &mut dtls_runner_task => {
+                    if let Err(e) = res {
+                        return Err(RtcError::Internal(format!("DTLS runner panicked: {e}")));
+                    }
                 }
                 _ = &mut sctp_runner => {
                      return Err(RtcError::Internal("SCTP runner stopped unexpectedly".into()));
@@ -1823,6 +1843,10 @@ impl PeerConnection {
             match crate::srtp::SrtpSession::new(profile, tx_keying, rx_keying) {
                 Ok(session) => {
                     rtp_transport.start_srtp(session);
+                    info!(
+                        "setup_srtp: SRTP session ready (is_client={}, profile={:?})",
+                        is_client, profile
+                    );
 
                     let transceivers = self.inner.transceivers.lock();
                     for t in transceivers.iter() {
@@ -1855,12 +1879,12 @@ impl PeerConnection {
                     *self.inner.rtp_transport.lock() = Some(rtp_transport.clone());
                 }
                 Err(e) => {
-                    debug!("Failed to create SRTP session: {}", e);
+                    warn!("Failed to create SRTP session: {}", e);
                 }
             }
         } else {
-            debug!(
-                "Failed to export keying material - DTLS state: {}",
+            warn!(
+                "Failed to export DTLS-SRTP keying material - DTLS state: {}",
                 dtls.get_state()
             );
         }
@@ -3151,6 +3175,8 @@ async fn run_ice_dtls_loop(
         match ice_state {
             crate::transports::ice::IceTransportState::Connected
             | crate::transports::ice::IceTransportState::Completed => {
+                ice_transport.nudge_passive_tcp_nomination();
+                tokio::task::yield_now().await;
                 // Wait for ICE nomination to complete before starting DTLS.
                 // This prevents a race where DTLS and the USE-CANDIDATE binding check
                 // compete for the same UDP socket, causing spurious nomination timeouts.
@@ -5037,8 +5063,13 @@ impl RtpSender {
         let _ = self.transport_change_tx.send(generation);
 
         *self.transport.lock() = Some(transport.clone());
+        let track_id = self.track_id.clone();
         let track = self.track.clone();
         let ssrc = self.ssrc;
+        info!(
+            "RtpSender: spawning send loop track_id={} ssrc={}",
+            track_id, ssrc
+        );
         let params_lock = self.params.clone();
         let stop_rx = self.stop_tx.clone();
         let mut transport_change_rx = self.transport_change_tx.subscribe();
@@ -5053,6 +5084,7 @@ impl RtpSender {
 
         tokio::spawn(async move {
             let mut sequence_number = next_seq.load(Ordering::SeqCst);
+            let mut logged_first_sample = false;
             let mut last_source_ts: Option<u32> = None;
             let mut timestamp_offset = random_u32(); // Start with random offset
             // Delay the first SR so the initial RTP burst is not immediately followed by RTCP
@@ -5124,6 +5156,13 @@ impl RtpSender {
                         }
                         match res {
                             Ok(mut sample) => {
+                                if !logged_first_sample {
+                                    logged_first_sample = true;
+                                    info!(
+                                        "RtpSender: first sample dequeued ssrc={} track_id={}",
+                                        ssrc, track_id
+                                    );
+                                }
                                 let payload_type = {
                                     let p = params_lock.lock();
                                     p.payload_type
@@ -5203,9 +5242,20 @@ impl RtpSender {
                                 let packet_timestamp = packet.header.timestamp;
 
                                 if let Err(e) = transport.send_rtp(packet).await {
-                                    debug!("Failed to send RTP: {}", e);
+                                    let n = packets_sent.load(Ordering::Relaxed);
+                                    if n < 5 {
+                                        warn!("RtpSender: failed to send RTP (ssrc={}): {}", ssrc, e);
+                                    } else {
+                                        debug!("Failed to send RTP: {}", e);
+                                    }
                                 } else {
-                                    packets_sent.fetch_add(1, Ordering::Relaxed);
+                                    let n = packets_sent.fetch_add(1, Ordering::Relaxed) + 1;
+                                    if n == 1 {
+                                        info!(
+                                            "RtpSender: first RTP packet sent on wire ssrc={} track_id={}",
+                                            ssrc, track_id
+                                        );
+                                    }
                                     octets_sent.fetch_add(payload_len, Ordering::Relaxed);
                                     last_rtp_timestamp.store(packet_timestamp, Ordering::Relaxed);
                                 }

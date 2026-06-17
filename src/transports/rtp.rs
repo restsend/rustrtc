@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
 use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
 
 const EXT_ID_NONE: u8 = 0;
 
@@ -395,16 +396,19 @@ impl RtpTransport {
     }
 
     pub async fn send_rtp(&self, mut packet: RtpPacket) -> Result<usize> {
-        if !self.has_sent_first_packet.load(Ordering::Relaxed) {
+        let is_first = !self.has_sent_first_packet.load(Ordering::Relaxed);
+        if is_first {
             self.has_sent_first_packet.store(true, Ordering::Relaxed);
             packet.header.marker = true;
         }
 
-        // Inject abs-send-time if enabled
+        // Inject abs-send-time if enabled (non-fatal: header may lack room on small payloads).
         if let Some(id) = decode_ext_id(self.abs_send_time_extension_id.load(Ordering::Relaxed)) {
             let abs_send_time = crate::rtp::calculate_abs_send_time(std::time::SystemTime::now());
             let data = abs_send_time.to_be_bytes()[1..4].to_vec();
-            packet.header.set_extension(id, &data)?;
+            if let Err(e) = packet.header.set_extension(id, &data) {
+                debug!("RtpTransport: abs-send-time extension skipped: {}", e);
+            }
         }
 
         let protected = {
@@ -415,12 +419,27 @@ impl RtpTransport {
                 packet.marshal()?
             } else {
                 if self.srtp_required {
+                    warn!("RtpTransport: SRTP required but session not ready, dropping RTP send");
                     return Err(anyhow::anyhow!("SRTP required but session not ready"));
                 }
                 packet.marshal()?
             }
         };
-        self.transport.send(&protected).await
+        match self.transport.send(&protected).await {
+            Ok(n) => {
+                if is_first {
+                    info!(
+                        "RtpTransport: first SRTP packet sent ({} bytes)",
+                        protected.len()
+                    );
+                }
+                Ok(n)
+            }
+            Err(e) => {
+                warn!("RtpTransport: failed to send SRTP packet ({} bytes): {}", protected.len(), e);
+                Err(e)
+            }
+        }
     }
 
     pub async fn send_rtcp(&self, packets: &[RtcpPacket]) -> Result<usize> {
