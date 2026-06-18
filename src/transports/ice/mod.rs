@@ -1,4 +1,5 @@
 pub mod conn;
+pub mod shared_tcp;
 pub mod stun;
 #[cfg(test)]
 mod tests;
@@ -798,6 +799,7 @@ impl IceTransport {
             buffer_stats: Arc::new(BufferStats::default()),
         };
         let inner = Arc::new(inner);
+        inner.gatherer.set_transport(Arc::downgrade(&inner));
 
         let runner = IceTransportRunner {
             inner: inner.clone(),
@@ -1281,6 +1283,7 @@ impl IceTransport {
         self.inner.gatherer.sockets.lock().clear();
         self.inner.gatherer.tcp_listeners.lock().clear();
         self.inner.gatherer.tcp_streams.lock().clear();
+        self.inner.gatherer.shared_tcp_regs.lock().clear();
         self.inner.gatherer.turn_clients.lock().clear();
     }
 
@@ -2478,6 +2481,21 @@ fn split_tcp_stream(stream: TcpStream, peer: SocketAddr) -> IceSocketWrapper {
     )
 }
 
+pub(crate) async fn attach_demuxed_tcp_stream(
+    inner: Arc<IceTransportInner>,
+    stream: TcpStream,
+    peer_addr: SocketAddr,
+    listen_addr: SocketAddr,
+    first_packet: Vec<u8>,
+) {
+    let wrapper = split_tcp_stream(stream, peer_addr);
+    inner
+        .gatherer
+        .store_tcp_stream(listen_addr, wrapper.clone());
+    let _ = inner.gatherer.socket_tx.send(wrapper.clone());
+    handle_packet(&first_packet, peer_addr, inner, wrapper).await;
+}
+
 pub(crate) async fn tcp_write_all(write: &Arc<Mutex<TcpWriteHalf>>, data: &[u8]) -> Result<()> {
     let mut offset = 0;
     while offset < data.len() {
@@ -3018,6 +3036,8 @@ struct IceGatherer {
     sockets: Arc<parking_lot::Mutex<Vec<Arc<UdpSocket>>>>,
     tcp_listeners: Arc<parking_lot::Mutex<Vec<Arc<TcpListener>>>>,
     tcp_streams: Arc<parking_lot::Mutex<HashMap<SocketAddr, IceSocketWrapper>>>,
+    shared_tcp_regs: Arc<parking_lot::Mutex<Vec<shared_tcp::SharedTcpRegistration>>>,
+    transport_inner: Arc<parking_lot::Mutex<Option<std::sync::Weak<IceTransportInner>>>>,
     turn_clients: Arc<parking_lot::Mutex<HashMap<SocketAddr, Arc<TurnClient>>>>,
     upnp_mappers: Arc<parking_lot::Mutex<Vec<UpnpPortMapper>>>,
     config: RtcConfiguration,
@@ -3037,11 +3057,43 @@ impl IceGatherer {
             sockets: Arc::new(parking_lot::Mutex::new(Vec::new())),
             tcp_listeners: Arc::new(parking_lot::Mutex::new(Vec::new())),
             tcp_streams: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            shared_tcp_regs: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            transport_inner: Arc::new(parking_lot::Mutex::new(None)),
             turn_clients: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             upnp_mappers: Arc::new(parking_lot::Mutex::new(Vec::new())),
             config,
             candidate_tx,
             socket_tx,
+        }
+    }
+
+    fn set_transport(&self, inner: std::sync::Weak<IceTransportInner>) {
+        *self.transport_inner.lock() = Some(inner);
+    }
+
+    fn push_tcp_passive_candidate(&self, local_addr: SocketAddr, bind_ip: IpAddr) {
+        if let Some(ext_ip) = &self.config.external_ip
+            && let Ok(parsed_ip) = ext_ip.parse::<IpAddr>()
+        {
+            if !bind_ip.is_loopback() {
+                let mut ext_addr = local_addr;
+                ext_addr.set_ip(parsed_ip);
+                let mut cand = IceCandidate::tcp(ext_addr, 1, "passive");
+                cand.related_address = Some(local_addr);
+                self.push_candidate(cand);
+            } else {
+                self.push_candidate(IceCandidate::tcp(local_addr, 1, "passive"));
+            }
+        } else if bind_ip.is_unspecified() {
+            let mut cand_addr = local_addr;
+            if let Ok(local_ip) = get_local_ip() {
+                cand_addr.set_ip(local_ip);
+            }
+            let mut cand = IceCandidate::tcp(cand_addr, 1, "passive");
+            cand.related_address = Some(local_addr);
+            self.push_candidate(cand);
+        } else {
+            self.push_candidate(IceCandidate::tcp(local_addr, 1, "passive"));
         }
     }
 
@@ -3417,7 +3469,32 @@ impl IceGatherer {
 
         // One passive TCP listener per local IP (first free port in range). Binding the
         // entire range per PeerConnection exhausts the pool after a single session.
+        // When start == end, share one listener process-wide and demux by ICE ufrag.
+        let use_shared_listener = start == end;
+
         for ip in bind_ips {
+            if use_shared_listener {
+                let addr = SocketAddr::new(ip, start);
+                let inner = self
+                    .transport_inner
+                    .lock()
+                    .as_ref()
+                    .and_then(|weak| weak.upgrade())
+                    .context("ICE transport unavailable during TCP gather")?;
+                let ufrag = inner.local_parameters.lock().username_fragment.clone();
+                match shared_tcp::acquire(addr, ufrag, Arc::downgrade(&inner)).await {
+                    Ok((local_addr, registration)) => {
+                        self.shared_tcp_regs.lock().push(registration);
+                        self.push_tcp_passive_candidate(local_addr, ip);
+                        break;
+                    }
+                    Err(e) => {
+                        debug!("shared TCP listener acquire on {} failed: {}", addr, e);
+                    }
+                }
+                continue;
+            }
+
             for port in start..=end {
                 let addr = SocketAddr::new(ip, port);
                 match TcpListener::bind(addr).await {
@@ -3430,29 +3507,7 @@ impl IceGatherer {
                         self.tcp_listeners.lock().push(listener.clone());
                         let _ = self.socket_tx.send(IceSocketWrapper::TcpListener(listener));
 
-                        if let Some(ext_ip) = &self.config.external_ip
-                            && let Ok(parsed_ip) = ext_ip.parse::<IpAddr>()
-                        {
-                            if !ip.is_loopback() {
-                                let mut ext_addr = local_addr;
-                                ext_addr.set_ip(parsed_ip);
-                                let mut cand = IceCandidate::tcp(ext_addr, 1, "passive");
-                                cand.related_address = Some(local_addr);
-                                self.push_candidate(cand);
-                            } else {
-                                self.push_candidate(IceCandidate::tcp(local_addr, 1, "passive"));
-                            }
-                        } else if ip.is_unspecified() {
-                            let mut cand_addr = local_addr;
-                            if let Ok(local_ip) = get_local_ip() {
-                                cand_addr.set_ip(local_ip);
-                            }
-                            let mut cand = IceCandidate::tcp(cand_addr, 1, "passive");
-                            cand.related_address = Some(local_addr);
-                            self.push_candidate(cand);
-                        } else {
-                            self.push_candidate(IceCandidate::tcp(local_addr, 1, "passive"));
-                        }
+                        self.push_tcp_passive_candidate(local_addr, ip);
                         break;
                     }
                     Err(_) => continue,
