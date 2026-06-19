@@ -297,6 +297,9 @@ struct SctpInner {
     // Cached Timeout State
     cached_rto_timeout: Mutex<Option<(Instant, Duration)>>,
 
+    // Rate-limit for suspicious RTO timeout debug log
+    last_suspicious_rto_log: Mutex<Option<(Instant, u32)>>,
+
     // Outqueue for non-blocking sends
     outbound_queue: Mutex<VecDeque<OutboundChunk>>,
     queued_bytes: AtomicUsize,
@@ -700,6 +703,7 @@ impl SctpTransport {
             used_rwnd: AtomicUsize::new(0),
             last_t3_fire_time: Mutex::new(None),
             cached_rto_timeout: Mutex::new(None),
+            last_suspicious_rto_log: Mutex::new(None),
             outbound_queue: Mutex::new(VecDeque::new()),
             queued_bytes: AtomicUsize::new(0),
             last_sack_time: Mutex::new(None),
@@ -927,15 +931,29 @@ impl SctpInner {
                             Duration::from_millis(1)
                         };
 
-                        // Log if timeout is suspiciously long
+                        // Log if timeout is suspiciously long (rate-limited: once per TSN change or per second)
                         if timeout > Duration::from_secs(5) {
-                            debug!(
-                                "RTO timer: suspiciously long timeout {:.1}s for TSN {}, rto={:.1}s, queue_len={}",
-                                timeout.as_secs_f64(),
-                                soonest_tsn.unwrap_or(0),
-                                rto,
-                                sent_queue.len()
-                            );
+                            let tsn_val = soonest_tsn.unwrap_or(0);
+                            let should_log = {
+                                let last_log = self.last_suspicious_rto_log.lock();
+                                match *last_log {
+                                    None => true,
+                                    Some((last_time, last_tsn)) => {
+                                        now.duration_since(last_time) > Duration::from_secs(1)
+                                            || tsn_val != last_tsn
+                                    }
+                                }
+                            };
+                            if should_log {
+                                debug!(
+                                    "RTO timer: suspiciously long timeout {:.1}s for TSN {}, rto={:.1}s, queue_len={}",
+                                    timeout.as_secs_f64(),
+                                    tsn_val,
+                                    rto,
+                                    sent_queue.len()
+                                );
+                                *self.last_suspicious_rto_log.lock() = Some((now, tsn_val));
+                            }
                         }
 
                         timeout
@@ -2239,6 +2257,7 @@ impl SctpInner {
                     // Peer is alive (proven by recent SACKs). Reset heartbeat failure
                     // counters — the HEARTBEAT_ACK was likely dropped by a rate-limited
                     // TURN relay, not because the peer is dead.
+                    self.association_error_count.store(0, Ordering::SeqCst);
                     self.consecutive_heartbeat_failures
                         .store(0, Ordering::SeqCst);
                     debug!(
@@ -2248,16 +2267,29 @@ impl SctpInner {
                 } else {
                     // No recent SACK — peer may actually be dead.
 
-                    // Track consecutive heartbeat failures
+                    // Track consecutive heartbeat failures (diagnostic counter)
                     let consecutive_failures = self
                         .consecutive_heartbeat_failures
                         .fetch_add(1, Ordering::SeqCst)
                         + 1;
 
-                    if !is_rto_backing_off {
-                        let error_count =
-                            self.association_error_count.fetch_add(1, Ordering::SeqCst) + 1;
-                        let sent_queue_len = self.sent_queue.lock().len();
+                    // Always increment association_error_count regardless of RTO state.
+                    // This unifies dead-peer detection under a single configurable limit
+                    // (max_association_retransmits, default 20 = 5 minutes) instead of
+                    // using separate aggressive (HEARTBEAT_DEAD, 4 failures) and lenient
+                    // (HEARTBEAT_TIMEOUT, 20 failures) paths. This is critical for TURN
+                    // relay scenarios where transient packet loss causes RTO backoff but
+                    // the peer is still alive — matching pion's behaviour.
+                    let error_count =
+                        self.association_error_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    let sent_queue_len = self.sent_queue.lock().len();
+
+                    if is_rto_backing_off {
+                        debug!(
+                            "SCTP Heartbeat timeout (RTO={:.1}s backing off, error: {}/{}, consecutive: {}, pending: {})",
+                            rto, error_count, self.max_association_retransmits, consecutive_failures, sent_queue_len
+                        );
+                    } else {
                         debug!(
                             "SCTP Heartbeat timeout! Error count: {}/{}, consecutive failures: {}, pending chunks: {}",
                             error_count,
@@ -2265,39 +2297,21 @@ impl SctpInner {
                             consecutive_failures,
                             sent_queue_len
                         );
-                        if error_count >= self.max_association_retransmits
-                            && self.max_association_retransmits > 0
-                        {
-                            let rto_state = self.rto_state.lock();
-                            debug!(
-                                "SCTP Association heartbeat timeout limit reached ({}/{}), RTO={:.1}s, closing connection",
-                                error_count, self.max_association_retransmits, rto_state.rto
-                            );
-                            drop(rto_state);
-                            self.print_stats("HEARTBEAT_TIMEOUT");
-                            *self.close_reason.lock() = Some("HEARTBEAT_TIMEOUT".into());
-                            self.set_state(SctpState::Closed);
-                            return Ok(());
-                        }
-                    } else {
-                        debug!(
-                            "SCTP Heartbeat timeout (RTO={:.1}s is backing off, consecutive failures: {})",
-                            rto, consecutive_failures
-                        );
+                    }
 
-                        // If we have consecutive heartbeat failures exceeding the
-                        // configured limit, even during RTO backoff,
-                        // the peer is likely dead. Force close the connection.
-                        if consecutive_failures >= self.max_heartbeat_failures {
-                            debug!(
-                                "SCTP Connection dead: {} consecutive heartbeat failures (RTO={:.1}s), closing connection",
-                                consecutive_failures, rto
-                            );
-                            self.print_stats("HEARTBEAT_DEAD");
-                            *self.close_reason.lock() = Some("HEARTBEAT_DEAD".into());
-                            self.set_state(SctpState::Closed);
-                            return Ok(());
-                        }
+                    if error_count >= self.max_association_retransmits
+                        && self.max_association_retransmits > 0
+                    {
+                        let rto_state = self.rto_state.lock();
+                        debug!(
+                            "SCTP Association heartbeat timeout limit reached ({}/{}), RTO={:.1}s, closing connection",
+                            error_count, self.max_association_retransmits, rto_state.rto
+                        );
+                        drop(rto_state);
+                        self.print_stats("HEARTBEAT_TIMEOUT");
+                        *self.close_reason.lock() = Some("HEARTBEAT_TIMEOUT".into());
+                        self.set_state(SctpState::Closed);
+                        return Ok(());
                     }
                 }
             }
@@ -3284,6 +3298,7 @@ impl SctpInner {
         let peer_rwnd = self.peer_rwnd.load(Ordering::SeqCst);
         let sent_queue_len = self.sent_queue.lock().len();
         let rto = self.rto_state.lock().rto;
+        let consecutive_hb = self.consecutive_heartbeat_failures.load(Ordering::SeqCst);
 
         debug!(
             "\n==================== SCTP CONNECTION CLOSED ====================\n\
@@ -3295,7 +3310,7 @@ impl SctpInner {
              Packets Received: {}\n\
              Retransmissions: {} ({:.1}% of sent)\n\
              Heartbeats Sent: {}\n\
-             Error Count: {}/{}\n\
+             Error Count: {}/{} (consecutive hb failures: {}/{})\n\
              Final RTO: {:.1}s\n\
              Final CWND_TX: {} bytes\n\
              Final CWND_RX: {} bytes\n\
@@ -3321,6 +3336,8 @@ impl SctpInner {
             heartbeats_sent,
             error_count,
             self.max_association_retransmits,
+            consecutive_hb,
+            self.max_heartbeat_failures,
             rto,
             cwnd_tx,
             cwnd_rx,
@@ -7444,8 +7461,9 @@ mod tests {
         println!("   SACKs correctly prevented heartbeat-based disconnect.");
     }
 
-    /// Test: verify that consecutive_heartbeat_failures DOES kill the connection
-    /// when no SACKs are received (peer is truly dead).
+    /// Test: verify that association_error_count kills the connection
+    /// when no SACKs are received (peer is truly dead). Uses a low
+    /// max_association_retransmits to keep the test fast.
     #[tokio::test]
     async fn test_heartbeat_kills_connection_when_peer_dead() {
         let (socket_tx, _) = tokio::sync::watch::channel(None);
@@ -7460,7 +7478,7 @@ mod tests {
             .unwrap();
 
         let mut config = RtcConfiguration::default();
-        config.sctp_max_association_retransmits = 20;
+        config.sctp_max_association_retransmits = 5; // Low limit for fast test
 
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
 
@@ -7481,15 +7499,15 @@ mod tests {
             .remote_verification_tag
             .store(12345, Ordering::SeqCst);
 
-        // RTO backed off
+        // RTO backed off (or not — both paths now use association_error_count)
         {
             let mut rto = sctp.inner.rto_state.lock();
             rto.rto = 6.0;
         }
 
         // NO SACKs at all — peer is truly dead.
-        // 4 consecutive heartbeat failures should close the connection.
-        for round in 1..=5 {
+        // max_association_retransmits=5: connection should close after 5 heartbeat failures.
+        for round in 1..=6 {
             {
                 let mut sent_time = sctp.inner.heartbeat_sent_time.lock();
                 *sent_time = Some(Instant::now() - Duration::from_secs(15));
@@ -7499,19 +7517,25 @@ mod tests {
 
             let state = sctp.inner.state.lock().clone();
             if state == SctpState::Closed {
+                let close_reason = sctp.inner.close_reason.lock().clone();
                 println!(
-                    "✅ Connection correctly closed at round {} (peer is dead)",
-                    round
+                    "✅ Connection correctly closed at round {} (peer dead, reason={:?})",
+                    round, close_reason
+                );
+                assert_eq!(
+                    close_reason,
+                    Some("HEARTBEAT_TIMEOUT".to_string()),
+                    "Should close with HEARTBEAT_TIMEOUT"
                 );
                 assert!(
-                    round <= 4,
-                    "Should close by round 4 (4 consecutive failures)"
+                    round <= 5,
+                    "Should close by round 5 (max_association_retransmits=5)"
                 );
                 return;
             }
         }
 
-        panic!("Connection should have been closed after 4 heartbeat failures with no SACKs");
+        panic!("Connection should have been closed after 5 heartbeat failures with no SACKs");
     }
 
     /// Test: cwnd collapse under TURN rate limiting prevents data transmission.
@@ -8129,8 +8153,11 @@ mod tests {
         );
     }
 
-    /// Test: higher max_heartbeat_failures keeps connection alive longer.
+    /// Test: higher max_association_retransmits keeps connection alive longer.
     /// Simulates the scenario where TURN rate-limits heartbeat ACKs.
+    /// After the HEARTBEAT_DEAD removal, dead-peer detection is unified under
+    /// max_association_retransmits (default 20). This test verifies that with
+    /// a higher limit, the connection survives more heartbeat failures.
     #[tokio::test]
     async fn test_higher_heartbeat_failures_keeps_alive() {
         let (socket_tx, _) = tokio::sync::watch::channel(None);
@@ -8144,11 +8171,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Configure with 8 max heartbeat failures (instead of default 4)
+        // Configure with 8 max association retransmits (instead of default 20) for fast test
         let mut config = RtcConfiguration::default();
         config.sctp_rto_initial = Duration::from_secs(1);
         config.sctp_rto_min = Duration::from_secs(1);
-        config.sctp_max_heartbeat_failures = 8;
+        config.sctp_max_association_retransmits = 8;
 
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
         let (sctp, _runner) = SctpTransport::new(
@@ -8168,7 +8195,8 @@ mod tests {
             .store(1, Ordering::SeqCst);
 
         // Simulate consecutive heartbeat failures during RTO backoff
-        // (RTO > 2.0 means is_rto_backing_off = true)
+        // (RTO > 2.0 means is_rto_backing_off = true, but now both paths use
+        // association_error_count for the close decision)
         {
             let mut rto_state = sctp.inner.rto_state.lock();
             rto_state.rto = 5.0; // Force RTO backing off
@@ -8177,8 +8205,7 @@ mod tests {
         // Set heartbeat_sent_time so the failure path is triggered
         *sctp.inner.heartbeat_sent_time.lock() = Some(Instant::now() - Duration::from_secs(30));
 
-        // With default config (max_heartbeat_failures=4), the connection would close after 4 failures.
-        // With our config (max_heartbeat_failures=8), it should survive through 7 failures.
+        // With max_association_retransmits=8, the connection should survive through 7 failures.
         for i in 1..=7 {
             sctp.inner.send_heartbeat().await.unwrap();
             let state = *sctp.inner.state.lock();
@@ -8188,13 +8215,13 @@ mod tests {
                 "Connection should NOT close at heartbeat failure #{} (max=8)",
                 i
             );
-            let failures = sctp
+            let error_count = sctp
                 .inner
-                .consecutive_heartbeat_failures
+                .association_error_count
                 .load(Ordering::SeqCst);
             println!(
-                "Heartbeat failure #{}: consecutive_failures={}, state={:?}",
-                i, failures, state
+                "Heartbeat failure #{}: error_count={}, state={:?}",
+                i, error_count, state
             );
             // Re-set heartbeat_sent_time for next iteration
             *sctp.inner.heartbeat_sent_time.lock() = Some(Instant::now() - Duration::from_secs(30));
@@ -8206,11 +8233,11 @@ mod tests {
         assert_eq!(
             final_state,
             SctpState::Closed,
-            "Connection should close at heartbeat failure #8 (max=8)"
+            "Connection should close at heartbeat failure #8 (max_association_retransmits=8)"
         );
 
         let close_reason = sctp.inner.close_reason.lock().clone();
-        assert_eq!(close_reason, Some("HEARTBEAT_DEAD".to_string()));
+        assert_eq!(close_reason, Some("HEARTBEAT_TIMEOUT".to_string()));
     }
 
     /// Test: ssthresh auto-raise is capped by configurable max_cwnd.
