@@ -3788,8 +3788,18 @@ impl PeerConnectionInner {
             let mut section = MediaSection::new(transceiver.kind(), mid);
             section.direction = direction.into();
 
-            if mode == TransportMode::Rtp && transceiver.kind() != MediaKind::Image {
-                section.protocol = "RTP/AVP".to_string();
+            if transceiver.kind() != MediaKind::Image
+                && transceiver.kind() != MediaKind::Application
+            {
+                // Plain-SIP media profiles. WebRTC keeps the default
+                // UDP/TLS/RTP/SAVPF; SDES-SRTP must advertise RTP/SAVP so that
+                // non-ICE/non-DTLS peers (e.g. SIP trunks, Twilio) accept the
+                // offer/answer, while plain RTP uses RTP/AVP.
+                match mode {
+                    TransportMode::Rtp => section.protocol = "RTP/AVP".to_string(),
+                    TransportMode::Srtp => section.protocol = "RTP/SAVP".to_string(),
+                    TransportMode::WebRtc => {}
+                }
             }
 
             let mut local_rtcp_addr = None;
@@ -4121,7 +4131,10 @@ impl PeerConnectionInner {
             }
         }
 
-        if self.config.transport_mode != TransportMode::Rtp {
+        // Only WebRTC uses DTLS-SRTP (a=fingerprint / a=setup). SDES-SRTP
+        // (TransportMode::Srtp) keys via a=crypto and must NOT advertise DTLS
+        // attributes, otherwise SIP/SDES peers (e.g. Twilio) reject the SDP.
+        if self.config.transport_mode == TransportMode::WebRtc {
             let setup_value = match sdp_type {
                 SdpType::Offer => "actpass",
                 SdpType::Answer => {
@@ -6572,11 +6585,19 @@ mod tests {
         assert!(!section.attributes.iter().any(|a| a.key == "ice-ufrag"));
         assert!(!section.attributes.iter().any(|a| a.key == "candidate"));
 
-        // Should have DTLS fingerprint
-        assert!(section.attributes.iter().any(|a| a.key == "fingerprint"));
+        // SDES-SRTP keys via a=crypto, so it must NOT advertise DTLS attributes.
+        assert!(
+            !section.attributes.iter().any(|a| a.key == "fingerprint"),
+            "SDES-SRTP must not include a DTLS fingerprint"
+        );
+        assert!(
+            !section.attributes.iter().any(|a| a.key == "setup"),
+            "SDES-SRTP must not include a=setup"
+        );
 
-        // Protocol should be UDP/TLS/RTP/SAVPF
-        assert_eq!(section.protocol, "UDP/TLS/RTP/SAVPF");
+        // Profile must be RTP/SAVP (not the WebRTC UDP/TLS/RTP/SAVPF).
+        assert_eq!(section.protocol, "RTP/SAVP");
+        assert!(section.attributes.iter().any(|a| a.key == "crypto"));
     }
 
     #[tokio::test]
@@ -6707,12 +6728,53 @@ a=ssrc-group:FID 12345 67890\r\n";
         let offer = pc.create_offer().await.unwrap();
         let section = &offer.media_sections[0];
 
+        // SDES-SRTP must advertise the RTP/SAVP profile (not the WebRTC
+        // UDP/TLS/RTP/SAVPF) so that non-ICE/non-DTLS SIP peers accept it.
+        assert_eq!(
+            section.protocol, "RTP/SAVP",
+            "SRTP mode must use RTP/SAVP profile, got {}",
+            section.protocol
+        );
+
         // Should have crypto attribute
         let crypto = section.attributes.iter().find(|a| a.key == "crypto");
         assert!(crypto.is_some(), "Missing crypto attribute in SRTP mode");
 
         let crypto_val = crypto.unwrap().value.as_ref().unwrap();
         assert!(crypto_val.starts_with("1 AES_CM_128_HMAC_SHA1_80 inline:"));
+    }
+
+    #[tokio::test]
+    async fn create_answer_srtp_mode_uses_savp_profile() {
+        use crate::TransportMode;
+        // Simulate a Twilio-style SDES-SRTP offer (RTP/SAVP + a=crypto).
+        let remote_offer = "v=0\r\n\
+o=root 1 1 IN IP4 168.86.151.229\r\n\
+s=-\r\n\
+c=IN IP4 168.86.151.229\r\n\
+t=0 0\r\n\
+m=audio 19960 RTP/SAVP 0 8 101\r\n\
+a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:a976SJLwniPcMiUP27gdcLYYcPm0bHZcghV84DsK\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:8 PCMA/8000\r\n\
+a=rtpmap:101 telephone-event/8000\r\n\
+a=sendrecv\r\n";
+
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Srtp;
+        let pc = PeerConnection::new(config);
+        let offer = SessionDescription::parse(SdpType::Offer, remote_offer).expect("parse offer");
+        pc.set_remote_description(offer).await.expect("set remote");
+
+        let answer = pc.create_answer().await.unwrap();
+        let section = &answer.media_sections[0];
+        assert_eq!(
+            section.protocol, "RTP/SAVP",
+            "SRTP answer must use RTP/SAVP profile, got {}",
+            section.protocol
+        );
+        let crypto = section.attributes.iter().find(|a| a.key == "crypto");
+        assert!(crypto.is_some(), "SRTP answer must include a=crypto");
     }
 
     #[tokio::test]
