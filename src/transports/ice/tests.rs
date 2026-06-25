@@ -1715,6 +1715,122 @@ async fn test_turn_refresh_tolerates_server_unreachable() -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// TURN destroy (RFC 5766 §7.4) tests
+// ============================================================================
+
+/// Verify that `TurnClient::create_destroy_packet` builds a valid
+/// Refresh(LIFETIME=0) request that the TURN server accepts. Per RFC 5766 §7.4
+/// a success response to Refresh(LIFETIME=0) means the allocation is destroyed.
+#[tokio::test]
+#[serial]
+async fn test_turn_destroy_releases_allocation() -> Result<()> {
+    let mut turn_server = TestTurnServer::start().await?;
+    let uri = IceServerUri::parse(&turn_server.turn_url())?;
+    let server =
+        IceServer::new(vec![turn_server.turn_url()]).with_credential(TEST_USERNAME, TEST_PASSWORD);
+
+    let client = TurnClient::connect(&uri, false).await?;
+    let creds = TurnCredentials::from_server(&server)?;
+    let allocation = client.allocate(creds).await?;
+    assert!(allocation.relayed_address.port() != 0, "allocation should succeed before destroy");
+
+    // Build and send the destroy request (Refresh LIFETIME=0).
+    let (bytes, tx_id) = client.create_destroy_packet().await?;
+    client.send(&bytes).await?;
+    let mut buf = [0u8; MAX_STUN_MESSAGE];
+    let len = client.recv(&mut buf).await?;
+    let resp = StunMessage::decode(&buf[..len])?;
+    assert_eq!(resp.transaction_id, tx_id, "destroy response tx id should match");
+    assert_eq!(resp.method, StunMethod::Refresh, "destroy response should be a Refresh");
+    assert_eq!(
+        resp.class,
+        StunClass::SuccessResponse,
+        "destroy should succeed, got error={:?}",
+        resp.error_code
+    );
+
+    turn_server.stop().await?;
+    Ok(())
+}
+
+/// Verify that `IceTransport::stop()` triggers best-effort destruction of TURN
+/// allocations: relayed traffic flows before `stop()`, and stops flowing
+/// shortly after, proving the server released the allocation (RFC 5766 §7.4).
+#[tokio::test]
+#[serial]
+async fn test_ice_stop_destroys_turn_allocations() -> Result<()> {
+    use tokio::net::UdpSocket;
+
+    let mut turn_server = TestTurnServer::start().await?;
+
+    let mut config = RtcConfiguration::default();
+    config.ice_transport_policy = IceTransportPolicy::Relay;
+    config.ice_servers.push(
+        IceServer::new(vec![turn_server.turn_url()]).with_credential(TEST_USERNAME, TEST_PASSWORD),
+    );
+
+    let (tx, _) = broadcast::channel(100);
+    let (socket_tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let gatherer = IceGatherer::new(config.clone(), tx, socket_tx);
+    gatherer.gather().await?;
+
+    let candidates = gatherer.local_candidates();
+    let relay = candidates
+        .iter()
+        .find(|c| c.typ == IceCandidateType::Relay)
+        .expect("should have relay candidate")
+        .clone();
+    let relay_addr = relay.address;
+
+    let client = {
+        let clients = gatherer.turn_clients.lock();
+        clients
+            .get(&relay_addr)
+            .cloned()
+            .expect("should have TurnClient for relay")
+    };
+
+    // Set up a peer sink that receives data relayed through TURN, and create a
+    // permission for it BEFORE the runner takes over the client socket.
+    let peer_socket = UdpSocket::bind("127.0.0.1:0").await?;
+    let peer_addr = peer_socket.local_addr()?;
+    client.create_permission(peer_addr).await?;
+
+    let (transport, runner) = IceTransport::new(config);
+    tokio::spawn(runner);
+    transport
+        .inner
+        .gatherer
+        .turn_clients
+        .lock()
+        .insert(relay_addr, client.clone());
+    let _ = transport.inner.state.send(IceTransportState::Connected);
+
+    // Sanity: relayed Send Indication delivers data to the peer.
+    client.send_indication(peer_addr, b"before").await?;
+    let mut rbuf = [0u8; 16];
+    let (n, _) = peer_socket.recv_from(&mut rbuf).await?;
+    assert_eq!(&rbuf[..n], b"before", "peer should receive relayed data before stop()");
+
+    // stop() spawns the detached best-effort destroy task.
+    transport.stop();
+
+    // Wait for the destroy (Refresh LIFETIME=0) to reach the server.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // After the allocation is destroyed, the relay drops Send Indications.
+    client.send_indication(peer_addr, b"after").await?;
+    let result = timeout(Duration::from_millis(500), peer_socket.recv_from(&mut rbuf)).await;
+    assert!(
+        result.is_err(),
+        "no relayed data should reach the peer after IceTransport::stop() destroyed the allocation"
+    );
+
+    turn_server.stop().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_nomination_fails_immediately_on_host_unreachable() -> Result<()> {
     // With the transient-error retry fix, EHOSTUNREACH is no longer an immediate

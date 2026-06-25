@@ -273,6 +273,34 @@ impl TurnClient {
         Ok((bytes, tx_id))
     }
 
+    /// Build a Refresh request with LIFETIME=0 to explicitly destroy the
+    /// allocation (RFC 5766 §7.4 "Destroying an Allocation"). The server
+    /// releases the allocation upon receipt of the request; the success
+    /// response (which carries LIFETIME=0) is purely informational.
+    pub(crate) async fn create_destroy_packet(&self) -> Result<(Vec<u8>, [u8; 12])> {
+        let tx_id = random_bytes::<12>();
+        let auth_guard = self.auth.lock().await;
+        let auth = auth_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("TURN destroy: no auth context"))?;
+
+        let attributes = vec![
+            StunAttribute::Lifetime(0),
+            StunAttribute::Username(auth.username.clone()),
+            StunAttribute::Realm(auth.realm.clone()),
+            StunAttribute::Nonce(auth.nonce.clone()),
+        ];
+
+        let msg = StunMessage {
+            class: StunClass::Request,
+            method: StunMethod::Refresh,
+            transaction_id: tx_id,
+            attributes,
+        };
+        let bytes = msg.encode(Some(&auth.key), true)?;
+        Ok((bytes, tx_id))
+    }
+
     /// Update the stored nonce (and realm) after receiving a 401/438 from the TURN server.
     /// Must be called before retrying the request that triggered the stale-nonce error.
     pub(crate) async fn update_nonce(&self, realm: String, nonce: String) {

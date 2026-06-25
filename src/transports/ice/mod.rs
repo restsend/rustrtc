@@ -1317,7 +1317,99 @@ impl IceTransport {
         let _ = self.inner.state.send(IceTransportState::Connected);
     }
 
+    /// Best-effort explicit destruction of all TURN allocations (RFC 5766 §7.4).
+    ///
+    /// Sends a Refresh request with LIFETIME=0 to each TURN server. The server
+    /// releases the allocation on receipt of the request; the success response
+    /// is informational. Runs on a detached task so it never blocks `stop()` /
+    /// `PeerConnection::close()`.
+    fn destroy_turn_allocations_best_effort(&self) {
+        let clients: Vec<Arc<TurnClient>> = {
+            let map = self.inner.gatherer.turn_clients.lock();
+            map.values().cloned().collect()
+        };
+        if clients.is_empty() {
+            return;
+        }
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            for client in clients {
+                Self::destroy_one_turn_allocation(&inner, &client).await;
+            }
+        });
+    }
+
+    /// Send Refresh(LIFETIME=0) to a single TURN server, retrying once on a
+    /// stale-nonce (401/438). Best-effort: a missing/erroneous response is
+    /// logged but never propagates — the allocation is destroyed server-side
+    /// as soon as the request is received.
+    async fn destroy_one_turn_allocation(
+        inner: &Arc<IceTransportInner>,
+        client: &Arc<TurnClient>,
+    ) {
+        for attempt in 0..2u8 {
+            let (bytes, tx_id) = match client.create_destroy_packet().await {
+                Ok(p) => p,
+                Err(e) => {
+                    debug!("TURN destroy packet creation failed: {}", e);
+                    return;
+                }
+            };
+            let (tx, rx) = oneshot::channel();
+            inner.pending_transactions.lock().insert(tx_id, tx);
+            if let Err(e) = client.send(&bytes).await {
+                debug!("TURN destroy send failed: {}", e);
+                inner.pending_transactions.lock().remove(&tx_id);
+                return;
+            }
+            match timeout(Duration::from_secs(2), rx).await {
+                Ok(Ok(msg)) if msg.class == StunClass::SuccessResponse => {
+                    debug!("TURN allocation destroyed (Refresh LIFETIME=0)");
+                    return;
+                }
+                Ok(Ok(msg))
+                    if matches!(msg.error_code, Some(401) | Some(438)) && attempt == 0 =>
+                {
+                    if let (Some(realm), Some(nonce)) = (msg.realm, msg.nonce) {
+                        debug!(
+                            "TURN destroy got {}: updating nonce, retrying",
+                            msg.error_code.unwrap()
+                        );
+                        client.update_nonce(realm, nonce).await;
+                        continue;
+                    }
+                    return;
+                }
+                Ok(Ok(msg)) => {
+                    debug!(
+                        "TURN destroy failed: error={:?}",
+                        msg.error_code
+                    );
+                    return;
+                }
+                _ => {
+                    // Timeout or read-loop already shut down (state -> Closed).
+                    // The server still destroys the allocation on request receipt.
+                    inner.pending_transactions.lock().remove(&tx_id);
+                    debug!(
+                        "TURN destroy: no response within 2s (best-effort; \
+                         allocation is released server-side on receipt)"
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
     pub fn stop(&self) {
+        // Best-effort explicit TURN allocation destruction (RFC 5766 §7.4).
+        // Spawned BEFORE flipping state to Closed so the TURN read loops that
+        // dispatch the success/stale-nonce responses are still alive. The server
+        // releases the allocation on receipt of Refresh(LIFETIME=0) regardless
+        // of whether we observe the response, so this is robust even if the
+        // detached task races the read-loop shutdown.
+        self.destroy_turn_allocations_best_effort();
+
         let _ = self.inner.state.send(IceTransportState::Closed);
         let _ = self.inner.selected_socket.send(None);
         let _ = self.inner.selected_rtcp_socket.send(None);
