@@ -3677,3 +3677,282 @@ async fn ice_udp_mux_two_sessions_share_one_port() -> Result<()> {
     assert_eq!(shared_udp::session_count(bind_addr), 0);
     Ok(())
 }
+
+// ============================================================================
+// Regression tests: handle_packet must dispatch ErrorResponse to
+// pending_transactions (fix: 401/438 retry path was previously dead code).
+// ============================================================================
+
+/// Build a minimal raw STUN ErrorResponse packet (no FINGERPRINT / MESSAGE-INTEGRITY).
+/// The decoder only requires: correct magic cookie, matching byte length, and
+/// well-formed attributes.
+fn build_raw_stun_error_response(
+    tx_id: [u8; 12],
+    method_bits: u16, // 0x0004 = Refresh, 0x0009 = ChannelBind, etc.
+    error_code: u16,  // e.g. 401, 438
+    realm: &str,
+    nonce: &str,
+) -> Vec<u8> {
+    const MAGIC_COOKIE: u32 = 0x2112_A442;
+
+    let class_num = (error_code / 100) as u8;
+    let number = (error_code % 100) as u8;
+    let reason: &str = match error_code {
+        401 => "Unauthorized",
+        438 => "Stale Nonce",
+        _ => "Error",
+    };
+
+    let mut attrs: Vec<u8> = Vec::new();
+
+    // ERROR-CODE (type 0x0009): [reserved(2), class(1), number(1), reason phrase]
+    {
+        let val_len = 4 + reason.len();
+        let pad = (4 - val_len % 4) % 4;
+        attrs.extend_from_slice(&0x0009_u16.to_be_bytes());
+        attrs.extend_from_slice(&(val_len as u16).to_be_bytes());
+        attrs.extend_from_slice(&[0x00, 0x00, class_num, number]);
+        attrs.extend_from_slice(reason.as_bytes());
+        attrs.extend(std::iter::repeat(0u8).take(pad));
+    }
+
+    // REALM (type 0x0014)
+    if !realm.is_empty() {
+        let rb = realm.as_bytes();
+        let pad = (4 - rb.len() % 4) % 4;
+        attrs.extend_from_slice(&0x0014_u16.to_be_bytes());
+        attrs.extend_from_slice(&(rb.len() as u16).to_be_bytes());
+        attrs.extend_from_slice(rb);
+        attrs.extend(std::iter::repeat(0u8).take(pad));
+    }
+
+    // NONCE (type 0x0015)
+    if !nonce.is_empty() {
+        let nb = nonce.as_bytes();
+        let pad = (4 - nb.len() % 4) % 4;
+        attrs.extend_from_slice(&0x0015_u16.to_be_bytes());
+        attrs.extend_from_slice(&(nb.len() as u16).to_be_bytes());
+        attrs.extend_from_slice(nb);
+        attrs.extend(std::iter::repeat(0u8).take(pad));
+    }
+
+    // STUN header: type | magic | tx_id | body
+    let msg_type = method_bits | 0x0110u16; // ErrorResponse class bits
+    let mut buf = Vec::with_capacity(20 + attrs.len());
+    buf.extend_from_slice(&msg_type.to_be_bytes());
+    buf.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
+    buf.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+    buf.extend_from_slice(&tx_id);
+    buf.extend_from_slice(&attrs);
+    buf
+}
+
+/// Regression test: `handle_packet` MUST dispatch STUN ErrorResponse (438) to
+/// `pending_transactions` so that the 401/438 retry loop in
+/// `refresh_one_turn_client` / `send_and_await_inner` actually fires.
+///
+/// Before the fix, the ErrorResponse branch was a no-op, causing every retry
+/// to silently time out after 5 s instead of receiving the stale-nonce error
+/// and retrying with the fresh nonce from the response.
+#[tokio::test]
+async fn test_handle_packet_dispatches_error_response_to_pending_transactions() {
+    let config = RtcConfiguration::default();
+    let (transport, runner) = IceTransport::new(config);
+    tokio::spawn(runner);
+
+    let tx_id: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+
+    // Register a pending transaction for this tx_id.
+    let (tx, rx) = tokio::sync::oneshot::channel::<StunDecoded>();
+    transport
+        .inner
+        .pending_transactions
+        .lock()
+        .insert(tx_id, tx);
+
+    // Build a 438 Stale Nonce response for a Refresh request.
+    let packet = build_raw_stun_error_response(
+        tx_id,
+        0x0004, // Refresh method
+        438,
+        TEST_REALM,
+        "fresh-nonce-abc",
+    );
+
+    // Provide a dummy UDP sender (not used when handling an ErrorResponse).
+    let dummy_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let sender = IceSocketWrapper::Udp(dummy_sock);
+    let addr: SocketAddr = "127.0.0.1:3478".parse().unwrap();
+
+    handle_packet(&packet, addr, transport.inner.clone(), sender).await;
+
+    // The oneshot MUST have been resolved immediately — no timeout path.
+    let result = timeout(Duration::from_millis(200), rx).await;
+    assert!(
+        result.is_ok(),
+        "handle_packet should dispatch ErrorResponse to pending_transactions immediately"
+    );
+    let decoded = result.unwrap().expect("oneshot should not be dropped");
+    assert_eq!(
+        decoded.error_code,
+        Some(438),
+        "dispatched message should carry error_code=438"
+    );
+    assert_eq!(
+        decoded.nonce.as_deref(),
+        Some("fresh-nonce-abc"),
+        "dispatched message should carry the fresh nonce from the response"
+    );
+}
+
+/// Regression test: `handle_packet` must also dispatch 401 Unauthorized
+/// (the other common TURN auth error) to `pending_transactions`.
+#[tokio::test]
+async fn test_handle_packet_dispatches_401_to_pending_transactions() {
+    let config = RtcConfiguration::default();
+    let (transport, runner) = IceTransport::new(config);
+    tokio::spawn(runner);
+
+    let tx_id: [u8; 12] = [9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 1, 2];
+    let (tx, rx) = tokio::sync::oneshot::channel::<StunDecoded>();
+    transport
+        .inner
+        .pending_transactions
+        .lock()
+        .insert(tx_id, tx);
+
+    let packet = build_raw_stun_error_response(tx_id, 0x0004, 401, TEST_REALM, "new-nonce-xyz");
+    let dummy_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let sender = IceSocketWrapper::Udp(dummy_sock);
+    let addr: SocketAddr = "127.0.0.1:3478".parse().unwrap();
+
+    handle_packet(&packet, addr, transport.inner.clone(), sender).await;
+
+    let result = timeout(Duration::from_millis(200), rx).await;
+    assert!(result.is_ok(), "handle_packet should dispatch 401 to pending_transactions");
+    let decoded = result.unwrap().unwrap();
+    assert_eq!(decoded.error_code, Some(401));
+    assert_eq!(decoded.nonce.as_deref(), Some("new-nonce-xyz"));
+}
+
+/// Error responses for transaction IDs that are NOT in `pending_transactions`
+/// must be silently ignored (no panic, no channel send).
+#[tokio::test]
+async fn test_handle_packet_ignores_unmatched_error_response() {
+    let config = RtcConfiguration::default();
+    let (transport, runner) = IceTransport::new(config);
+    tokio::spawn(runner);
+
+    // Register a DIFFERENT tx_id in pending_transactions.
+    let registered_id: [u8; 12] = [0xAA; 12];
+    let (tx, rx) = tokio::sync::oneshot::channel::<StunDecoded>();
+    transport
+        .inner
+        .pending_transactions
+        .lock()
+        .insert(registered_id, tx);
+
+    // Send an error response for a DIFFERENT, unregistered tx_id.
+    let unregistered_id: [u8; 12] = [0xBB; 12];
+    let packet =
+        build_raw_stun_error_response(unregistered_id, 0x0004, 438, TEST_REALM, "some-nonce");
+    let dummy_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let sender = IceSocketWrapper::Udp(dummy_sock);
+    let addr: SocketAddr = "127.0.0.1:3478".parse().unwrap();
+
+    handle_packet(&packet, addr, transport.inner.clone(), sender).await;
+
+    // The registered channel must NOT have received anything.
+    let result = timeout(Duration::from_millis(50), rx).await;
+    assert!(
+        result.is_err(),
+        "unmatched error response must NOT be delivered to registered tx channel"
+    );
+
+    // pending_transactions must still contain the registered id (it was not consumed).
+    let map = transport.inner.pending_transactions.lock();
+    assert!(
+        map.contains_key(&registered_id),
+        "unmatched error response must not remove an unrelated pending transaction"
+    );
+
+    // Sender must be dropped as part of `tx` still being alive via the map.
+    let _ = tx; // keep alive
+}
+
+/// End-to-end integration: `run_turn_refresh` must successfully retry after
+/// receiving a stale-nonce error response via the TURN read loop.
+///
+/// With the bug (ErrorResponse not dispatched): `send_and_await_inner` times
+/// out after 5 s → refresh silently fails → allocation eventually expires.
+///
+/// With the fix: 401/438 is dispatched → nonce updated → retry succeeds in
+/// < 1 s.  We assert the whole refresh completes in < 4 s to catch regressions.
+#[tokio::test]
+#[serial]
+async fn test_run_turn_refresh_succeeds_after_stale_nonce_via_inner() -> Result<()> {
+    let mut turn_server = TestTurnServer::start().await?;
+    let uri = IceServerUri::parse(&turn_server.turn_url())?;
+    let server =
+        IceServer::new(vec![turn_server.turn_url()]).with_credential(TEST_USERNAME, TEST_PASSWORD);
+
+    // Allocate a real TURN allocation.
+    let client = Arc::new(TurnClient::connect(&uri, false).await?);
+    let creds = TurnCredentials::from_server(&server)?;
+    let alloc = client.allocate(creds).await?;
+
+    // Build a transport inner (runner is required to keep state channels alive).
+    let mut config = RtcConfiguration::default();
+    config.ice_transport_policy = IceTransportPolicy::Relay;
+    config.ice_servers.push(server.clone());
+    let (transport, runner) = IceTransport::new(config);
+    tokio::spawn(runner);
+
+    // Register the TURN client under its relay address so run_turn_refresh finds it.
+    {
+        let mut clients = transport.inner.gatherer.turn_clients.lock();
+        clients.insert(alloc.relayed_address, client.clone());
+    }
+
+    // Spawn the TURN read loop — this is the component that was missing in the
+    // bug scenario: without it, responses were never dispatched to pending_transactions.
+    let inner_clone = transport.inner.clone();
+    let client_clone = client.clone();
+    tokio::spawn(async move {
+        IceTransportRunner::run_turn_read_loop(client_clone, alloc.relayed_address, inner_clone)
+            .await;
+    });
+
+    // Set a fake selected pair so run_turn_refresh has a remote address for the
+    // permission refresh step.
+    let remote = IceCandidate::host("127.0.0.1:19999".parse().unwrap(), 1);
+    let local_relay = IceCandidate::relay(alloc.relayed_address, 1, "udp");
+    *transport.inner.selected_pair.lock() = Some(IceCandidatePair::new(local_relay, remote));
+    let _ = transport.inner.state.send(IceTransportState::Connected);
+
+    // Poison the stored nonce.  The next Refresh / CreatePermission will carry
+    // this bad nonce; the server will reply with 4xx + a fresh nonce.
+    client
+        .update_nonce(TEST_REALM.to_string(), "stale-poison-nonce".to_string())
+        .await;
+
+    // With the fix: the read loop dispatches the 4xx → retry fires → success.
+    // The whole round-trip should take well under 4 s.
+    // Without the fix: the allocation refresh alone times out after 5 s.
+    let start = std::time::Instant::now();
+    let result = timeout(
+        Duration::from_secs(4),
+        IceTransportRunner::run_turn_refresh(&transport.inner),
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "run_turn_refresh should complete within 4 s when the TURN read loop \
+         dispatches 4xx responses (elapsed: {:?})",
+        start.elapsed()
+    );
+
+    turn_server.stop().await?;
+    Ok(())
+}

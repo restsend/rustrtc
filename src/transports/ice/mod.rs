@@ -2097,6 +2097,13 @@ async fn handle_packet(
                         }
                         trace!("Error code: {}", code);
                     }
+                    // Dispatch error responses to pending transactions so that callers
+                    // waiting on send_and_await_inner (e.g. TURN Refresh, ChannelBind)
+                    // can receive 401/438 and retry with a fresh nonce instead of timing out.
+                    let mut map = inner.pending_transactions.lock();
+                    if let Some(tx) = map.remove(&msg.transaction_id) {
+                        let _ = tx.send(msg);
+                    }
                 }
             }
             Err(e) => {
