@@ -108,6 +108,10 @@ pub struct StunDecoded {
     pub nonce: Option<String>,
     pub data: Option<Vec<u8>>,
     pub use_candidate: bool,
+    /// Value of the LIFETIME attribute (0x000D), if present (TURN Allocate /
+    /// Refresh responses). Honored per RFC 5766 §2.2 — the server may grant a
+    /// lifetime shorter than the one requested by the client.
+    pub lifetime: Option<u32>,
 }
 
 fn encode_stun_message(
@@ -323,6 +327,7 @@ fn decode_stun_message(bytes: &[u8]) -> Result<StunDecoded> {
     let mut nonce = None;
     let mut data = None;
     let mut use_candidate = false;
+    let mut lifetime = None;
     while offset + 4 <= bytes.len() {
         let typ = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
         let len = u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]) as usize;
@@ -366,6 +371,12 @@ fn decode_stun_message(bytes: &[u8]) -> Result<StunDecoded> {
             0x0013 => {
                 data = Some(value.to_vec());
             }
+            0x000D => {
+                // LIFETIME (RFC 5766): 4-byte big-endian seconds.
+                if value.len() >= 4 {
+                    lifetime = Some(u32::from_be_bytes([value[0], value[1], value[2], value[3]]));
+                }
+            }
             0x0025 => {
                 use_candidate = true;
             }
@@ -386,6 +397,7 @@ fn decode_stun_message(bytes: &[u8]) -> Result<StunDecoded> {
         nonce,
         data,
         use_candidate,
+        lifetime,
     })
 }
 

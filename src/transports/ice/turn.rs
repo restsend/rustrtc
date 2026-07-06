@@ -162,9 +162,14 @@ impl TurnClient {
                                 key,
                             ));
                         }
+                        let granted_lifetime = parsed
+                            .lifetime
+                            .filter(|&l| l > 0)
+                            .unwrap_or(DEFAULT_TURN_LIFETIME);
                         return Ok(TurnAllocation {
                             relayed_address: relayed,
                             transport: self.transport.protocol(),
+                            lifetime_secs: granted_lifetime,
                         });
                     }
                     bail!("TURN success without relayed address");
@@ -519,6 +524,10 @@ struct TurnNonce {
 pub(crate) struct TurnAllocation {
     pub relayed_address: SocketAddr,
     pub transport: IceTransportProtocol,
+    /// Lifetime (seconds) the server actually granted. May be smaller than the
+    /// requested `DEFAULT_TURN_LIFETIME`; clients must refresh before it elapses
+    /// (RFC 5766 §2.2/§7).
+    pub lifetime_secs: u32,
 }
 
 impl TurnTransport {

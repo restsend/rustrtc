@@ -140,6 +140,10 @@ struct IceTransportInner {
     /// Controlled side immediately sends `true` (no nomination to do).
     nomination_complete: watch::Sender<Option<bool>>,
     _nomination_complete_rx: watch::Receiver<Option<bool>>,
+    /// Guards against overlapping `run_turn_refresh` invocations: the refresh
+    /// timer tick skips when a previous refresh is still in flight instead of
+    /// cancelling it (which used to orphan pending transactions).
+    turn_refresh_in_progress: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for IceTransportInner {
@@ -184,10 +188,16 @@ impl IceTransportRunner {
                 tokio::time::Instant::now() + Duration::from_secs(1),
                 Duration::from_secs(1),
             );
-            // TURN refresh interval: every 120s (well under 300s permission timeout)
+            // TURN refresh interval. Kept well under both the 300 s permission
+            // timeout AND typical UDP NAT mapping idle timeouts (~30 s on many
+            // carrier/CGNAT deployments): each Refresh is bidirectional traffic
+            // on the client<->TURN-server 5-tuple, so this also keeps that NAT
+            // mapping warm for relays that are gathered but not selected (and
+            // therefore carry no media ChannelData). 25 s is safely under all
+            // those budgets while staying cheap (tiny authenticated packets).
             let mut turn_refresh_interval = tokio::time::interval_at(
-                tokio::time::Instant::now() + Duration::from_secs(120),
-                Duration::from_secs(120),
+                tokio::time::Instant::now() + Duration::from_secs(25),
+                Duration::from_secs(25),
             );
             let mut read_futures: FuturesUnordered<BoxFuture<'static, ()>> =
                 FuturesUnordered::new();
@@ -277,13 +287,22 @@ impl IceTransportRunner {
                         }
                     }
                     _ = turn_refresh_interval.tick() => {
-                        // Only start a new refresh if the previous one has completed.
-                        // If still running (e.g. server slow), skip this tick rather than
-                        // stacking up concurrent refreshes.
-                        let inner = self.inner.clone();
-                        turn_refresh_future = Box::pin(async move {
-                            Self::run_turn_refresh(&inner).await;
-                        });
+                        // Only start a new refresh if the previous one has
+                        // completed. If still running (e.g. server slow), skip
+                        // this tick rather than reassigning the future, which
+                        // would cancel the in-flight refresh and orphan its
+                        // pending transactions. The in-progress flag is cleared
+                        // by `run_turn_refresh` on every exit path.
+                        if !self
+                            .inner
+                            .turn_refresh_in_progress
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                        {
+                            let inner = self.inner.clone();
+                            turn_refresh_future = Box::pin(async move {
+                                Self::run_turn_refresh(&inner).await;
+                            });
+                        }
                     }
                     _ = &mut turn_refresh_future => {
                         turn_refresh_future = Box::pin(futures::future::pending());
@@ -590,13 +609,35 @@ impl IceTransportRunner {
     ///   - Permission lifetime: 300s, must be refreshed
     ///   - ChannelBind lifetime: 600s, must be refreshed
     ///
-    /// This runs every ~120s which is well under all three timeouts.
+    /// This runs every ~25s — well under all three timeouts AND under typical
+    /// UDP NAT mapping idle timeouts, so the client<->TURN-server 5-tuple stays
+    /// mapped even for relays that carry no media (the bidirectional Refresh
+    /// traffic refreshes the NAT). See the interval setup in `run`.
     ///
     /// Each request is awaited directly (no spawning) so that a 401/438
     /// stale-nonce response is detected immediately and the nonce is refreshed
     /// before retrying — preventing silent refresh failures that eventually let
     /// ChannelBindings expire and cause SCTP disconnects.
     async fn run_turn_refresh(inner: &Arc<IceTransportInner>) {
+        // Acquire the in-progress guard. If a previous refresh is somehow still
+        // running (e.g. the runner raced two ticks), bail out instead of running
+        // two concurrent refreshes that could interleave nonce updates.
+        if inner
+            .turn_refresh_in_progress
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        // RAII: guarantees the flag is cleared on every exit path, including
+        // early returns and panics, so the timer never deadlocks on refresh.
+        struct RefreshGuard<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for RefreshGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _guard = RefreshGuard(&inner.turn_refresh_in_progress);
+
         let state = *inner.state.borrow();
         if state != IceTransportState::Connected && state != IceTransportState::Disconnected {
             return;
@@ -833,6 +874,7 @@ impl IceTransport {
             checking_pairs: Mutex::new(std::collections::HashSet::new()),
             nomination_complete: nomination_complete_tx,
             _nomination_complete_rx: nomination_complete_rx,
+            turn_refresh_in_progress: std::sync::atomic::AtomicBool::new(false),
             buffer_stats: Arc::new(BufferStats::default()),
         };
         let inner = Arc::new(inner);
@@ -4028,6 +4070,10 @@ impl IceGatherer {
         let client = TurnClient::connect(uri, self.config.disable_ipv6).await?;
         let allocation = client.allocate(credentials).await?;
         let relayed_addr = allocation.relayed_address;
+        debug!(
+            "TURN allocation granted: relayed={}, lifetime={}s",
+            relayed_addr, allocation.lifetime_secs
+        );
 
         let client = Arc::new(client);
         self.turn_clients
