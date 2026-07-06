@@ -345,7 +345,7 @@ pub fn calculate_abs_send_time(time: SystemTime) -> u32 {
     let ntp_seconds = duration.as_secs() + 2208988800;
     let ntp_fraction = (duration.subsec_nanos() as u64 * (1u64 << 32) / 1_000_000_000) as u32;
 
-    let ntp_timestamp = ((ntp_seconds as u64) << 32) | (ntp_fraction as u64);
+    let ntp_timestamp = (ntp_seconds << 32) | (ntp_fraction as u64);
     ((ntp_timestamp >> 14) & 0x00ffffff) as u32
 }
 
@@ -1079,7 +1079,7 @@ mod tests {
             sender_ssrc: 1,
             media_ssrc: 2,
         });
-        let bytes = marshal_rtcp_packets(&[pli.clone()]).unwrap();
+        let bytes = marshal_rtcp_packets(std::slice::from_ref(&pli)).unwrap();
         let parsed = parse_rtcp_packets(&bytes, None).unwrap();
         assert!(matches!(parsed[0], RtcpPacket::PictureLossIndication(_)));
     }
@@ -1091,7 +1091,7 @@ mod tests {
             media_ssrc: 6,
             lost_packets: vec![100, 102],
         });
-        let bytes = marshal_rtcp_packets(&[nack.clone()]).unwrap();
+        let bytes = marshal_rtcp_packets(std::slice::from_ref(&nack)).unwrap();
         let parsed = parse_rtcp_packets(&bytes, None).unwrap();
         match &parsed[0] {
             RtcpPacket::GenericNack(out) => {

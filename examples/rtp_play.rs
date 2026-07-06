@@ -1,3 +1,12 @@
+// Test/example crate: relax pedantic style lints that are noisy in fixtures.
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::redundant_pattern_matching)]
+#![allow(clippy::while_let_loop)]
+#![allow(clippy::manual_checked_ops)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::explicit_counter_loop)]
+#![allow(clippy::cloned_ref_to_slice_refs)]
+#![allow(clippy::zombie_processes)]
 use async_trait::async_trait;
 use rustrtc::media::{
     MediaError, MediaKind, MediaResult, MediaSample, MediaSource, Packetizer, VideoFrame,
@@ -45,15 +54,14 @@ async fn main() {
     pc.set_local_description(offer)
         .expect("failed to set local description");
 
-    let remote_sdp_str = format!(
-        "v=0\r\n\
+    let remote_sdp_str = "v=0\r\n\
          o=- 0 0 IN IP4 127.0.0.1\r\n\
          s=-\r\n\
          c=IN IP4 127.0.0.1\r\n\
          t=0 0\r\n\
          m=video 5004 RTP/AVP 96\r\n\
          a=rtpmap:96 VP8/90000\r\n"
-    );
+        .to_string();
     let remote_sdp = SessionDescription::parse(SdpType::Answer, &remote_sdp_str)
         .expect("failed to parse remote sdp");
     pc.set_remote_description(remote_sdp)

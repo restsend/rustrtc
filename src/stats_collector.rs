@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use serde_json::json;
 use std::collections::HashMap;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct RemoteInboundStats {
     packets_lost: i32,
     fraction_lost: u8,
@@ -15,62 +15,23 @@ struct RemoteInboundStats {
     round_trip_time: Option<f64>,
 }
 
-impl Default for RemoteInboundStats {
-    fn default() -> Self {
-        Self {
-            packets_lost: 0,
-            fraction_lost: 0,
-            jitter: 0,
-            round_trip_time: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct RemoteOutboundStats {
     packets_sent: u32,
     bytes_sent: u32,
     remote_timestamp: u32,
 }
 
-impl Default for RemoteOutboundStats {
-    fn default() -> Self {
-        Self {
-            packets_sent: 0,
-            bytes_sent: 0,
-            remote_timestamp: 0,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct LocalInboundStats {
     packets_received: u64,
     bytes_received: u64,
 }
 
-impl Default for LocalInboundStats {
-    fn default() -> Self {
-        Self {
-            packets_received: 0,
-            bytes_received: 0,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct LocalOutboundStats {
     packets_sent: u64,
     bytes_sent: u64,
-}
-
-impl Default for LocalOutboundStats {
-    fn default() -> Self {
-        Self {
-            packets_sent: 0,
-            bytes_sent: 0,
-        }
-    }
 }
 
 #[derive(Default)]

@@ -1733,7 +1733,10 @@ async fn test_turn_destroy_releases_allocation() -> Result<()> {
     let client = TurnClient::connect(&uri, false).await?;
     let creds = TurnCredentials::from_server(&server)?;
     let allocation = client.allocate(creds).await?;
-    assert!(allocation.relayed_address.port() != 0, "allocation should succeed before destroy");
+    assert!(
+        allocation.relayed_address.port() != 0,
+        "allocation should succeed before destroy"
+    );
 
     // Build and send the destroy request (Refresh LIFETIME=0).
     let (bytes, tx_id) = client.create_destroy_packet().await?;
@@ -1741,8 +1744,15 @@ async fn test_turn_destroy_releases_allocation() -> Result<()> {
     let mut buf = [0u8; MAX_STUN_MESSAGE];
     let len = client.recv(&mut buf).await?;
     let resp = StunMessage::decode(&buf[..len])?;
-    assert_eq!(resp.transaction_id, tx_id, "destroy response tx id should match");
-    assert_eq!(resp.method, StunMethod::Refresh, "destroy response should be a Refresh");
+    assert_eq!(
+        resp.transaction_id, tx_id,
+        "destroy response tx id should match"
+    );
+    assert_eq!(
+        resp.method,
+        StunMethod::Refresh,
+        "destroy response should be a Refresh"
+    );
     assert_eq!(
         resp.class,
         StunClass::SuccessResponse,
@@ -1811,7 +1821,11 @@ async fn test_ice_stop_destroys_turn_allocations() -> Result<()> {
     client.send_indication(peer_addr, b"before").await?;
     let mut rbuf = [0u8; 16];
     let (n, _) = peer_socket.recv_from(&mut rbuf).await?;
-    assert_eq!(&rbuf[..n], b"before", "peer should receive relayed data before stop()");
+    assert_eq!(
+        &rbuf[..n],
+        b"before",
+        "peer should receive relayed data before stop()"
+    );
 
     // stop() spawns the detached best-effort destroy task.
     transport.stop();
@@ -2243,6 +2257,7 @@ async fn test_nomination_race_under_high_packet_loss() -> Result<()> {
 
 /// Test that default UPnP constants are valid
 #[test]
+#[allow(clippy::assertions_on_constants)] // intentional compile-time invariant checks
 fn test_upnp_default_constants() {
     assert!(MIN_LEASE_DURATION > 0);
     assert!(MAX_LEASE_DURATION > MIN_LEASE_DURATION);
@@ -2268,7 +2283,7 @@ fn test_port_mapping_expiry() {
 
     // Check remaining lifetime is around 70
     let remaining = mapping.remaining_lifetime();
-    assert!(remaining >= 69 && remaining <= 70);
+    assert!((69..=70).contains(&remaining));
 }
 
 /// Test PortMapping remaining lifetime calculation
@@ -3713,7 +3728,7 @@ fn build_raw_stun_error_response(
         attrs.extend_from_slice(&(val_len as u16).to_be_bytes());
         attrs.extend_from_slice(&[0x00, 0x00, class_num, number]);
         attrs.extend_from_slice(reason.as_bytes());
-        attrs.extend(std::iter::repeat(0u8).take(pad));
+        attrs.extend(std::iter::repeat_n(0u8, pad));
     }
 
     // REALM (type 0x0014)
@@ -3723,7 +3738,7 @@ fn build_raw_stun_error_response(
         attrs.extend_from_slice(&0x0014_u16.to_be_bytes());
         attrs.extend_from_slice(&(rb.len() as u16).to_be_bytes());
         attrs.extend_from_slice(rb);
-        attrs.extend(std::iter::repeat(0u8).take(pad));
+        attrs.extend(std::iter::repeat_n(0u8, pad));
     }
 
     // NONCE (type 0x0015)
@@ -3733,7 +3748,7 @@ fn build_raw_stun_error_response(
         attrs.extend_from_slice(&0x0015_u16.to_be_bytes());
         attrs.extend_from_slice(&(nb.len() as u16).to_be_bytes());
         attrs.extend_from_slice(nb);
-        attrs.extend(std::iter::repeat(0u8).take(pad));
+        attrs.extend(std::iter::repeat_n(0u8, pad));
     }
 
     // STUN header: type | magic | tx_id | body
@@ -3829,7 +3844,10 @@ async fn test_handle_packet_dispatches_401_to_pending_transactions() {
     handle_packet(&packet, addr, transport.inner.clone(), sender).await;
 
     let result = timeout(Duration::from_millis(200), rx).await;
-    assert!(result.is_ok(), "handle_packet should dispatch 401 to pending_transactions");
+    assert!(
+        result.is_ok(),
+        "handle_packet should dispatch 401 to pending_transactions"
+    );
     let decoded = result.unwrap().unwrap();
     assert_eq!(decoded.error_code, Some(401));
     assert_eq!(decoded.nonce.as_deref(), Some("new-nonce-xyz"));

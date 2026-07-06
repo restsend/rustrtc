@@ -1,3 +1,12 @@
+// Test/example crate: relax pedantic style lints that are noisy in fixtures.
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::redundant_pattern_matching)]
+#![allow(clippy::while_let_loop)]
+#![allow(clippy::manual_checked_ops)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::explicit_counter_loop)]
+#![allow(clippy::cloned_ref_to_slice_refs)]
+#![allow(clippy::zombie_processes)]
 use async_trait::async_trait;
 use axum::{
     Router,
@@ -87,10 +96,10 @@ fn find_vp8_payload_type(desc: &SessionDescription) -> Option<u8> {
                 let mut parts = value.split_whitespace();
                 if let (Some(pt_str), Some(codec_part)) = (parts.next(), parts.next()) {
                     let codec_name = codec_part.split('/').next().unwrap_or("");
-                    if codec_name.eq_ignore_ascii_case("VP8") {
-                        if let Ok(pt) = pt_str.parse::<u8>() {
-                            return Some(pt);
-                        }
+                    if codec_name.eq_ignore_ascii_case("VP8")
+                        && let Ok(pt) = pt_str.parse::<u8>()
+                    {
+                        return Some(pt);
                     }
                 }
             }
@@ -292,11 +301,11 @@ async fn start_echo(pc: PeerConnection, vp8_pt: u8) {
                         let mut sample = sample;
                         if let MediaSample::Video(ref mut f) = sample {
                             // Filter out non-VP8 packets (e.g. RTX)
-                            if let Some(pt) = f.payload_type {
-                                if pt != vp8_pt {
-                                    info!("Dropping video packet with PT: {}", pt);
-                                    continue;
-                                }
+                            if let Some(pt) = f.payload_type
+                                && pt != vp8_pt
+                            {
+                                info!("Dropping video packet with PT: {}", pt);
+                                continue;
                             }
                             // Strip extensions to avoid sending bad transport-cc
                             f.header_extension = None;

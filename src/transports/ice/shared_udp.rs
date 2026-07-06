@@ -160,7 +160,7 @@ impl SharedUdpPort {
                     // than packets arrive. Drop the newest packet (UDP semantics)
                     // and count it so operators can spot sustained overload.
                     let prev = self.dropped_full.fetch_add(1, Ordering::Relaxed);
-                    if prev % 1024 == 0 {
+                    if prev.is_multiple_of(1024) {
                         debug!(
                             "shared UDP: session {} channel full — dropped packet from {} \
                              (total dropped so far: {})",

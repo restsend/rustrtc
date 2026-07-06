@@ -99,7 +99,7 @@ fn resolve_local_ip_uncached() -> Result<IpAddr, anyhow::Error> {
         }
 
         // Sort by score (highest first) and return the best one
-        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
 
         if let Some((ip, score, name)) = candidates.first() {
             tracing::trace!(

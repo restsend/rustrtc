@@ -1,3 +1,12 @@
+// Test/example crate: relax pedantic style lints that are noisy in fixtures.
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::redundant_pattern_matching)]
+#![allow(clippy::while_let_loop)]
+#![allow(clippy::manual_checked_ops)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::explicit_counter_loop)]
+#![allow(clippy::cloned_ref_to_slice_refs)]
+#![allow(clippy::zombie_processes)]
 use indicatif::{ProgressBar, ProgressStyle};
 use std::env;
 use std::process::Command;
@@ -173,24 +182,24 @@ fn parse_output(output: &str, mode: &str) -> Option<BenchResult> {
             }
         } else if line.starts_with("Setup Latency:") {
             // Format: Setup Latency:       4.00 ms (avg)
-            if let Some(val) = line.split_whitespace().nth(2) {
-                if let Ok(v) = val.parse::<f64>() {
-                    dc_latency = v;
-                }
+            if let Some(val) = line.split_whitespace().nth(2)
+                && let Ok(v) = val.parse::<f64>()
+            {
+                dc_latency = v;
             }
         } else if line.starts_with("Total Data:") {
             // Format: Total Data:          1379.16 MB
-            if let Some(val) = line.split_whitespace().nth(2) {
-                if let Ok(v) = val.parse::<f64>() {
-                    bytes = (v * 1024.0 * 1024.0) as u64;
-                }
+            if let Some(val) = line.split_whitespace().nth(2)
+                && let Ok(v) = val.parse::<f64>()
+            {
+                bytes = (v * 1024.0 * 1024.0) as u64;
             }
         } else if line.starts_with("Total Messages:") {
             // Format: Total Messages:      1412263
-            if let Some(val) = line.split_whitespace().nth(2) {
-                if let Ok(v) = val.parse::<u64>() {
-                    msgs = v;
-                }
+            if let Some(val) = line.split_whitespace().nth(2)
+                && let Ok(v) = val.parse::<u64>()
+            {
+                msgs = v;
             }
         } else if line.starts_with("Avg CPU Usage:") {
             // Format: Avg CPU Usage:       842.49%
@@ -202,10 +211,10 @@ fn parse_output(output: &str, mode: &str) -> Option<BenchResult> {
             }
         } else if line.starts_with("Peak Memory RSS:") {
             // Format: Peak Memory RSS:     26 MB
-            if let Some(val) = line.split_whitespace().nth(3) {
-                if let Ok(v) = val.parse::<u64>() {
-                    memory_rss = v;
-                }
+            if let Some(val) = line.split_whitespace().nth(3)
+                && let Ok(v) = val.parse::<u64>()
+            {
+                memory_rss = v;
             }
         }
     }
@@ -274,7 +283,7 @@ fn start_resource_monitor() -> (
     tokio::spawn(async move {
         while running_clone.load(Ordering::Relaxed) {
             let output = Command::new("ps")
-                .args(&["-o", "rss,%cpu", "-p", &pid.to_string()])
+                .args(["-o", "rss,%cpu", "-p", &pid.to_string()])
                 .output();
 
             if let Ok(output) = output {
@@ -427,7 +436,7 @@ fn print_bar_charts(results: &[BenchResult]) {
             "Lower is better"
         };
         println!("\n{} ({})", name, remark);
-        let max_val = results.iter().map(|r| getter(r)).fold(0.0, f64::max);
+        let max_val = results.iter().map(getter).fold(0.0, f64::max);
 
         for res in results {
             let val = getter(res);
@@ -445,7 +454,7 @@ fn print_bar_charts(results: &[BenchResult]) {
             };
             let reset = "\x1b[0m";
 
-            let bar: String = std::iter::repeat("█").take(bar_len).collect();
+            let bar: String = std::iter::repeat_n("█", bar_len).collect();
             println!(
                 "{:<10} | {}{:<40}{} {:.2}",
                 res.mode, color, bar, reset, val
@@ -547,14 +556,10 @@ async fn run_rustrtc(count: usize) -> (f64, u64, u64) {
             while start_wait.elapsed() < Duration::from_secs(5) {
                 if let Ok(Some(event)) =
                     tokio::time::timeout(Duration::from_secs(1), pc2.recv()).await
+                    && let PeerConnectionEvent::DataChannel(dc) = event
                 {
-                    match event {
-                        PeerConnectionEvent::DataChannel(dc) => {
-                            dc2 = Some(dc);
-                            break;
-                        }
-                        _ => {}
-                    }
+                    dc2 = Some(dc);
+                    break;
                 }
             }
 

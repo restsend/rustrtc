@@ -48,10 +48,10 @@ impl JitterBuffer {
         };
 
         // If we already delivered this or a newer sequence (with wrap-around check), ignore it
-        if let Some(last) = self.last_delivered_seq {
-            if !is_newer(seq, last) {
-                return;
-            }
+        if let Some(last) = self.last_delivered_seq
+            && !is_newer(seq, last)
+        {
+            return;
         }
 
         // Validate timestamp continuity to reject interleaved streams with different timestamp bases

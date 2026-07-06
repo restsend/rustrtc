@@ -361,11 +361,7 @@ impl PacketReceiver for IceConn {
                 Some(IceSocketWrapper::TcpStream(_, _, _))
             )
         };
-        if socket_is_inbound_tcp
-            && (current_remote.port() == 0 || current_remote != addr)
-        {
-            *self.remote_addr.write() = addr;
-        } else if current_remote.port() == 0 {
+        if current_remote.port() == 0 || (socket_is_inbound_tcp && current_remote != addr) {
             *self.remote_addr.write() = addr;
         } else if addr != current_remote {
             // Note: We no longer automatically switch the remote address just by receiving
@@ -412,133 +408,130 @@ impl PacketReceiver for IceConn {
                         *remote_rtcp_addr = Some(addr);
                         self.rtcp_latched.store(true, Ordering::Relaxed);
                     }
-                } else if !self.rtp_latched.load(Ordering::Relaxed) {
-                    if packet.len() >= 12 {
-                        let expected = self.expected_ssrc.load(Ordering::Relaxed);
-                        let pkt_ssrc =
-                            u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
+                } else if !self.rtp_latched.load(Ordering::Relaxed) && packet.len() >= 12 {
+                    let expected = self.expected_ssrc.load(Ordering::Relaxed);
+                    let pkt_ssrc =
+                        u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
 
-                        let ssrc_ok = expected == 0 || pkt_ssrc == expected;
+                    let ssrc_ok = expected == 0 || pkt_ssrc == expected;
 
-                        if ssrc_ok {
-                            let seq = u16::from_be_bytes([packet[2], packet[3]]);
-                            let ts =
-                                u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
-                            let marker = (packet[1] & 0x80) != 0;
+                    if ssrc_ok {
+                        let seq = u16::from_be_bytes([packet[2], packet[3]]);
+                        let ts = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+                        let marker = (packet[1] & 0x80) != 0;
 
-                            let mut probation_guard = self.probation.lock();
-                            if let Some(ref mut prob) = *probation_guard {
-                                prob.total_packets = prob.total_packets.saturating_add(1);
+                        let mut probation_guard = self.probation.lock();
+                        if let Some(ref mut prob) = *probation_guard {
+                            prob.total_packets = prob.total_packets.saturating_add(1);
 
-                                let pos = prob.candidates.iter().position(|c| c.addr == addr);
-                                if let Some(i) = pos {
-                                    let c = &mut prob.candidates[i];
-                                    if seq == c.last_seq.wrapping_add(1) {
-                                        c.consecutive_count = c.consecutive_count.saturating_add(1);
-                                    } else {
-                                        // Non-sequential — reset run
-                                        c.consecutive_count = 0;
-                                    }
-                                    c.last_seq = seq;
-                                    c.packet_count = c.packet_count.saturating_add(1);
-                                    if marker {
-                                        c.has_marker = true;
-                                    }
-                                    if ts < c.first_ts {
-                                        c.first_ts = ts;
-                                    }
-                                    if seq < c.first_seq {
-                                        c.first_seq = seq;
-                                    }
+                            let pos = prob.candidates.iter().position(|c| c.addr == addr);
+                            if let Some(i) = pos {
+                                let c = &mut prob.candidates[i];
+                                if seq == c.last_seq.wrapping_add(1) {
+                                    c.consecutive_count = c.consecutive_count.saturating_add(1);
                                 } else {
-                                    prob.candidates.push(RtpCandidateState {
-                                        addr,
-                                        ssrc: pkt_ssrc,
-                                        first_seq: seq,
-                                        last_seq: seq,
-                                        first_ts: ts,
-                                        packet_count: 1,
-                                        consecutive_count: 0,
-                                        has_marker: marker,
-                                    });
+                                    // Non-sequential — reset run
+                                    c.consecutive_count = 0;
                                 }
-
-                                if addr != current_remote {
-                                    *self.remote_addr.write() = addr;
+                                c.last_seq = seq;
+                                c.packet_count = c.packet_count.saturating_add(1);
+                                if marker {
+                                    c.has_marker = true;
                                 }
-
-                                let total = prob.total_packets;
-                                let winner: Option<SocketAddr>;
-
-                                // Rule 1: candidate with marker=true and the
-                                // lowest first_seq wins immediately.
-                                let marker_winner = prob
-                                    .candidates
-                                    .iter()
-                                    .filter(|c| c.has_marker)
-                                    .min_by_key(|c| c.first_seq);
-
-                                if let Some(mw) = marker_winner {
-                                    winner = Some(mw.addr);
-                                } else if total >= prob.max_packets {
-                                    // Rule 3 (timeout fallback): pick the
-                                    // candidate with the most packets; break
-                                    // ties by lowest first_seq.
-                                    winner = prob
-                                        .candidates
-                                        .iter()
-                                        .max_by(|a, b| {
-                                            a.packet_count
-                                                .cmp(&b.packet_count)
-                                                .then(b.first_seq.cmp(&a.first_seq))
-                                        })
-                                        .map(|c| c.addr);
-                                } else {
-                                    // Rule 2: consecutive dominance — at
-                                    // least 2 consecutive packets from one
-                                    // source and at least 3 total observed.
-                                    winner = if total >= 3 {
-                                        prob.candidates
-                                            .iter()
-                                            .find(|c| c.consecutive_count >= 2)
-                                            .map(|c| c.addr)
-                                    } else {
-                                        None
-                                    };
+                                if ts < c.first_ts {
+                                    c.first_ts = ts;
                                 }
-
-                                if let Some(win_addr) = winner {
-                                    // Commit the latch.
-                                    *probation_guard = None; // drop state
-                                    drop(probation_guard);
-
-                                    if win_addr != current_remote {
-                                        *self.remote_addr.write() = win_addr;
-                                    }
-                                    self.rtp_latched.store(true, Ordering::Relaxed);
-                                    tracing::info!(
-                                        "IceConn: RTP latched to {} after probation \
-                                         (expected_ssrc={}, total_obs={})",
-                                        win_addr,
-                                        expected,
-                                        total
-                                    );
+                                if seq < c.first_seq {
+                                    c.first_seq = seq;
                                 }
                             } else {
-                                // No probation state — immediate latch
-                                // (legacy path for callers that never called
-                                // `enable_latch_on_rtp`).
-                                if addr != current_remote {
-                                    *self.remote_addr.write() = addr;
+                                prob.candidates.push(RtpCandidateState {
+                                    addr,
+                                    ssrc: pkt_ssrc,
+                                    first_seq: seq,
+                                    last_seq: seq,
+                                    first_ts: ts,
+                                    packet_count: 1,
+                                    consecutive_count: 0,
+                                    has_marker: marker,
+                                });
+                            }
+
+                            if addr != current_remote {
+                                *self.remote_addr.write() = addr;
+                            }
+
+                            let total = prob.total_packets;
+                            let winner: Option<SocketAddr>;
+
+                            // Rule 1: candidate with marker=true and the
+                            // lowest first_seq wins immediately.
+                            let marker_winner = prob
+                                .candidates
+                                .iter()
+                                .filter(|c| c.has_marker)
+                                .min_by_key(|c| c.first_seq);
+
+                            if let Some(mw) = marker_winner {
+                                winner = Some(mw.addr);
+                            } else if total >= prob.max_packets {
+                                // Rule 3 (timeout fallback): pick the
+                                // candidate with the most packets; break
+                                // ties by lowest first_seq.
+                                winner = prob
+                                    .candidates
+                                    .iter()
+                                    .max_by(|a, b| {
+                                        a.packet_count
+                                            .cmp(&b.packet_count)
+                                            .then(b.first_seq.cmp(&a.first_seq))
+                                    })
+                                    .map(|c| c.addr);
+                            } else {
+                                // Rule 2: consecutive dominance — at
+                                // least 2 consecutive packets from one
+                                // source and at least 3 total observed.
+                                winner = if total >= 3 {
+                                    prob.candidates
+                                        .iter()
+                                        .find(|c| c.consecutive_count >= 2)
+                                        .map(|c| c.addr)
+                                } else {
+                                    None
+                                };
+                            }
+
+                            if let Some(win_addr) = winner {
+                                // Commit the latch.
+                                *probation_guard = None; // drop state
+                                drop(probation_guard);
+
+                                if win_addr != current_remote {
+                                    *self.remote_addr.write() = win_addr;
                                 }
                                 self.rtp_latched.store(true, Ordering::Relaxed);
                                 tracing::info!(
-                                    "IceConn: RTP latched to {} immediately \
-                                     (expected_ssrc={})",
-                                    addr,
-                                    expected
+                                    "IceConn: RTP latched to {} after probation \
+                                         (expected_ssrc={}, total_obs={})",
+                                    win_addr,
+                                    expected,
+                                    total
                                 );
                             }
+                        } else {
+                            // No probation state — immediate latch
+                            // (legacy path for callers that never called
+                            // `enable_latch_on_rtp`).
+                            if addr != current_remote {
+                                *self.remote_addr.write() = addr;
+                            }
+                            self.rtp_latched.store(true, Ordering::Relaxed);
+                            tracing::info!(
+                                "IceConn: RTP latched to {} immediately \
+                                     (expected_ssrc={})",
+                                addr,
+                                expected
+                            );
                         }
                     }
                 }
@@ -1021,7 +1014,7 @@ mod tests {
         for i in 0..(probation_max - 1) {
             // Use non-sequential seq values (skip every other) to avoid
             // triggering the consecutive-dominance rule.
-            let seq = (i * 2 + 10) as u8;
+            let seq = i * 2 + 10;
             let pkt = Bytes::from(vec![
                 0x80, 0x00, 0x00, seq, 0x00, 0x00, 0x00, seq, 0x00, 0x00, 0x00, 0x01,
             ]);
@@ -1148,7 +1141,10 @@ mod tests {
         expected_frame.extend_from_slice(payload);
 
         // Send via wrapper
-        wrapper.send_to(payload, server_stream.local_addr().unwrap()).await.unwrap();
+        wrapper
+            .send_to(payload, server_stream.local_addr().unwrap())
+            .await
+            .unwrap();
 
         // Read framed data on server side
         let mut len_buf = [0u8; 2];
@@ -1168,7 +1164,10 @@ mod tests {
 
         let msgs: &[&[u8]] = &[b"msg-a", b"msg-bb", b"msg-ccc"];
         for msg in msgs {
-            wrapper.send_to(msg, server_stream.local_addr().unwrap()).await.unwrap();
+            wrapper
+                .send_to(msg, server_stream.local_addr().unwrap())
+                .await
+                .unwrap();
         }
 
         let s = &mut server_stream;

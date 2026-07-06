@@ -1,3 +1,12 @@
+// Test/example crate: relax pedantic style lints that are noisy in fixtures.
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::redundant_pattern_matching)]
+#![allow(clippy::while_let_loop)]
+#![allow(clippy::manual_checked_ops)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::explicit_counter_loop)]
+#![allow(clippy::cloned_ref_to_slice_refs)]
+#![allow(clippy::zombie_processes)]
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -6,7 +15,7 @@ use std::time::Duration;
 fn test_rust_server_go_client() {
     // 0. Build Rust example (use separate target dir to avoid lock contention)
     let status = Command::new("cargo")
-        .args(&[
+        .args([
             "build",
             "--example",
             "interop_pion",
@@ -19,7 +28,7 @@ fn test_rust_server_go_client() {
 
     // 1. Build Go binary
     let status = Command::new("go")
-        .args(&["build", "-o", "interop_pion_go", "."])
+        .args(["build", "-o", "interop_pion_go", "."])
         .current_dir("examples/interop_pion_go")
         .status();
 
@@ -33,7 +42,7 @@ fn test_rust_server_go_client() {
 
     // 2. Start Rust Server
     let mut server = Command::new("./target/e2e/debug/examples/interop_pion")
-        .args(&["server", "127.0.0.1:3000"])
+        .args(["server", "127.0.0.1:3000"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -44,7 +53,7 @@ fn test_rust_server_go_client() {
 
     // 3. Start Go Client
     let client = Command::new("./examples/interop_pion_go/interop_pion_go")
-        .args(&["-mode", "client", "-addr", "127.0.0.1:3000"])
+        .args(["-mode", "client", "-addr", "127.0.0.1:3000"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -80,7 +89,7 @@ fn test_rust_server_go_client() {
 fn test_go_server_rust_client() {
     // 0. Build Rust example
     let status = Command::new("cargo")
-        .args(&[
+        .args([
             "build",
             "--example",
             "interop_pion",
@@ -93,7 +102,7 @@ fn test_go_server_rust_client() {
 
     // 1. Build Go binary
     let status = Command::new("go")
-        .args(&["build", "-o", "interop_pion_go", "."])
+        .args(["build", "-o", "interop_pion_go", "."])
         .current_dir("examples/interop_pion_go")
         .status();
 
@@ -107,7 +116,7 @@ fn test_go_server_rust_client() {
 
     // 2. Start Go Server
     let mut server = Command::new("./examples/interop_pion_go/interop_pion_go")
-        .args(&["-mode", "server", "-addr", "127.0.0.1:3001"]) // Use different port
+        .args(["-mode", "server", "-addr", "127.0.0.1:3001"]) // Use different port
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -118,7 +127,7 @@ fn test_go_server_rust_client() {
 
     // 3. Start Rust Client
     let mut client = Command::new("./target/e2e/debug/examples/interop_pion")
-        .args(&["client", "127.0.0.1:3001"])
+        .args(["client", "127.0.0.1:3001"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

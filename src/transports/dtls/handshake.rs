@@ -600,7 +600,7 @@ mod tests {
         let mut buf = BytesMut::new();
         client_hello.encode(&mut buf);
 
-        assert!(buf.len() > 0);
+        assert!(!buf.is_empty());
         // Basic length check:
         // Version (2) + Random (32) + SessionID Len (1) + SessionID (3) +
         // Cookie Len (1) + Cookie (2) + CipherSuites Len (2) + CipherSuites (2) +
@@ -622,7 +622,7 @@ mod tests {
         let mut buf = BytesMut::new();
         server_hello.encode(&mut buf);
 
-        assert!(buf.len() > 0);
+        assert!(!buf.is_empty());
         // Basic length check:
         // Version (2) + Random (32) + SessionID Len (1) + SessionID (4) +
         // CipherSuite (2) + CompressionMethod (1) = 42 bytes

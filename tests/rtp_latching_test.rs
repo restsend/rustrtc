@@ -1,3 +1,12 @@
+// Test/example crate: relax pedantic style lints that are noisy in fixtures.
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::redundant_pattern_matching)]
+#![allow(clippy::while_let_loop)]
+#![allow(clippy::manual_checked_ops)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::explicit_counter_loop)]
+#![allow(clippy::cloned_ref_to_slice_refs)]
+#![allow(clippy::zombie_processes)]
 use anyhow::Result;
 use local_ip_address::list_afinet_netifas;
 use rustrtc::media::frame::{MediaSample, VideoFrame};
@@ -17,21 +26,23 @@ async fn test_rtp_latching() -> Result<()> {
     let interfaces = list_afinet_netifas().unwrap();
     let mut ips = HashSet::new();
     for (name, addr) in interfaces {
-        if let IpAddr::V4(ip) = addr {
-            if !ip.is_multicast() && !ip.is_unspecified() && !ip.is_loopback() {
-                // Skip common virtual interface prefixes
-                if name.starts_with("utun")
-                    || name.starts_with("gif")
-                    || name.starts_with("stf")
-                    || name.starts_with("awdl")
-                    || name.starts_with("llw")
-                {
-                    continue;
-                }
-                // Try to bind to it to see if it's usable
-                if std::net::UdpSocket::bind(SocketAddr::new(IpAddr::V4(ip), 0)).is_ok() {
-                    ips.insert(IpAddr::V4(ip));
-                }
+        if let IpAddr::V4(ip) = addr
+            && !ip.is_multicast()
+            && !ip.is_unspecified()
+            && !ip.is_loopback()
+        {
+            // Skip common virtual interface prefixes
+            if name.starts_with("utun")
+                || name.starts_with("gif")
+                || name.starts_with("stf")
+                || name.starts_with("awdl")
+                || name.starts_with("llw")
+            {
+                continue;
+            }
+            // Try to bind to it to see if it's usable
+            if std::net::UdpSocket::bind(SocketAddr::new(IpAddr::V4(ip), 0)).is_ok() {
+                ips.insert(IpAddr::V4(ip));
             }
         }
     }

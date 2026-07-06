@@ -10,8 +10,8 @@ use aes_gcm::{
 use ctr::cipher::{KeyIvInit, StreamCipher};
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fmt;
 
 type Aes128Ctr = ctr::Ctr128BE<Aes128>;
@@ -941,7 +941,10 @@ mod security_tests {
         ctx.protect(&mut packet).unwrap();
         // Payload should be unchanged + 10 bytes auth tag appended
         assert_eq!(packet.payload.len(), original_payload.len() + 10);
-        assert_eq!(&packet.payload[..original_payload.len()], &original_payload[..]);
+        assert_eq!(
+            &packet.payload[..original_payload.len()],
+            &original_payload[..]
+        );
         // Must still verify
         let mut rx_ctx = SrtpContext::new(
             42,

@@ -118,11 +118,11 @@ async fn offer(
         let pc_sender = pc_clone.clone();
         let sender_task = tokio::spawn(async move {
             while let Ok(msg) = rx.recv().await {
-                if msg.sender_id != my_id {
-                    if let Err(e) = pc_sender.send_text(0, msg.text).await {
-                        warn!("Failed to send data to client {}: {}", my_id, e);
-                        break;
-                    }
+                if msg.sender_id != my_id
+                    && let Err(e) = pc_sender.send_text(0, msg.text).await
+                {
+                    warn!("Failed to send data to client {}: {}", my_id, e);
+                    break;
                 }
             }
         });

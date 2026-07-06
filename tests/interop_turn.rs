@@ -1,3 +1,12 @@
+// Test/example crate: relax pedantic style lints that are noisy in fixtures.
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::redundant_pattern_matching)]
+#![allow(clippy::while_let_loop)]
+#![allow(clippy::manual_checked_ops)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::explicit_counter_loop)]
+#![allow(clippy::cloned_ref_to_slice_refs)]
+#![allow(clippy::zombie_processes)]
 use anyhow::Result;
 use rustrtc::{IceCandidateType, IceServer, IceTransportPolicy, PeerConnection, RtcConfiguration};
 use std::sync::Arc;
@@ -201,17 +210,14 @@ async fn interop_turn_datachannel_test() -> Result<()> {
     let mut received_msg = false;
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(10) {
-        if let Ok(Some(event)) = timeout(Duration::from_millis(100), rust_dc.recv()).await {
-            match event {
-                rustrtc::DataChannelEvent::Message(data) => {
-                    let s = String::from_utf8_lossy(&data).to_string();
-                    println!("RustRTC received: {}", s);
-                    assert_eq!(s, "Hello back via TURN");
-                    received_msg = true;
-                    break;
-                }
-                _ => {}
-            }
+        if let Ok(Some(event)) = timeout(Duration::from_millis(100), rust_dc.recv()).await
+            && let rustrtc::DataChannelEvent::Message(data) = event
+        {
+            let s = String::from_utf8_lossy(&data).to_string();
+            println!("RustRTC received: {}", s);
+            assert_eq!(s, "Hello back via TURN");
+            received_msg = true;
+            break;
         }
     }
     assert!(received_msg, "RustRTC did not receive message");

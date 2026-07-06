@@ -1,3 +1,12 @@
+// Test/example crate: relax pedantic style lints that are noisy in fixtures.
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::redundant_pattern_matching)]
+#![allow(clippy::while_let_loop)]
+#![allow(clippy::manual_checked_ops)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::explicit_counter_loop)]
+#![allow(clippy::cloned_ref_to_slice_refs)]
+#![allow(clippy::zombie_processes)]
 use rustrtc::media::MediaStreamTrack;
 /// Example demonstrating RTP mode with SSRC latching and Track events
 /// This simulates a SIP call scenario where:
@@ -56,7 +65,7 @@ a=mid:0
     if let Some(receiver) = transceiver.receiver() {
         let ssrc = receiver.ssrc();
         println!("\n📊 Initial SSRC: {} (provisional, range 2000-2999)", ssrc);
-        assert!(ssrc >= 2000 && ssrc < 3000, "Should be provisional SSRC");
+        assert!((2000..3000).contains(&ssrc), "Should be provisional SSRC");
     }
 
     // Create answer

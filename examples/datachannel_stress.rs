@@ -79,61 +79,50 @@ async fn offer(Json(payload): Json<OfferRequest>) -> impl IntoResponse {
 
     tokio::spawn(async move {
         while let Some(ev) = pc_clone.recv().await {
-            match ev {
-                PeerConnectionEvent::DataChannel(dc) => {
-                    info!("Received DataChannel: {} label: {}", dc.id, dc.label);
-                    let channel_id = dc.id;
-                    let pc_sender = pc_clone.clone();
-                    let dc_clone = dc.clone();
+            if let PeerConnectionEvent::DataChannel(dc) = ev {
+                info!("Received DataChannel: {} label: {}", dc.id, dc.label);
+                let channel_id = dc.id;
+                let pc_sender = pc_clone.clone();
+                let dc_clone = dc.clone();
 
-                    tokio::spawn(async move {
-                        if use_ping_pong {
-                            info!("Waiting for ping...");
-                            while let Some(event) = dc_clone.recv().await {
-                                match event {
-                                    rustrtc::DataChannelEvent::Message(msg) => {
-                                        if msg == "ping".as_bytes() {
-                                            info!("Received ping, sending pong...");
-                                            if let Err(e) =
-                                                pc_sender.send_data(channel_id, b"pong").await
-                                            {
-                                                info!("Failed to send pong: {}", e);
-                                                return;
-                                            }
-
-                                            // Give client a moment to process pong
-                                            tokio::time::sleep(std::time::Duration::from_millis(
-                                                100,
-                                            ))
-                                            .await;
-                                            break;
-                                        }
-                                    }
-                                    _ => {}
+                tokio::spawn(async move {
+                    if use_ping_pong {
+                        info!("Waiting for ping...");
+                        while let Some(event) = dc_clone.recv().await {
+                            if let rustrtc::DataChannelEvent::Message(msg) = event
+                                && msg == "ping".as_bytes()
+                            {
+                                info!("Received ping, sending pong...");
+                                if let Err(e) = pc_sender.send_data(channel_id, b"pong").await {
+                                    info!("Failed to send pong: {}", e);
+                                    return;
                                 }
-                            }
-                        } else {
-                            info!("Ping-pong disabled, waiting 1s before sending...");
-                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        }
 
-                        info!(
-                            "Starting to send data... chunk_count={} chunk_size={}",
-                            chunk_count, chunk_size
-                        );
-                        let data = vec![0u8; chunk_size];
-                        for i in 0..chunk_count {
-                            if let Err(e) = pc_sender.send_data(channel_id, &data).await {
-                                info!("Failed to send data packet {}: {}", i, e);
+                                // Give client a moment to process pong
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                                 break;
                             }
                         }
-                        info!("Finished sending data");
-                        // Keep channel open for a bit to ensure delivery
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    });
-                }
-                _ => {}
+                    } else {
+                        info!("Ping-pong disabled, waiting 1s before sending...");
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+
+                    info!(
+                        "Starting to send data... chunk_count={} chunk_size={}",
+                        chunk_count, chunk_size
+                    );
+                    let data = vec![0u8; chunk_size];
+                    for i in 0..chunk_count {
+                        if let Err(e) = pc_sender.send_data(channel_id, &data).await {
+                            info!("Failed to send data packet {}: {}", i, e);
+                            break;
+                        }
+                    }
+                    info!("Finished sending data");
+                    // Keep channel open for a bit to ensure delivery
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                });
             }
         }
     });
@@ -206,20 +195,17 @@ async fn offer_webrtc(payload: OfferRequest) -> Json<OfferResponse> {
                     let msg_data = msg.data.clone();
                     let d_clone = d3.clone();
                     Box::pin(async move {
-                        if use_ping_pong {
-                            if msg_data == "ping".as_bytes() {
-                                info!("Received ping, sending pong...");
-                                if let Err(e) =
-                                    d_clone.send(&bytes::Bytes::from_static(b"pong")).await
-                                {
-                                    info!("Failed to send pong: {}", e);
-                                    return;
-                                }
-                                // Give client a moment to process pong
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-                                send_stress_data(d_clone, chunk_count, chunk_size).await;
+                        if use_ping_pong && msg_data == "ping".as_bytes() {
+                            info!("Received ping, sending pong...");
+                            if let Err(e) = d_clone.send(&bytes::Bytes::from_static(b"pong")).await
+                            {
+                                info!("Failed to send pong: {}", e);
+                                return;
                             }
+                            // Give client a moment to process pong
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                            send_stress_data(d_clone, chunk_count, chunk_size).await;
                         }
                     })
                 }));

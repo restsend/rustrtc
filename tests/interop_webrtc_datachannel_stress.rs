@@ -88,23 +88,20 @@ async fn interop_datachannel_stress_test() -> Result<()> {
     let rust_pc_clone = rust_pc.clone();
     tokio::spawn(async move {
         while let Some(ev) = rust_pc_clone.recv().await {
-            match ev {
-                PeerConnectionEvent::DataChannel(dc) => {
-                    println!("RustRTC received DataChannel: {}", dc.id);
-                    let channel_id = dc.id;
+            if let PeerConnectionEvent::DataChannel(dc) = ev {
+                println!("RustRTC received DataChannel: {}", dc.id);
+                let channel_id = dc.id;
 
-                    // Send data as requested
-                    let data = [0u8; 62208];
-                    for i in 0..chunk_count {
-                        if let Err(e) = rust_pc_clone.send_data(channel_id, &data).await {
-                            eprintln!("Failed to send data packet {}: {}", i, e);
-                            break;
-                        }
-                        // println!("Sent packet {}", i);
+                // Send data as requested
+                let data = [0u8; 62208];
+                for i in 0..chunk_count {
+                    if let Err(e) = rust_pc_clone.send_data(channel_id, &data).await {
+                        eprintln!("Failed to send data packet {}: {}", i, e);
+                        break;
                     }
-                    println!("RustRTC finished sending data");
+                    // println!("Sent packet {}", i);
                 }
-                _ => {}
+                println!("RustRTC finished sending data");
             }
         }
     });

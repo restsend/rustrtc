@@ -1,3 +1,12 @@
+// Test/example crate: relax pedantic style lints that are noisy in fixtures.
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::redundant_pattern_matching)]
+#![allow(clippy::while_let_loop)]
+#![allow(clippy::manual_checked_ops)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::explicit_counter_loop)]
+#![allow(clippy::cloned_ref_to_slice_refs)]
+#![allow(clippy::zombie_processes)]
 use anyhow::Result;
 use rustrtc::media::MediaStreamTrack;
 use rustrtc::{
@@ -30,7 +39,7 @@ fn create_rtp_packet(seq: u16, ssrc: u32, payload_type: u8) -> Vec<u8> {
     // SSRC
     packet.extend_from_slice(&ssrc.to_be_bytes());
     // Payload
-    packet.extend(std::iter::repeat(0xAB).take(10));
+    packet.extend(std::iter::repeat_n(0xAB, 10));
     packet
 }
 

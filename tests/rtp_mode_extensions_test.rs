@@ -1,3 +1,12 @@
+// Test/example crate: relax pedantic style lints that are noisy in fixtures.
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::redundant_pattern_matching)]
+#![allow(clippy::while_let_loop)]
+#![allow(clippy::manual_checked_ops)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::explicit_counter_loop)]
+#![allow(clippy::cloned_ref_to_slice_refs)]
+#![allow(clippy::zombie_processes)]
 use anyhow::Result;
 use rustrtc::media::frame::{MediaSample, VideoFrame};
 use rustrtc::{PeerConnection, RtcConfiguration, RtpCodecParameters, SdpType, TransportMode};
@@ -36,18 +45,18 @@ async fn test_rtp_mode_no_default_extensions() -> Result<()> {
     // 3. Inspect SDP (Verification Step 1: No extensions in Offer)
     for section in &offer.media_sections {
         for attr in &section.attributes {
-            if attr.key == "extmap" {
-                if let Some(val) = &attr.value {
-                    println!("Found extmap: {}", val);
-                    if val.contains("http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time") {
-                        panic!("Found abs-send-time extension in RTP mode offer!");
-                    }
-                    if val.contains("urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id") {
-                        panic!("Found rid extension in RTP mode offer!");
-                    }
-                    if val.contains("urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id") {
-                        panic!("Found repaired-rid extension in RTP mode offer!");
-                    }
+            if attr.key == "extmap"
+                && let Some(val) = &attr.value
+            {
+                println!("Found extmap: {}", val);
+                if val.contains("http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time") {
+                    panic!("Found abs-send-time extension in RTP mode offer!");
+                }
+                if val.contains("urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id") {
+                    panic!("Found rid extension in RTP mode offer!");
+                }
+                if val.contains("urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id") {
+                    panic!("Found repaired-rid extension in RTP mode offer!");
                 }
             }
         }

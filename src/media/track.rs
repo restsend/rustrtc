@@ -822,6 +822,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // intentionally held to prove send_audio doesn't deadlock
     async fn send_does_not_block_when_receiver_lock_is_held() {
         let (source, _track, _) = sample_track(MediaKind::Audio, 1);
         source.send_audio(AudioFrame::default()).await.unwrap();

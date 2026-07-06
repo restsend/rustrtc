@@ -387,8 +387,11 @@ impl DtlsTransport {
         let state = self.inner.state.lock();
         if let DtlsState::Connected(crypto, _) = &*state {
             // RFC 5764: seed = client_random || server_random (in that order).
-            let seed = [crypto.keys.client_random.as_slice(), crypto.keys.server_random.as_slice()]
-                .concat();
+            let seed = [
+                crypto.keys.client_random.as_slice(),
+                crypto.keys.server_random.as_slice(),
+            ]
+            .concat();
             prf_sha256(&crypto.keys.master_secret, label.as_bytes(), &seed, len)
         } else {
             Err(anyhow::anyhow!("DTLS not connected"))
@@ -407,28 +410,28 @@ impl DtlsInner {
         if *self.state.lock() != DtlsState::Handshaking {
             return;
         }
-        if let Some(records) = &ctx.last_flight_records {
-            if let Err(e) = self.conn.send_dtls_record_batch(records).await {
-                let msg = format!("{:?}", e);
-                if msg.contains("No selected socket") || msg.contains("Remote address not set") {
-                    debug!("Retransmission skipped — ICE socket unavailable");
-                } else if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-                    match io_err.kind() {
-                        std::io::ErrorKind::HostUnreachable
-                        | std::io::ErrorKind::NetworkUnreachable => {
+        if let Some(records) = &ctx.last_flight_records
+            && let Err(e) = self.conn.send_dtls_record_batch(records).await
+        {
+            let msg = format!("{:?}", e);
+            if msg.contains("No selected socket") || msg.contains("Remote address not set") {
+                debug!("Retransmission skipped — ICE socket unavailable");
+            } else if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                match io_err.kind() {
+                    std::io::ErrorKind::HostUnreachable
+                    | std::io::ErrorKind::NetworkUnreachable => {
+                        debug!("Retransmission failed: {}", e);
+                    }
+                    _ => {
+                        if io_err.raw_os_error() == Some(65) {
+                            debug!("Retransmission failed: {}", e);
+                        } else {
                             debug!("Retransmission failed: {}", e);
                         }
-                        _ => {
-                            if io_err.raw_os_error() == Some(65) {
-                                debug!("Retransmission failed: {}", e);
-                            } else {
-                                debug!("Retransmission failed: {}", e);
-                            }
-                        }
                     }
-                } else {
-                    debug!("Retransmission failed: {}", e);
                 }
+            } else {
+                debug!("Retransmission failed: {}", e);
             }
         }
     }
@@ -818,25 +821,25 @@ impl DtlsInner {
         }
 
         if ctx.server_random.is_some() {
-            if let Some(records) = &ctx.last_flight_records {
-                if let Err(e) = self.conn.send_dtls_record_batch(records).await {
-                    if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-                        match io_err.kind() {
-                            std::io::ErrorKind::HostUnreachable
-                            | std::io::ErrorKind::NetworkUnreachable => {
+            if let Some(records) = &ctx.last_flight_records
+                && let Err(e) = self.conn.send_dtls_record_batch(records).await
+            {
+                if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                    match io_err.kind() {
+                        std::io::ErrorKind::HostUnreachable
+                        | std::io::ErrorKind::NetworkUnreachable => {
+                            debug!("Failed to retransmit flight: {}", e);
+                        }
+                        _ => {
+                            if io_err.raw_os_error() == Some(65) {
                                 debug!("Failed to retransmit flight: {}", e);
-                            }
-                            _ => {
-                                if io_err.raw_os_error() == Some(65) {
-                                    debug!("Failed to retransmit flight: {}", e);
-                                } else {
-                                    warn!("Failed to retransmit flight: {}", e);
-                                }
+                            } else {
+                                warn!("Failed to retransmit flight: {}", e);
                             }
                         }
-                    } else {
-                        warn!("Failed to retransmit flight: {}", e);
                     }
+                } else {
+                    warn!("Failed to retransmit flight: {}", e);
                 }
             }
             return Ok(());
@@ -1080,9 +1083,7 @@ impl DtlsInner {
         )?);
         ctx.message_seq += 1;
 
-        self.conn
-            .send_dtls_record_batch(&flight_records)
-            .await?;
+        self.conn.send_dtls_record_batch(&flight_records).await?;
         ctx.last_flight_records = Some(flight_records);
 
         Ok(())
@@ -1268,18 +1269,14 @@ impl DtlsInner {
             handshake_msg.encode(&mut buf);
             ctx.handshake_messages.extend_from_slice(&buf);
 
-            flight_records.push(
-                self.build_handshake_record(
-                    handshake_msg,
-                    ctx.epoch,
-                    &mut ctx.sequence_number,
-                    ctx.session_keys.as_ref(),
-                    is_client,
-                )?,
-            );
-            self.conn
-                .send_dtls_record_batch(&flight_records)
-                .await?;
+            flight_records.push(self.build_handshake_record(
+                handshake_msg,
+                ctx.epoch,
+                &mut ctx.sequence_number,
+                ctx.session_keys.as_ref(),
+                is_client,
+            )?);
+            self.conn.send_dtls_record_batch(&flight_records).await?;
             ctx.last_flight_records = Some(flight_records);
             // message_seq += 1; // End of handshake
 
@@ -1387,14 +1384,13 @@ impl DtlsInner {
             handshake_msg.encode(&mut buf);
             ctx.handshake_messages.extend_from_slice(&buf);
 
-            let buf = self
-                .build_handshake_record(
-                    handshake_msg,
-                    ctx.epoch,
-                    &mut ctx.sequence_number,
-                    None,
-                    is_client,
-                )?;
+            let buf = self.build_handshake_record(
+                handshake_msg,
+                ctx.epoch,
+                &mut ctx.sequence_number,
+                None,
+                is_client,
+            )?;
             self.conn.send(&buf).await?;
             ctx.last_flight_records = Some(vec![buf]);
             ctx.message_seq += 1;
@@ -1649,18 +1645,14 @@ impl DtlsInner {
         handshake_msg.encode(&mut buf);
         ctx.handshake_messages.extend_from_slice(&buf);
 
-        flight_records.push(
-            self.build_handshake_record(
-                handshake_msg,
-                ctx.epoch,
-                &mut ctx.sequence_number,
-                ctx.session_keys.as_ref(),
-                is_client,
-            )?,
-        );
-        self.conn
-            .send_dtls_record_batch(&flight_records)
-            .await?;
+        flight_records.push(self.build_handshake_record(
+            handshake_msg,
+            ctx.epoch,
+            &mut ctx.sequence_number,
+            ctx.session_keys.as_ref(),
+            is_client,
+        )?);
+        self.conn.send_dtls_record_batch(&flight_records).await?;
         ctx.last_flight_records = Some(flight_records);
         ctx.message_seq += 1;
 
@@ -1753,19 +1745,14 @@ impl DtlsInner {
             // update the seen version) here as the authoritative check guarantees
             // we never miss the transition regardless of select! racing.
             if socket_rx.borrow().is_none() {
-                let is_handshaking =
-                    matches!(*self.state.lock(), DtlsState::Handshaking);
+                let is_handshaking = matches!(*self.state.lock(), DtlsState::Handshaking);
                 if is_handshaking {
                     warn!("ICE socket closed during DTLS handshake — aborting");
                     *self.state.lock() = DtlsState::Failed;
                     let _ = self.state_tx.send(DtlsState::Failed);
-                    return Err(anyhow::anyhow!(
-                        "ICE socket closed during DTLS handshake"
-                    ));
+                    return Err(anyhow::anyhow!("ICE socket closed during DTLS handshake"));
                 } else {
-                    debug!(
-                        "ICE socket closed after DTLS connected — closing transport"
-                    );
+                    debug!("ICE socket closed after DTLS connected — closing transport");
                     *self.state.lock() = DtlsState::Closed;
                     let _ = self.state_tx.send(DtlsState::Closed);
                     return Ok(());
@@ -1902,13 +1889,8 @@ impl DtlsInner {
         session_keys: Option<&SessionKeys>,
         is_client: bool,
     ) -> Result<Vec<u8>> {
-        let buf = self.build_handshake_record(
-            msg,
-            epoch,
-            sequence_number,
-            session_keys,
-            is_client,
-        )?;
+        let buf =
+            self.build_handshake_record(msg, epoch, sequence_number, session_keys, is_client)?;
         if let Err(e) = self.conn.send(&buf).await {
             if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
                 match io_err.kind() {

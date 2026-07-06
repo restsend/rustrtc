@@ -205,6 +205,12 @@ pub struct UdtlReceiveBuffer {
     pub last_delivered_seq: Option<u16>,
 }
 
+impl Default for UdtlReceiveBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UdtlReceiveBuffer {
     pub fn new() -> Self {
         Self {
@@ -258,7 +264,7 @@ impl UdtlReceiveBuffer {
 
     /// Flush any contiguous buffered packets starting at expected_seq (no data returned).
     fn flush_contiguous(&mut self) {
-        while let Some(_) = self.buffer.remove(&self.expected_seq) {
+        while self.buffer.remove(&self.expected_seq).is_some() {
             self.expected_seq = self.expected_seq.wrapping_add(1);
             self.last_delivered_seq = Some(self.expected_seq.wrapping_sub(1));
             self.packets_recovered += 1;

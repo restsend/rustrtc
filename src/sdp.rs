@@ -758,16 +758,15 @@ impl MediaSection {
 
     pub fn get_extmap_id(&self, uri: &str) -> Option<u8> {
         for attr in &self.attributes {
-            if attr.key == "extmap" {
-                if let Some(val) = &attr.value {
-                    let mut parts = val.split_whitespace();
-                    if let Some(id_str) = parts.next() {
-                        if let Some(attr_uri) = parts.next() {
-                            if attr_uri == uri {
-                                return id_str.parse().ok();
-                            }
-                        }
-                    }
+            if attr.key == "extmap"
+                && let Some(val) = &attr.value
+            {
+                let mut parts = val.split_whitespace();
+                if let Some(id_str) = parts.next()
+                    && let Some(attr_uri) = parts.next()
+                    && attr_uri == uri
+                {
+                    return id_str.parse().ok();
                 }
             }
         }
@@ -808,24 +807,21 @@ impl MediaSection {
             let mut clock_rate = 90000u32; // Default for video
 
             for attr in &self.attributes {
-                if attr.key == "rtpmap" {
-                    if let Some(value) = &attr.value {
-                        if let Some((pt_part, rest)) = value.split_once(' ') {
-                            if let Ok(pt) = pt_part.parse::<u8>() {
-                                if pt == payload_type {
-                                    // Parse "codec_name/clock_rate"
-                                    let parts: Vec<&str> = rest.split('/').collect();
-                                    if !parts.is_empty() {
-                                        codec_name = parts[0].to_string();
-                                    }
-                                    if parts.len() >= 2 {
-                                        if let Ok(rate) = parts[1].parse() {
-                                            clock_rate = rate;
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                if attr.key == "rtpmap"
+                    && let Some(value) = &attr.value
+                    && let Some((pt_part, rest)) = value.split_once(' ')
+                    && let Ok(pt) = pt_part.parse::<u8>()
+                    && pt == payload_type
+                {
+                    // Parse "codec_name/clock_rate"
+                    let parts: Vec<&str> = rest.split('/').collect();
+                    if !parts.is_empty() {
+                        codec_name = parts[0].to_string();
+                    }
+                    if parts.len() >= 2
+                        && let Ok(rate) = parts[1].parse()
+                    {
+                        clock_rate = rate;
                     }
                 }
             }
@@ -833,7 +829,7 @@ impl MediaSection {
             // If no rtpmap found, use payload type to guess
             if codec_name.is_empty() {
                 codec_name = match payload_type {
-                    96 | 97 | 98 => "VP8",
+                    96..=98 => "VP8",
                     99 | 100 => "H264",
                     101 => "VP9",
                     102 => "AV1",
@@ -845,35 +841,28 @@ impl MediaSection {
             // Parse fmtp for this payload type
             let mut fmtp = None;
             for attr in &self.attributes {
-                if attr.key == "fmtp" {
-                    if let Some(value) = &attr.value {
-                        if let Some((pt_part, rest)) = value.split_once(' ') {
-                            if let Ok(pt) = pt_part.parse::<u8>() {
-                                if pt == payload_type {
-                                    fmtp = Some(rest.to_string());
-                                    break;
-                                }
-                            }
-                        }
-                    }
+                if attr.key == "fmtp"
+                    && let Some(value) = &attr.value
+                    && let Some((pt_part, rest)) = value.split_once(' ')
+                    && let Ok(pt) = pt_part.parse::<u8>()
+                    && pt == payload_type
+                {
+                    fmtp = Some(rest.to_string());
+                    break;
                 }
             }
 
             // Parse rtcp-fb for this payload type
             let mut rtcp_fbs = wildcard_rtcp_fbs.clone();
             for attr in &self.attributes {
-                if attr.key == "rtcp-fb" {
-                    if let Some(value) = &attr.value {
-                        if let Some((pt_part, rest)) = value.split_once(' ') {
-                            if let Ok(pt) = pt_part.parse::<u8>() {
-                                if pt == payload_type
-                                    && !rtcp_fbs.iter().any(|existing| existing == rest)
-                                {
-                                    rtcp_fbs.push(rest.to_string());
-                                }
-                            }
-                        }
-                    }
+                if attr.key == "rtcp-fb"
+                    && let Some(value) = &attr.value
+                    && let Some((pt_part, rest)) = value.split_once(' ')
+                    && let Ok(pt) = pt_part.parse::<u8>()
+                    && pt == payload_type
+                    && !rtcp_fbs.iter().any(|existing| existing == rest)
+                {
+                    rtcp_fbs.push(rest.to_string());
                 }
             }
 
@@ -908,29 +897,26 @@ impl MediaSection {
             let mut channels = 1u8;
 
             for attr in &self.attributes {
-                if attr.key == "rtpmap" {
-                    if let Some(value) = &attr.value {
-                        if let Some((pt_part, rest)) = value.split_once(' ') {
-                            if let Ok(pt) = pt_part.parse::<u8>() {
-                                if pt == payload_type {
-                                    // Parse "codec_name/clock_rate[/channels]"
-                                    let parts: Vec<&str> = rest.split('/').collect();
-                                    if !parts.is_empty() {
-                                        codec_name = parts[0].to_string();
-                                    }
-                                    if parts.len() >= 2 {
-                                        if let Ok(rate) = parts[1].parse() {
-                                            clock_rate = rate;
-                                        }
-                                    }
-                                    if parts.len() >= 3 {
-                                        if let Ok(ch) = parts[2].parse() {
-                                            channels = ch;
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                if attr.key == "rtpmap"
+                    && let Some(value) = &attr.value
+                    && let Some((pt_part, rest)) = value.split_once(' ')
+                    && let Ok(pt) = pt_part.parse::<u8>()
+                    && pt == payload_type
+                {
+                    // Parse "codec_name/clock_rate[/channels]"
+                    let parts: Vec<&str> = rest.split('/').collect();
+                    if !parts.is_empty() {
+                        codec_name = parts[0].to_string();
+                    }
+                    if parts.len() >= 2
+                        && let Ok(rate) = parts[1].parse()
+                    {
+                        clock_rate = rate;
+                    }
+                    if parts.len() >= 3
+                        && let Ok(ch) = parts[2].parse()
+                    {
+                        channels = ch;
                     }
                 }
             }
@@ -952,17 +938,14 @@ impl MediaSection {
             // Parse fmtp for this payload type
             let mut fmtp = None;
             for attr in &self.attributes {
-                if attr.key == "fmtp" {
-                    if let Some(value) = &attr.value {
-                        if let Some((pt_part, rest)) = value.split_once(' ') {
-                            if let Ok(pt) = pt_part.parse::<u8>() {
-                                if pt == payload_type {
-                                    fmtp = Some(rest.to_string());
-                                    break;
-                                }
-                            }
-                        }
-                    }
+                if attr.key == "fmtp"
+                    && let Some(value) = &attr.value
+                    && let Some((pt_part, rest)) = value.split_once(' ')
+                    && let Ok(pt) = pt_part.parse::<u8>()
+                    && pt == payload_type
+                {
+                    fmtp = Some(rest.to_string());
+                    break;
                 }
             }
 
@@ -974,16 +957,13 @@ impl MediaSection {
             // Parse rtcp-fb for this payload type
             let mut rtcp_fbs = Vec::new();
             for attr in &self.attributes {
-                if attr.key == "rtcp-fb" {
-                    if let Some(value) = &attr.value {
-                        if let Some((pt_part, rest)) = value.split_once(' ') {
-                            if let Ok(pt) = pt_part.parse::<u8>() {
-                                if pt == payload_type {
-                                    rtcp_fbs.push(rest.to_string());
-                                }
-                            }
-                        }
-                    }
+                if attr.key == "rtcp-fb"
+                    && let Some(value) = &attr.value
+                    && let Some((pt_part, rest)) = value.split_once(' ')
+                    && let Ok(pt) = pt_part.parse::<u8>()
+                    && pt == payload_type
+                {
+                    rtcp_fbs.push(rest.to_string());
                 }
             }
 
@@ -1390,15 +1370,14 @@ pub fn parse_bundle_mid_info(sdp: &str) -> Option<(u8, String, String)> {
             } else if in_video && video_mid.is_none() {
                 video_mid = Some(mid.to_string());
             }
-        } else if extmap_id.is_none() && line.starts_with("a=extmap:") && line.contains("sdes:mid")
+        } else if extmap_id.is_none()
+            && line.starts_with("a=extmap:")
+            && line.contains("sdes:mid")
+            && let Some(rest) = line.strip_prefix("a=extmap:")
+            && let Some(id_str) = rest.split([' ', '/']).next()
+            && let Ok(id) = id_str.parse::<u8>()
         {
-            if let Some(rest) = line.strip_prefix("a=extmap:") {
-                if let Some(id_str) = rest.split(|c: char| c == ' ' || c == '/').next() {
-                    if let Ok(id) = id_str.parse::<u8>() {
-                        extmap_id = Some(id);
-                    }
-                }
-            }
+            extmap_id = Some(id);
         }
     }
 

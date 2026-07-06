@@ -246,18 +246,13 @@ impl Default for ApplicationCapability {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum T38FaxRateManagement {
     #[serde(rename = "transferredTCF")]
+    #[default]
     TransferredTCF,
     #[serde(rename = "localTCF")]
     LocalTCF,
-}
-
-impl Default for T38FaxRateManagement {
-    fn default() -> Self {
-        Self::TransferredTCF
-    }
 }
 
 impl std::fmt::Display for T38FaxRateManagement {
@@ -269,18 +264,13 @@ impl std::fmt::Display for T38FaxRateManagement {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum T38UdpEC {
     #[serde(rename = "t38UDPRedundancy")]
+    #[default]
     T38UDPRedundancy,
     #[serde(rename = "t38UDPFEC")]
     T38UDPFEC,
-}
-
-impl Default for T38UdpEC {
-    fn default() -> Self {
-        Self::T38UDPRedundancy
-    }
 }
 
 impl std::fmt::Display for T38UdpEC {

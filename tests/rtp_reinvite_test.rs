@@ -427,30 +427,30 @@ fn extract_payload_map_helper(
     let mut payload_map = HashMap::new();
 
     for attr in &section.attributes {
-        if attr.key == "rtpmap" {
-            if let Some(val) = &attr.value {
-                let parts: Vec<&str> = val.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    if let Ok(pt) = parts[0].parse::<u8>() {
-                        let codec_parts: Vec<&str> = parts[1].split('/').collect();
-                        if codec_parts.len() >= 2 {
-                            let clock_rate = codec_parts[1].parse().unwrap_or(90000);
-                            let channels = if codec_parts.len() >= 3 {
-                                codec_parts[2].parse().unwrap_or(0)
-                            } else {
-                                0
-                            };
+        if attr.key == "rtpmap"
+            && let Some(val) = &attr.value
+        {
+            let parts: Vec<&str> = val.split_whitespace().collect();
+            if parts.len() >= 2
+                && let Ok(pt) = parts[0].parse::<u8>()
+            {
+                let codec_parts: Vec<&str> = parts[1].split('/').collect();
+                if codec_parts.len() >= 2 {
+                    let clock_rate = codec_parts[1].parse().unwrap_or(90000);
+                    let channels = if codec_parts.len() >= 3 {
+                        codec_parts[2].parse().unwrap_or(0)
+                    } else {
+                        0
+                    };
 
-                            payload_map.insert(
-                                pt,
-                                peer_connection::RtpCodecParameters {
-                                    payload_type: pt,
-                                    clock_rate,
-                                    channels,
-                                },
-                            );
-                        }
-                    }
+                    payload_map.insert(
+                        pt,
+                        peer_connection::RtpCodecParameters {
+                            payload_type: pt,
+                            clock_rate,
+                            channels,
+                        },
+                    );
                 }
             }
         }
@@ -463,14 +463,14 @@ fn extract_extmap_helper(section: &rustrtc::MediaSection) -> HashMap<u8, String>
     let mut extmap = HashMap::new();
 
     for attr in &section.attributes {
-        if attr.key == "extmap" {
-            if let Some(val) = &attr.value {
-                let parts: Vec<&str> = val.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    if let Ok(id) = parts[0].parse::<u8>() {
-                        extmap.insert(id, parts[1].to_string());
-                    }
-                }
+        if attr.key == "extmap"
+            && let Some(val) = &attr.value
+        {
+            let parts: Vec<&str> = val.split_whitespace().collect();
+            if parts.len() >= 2
+                && let Ok(id) = parts[0].parse::<u8>()
+            {
+                extmap.insert(id, parts[1].to_string());
             }
         }
     }

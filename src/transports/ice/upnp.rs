@@ -516,7 +516,7 @@ mod tests {
 
         // Verify remaining lifetime is close to 70
         let remaining = mapping.remaining_lifetime();
-        assert!(remaining >= 69 && remaining <= 70);
+        assert!((69..=70).contains(&remaining));
     }
 
     #[test]
@@ -643,6 +643,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)] // intentional compile-time invariant checks
     fn test_mapping_constants() {
         assert!(MIN_LEASE_DURATION > 0);
         assert!(MAX_LEASE_DURATION > MIN_LEASE_DURATION);

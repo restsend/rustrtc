@@ -44,23 +44,12 @@ fn try_send_dropping<T>(
     tx.try_send(value)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct RtpRewriteBridgeParams {
     pub ssrc_offset: u32,
     pub payload_type: Option<u8>,
     pub initial_sequence_number: Option<u16>,
     pub initial_timestamp_offset: Option<u32>,
-}
-
-impl Default for RtpRewriteBridgeParams {
-    fn default() -> Self {
-        Self {
-            ssrc_offset: 0,
-            payload_type: None,
-            initial_sequence_number: None,
-            initial_timestamp_offset: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -436,7 +425,11 @@ impl RtpTransport {
                 Ok(n)
             }
             Err(e) => {
-                warn!("RtpTransport: failed to send SRTP packet ({} bytes): {}", protected.len(), e);
+                warn!(
+                    "RtpTransport: failed to send SRTP packet ({} bytes): {}",
+                    protected.len(),
+                    e
+                );
                 Err(e)
             }
         }
@@ -605,24 +598,21 @@ impl PacketReceiver for RtpTransport {
                 let mut selected = None;
                 let mut bind_ssrc = false;
 
-                if let Some(id) = rid_id {
-                    if let Some(rid) = rtp_packet.header.get_extension(id) {
-                        if let Ok(rid_str) = std::str::from_utf8(&rid) {
-                            selected = listeners.by_rid.get(rid_str).cloned();
-                            bind_ssrc = selected.is_some();
-                        }
-                    }
+                if let Some(id) = rid_id
+                    && let Some(rid) = rtp_packet.header.get_extension(id)
+                    && let Ok(rid_str) = std::str::from_utf8(&rid)
+                {
+                    selected = listeners.by_rid.get(rid_str).cloned();
+                    bind_ssrc = selected.is_some();
                 }
 
-                if selected.is_none() {
-                    if let Some(id) = mid_id {
-                        if let Some(mid) = rtp_packet.header.get_extension(id) {
-                            if let Ok(mid_str) = std::str::from_utf8(&mid) {
-                                selected = listeners.by_mid(mid_str);
-                                bind_ssrc = selected.is_some();
-                            }
-                        }
-                    }
+                if selected.is_none()
+                    && let Some(id) = mid_id
+                    && let Some(mid) = rtp_packet.header.get_extension(id)
+                    && let Ok(mid_str) = std::str::from_utf8(&mid)
+                {
+                    selected = listeners.by_mid(mid_str);
+                    bind_ssrc = selected.is_some();
                 }
 
                 if selected.is_none() {

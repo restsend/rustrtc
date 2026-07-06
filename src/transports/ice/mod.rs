@@ -105,7 +105,7 @@ pub struct IceTransport {
     inner: Arc<IceTransportInner>,
 }
 
-struct IceTransportInner {
+pub(crate) struct IceTransportInner {
     state: watch::Sender<IceTransportState>,
     _state_rx_keeper: watch::Receiver<IceTransportState>,
     gathering_state: watch::Sender<IceGathererState>,
@@ -182,137 +182,133 @@ struct IceTransportRunner {
 }
 
 impl IceTransportRunner {
-    fn run(mut self) -> impl std::future::Future<Output = ()> + Send {
-        async move {
-            let mut interval = tokio::time::interval_at(
-                tokio::time::Instant::now() + Duration::from_secs(1),
-                Duration::from_secs(1),
-            );
-            // TURN refresh interval. Kept well under both the 300 s permission
-            // timeout AND typical UDP NAT mapping idle timeouts (~30 s on many
-            // carrier/CGNAT deployments): each Refresh is bidirectional traffic
-            // on the client<->TURN-server 5-tuple, so this also keeps that NAT
-            // mapping warm for relays that are gathered but not selected (and
-            // therefore carry no media ChannelData). 25 s is safely under all
-            // those budgets while staying cheap (tiny authenticated packets).
-            let mut turn_refresh_interval = tokio::time::interval_at(
-                tokio::time::Instant::now() + Duration::from_secs(25),
-                Duration::from_secs(25),
-            );
-            let mut read_futures: FuturesUnordered<BoxFuture<'static, ()>> =
-                FuturesUnordered::new();
-            let mut gathering_future: BoxFuture<'static, ()> = Box::pin(futures::future::pending());
-            let mut turn_refresh_future: BoxFuture<'static, ()> =
-                Box::pin(futures::future::pending());
+    async fn run(mut self) {
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        // TURN refresh interval. Kept well under both the 300 s permission
+        // timeout AND typical UDP NAT mapping idle timeouts (~30 s on many
+        // carrier/CGNAT deployments): each Refresh is bidirectional traffic
+        // on the client<->TURN-server 5-tuple, so this also keeps that NAT
+        // mapping warm for relays that are gathered but not selected (and
+        // therefore carry no media ChannelData). 25 s is safely under all
+        // those budgets while staying cheap (tiny authenticated packets).
+        let mut turn_refresh_interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(25),
+            Duration::from_secs(25),
+        );
+        let mut read_futures: FuturesUnordered<BoxFuture<'static, ()>> = FuturesUnordered::new();
+        let mut gathering_future: BoxFuture<'static, ()> = Box::pin(futures::future::pending());
+        let mut turn_refresh_future: BoxFuture<'static, ()> = Box::pin(futures::future::pending());
 
-            loop {
-                tokio::select! {
-                    res = self.state_rx.changed() => {
-                        if res.is_err() {
-                            break;
+        loop {
+            tokio::select! {
+                res = self.state_rx.changed() => {
+                    if res.is_err() {
+                        break;
+                    }
+                    if matches!(*self.state_rx.borrow(), IceTransportState::Closed | IceTransportState::Failed) {
+                        break;
+                    }
+                }
+                Some(socket) = self.socket_rx.recv() => {
+                    match socket {
+                        IceSocketWrapper::Udp(s) => {
+                            read_futures.push(Box::pin(Self::run_udp_read_loop(s, self.inner.clone())));
                         }
-                        if matches!(*self.state_rx.borrow(), IceTransportState::Closed | IceTransportState::Failed) {
-                            break;
+                        IceSocketWrapper::SharedUdp(handle) => {
+                            read_futures.push(Box::pin(Self::run_shared_udp_read_loop(handle, self.inner.clone())));
+                        }
+                        IceSocketWrapper::TcpListener(l) => {
+                            read_futures.push(Box::pin(Self::run_tcp_listen_loop(l, self.inner.clone())));
+                        }
+                        IceSocketWrapper::TcpStream(read, write, peer) => {
+                            read_futures.push(Box::pin(Self::run_tcp_read_loop(
+                                read,
+                                write,
+                                peer,
+                                self.inner.clone(),
+                            )));
+                        }
+                        IceSocketWrapper::Turn(c, addr) => {
+                            read_futures.push(Box::pin(Self::run_turn_read_loop(c, addr, self.inner.clone())));
                         }
                     }
-                    Some(socket) = self.socket_rx.recv() => {
-                        match socket {
-                            IceSocketWrapper::Udp(s) => {
-                                read_futures.push(Box::pin(Self::run_udp_read_loop(s, self.inner.clone())));
-                            }
-                            IceSocketWrapper::SharedUdp(handle) => {
-                                read_futures.push(Box::pin(Self::run_shared_udp_read_loop(handle, self.inner.clone())));
-                            }
-                            IceSocketWrapper::TcpListener(l) => {
-                                read_futures.push(Box::pin(Self::run_tcp_listen_loop(l, self.inner.clone())));
-                            }
-                            IceSocketWrapper::TcpStream(read, write, peer) => {
-                                read_futures.push(Box::pin(Self::run_tcp_read_loop(
-                                    read,
-                                    write,
-                                    peer,
-                                    self.inner.clone(),
-                                )));
-                            }
-                            IceSocketWrapper::Turn(c, addr) => {
-                                read_futures.push(Box::pin(Self::run_turn_read_loop(c, addr, self.inner.clone())));
-                            }
-                        }
-                    }
-                    res = self.candidate_rx.recv() => {
-                        match res {
-                            Ok(_) => {
-                                let inner = self.inner.clone();
-                                read_futures.push(Box::pin(async move {
-                                    perform_connectivity_checks_async(inner).await;
-                                }));
-                            }
-                            Err(broadcast::error::RecvError::Closed) => break,
-                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        }
-                    }
-                    Some(cmd) = self.cmd_rx.recv() => {
-                        trace!("Runner received command: {:?}", cmd);
-                        match cmd {
-                            IceCommand::StartGathering => {
-                                let inner = self.inner.clone();
-                                gathering_future = Box::pin(async move {
-                                    if let Err(e) = inner.gatherer.gather().await {
-                                        debug!("Gathering failed: {}", e);
-                                    }
-                                    {
-                                        let mut buffer = inner.local_candidates.lock().await;
-                                        *buffer = inner.gatherer.local_candidates();
-                                    }
-                                    *inner.gather_state.lock() = IceGathererState::Complete;
-                                    let _ = inner.gathering_state.send(IceGathererState::Complete);
-                                });
-                            }
-                            IceCommand::RunChecks => {
-                                let inner = self.inner.clone();
-                                // Spawn connectivity checks in a separate task so they don't
-                                // block the runner's event loop. This is critical for TCP
-                                // candidates: the check may block on TcpStream::connect while
-                                // the runner still needs to process pending socket_rx messages
-                                // (e.g. TcpListener accept loops) to complete the connection.
-                                tokio::spawn(async move {
-                                    perform_connectivity_checks_async(inner).await;
-                                });
-                            }
-                        }
-                    }
-                    _ = interval.tick() => {
-                        if let Some(f) = Self::run_keepalive_tick(&self.inner).await {
-                            read_futures.push(f);
-                        }
-                    }
-                    _ = turn_refresh_interval.tick() => {
-                        // Only start a new refresh if the previous one has
-                        // completed. If still running (e.g. server slow), skip
-                        // this tick rather than reassigning the future, which
-                        // would cancel the in-flight refresh and orphan its
-                        // pending transactions. The in-progress flag is cleared
-                        // by `run_turn_refresh` on every exit path.
-                        if !self
-                            .inner
-                            .turn_refresh_in_progress
-                            .load(std::sync::atomic::Ordering::SeqCst)
-                        {
+                }
+                res = self.candidate_rx.recv() => {
+                    match res {
+                        Ok(_) => {
                             let inner = self.inner.clone();
-                            turn_refresh_future = Box::pin(async move {
-                                Self::run_turn_refresh(&inner).await;
+                            read_futures.push(Box::pin(async move {
+                                perform_connectivity_checks_async(inner).await;
+                            }));
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    }
+                }
+                Some(cmd) = self.cmd_rx.recv() => {
+                    trace!("Runner received command: {:?}", cmd);
+                    match cmd {
+                        IceCommand::StartGathering => {
+                            let inner = self.inner.clone();
+                            gathering_future = Box::pin(async move {
+                                if let Err(e) = inner.gatherer.gather().await {
+                                    debug!("Gathering failed: {}", e);
+                                }
+                                {
+                                    let mut buffer = inner.local_candidates.lock().await;
+                                    *buffer = inner.gatherer.local_candidates();
+                                }
+                                *inner.gather_state.lock() = IceGathererState::Complete;
+                                let _ = inner.gathering_state.send(IceGathererState::Complete);
+                            });
+                        }
+                        IceCommand::RunChecks => {
+                            let inner = self.inner.clone();
+                            // Spawn connectivity checks in a separate task so they don't
+                            // block the runner's event loop. This is critical for TCP
+                            // candidates: the check may block on TcpStream::connect while
+                            // the runner still needs to process pending socket_rx messages
+                            // (e.g. TcpListener accept loops) to complete the connection.
+                            tokio::spawn(async move {
+                                perform_connectivity_checks_async(inner).await;
                             });
                         }
                     }
-                    _ = &mut turn_refresh_future => {
-                        turn_refresh_future = Box::pin(futures::future::pending());
+                }
+                _ = interval.tick() => {
+                    if let Some(f) = Self::run_keepalive_tick(&self.inner).await {
+                        read_futures.push(f);
                     }
-                    Some(_) = read_futures.next() => {
-                        // Read loop finished
+                }
+                _ = turn_refresh_interval.tick() => {
+                    // Only start a new refresh if the previous one has
+                    // completed. If still running (e.g. server slow), skip
+                    // this tick rather than reassigning the future, which
+                    // would cancel the in-flight refresh and orphan its
+                    // pending transactions. The in-progress flag is cleared
+                    // by `run_turn_refresh` on every exit path.
+                    if !self
+                        .inner
+                        .turn_refresh_in_progress
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        let inner = self.inner.clone();
+                        turn_refresh_future = Box::pin(async move {
+                            Self::run_turn_refresh(&inner).await;
+                        });
                     }
-                    _ = &mut gathering_future => {
-                        gathering_future = Box::pin(futures::future::pending());
-                    }
+                }
+                _ = &mut turn_refresh_future => {
+                    turn_refresh_future = Box::pin(futures::future::pending());
+                }
+                Some(_) = read_futures.next() => {
+                    // Read loop finished
+                }
+                _ = &mut gathering_future => {
+                    gathering_future = Box::pin(futures::future::pending());
                 }
             }
         }
@@ -592,10 +588,10 @@ impl IceTransportRunner {
                             let _ = socket.send_to(&bytes, pair.remote.address).await;
                             return Some(cleanup);
                         }
-                    } else if inner.config.transport_mode != crate::TransportMode::WebRtc {
-                        if let Ok(bytes) = msg.encode(None, false) {
-                            let _ = socket.send_to(&bytes, pair.remote.address).await;
-                        }
+                    } else if inner.config.transport_mode != crate::TransportMode::WebRtc
+                        && let Ok(bytes) = msg.encode(None, false)
+                    {
+                        let _ = socket.send_to(&bytes, pair.remote.address).await;
                     }
                 }
             }
@@ -689,8 +685,6 @@ impl IceTransportRunner {
                 }
             }
         }
-
-        let client = client;
 
         // 1. Refresh the allocation (extends lifetime).
         //    On 401/438 update the nonce and retry once.
@@ -1161,25 +1155,24 @@ impl IceTransport {
         // Fall back to external_ip config if UPnP not available
         if upnp_external_addr.is_none() {
             if let Some(ext_ip) = &self.inner.config.external_ip {
-                if let Ok(parsed_ip) = ext_ip.parse::<IpAddr>() {
-                    if !bind_ip.is_loopback() {
-                        cand_addr.set_ip(parsed_ip);
-                    }
+                if let Ok(parsed_ip) = ext_ip.parse::<IpAddr>()
+                    && !bind_ip.is_loopback()
+                {
+                    cand_addr.set_ip(parsed_ip);
                 }
-            } else if bind_ip.is_unspecified() {
-                if let Ok(local_ip) = get_local_ip() {
-                    cand_addr.set_ip(local_ip);
-                }
+            } else if bind_ip.is_unspecified()
+                && let Ok(local_ip) = get_local_ip()
+            {
+                cand_addr.set_ip(local_ip);
             }
         }
 
         // Apply external_port override (for NAT port forwarding)
-        if upnp_external_addr.is_none() {
-            if let Some(ext_port) = self.inner.config.external_port {
-                if !bind_ip.is_loopback() {
-                    cand_addr.set_port(ext_port);
-                }
-            }
+        if upnp_external_addr.is_none()
+            && let Some(ext_port) = self.inner.config.external_port
+            && !bind_ip.is_loopback()
+        {
+            cand_addr.set_port(ext_port);
         }
 
         let mut local_candidate = IceCandidate::host(cand_addr, 1);
@@ -1283,25 +1276,24 @@ impl IceTransport {
         // Fall back to external_ip config if UPnP not available
         if upnp_external_addr.is_none() {
             if let Some(ext_ip) = &self.inner.config.external_ip {
-                if let Ok(parsed_ip) = ext_ip.parse::<IpAddr>() {
-                    if !bind_ip.is_loopback() {
-                        cand_addr.set_ip(parsed_ip);
-                    }
+                if let Ok(parsed_ip) = ext_ip.parse::<IpAddr>()
+                    && !bind_ip.is_loopback()
+                {
+                    cand_addr.set_ip(parsed_ip);
                 }
-            } else if bind_ip.is_unspecified() {
-                if let Ok(local_ip) = get_local_ip() {
-                    cand_addr.set_ip(local_ip);
-                }
+            } else if bind_ip.is_unspecified()
+                && let Ok(local_ip) = get_local_ip()
+            {
+                cand_addr.set_ip(local_ip);
             }
         }
 
         // Apply external_port override (for NAT port forwarding)
-        if upnp_external_addr.is_none() {
-            if let Some(ext_port) = self.inner.config.external_port {
-                if !bind_ip.is_loopback() {
-                    cand_addr.set_port(ext_port);
-                }
-            }
+        if upnp_external_addr.is_none()
+            && let Some(ext_port) = self.inner.config.external_port
+            && !bind_ip.is_loopback()
+        {
+            cand_addr.set_port(ext_port);
         }
 
         let mut local_candidate = IceCandidate::host(cand_addr, 1);
@@ -1385,10 +1377,7 @@ impl IceTransport {
     /// stale-nonce (401/438). Best-effort: a missing/erroneous response is
     /// logged but never propagates — the allocation is destroyed server-side
     /// as soon as the request is received.
-    async fn destroy_one_turn_allocation(
-        inner: &Arc<IceTransportInner>,
-        client: &Arc<TurnClient>,
-    ) {
+    async fn destroy_one_turn_allocation(inner: &Arc<IceTransportInner>, client: &Arc<TurnClient>) {
         for attempt in 0..2u8 {
             let (bytes, tx_id) = match client.create_destroy_packet().await {
                 Ok(p) => p,
@@ -1409,9 +1398,7 @@ impl IceTransport {
                     debug!("TURN allocation destroyed (Refresh LIFETIME=0)");
                     return;
                 }
-                Ok(Ok(msg))
-                    if matches!(msg.error_code, Some(401) | Some(438)) && attempt == 0 =>
-                {
+                Ok(Ok(msg)) if matches!(msg.error_code, Some(401) | Some(438)) && attempt == 0 => {
                     if let (Some(realm), Some(nonce)) = (msg.realm, msg.nonce) {
                         debug!(
                             "TURN destroy got {}: updating nonce, retrying",
@@ -1423,10 +1410,7 @@ impl IceTransport {
                     return;
                 }
                 Ok(Ok(msg)) => {
-                    debug!(
-                        "TURN destroy failed: error={:?}",
-                        msg.error_code
-                    );
+                    debug!("TURN destroy failed: error={:?}", msg.error_code);
                     return;
                 }
                 _ => {
@@ -1547,7 +1531,7 @@ impl IceTransport {
         // Check for ChannelData (0x4000 - 0x7FFF)
         if packet.len() >= 4 {
             let channel_num = u16::from_be_bytes([packet[0], packet[1]]);
-            if channel_num >= 0x4000 && channel_num <= 0x7FFF {
+            if (0x4000..=0x7FFF).contains(&channel_num) {
                 let len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
                 if packet.len() >= 4 + len {
                     let data = &packet[4..4 + len];
@@ -1663,7 +1647,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     }
 
     // Sort by priority
-    pairs.sort_by(|a, b| b.priority(role).cmp(&a.priority(role)));
+    pairs.sort_by_key(|p| std::cmp::Reverse(p.priority(role)));
 
     // If configured, demote host candidate pairs behind NAT so that srflx
     // pairs are checked first.  A host behind NAT may pass a single STUN
@@ -1784,7 +1768,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     }
 
     // Sort by priority: host > srflx > relay.  P2P first, relay last.
-    successful_pairs.sort_by(|a, b| b.priority(role).cmp(&a.priority(role)));
+    successful_pairs.sort_by_key(|p| std::cmp::Reverse(p.priority(role)));
 
     if role == IceRole::Controlling {
         // Try nomination on each successful pair in priority order.
@@ -1869,10 +1853,10 @@ fn resolve_socket(inner: &IceTransportInner, pair: &IceCandidatePair) -> Option<
         // when multiple sessions share a passive port range.
         let streams = inner.gatherer.tcp_streams.lock();
         for wrapper in streams.values() {
-            if let IceSocketWrapper::TcpStream(_, _, peer) = wrapper {
-                if *peer == pair.remote.address {
-                    return Some(wrapper.clone());
-                }
+            if let IceSocketWrapper::TcpStream(_, _, peer) = wrapper
+                && *peer == pair.remote.address
+            {
+                return Some(wrapper.clone());
             }
         }
         drop(streams);
@@ -2292,19 +2276,20 @@ async fn handle_stun_request(
     }
     if inner.config.enable_latching {
         let current_pair = inner.selected_pair.lock().clone();
-        if let Some(pair) = current_pair {
-            if pair.remote.address.port() == addr.port() && pair.remote.address.ip() != addr.ip() {
-                debug!(
-                    "RTP latching: updating remote address from {} to {}",
-                    pair.remote.address, addr
-                );
-                let mut new_remote = pair.remote.clone();
-                new_remote.address = addr;
-                let new_pair = IceCandidatePair::new(pair.local.clone(), new_remote);
-                *inner.selected_pair.lock() = Some(new_pair.clone());
-                let _ = inner.selected_pair_notifier.send(Some(new_pair.clone()));
-                publish_selected_socket(&inner, &new_pair, Some(sender));
-            }
+        if let Some(pair) = current_pair
+            && pair.remote.address.port() == addr.port()
+            && pair.remote.address.ip() != addr.ip()
+        {
+            debug!(
+                "RTP latching: updating remote address from {} to {}",
+                pair.remote.address, addr
+            );
+            let mut new_remote = pair.remote.clone();
+            new_remote.address = addr;
+            let new_pair = IceCandidatePair::new(pair.local.clone(), new_remote);
+            *inner.selected_pair.lock() = Some(new_pair.clone());
+            let _ = inner.selected_pair_notifier.send(Some(new_pair.clone()));
+            publish_selected_socket(&inner, &new_pair, Some(sender));
         }
     }
 
@@ -2500,34 +2485,33 @@ async fn perform_binding_check(
                 }
 
                 // Try ChannelBind if not already bound
-                if client.get_channel(remote.address).await.is_none() {
-                    if let Ok((bind_bytes, bind_tx_id, channel_num)) =
+                if client.get_channel(remote.address).await.is_none()
+                    && let Ok((bind_bytes, bind_tx_id, channel_num)) =
                         client.create_channel_bind_packet(remote.address).await
+                {
+                    let (bind_tx, bind_rx) = oneshot::channel();
                     {
-                        let (bind_tx, bind_rx) = oneshot::channel();
-                        {
-                            let mut map = inner.pending_transactions.lock();
-                            map.insert(bind_tx_id, bind_tx);
-                        }
+                        let mut map = inner.pending_transactions.lock();
+                        map.insert(bind_tx_id, bind_tx);
+                    }
 
-                        if let Ok(_) = client.send(&bind_bytes).await {
-                            let client_clone = client.clone();
-                            let remote_addr = remote.address;
-                            let inner_weak = Arc::downgrade(&inner);
-                            let timeout_dur = inner.config.stun_timeout;
+                    if client.send(&bind_bytes).await.is_ok() {
+                        let client_clone = client.clone();
+                        let remote_addr = remote.address;
+                        let inner_weak = Arc::downgrade(inner);
+                        let timeout_dur = inner.config.stun_timeout;
 
-                            match timeout(timeout_dur, bind_rx).await {
-                                Ok(Ok(msg)) => {
-                                    if msg.class == StunClass::SuccessResponse {
-                                        client_clone.add_channel(remote_addr, channel_num).await;
-                                    }
+                        match timeout(timeout_dur, bind_rx).await {
+                            Ok(Ok(msg)) => {
+                                if msg.class == StunClass::SuccessResponse {
+                                    client_clone.add_channel(remote_addr, channel_num).await;
                                 }
-                                _ => {
-                                    // Timeout or error: clean up pending transaction
-                                    if let Some(inner) = inner_weak.upgrade() {
-                                        let mut map = inner.pending_transactions.lock();
-                                        map.remove(&bind_tx_id);
-                                    }
+                            }
+                            _ => {
+                                // Timeout or error: clean up pending transaction
+                                if let Some(inner) = inner_weak.upgrade() {
+                                    let mut map = inner.pending_transactions.lock();
+                                    map.remove(&bind_tx_id);
                                 }
                             }
                         }
@@ -2603,24 +2587,24 @@ async fn perform_binding_check(
                 Ok(Err(e)) => return Err(e),
                 Err(_) => return Err(anyhow!("TCP binding check timeout")),
             }
-        } else if let Some(socket) = &socket {
-            if let Err(e) = socket.send_to(&bytes, remote.address).await {
-                let is_fatal = matches!(
-                    e.kind(),
-                    std::io::ErrorKind::BrokenPipe
-                        | std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::NotConnected
+        } else if let Some(socket) = &socket
+            && let Err(e) = socket.send_to(&bytes, remote.address).await
+        {
+            let is_fatal = matches!(
+                e.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::NotConnected
+            );
+            if is_fatal {
+                debug!(
+                    "socket.send_to {} fatal error, aborting nomination: {}",
+                    remote.address, e
                 );
-                if is_fatal {
-                    debug!(
-                        "socket.send_to {} fatal error, aborting nomination: {}",
-                        remote.address, e
-                    );
-                    return Err(e.into());
-                }
-                // Transient error (e.g., EHOSTUNREACH / os error 65 during route setup).
-                // Treat as a dropped send — wait for next RTO and retry.
+                return Err(e.into());
             }
+            // Transient error (e.g., EHOSTUNREACH / os error 65 during route setup).
+            // Treat as a dropped send — wait for next RTO and retry.
         }
 
         let timeout_fut = tokio::time::sleep(max_timeout.saturating_sub(start.elapsed()));
@@ -2665,6 +2649,7 @@ async fn perform_binding_check(
 /// 2. Send the STUN binding request over the TCP stream
 /// 3. Read the response, decode it, and deliver it to the pending transaction
 /// 4. Store the stream for later media use
+///
 /// RFC 4571 STUN/TCP framing used by WebRTC (length prefix + message).
 fn frame_stun_for_tcp(data: &[u8]) -> Vec<u8> {
     let len = data.len() as u16;
@@ -3048,13 +3033,13 @@ impl IceCandidate {
             parts.push("tcptype".into());
             parts.push(tcp_type.as_str().into());
         }
-        if let Some(addr) = self.related_address {
-            if self.typ != IceCandidateType::Host {
-                parts.push("raddr".into());
-                parts.push(addr.ip().to_string());
-                parts.push("rport".into());
-                parts.push(addr.port().to_string());
-            }
+        if let Some(addr) = self.related_address
+            && self.typ != IceCandidateType::Host
+        {
+            parts.push("raddr".into());
+            parts.push(addr.ip().to_string());
+            parts.push("rport".into());
+            parts.push(addr.port().to_string());
         }
         parts.join(" ")
     }
@@ -3390,10 +3375,9 @@ impl IceGatherer {
         // `sockets` (to keep a single demux read loop).
         if let Some(IceSocketWrapper::SharedUdp(handle)) = self.shared_udp_socket.lock().clone()
             && let Ok(local) = handle.local_addr()
+            && (local == addr || (local.ip().is_unspecified() && local.port() == addr.port()))
         {
-            if local == addr || (local.ip().is_unspecified() && local.port() == addr.port()) {
-                return Some(handle.socket().clone());
-            }
+            return Some(handle.socket().clone());
         }
         // Avoid unwrap in logging to prevent panic hiding
         let available: Vec<String> = self
@@ -3464,10 +3448,10 @@ impl IceGatherer {
                         (Some(s), Some(e)) => s > 0 && e > 0 && s <= e,
                         _ => false,
                     };
-                    if !has_tcp_listen_range {
-                        if let Err(e) = self.gather_tcp_active_candidates().await {
-                            debug!("TCP active gathering failed: {}", e);
-                        }
+                    if !has_tcp_listen_range
+                        && let Err(e) = self.gather_tcp_active_candidates().await
+                    {
+                        debug!("TCP active gathering failed: {}", e);
                     }
                 }
             }
@@ -3476,10 +3460,10 @@ impl IceGatherer {
         host_fut.await;
 
         // TCP host candidate gathering
-        if self.config.tcp_port_range_start.is_some() || self.config.tcp_port_range_end.is_some() {
-            if let Err(e) = self.gather_tcp_host_candidates().await {
-                debug!("TCP host gathering failed: {}", e);
-            }
+        if (self.config.tcp_port_range_start.is_some() || self.config.tcp_port_range_end.is_some())
+            && let Err(e) = self.gather_tcp_host_candidates().await
+        {
+            debug!("TCP host gathering failed: {}", e);
         }
 
         // STUN must complete before UPnP so we can detect double-NAT
@@ -3494,10 +3478,11 @@ impl IceGatherer {
         };
 
         // UPnP depends on host sockets and optionally STUN's public IP
-        if self.config.enable_upnp && self.config.ice_transport_policy == IceTransportPolicy::All {
-            if let Err(e) = self.gather_upnp_candidates(stun_public_ip).await {
-                debug!("UPnP gathering failed: {}", e);
-            }
+        if self.config.enable_upnp
+            && self.config.ice_transport_policy == IceTransportPolicy::All
+            && let Err(e) = self.gather_upnp_candidates(stun_public_ip).await
+        {
+            debug!("UPnP gathering failed: {}", e);
         }
 
         *self.state.lock() = IceGathererState::Complete;
@@ -3591,19 +3576,20 @@ impl IceGatherer {
             use local_ip_address::list_afinet_netifas;
             if let Ok(interfaces) = list_afinet_netifas() {
                 for (name, addr) in interfaces {
-                    if let IpAddr::V4(ip) = addr {
-                        if !ip.is_loopback() && !bind_ips.contains(&IpAddr::V4(ip)) {
-                            // Skip common virtual interface prefixes
-                            if name.starts_with("utun")
-                                || name.starts_with("gif")
-                                || name.starts_with("stf")
-                                || name.starts_with("awdl")
-                                || name.starts_with("llw")
-                            {
-                                continue;
-                            }
-                            bind_ips.push(IpAddr::V4(ip));
+                    if let IpAddr::V4(ip) = addr
+                        && !ip.is_loopback()
+                        && !bind_ips.contains(&IpAddr::V4(ip))
+                    {
+                        // Skip common virtual interface prefixes
+                        if name.starts_with("utun")
+                            || name.starts_with("gif")
+                            || name.starts_with("stf")
+                            || name.starts_with("awdl")
+                            || name.starts_with("llw")
+                        {
+                            continue;
                         }
+                        bind_ips.push(IpAddr::V4(ip));
                     }
                 }
             }
@@ -3678,15 +3664,14 @@ impl IceGatherer {
 
                             let tcp_type = TcpType::Passive;
                             let mut cand = IceCandidate::host_tcp(addr, 1, tcp_type);
-                            if ip.is_unspecified() {
-                                if let Ok(local_ip) = get_local_ip() {
-                                    let mut cand_addr = addr;
-                                    cand_addr.set_ip(local_ip);
-                                    let mut ext_cand =
-                                        IceCandidate::host_tcp(cand_addr, 1, tcp_type);
-                                    ext_cand.related_address = Some(addr);
-                                    cand = ext_cand;
-                                }
+                            if ip.is_unspecified()
+                                && let Ok(local_ip) = get_local_ip()
+                            {
+                                let mut cand_addr = addr;
+                                cand_addr.set_ip(local_ip);
+                                let mut ext_cand = IceCandidate::host_tcp(cand_addr, 1, tcp_type);
+                                ext_cand.related_address = Some(addr);
+                                cand = ext_cand;
                             }
                             self.push_candidate(cand);
                         }
@@ -3710,10 +3695,10 @@ impl IceGatherer {
         const ACTIVE_PLACEHOLDER_PORT: u16 = 9;
 
         let mut bind_ips = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
-        if let Ok(local_ip) = get_local_ip() {
-            if !bind_ips.contains(&local_ip) {
-                bind_ips.push(local_ip);
-            }
+        if let Ok(local_ip) = get_local_ip()
+            && !bind_ips.contains(&local_ip)
+        {
+            bind_ips.push(local_ip);
         }
 
         for ip in bind_ips {
@@ -3751,18 +3736,19 @@ impl IceGatherer {
             use local_ip_address::list_afinet_netifas;
             if let Ok(interfaces) = list_afinet_netifas() {
                 for (name, addr) in interfaces {
-                    if let IpAddr::V4(ip) = addr {
-                        if !ip.is_loopback() && !ips.contains(&IpAddr::V4(ip)) {
-                            if name.starts_with("utun")
-                                || name.starts_with("gif")
-                                || name.starts_with("stf")
-                                || name.starts_with("awdl")
-                                || name.starts_with("llw")
-                            {
-                                continue;
-                            }
-                            ips.push(IpAddr::V4(ip));
+                    if let IpAddr::V4(ip) = addr
+                        && !ip.is_loopback()
+                        && !ips.contains(&IpAddr::V4(ip))
+                    {
+                        if name.starts_with("utun")
+                            || name.starts_with("gif")
+                            || name.starts_with("stf")
+                            || name.starts_with("awdl")
+                            || name.starts_with("llw")
+                        {
+                            continue;
                         }
+                        ips.push(IpAddr::V4(ip));
                     }
                 }
             }
@@ -3939,7 +3925,7 @@ impl IceGatherer {
             }
         }
 
-        while let Some(_) = tasks.next().await {}
+        while tasks.next().await.is_some() {}
         Ok(())
     }
 
@@ -3995,8 +3981,8 @@ impl IceGatherer {
             }
         }
 
-        while let Some(_) = tasks.next().await {}
-        let ip = public_ip.lock().clone();
+        while tasks.next().await.is_some() {}
+        let ip = *public_ip.lock();
         if let Some(ip) = &ip {
             debug!("STUN public IP for UPnP double-NAT detection: {}", ip);
         } else {

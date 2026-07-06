@@ -49,6 +49,12 @@ pub struct H264Depacketizer {
     drop_count: Arc<AtomicU64>,
 }
 
+impl Default for H264Depacketizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl H264Depacketizer {
     pub fn new() -> Self {
         Self {
@@ -322,7 +328,7 @@ mod tests {
             MediaSample::Video(v) => {
                 assert_eq!(v.data, Bytes::from(nal1));
                 assert_eq!(v.rtp_timestamp, 200);
-                assert_eq!(v.is_last_packet, false); // Not last in packet
+                assert!(!v.is_last_packet); // Not last in packet
             }
             _ => panic!("Expected Video sample"),
         }
@@ -331,7 +337,7 @@ mod tests {
             MediaSample::Video(v) => {
                 assert_eq!(v.data, Bytes::from(nal2));
                 assert_eq!(v.rtp_timestamp, 200);
-                assert_eq!(v.is_last_packet, true); // Last in packet inherits marker
+                assert!(v.is_last_packet); // Last in packet inherits marker
             }
             _ => panic!("Expected Video sample"),
         }

@@ -5,7 +5,7 @@
 //! server ufrag in the first STUN Binding request USERNAME attribute.
 
 use super::{IceTransportInner, MAX_STUN_MESSAGE, attach_demuxed_tcp_stream};
-use crate::transports::ice::stun::{StunAttribute, StunClass, StunMessage, StunMethod};
+use crate::transports::ice::stun::{StunClass, StunMessage, StunMethod};
 use anyhow::{Context, Result, anyhow, bail};
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -221,7 +221,7 @@ pub(crate) fn username_from_stun_bytes(bytes: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transports::ice::stun::random_bytes;
+    use crate::transports::ice::stun::{StunAttribute, random_bytes};
 
     #[test]
     fn extracts_peer_ufrag_from_binding_username() {

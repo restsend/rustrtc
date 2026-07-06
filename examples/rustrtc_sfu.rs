@@ -1,3 +1,12 @@
+// Test/example crate: relax pedantic style lints that are noisy in fixtures.
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::redundant_pattern_matching)]
+#![allow(clippy::while_let_loop)]
+#![allow(clippy::manual_checked_ops)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::explicit_counter_loop)]
+#![allow(clippy::cloned_ref_to_slice_refs)]
+#![allow(clippy::zombie_processes)]
 use axum::{
     Router,
     extract::{Json, State},
@@ -557,10 +566,10 @@ async fn setup_new_peer(peer: Arc<Peer>, room: Arc<Room>) {
         // 2. Remove peer and clean up others
         {
             let mut peers = room_clone.peers.write().await;
-            if let Some(current_peer) = peers.get(&user_id) {
-                if current_peer.id == peer_clone.id {
-                    peers.remove(&user_id);
-                }
+            if let Some(current_peer) = peers.get(&user_id)
+                && current_peer.id == peer_clone.id
+            {
+                peers.remove(&user_id);
             }
 
             for (other_id, other_peer) in peers.iter() {
@@ -861,47 +870,46 @@ async fn negotiate(peer: &Peer) {
         // Try to resend the current local description.
         if signaling_state == SignalingState::HaveLocalOffer
             && peer.negotiation_pending.load(Ordering::SeqCst)
+            && let Some(local_desc) = peer.pc.local_description()
         {
-            if let Some(local_desc) = peer.pc.local_description() {
-                info!("Resending pending offer for {}", peer.user_id);
+            info!("Resending pending offer for {}", peer.user_id);
 
-                let sdp_dto = SdpDto {
-                    sdp_type: "offer".to_string(),
-                    sdp: local_desc.to_sdp_string(),
-                };
+            let sdp_dto = SdpDto {
+                sdp_type: "offer".to_string(),
+                sdp: local_desc.to_sdp_string(),
+            };
 
-                let msg = Message {
-                    type_: "sdp".to_string(),
-                    sdp: Some(sdp_dto),
-                    ..Default::default()
-                };
+            let msg = Message {
+                type_: "sdp".to_string(),
+                sdp: Some(sdp_dto),
+                ..Default::default()
+            };
 
-                if let Some(dc) = peer.dc.read().await.as_ref() {
-                    if let Ok(data) = serde_json::to_string(&msg) {
-                        info!("Sending JSON Offer (Resend) to {}: {}", peer.user_id, data);
-                        if let Err(e) = peer.pc.send_text(dc.id, &data).await {
-                            error!("Failed to send offer via DC: {}", e);
-                            // Keep pending
-                            return;
-                        } else {
-                            info!("Sent offer via DC to {}", peer.user_id);
-                            // We successfully sent the offer, so we are waiting for answer.
-                            // We DO NOT clear pending flag here, because we might have accumulated
-                            // more changes (like new tracks) while we were waiting for DC.
-                            // If we keep pending=true, then when the Answer arrives, handle_chat_datachannel
-                            // will trigger negotiate() again, which will generate a NEW offer with the new tracks.
-                            // peer.negotiation_pending.store(false, Ordering::SeqCst);
-                            return;
-                        }
+            if let Some(dc) = peer.dc.read().await.as_ref() {
+                if let Ok(data) = serde_json::to_string(&msg) {
+                    info!("Sending JSON Offer (Resend) to {}: {}", peer.user_id, data);
+                    if let Err(e) = peer.pc.send_text(dc.id, &data).await {
+                        error!("Failed to send offer via DC: {}", e);
+                        // Keep pending
+                        return;
+                    } else {
+                        info!("Sent offer via DC to {}", peer.user_id);
+                        // We successfully sent the offer, so we are waiting for answer.
+                        // We DO NOT clear pending flag here, because we might have accumulated
+                        // more changes (like new tracks) while we were waiting for DC.
+                        // If we keep pending=true, then when the Answer arrives, handle_chat_datachannel
+                        // will trigger negotiate() again, which will generate a NEW offer with the new tracks.
+                        // peer.negotiation_pending.store(false, Ordering::SeqCst);
+                        return;
                     }
-                } else {
-                    warn!(
-                        "Cannot negotiate (Resend): DataChannel not ready for user {}",
-                        peer.user_id
-                    );
-                    // Keep pending
-                    return;
                 }
+            } else {
+                warn!(
+                    "Cannot negotiate (Resend): DataChannel not ready for user {}",
+                    peer.user_id
+                );
+                // Keep pending
+                return;
             }
         }
 
@@ -978,10 +986,10 @@ async fn broadcast(room: &Room, msg: Message, exclude_user_id: Option<&str>) {
     };
 
     for (uid, peer) in peers.iter() {
-        if let Some(exclude) = exclude_user_id {
-            if uid == exclude {
-                continue;
-            }
+        if let Some(exclude) = exclude_user_id
+            && uid == exclude
+        {
+            continue;
         }
         if let Some(dc) = peer.dc.read().await.as_ref() {
             info!("Broadcasting to {}: {}", uid, data);

@@ -578,11 +578,7 @@ async fn test_dtls_exits_after_connected_when_ice_socket_cleared() -> Result<()>
     client_socket_tx.send(None)?;
 
     // The client DTLS task must transition to Closed and exit.
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        client_task,
-    )
-    .await;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), client_task).await;
     assert!(
         result.is_ok(),
         "Client DTLS task did NOT exit after ICE socket was cleared post-Connected"

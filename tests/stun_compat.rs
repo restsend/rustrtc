@@ -28,9 +28,9 @@ fn test_stun_encoding_compatibility() {
 
     // Now try to decode with webrtc crate
     let mut other_msg = Message::new();
-    let mut buf = encoded.clone();
+    let buf = encoded.clone();
     other_msg
-        .unmarshal_binary(&mut buf)
+        .unmarshal_binary(&buf)
         .expect("failed to unmarshal with webrtc");
 
     assert_eq!(other_msg.typ, BINDING_REQUEST);

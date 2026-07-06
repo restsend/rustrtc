@@ -1,3 +1,12 @@
+// Test/example crate: relax pedantic style lints that are noisy in fixtures.
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::redundant_pattern_matching)]
+#![allow(clippy::while_let_loop)]
+#![allow(clippy::manual_checked_ops)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::explicit_counter_loop)]
+#![allow(clippy::cloned_ref_to_slice_refs)]
+#![allow(clippy::zombie_processes)]
 use anyhow::Result;
 use rustrtc::PeerConnection;
 use rustrtc::RtcConfiguration;
@@ -149,17 +158,14 @@ async fn interop_datachannel_test() -> Result<()> {
     let mut received_msg = false;
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(2) {
-        if let Ok(Some(event)) = timeout(Duration::from_millis(100), rust_dc.recv()).await {
-            match event {
-                rustrtc::transports::sctp::DataChannelEvent::Message(data) => {
-                    let s = String::from_utf8_lossy(&data).to_string();
-                    println!("RustRTC received message: {}", s);
-                    assert_eq!(s, "Hello RustRTC");
-                    received_msg = true;
-                    break;
-                }
-                _ => {}
-            }
+        if let Ok(Some(event)) = timeout(Duration::from_millis(100), rust_dc.recv()).await
+            && let rustrtc::transports::sctp::DataChannelEvent::Message(data) = event
+        {
+            let s = String::from_utf8_lossy(&data).to_string();
+            println!("RustRTC received message: {}", s);
+            assert_eq!(s, "Hello RustRTC");
+            received_msg = true;
+            break;
         }
     }
     assert!(received_msg, "RustRTC did not receive message");

@@ -1,3 +1,12 @@
+// Test/example crate: relax pedantic style lints that are noisy in fixtures.
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::redundant_pattern_matching)]
+#![allow(clippy::while_let_loop)]
+#![allow(clippy::manual_checked_ops)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::explicit_counter_loop)]
+#![allow(clippy::cloned_ref_to_slice_refs)]
+#![allow(clippy::zombie_processes)]
 use anyhow::{Context, Result, bail};
 use rustrtc::media::track::sample_track;
 use rustrtc::media::{MediaKind, MediaStreamTrack};
@@ -105,12 +114,11 @@ fn make_server_config() -> RtcConfiguration {
 }
 
 fn generate_offer(tracks: usize, local_addr: SocketAddr) -> String {
-    let mut sdp = format!(
-        "v=0\r\n\
+    let mut sdp = "v=0\r\n\
          o=- 0 0 IN IP4 127.0.0.1\r\n\
          s=-\r\n\
          t=0 0\r\n"
-    );
+        .to_string();
 
     for i in 0..tracks {
         let ssrc = 1000 + i as u32;
@@ -135,16 +143,16 @@ fn parse_answer_target(answer_sdp: &str) -> Result<RemoteRtpTarget> {
     let mut remote_port: Option<u16> = None;
 
     for line in answer_sdp.lines() {
-        if line.starts_with("c=IN IP4") {
-            if let Some(ip_str) = line.split_whitespace().last() {
-                remote_ip = Some(ip_str.parse().context("parse answer IP")?);
-            }
+        if line.starts_with("c=IN IP4")
+            && let Some(ip_str) = line.split_whitespace().last()
+        {
+            remote_ip = Some(ip_str.parse().context("parse answer IP")?);
         }
-        if line.starts_with("m=audio") {
-            if let Some(port_str) = line.split_whitespace().nth(1) {
-                remote_port = Some(port_str.parse().context("parse answer RTP port")?);
-                break;
-            }
+        if line.starts_with("m=audio")
+            && let Some(port_str) = line.split_whitespace().nth(1)
+        {
+            remote_port = Some(port_str.parse().context("parse answer RTP port")?);
+            break;
         }
     }
 

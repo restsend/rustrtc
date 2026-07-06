@@ -1,3 +1,12 @@
+// Test/example crate: relax pedantic style lints that are noisy in fixtures.
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::redundant_pattern_matching)]
+#![allow(clippy::while_let_loop)]
+#![allow(clippy::manual_checked_ops)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::explicit_counter_loop)]
+#![allow(clippy::cloned_ref_to_slice_refs)]
+#![allow(clippy::zombie_processes)]
 use anyhow::Result;
 use rustrtc::{MediaKind, RtcConfiguration};
 use rustrtc::{PeerConnection, TransceiverDirection};
@@ -226,7 +235,7 @@ async fn interop_vp8_echo() -> Result<()> {
             let mut data = bytes::BytesMut::with_capacity(4);
             data.extend_from_slice(&u32::to_be_bytes(i));
             let frame = rustrtc::media::VideoFrame {
-                rtp_timestamp: i as u32 * 3000,
+                rtp_timestamp: i * 3000,
                 data: data.freeze(),
                 is_last_packet: true,
                 payload_type: None,
@@ -425,7 +434,7 @@ async fn interop_vp8_echo_with_pli() -> Result<()> {
             let mut data = bytes::BytesMut::with_capacity(4);
             data.extend_from_slice(&u32::to_be_bytes(i));
             let frame = rustrtc::media::VideoFrame {
-                rtp_timestamp: i as u32 * 3000,
+                rtp_timestamp: i * 3000,
                 data: data.freeze(),
                 is_last_packet: true,
                 payload_type: None,

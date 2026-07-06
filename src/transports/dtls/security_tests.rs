@@ -96,7 +96,10 @@ async fn test_dtls_handshake_with_fingerprint_verification() -> Result<()> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let state = server_state_rx.borrow().clone();
-        if matches!(state, DtlsState::Connected(..) | DtlsState::Failed | DtlsState::Closed) {
+        if matches!(
+            state,
+            DtlsState::Connected(..) | DtlsState::Failed | DtlsState::Closed
+        ) {
             assert!(matches!(state, DtlsState::Connected(..)));
             break;
         }
@@ -175,7 +178,10 @@ async fn test_dtls_handshake_rejects_wrong_fingerprint() -> Result<()> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let state = client_state_rx.borrow().clone();
-        if matches!(state, DtlsState::Connected(..) | DtlsState::Failed | DtlsState::Closed) {
+        if matches!(
+            state,
+            DtlsState::Connected(..) | DtlsState::Failed | DtlsState::Closed
+        ) {
             assert!(
                 matches!(state, DtlsState::Failed),
                 "Expected DtlsState::Failed due to fingerprint mismatch, got {}",
@@ -258,7 +264,10 @@ async fn test_dtls_encrypted_data_exchange() -> Result<()> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let state = client_state_rx.borrow().clone();
-        if matches!(state, DtlsState::Connected(..) | DtlsState::Failed | DtlsState::Closed) {
+        if matches!(
+            state,
+            DtlsState::Connected(..) | DtlsState::Failed | DtlsState::Closed
+        ) {
             assert!(matches!(state, DtlsState::Connected(..)));
             break;
         }
@@ -273,7 +282,10 @@ async fn test_dtls_encrypted_data_exchange() -> Result<()> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let state = server_state_rx.borrow().clone();
-        if matches!(state, DtlsState::Connected(..) | DtlsState::Failed | DtlsState::Closed) {
+        if matches!(
+            state,
+            DtlsState::Connected(..) | DtlsState::Failed | DtlsState::Closed
+        ) {
             assert!(matches!(state, DtlsState::Connected(..)));
             break;
         }
@@ -354,6 +366,11 @@ fn test_handshake_state_transitions() {
 
     for state in &states {
         let cloned = state.clone();
-        assert!(*state == cloned, "State clone mismatch: {} != {}", state, cloned);
+        assert!(
+            *state == cloned,
+            "State clone mismatch: {} != {}",
+            state,
+            cloned
+        );
     }
 }

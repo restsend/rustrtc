@@ -491,13 +491,12 @@ async fn dcep_ordered_bidirectional_test() -> Result<()> {
                 let done_tx = done_tx.clone();
                 Box::pin(async move {
                     // Check for "pong" response
-                    if msg.data.len() == 4 {
-                        if let Ok(text) = std::str::from_utf8(&msg.data) {
-                            if text == "pong" {
-                                println!("WebRTC: Received pong!");
-                                return;
-                            }
-                        }
+                    if msg.data.len() == 4
+                        && let Ok(text) = std::str::from_utf8(&msg.data)
+                        && text == "pong"
+                    {
+                        println!("WebRTC: Received pong!");
+                        return;
                     }
 
                     let prev = bytes_received

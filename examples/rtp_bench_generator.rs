@@ -1,3 +1,12 @@
+// Test/example crate: relax pedantic style lints that are noisy in fixtures.
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::redundant_pattern_matching)]
+#![allow(clippy::while_let_loop)]
+#![allow(clippy::manual_checked_ops)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::explicit_counter_loop)]
+#![allow(clippy::cloned_ref_to_slice_refs)]
+#![allow(clippy::zombie_processes)]
 use rustrtc::rtp::{RtpHeader, RtpPacket};
 use serde::{Deserialize, Serialize};
 use std::net::{SocketAddr, UdpSocket};
@@ -15,12 +24,11 @@ struct OfferResponse {
 }
 
 fn generate_sdp(num_tracks: usize, _local_addr: SocketAddr) -> String {
-    let mut sdp = format!(
-        "v=0\r\n\
+    let mut sdp = "v=0\r\n\
          o=- 0 0 IN IP4 127.0.0.1\r\n\
          s=-\r\n\
          t=0 0\r\n"
-    );
+        .to_string();
 
     for i in 0..num_tracks {
         let ssrc = 1000 + i as u32;
@@ -83,19 +91,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut remote_port: u16 = 0;
 
     for line in answer_sdp.lines() {
-        if line.starts_with("c=IN IP4") {
-            if let Some(ip_str) = line.split_whitespace().last() {
-                if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
-                    remote_ip = ip;
-                }
-            }
+        if line.starts_with("c=IN IP4")
+            && let Some(ip_str) = line.split_whitespace().last()
+            && let Ok(ip) = ip_str.parse::<std::net::IpAddr>()
+        {
+            remote_ip = ip;
         }
-        if line.starts_with("m=audio") || line.starts_with("m=video") {
-            if let Some(port_str) = line.split_whitespace().nth(1) {
-                if let Ok(p) = port_str.parse::<u16>() {
-                    remote_port = p;
-                }
-            }
+        if (line.starts_with("m=audio") || line.starts_with("m=video"))
+            && let Some(port_str) = line.split_whitespace().nth(1)
+            && let Ok(p) = port_str.parse::<u16>()
+        {
+            remote_port = p;
         }
     }
 
@@ -120,19 +126,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut latency_count = 0u64;
 
         loop {
-            if let Ok((size, _)) = socket_clone.recv_from(&mut buf) {
-                if let Ok(packet) = RtpPacket::parse(&buf[..size]) {
-                    count += 1;
-                    if packet.payload.len() >= 8 {
-                        let sent_at = u64::from_be_bytes(packet.payload[..8].try_into().unwrap());
-                        let now = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_micros() as u64;
-                        if now >= sent_at {
-                            total_latency += now - sent_at;
-                            latency_count += 1;
-                        }
+            if let Ok((size, _)) = socket_clone.recv_from(&mut buf)
+                && let Ok(packet) = RtpPacket::parse(&buf[..size])
+            {
+                count += 1;
+                if packet.payload.len() >= 8 {
+                    let sent_at = u64::from_be_bytes(packet.payload[..8].try_into().unwrap());
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros() as u64;
+                    if now >= sent_at {
+                        total_latency += now - sent_at;
+                        latency_count += 1;
                     }
                 }
             }

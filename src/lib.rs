@@ -1,3 +1,17 @@
+//! rustrtc — WebRTC / RTP / SRTP / T.38 real-time communication library.
+
+// These lints are opinionated style choices that don't fit this codebase's
+// established patterns (large RTC structs naturally have many fields/args and
+// use composite shared-state types). Allowed crate-wide to keep `cargo clippy`
+// focused on genuinely useful diagnostics.
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::result_large_err)]
+#![allow(clippy::large_enum_variant)]
+// `let mut x = T::default(); x.field = v;` is often clearer than a partial
+// struct literal, especially in tests. Pervasive here, so allowed crate-wide.
+#![allow(clippy::field_reassign_with_default)]
+
 pub mod config;
 pub mod errors;
 pub mod media;
