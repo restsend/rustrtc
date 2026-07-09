@@ -7,10 +7,11 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -61,29 +62,25 @@ struct StreamRewriteState {
 }
 
 struct RewriteBridge {
-    target: Weak<RtpTransport>,
+    target_ice_conn: Arc<IceConn>,
     params: RtpRewriteBridgeParams,
-    streams: Mutex<HashMap<u32, StreamRewriteState>>,
+    streams: RefCell<HashMap<u32, StreamRewriteState>>,
 }
 
 impl RewriteBridge {
     fn new(target: Arc<RtpTransport>, params: RtpRewriteBridgeParams) -> Self {
         Self {
-            target: Arc::downgrade(&target),
+            target_ice_conn: target.ice_conn(),
             params,
-            streams: Mutex::new(HashMap::new()),
+            streams: RefCell::new(HashMap::new()),
         }
-    }
-
-    fn target(&self) -> Option<Arc<RtpTransport>> {
-        self.target.upgrade()
     }
 
     fn rewrite_packet(&self, packet: &mut RtpPacket) {
         let params = self.params;
         let src_ssrc = packet.header.ssrc;
         let src_timestamp = packet.header.timestamp;
-        let mut streams = self.streams.lock();
+        let mut streams = self.streams.borrow_mut();
         let state = streams
             .entry(src_ssrc)
             .or_insert_with(|| StreamRewriteState {
@@ -250,7 +247,8 @@ pub struct RtpTransport {
     rid_extension_id: AtomicU8,
     sdes_mid_extension_id: AtomicU8,
     abs_send_time_extension_id: AtomicU8,
-    rewrite_bridge: Mutex<Option<Arc<RewriteBridge>>>,
+    rewrite_bridge: Mutex<Option<Box<RewriteBridge>>>,
+    has_bridge: AtomicBool,
     srtp_required: bool,
     has_sent_first_packet: AtomicBool,
 }
@@ -274,6 +272,7 @@ impl RtpTransport {
             sdes_mid_extension_id: AtomicU8::new(EXT_ID_NONE),
             abs_send_time_extension_id: AtomicU8::new(EXT_ID_NONE),
             rewrite_bridge: Mutex::new(None),
+            has_bridge: AtomicBool::new(false),
             srtp_required,
             has_sent_first_packet: AtomicBool::new(false),
         }
@@ -348,11 +347,13 @@ impl RtpTransport {
     }
 
     pub fn bridge_rewrite_to(&self, dst: Arc<RtpTransport>, params: RtpRewriteBridgeParams) {
-        *self.rewrite_bridge.lock() = Some(Arc::new(RewriteBridge::new(dst, params)));
+        *self.rewrite_bridge.lock() = Some(Box::new(RewriteBridge::new(dst, params)));
+        self.has_bridge.store(true, Ordering::Release);
     }
 
     pub fn clear_bridge_rewrite(&self) {
         *self.rewrite_bridge.lock() = None;
+        self.has_bridge.store(false, Ordering::Release);
     }
 
     pub async fn send(&self, buf: &[u8]) -> Result<usize> {
@@ -368,8 +369,8 @@ impl RtpTransport {
                 {
                     let abs_send_time =
                         crate::rtp::calculate_abs_send_time(std::time::SystemTime::now());
-                    let data = abs_send_time.to_be_bytes()[1..4].to_vec();
-                    packet.header.set_extension(id, &data)?;
+                    let data = abs_send_time.to_be_bytes();
+                    packet.header.set_extension(id, &data[1..4])?;
                 }
 
                 srtp.protect_rtp(&mut packet)?;
@@ -394,8 +395,8 @@ impl RtpTransport {
         // Inject abs-send-time if enabled (non-fatal: header may lack room on small payloads).
         if let Some(id) = decode_ext_id(self.abs_send_time_extension_id.load(Ordering::Relaxed)) {
             let abs_send_time = crate::rtp::calculate_abs_send_time(std::time::SystemTime::now());
-            let data = abs_send_time.to_be_bytes()[1..4].to_vec();
-            if let Err(e) = packet.header.set_extension(id, &data) {
+            let data = abs_send_time.to_be_bytes();
+            if let Err(e) = packet.header.set_extension(id, &data[1..4]) {
                 debug!("RtpTransport: abs-send-time extension skipped: {}", e);
             }
         }
@@ -455,19 +456,18 @@ impl RtpTransport {
         self.transport.send_rtcp(&protected).await
     }
 
-    async fn try_bridge_rewrite_rtp(&self, mut packet: RtpPacket) -> Option<RtpPacket> {
-        let bridge = self.rewrite_bridge.lock().clone();
-        let Some(bridge) = bridge else {
+    fn try_bridge_rewrite_rtp(&self, mut packet: RtpPacket, marshal_buf: &mut Vec<u8>) -> Option<RtpPacket> {
+        if !self.has_bridge.load(Ordering::Acquire) {
             return Some(packet);
-        };
-
-        let Some(target) = bridge.target() else {
-            *self.rewrite_bridge.lock() = None;
+        }
+        let mut guard = self.rewrite_bridge.lock();
+        let Some(bridge) = guard.as_mut() else {
             return Some(packet);
         };
 
         bridge.rewrite_packet(&mut packet);
-        let _ = target.send_rtp(packet).await;
+        packet.marshal_into(marshal_buf);
+        let _ = bridge.target_ice_conn.try_send(marshal_buf);
         None
     }
 
@@ -502,7 +502,7 @@ impl RtpTransport {
 
 #[async_trait]
 impl PacketReceiver for RtpTransport {
-    async fn receive(&self, packet: Bytes, addr: SocketAddr) {
+    async fn receive(&self, packet: Bytes, addr: SocketAddr, marshal_buf: &mut Vec<u8>) {
         let is_rtcp_packet = is_rtcp(&packet);
 
         if is_rtcp_packet {
@@ -557,6 +557,8 @@ impl PacketReceiver for RtpTransport {
                 let session_guard = self.srtp_session.lock();
                 if let Some(session) = &*session_guard {
                     let mut srtp = session.lock();
+                    // SRTP path: keep a borrowed parse (crypto materializes a
+                    // mutable copy itself, so no benefit from zero-copy here).
                     match RtpPacket::parse(&packet) {
                         Ok(mut rtp_packet) => match srtp.unprotect_rtp(&mut rtp_packet) {
                             Ok(_) => rtp_packet,
@@ -574,7 +576,10 @@ impl PacketReceiver for RtpTransport {
                         );
                         return;
                     }
-                    match RtpPacket::parse(&packet) {
+                    // Plain-RTP fast path: zero-copy parse — the packet's
+                    // payload/extension are cheap `Bytes` slices of the
+                    // already-owned receive buffer instead of fresh Vec copies.
+                    match RtpPacket::parse_bytes(packet.clone()) {
                         Ok(rtp_packet) => rtp_packet,
                         Err(e) => {
                             tracing::debug!("RTP parse failed: {}", e);
@@ -584,7 +589,7 @@ impl PacketReceiver for RtpTransport {
                 }
             };
 
-            let Some(rtp_packet) = self.try_bridge_rewrite_rtp(rtp_packet).await else {
+            let Some(rtp_packet) = self.try_bridge_rewrite_rtp(rtp_packet, marshal_buf) else {
                 return;
             };
 
@@ -684,10 +689,12 @@ mod tests {
         // First packet with SSRC 100
         let header1 = crate::rtp::RtpHeader::new(0, 1, 0, 100);
         let packet1 = crate::rtp::RtpPacket::new(header1, vec![1u8; 160]);
+        let mut marshal_buf = Vec::new();
         transport
             .receive(
                 Bytes::from(packet1.marshal().unwrap()),
                 "127.0.0.1:5000".parse().unwrap(),
+                &mut marshal_buf,
             )
             .await;
 
@@ -701,6 +708,7 @@ mod tests {
             .receive(
                 Bytes::from(packet2.marshal().unwrap()),
                 "127.0.0.1:5000".parse().unwrap(),
+                &mut marshal_buf,
             )
             .await;
 
@@ -737,7 +745,8 @@ mod tests {
         let header1 = crate::rtp::RtpHeader::new(0, 1, 0, ssrc1);
         let packet1 = crate::rtp::RtpPacket::new(header1, vec![0u8; 160]);
         let bytes1 = packet1.marshal().unwrap();
-        transport.receive(Bytes::from(bytes1), addr).await;
+        let mut marshal_buf = Vec::new();
+        transport.receive(Bytes::from(bytes1), addr, &mut marshal_buf).await;
 
         let received1 = rx.recv().await.expect("Should receive packet 1");
         assert_eq!(received1.0.header.ssrc, ssrc1);
@@ -756,7 +765,7 @@ mod tests {
         let packet2 = crate::rtp::RtpPacket::new(header2, vec![1u8; 160]);
         let bytes2 = packet2.marshal().unwrap();
 
-        transport.receive(Bytes::from(bytes2), addr).await;
+        transport.receive(Bytes::from(bytes2), addr, &mut marshal_buf).await;
 
         let received2 = rx.recv().await.expect("Should receive packet 2 (new SSRC)");
         assert_eq!(received2.0.header.ssrc, ssrc2);
@@ -767,7 +776,7 @@ mod tests {
         let packet3 = crate::rtp::RtpPacket::new(header3, vec![2u8; 160]);
         let bytes3 = packet3.marshal().unwrap();
 
-        transport.receive(Bytes::from(bytes3), addr).await;
+        transport.receive(Bytes::from(bytes3), addr, &mut marshal_buf).await;
 
         let received3 = rx
             .recv()
@@ -797,10 +806,12 @@ mod tests {
 
         let header = crate::rtp::RtpHeader::new(96, 1, 0, 4444);
         let packet = crate::rtp::RtpPacket::new(header, vec![0u8; 160]);
+        let mut marshal_buf = Vec::new();
         transport
             .receive(
                 Bytes::from(packet.marshal().unwrap()),
                 "127.0.0.1:5000".parse().unwrap(),
+                &mut marshal_buf,
             )
             .await;
 
@@ -835,10 +846,12 @@ mod tests {
         let mut header = crate::rtp::RtpHeader::new(96, 1, 0, 5555);
         header.set_extension(1, b"vs").unwrap();
         let packet = crate::rtp::RtpPacket::new(header, vec![0u8; 160]);
+        let mut marshal_buf = Vec::new();
         transport
             .receive(
                 Bytes::from(packet.marshal().unwrap()),
                 "127.0.0.1:5000".parse().unwrap(),
+                &mut marshal_buf,
             )
             .await;
 
@@ -858,6 +871,7 @@ mod tests {
             .receive(
                 Bytes::from(packet.marshal().unwrap()),
                 "127.0.0.1:5000".parse().unwrap(),
+                &mut marshal_buf,
             )
             .await;
 
@@ -889,10 +903,12 @@ mod tests {
         let mut header = crate::rtp::RtpHeader::new(96, 1, 0, 6666);
         header.set_extension(1, b"vs").unwrap();
         let packet = crate::rtp::RtpPacket::new(header, vec![0u8; 160]);
+        let mut marshal_buf = Vec::new();
         transport
             .receive(
                 Bytes::from(packet.marshal().unwrap()),
                 "127.0.0.1:5000".parse().unwrap(),
+                &mut marshal_buf,
             )
             .await;
 
@@ -911,6 +927,7 @@ mod tests {
             .receive(
                 Bytes::from(packet.marshal().unwrap()),
                 "127.0.0.1:5000".parse().unwrap(),
+                &mut marshal_buf,
             )
             .await;
 
@@ -947,18 +964,20 @@ mod tests {
             },
         );
 
-        let bridge = src_transport
+        let mut guard = src_transport
             .rewrite_bridge
-            .lock()
-            .clone()
+            .lock();
+        let bridge = guard.as_mut()
             .expect("rewrite bridge should be configured");
 
         let mut packet = RtpPacket::new(crate::rtp::RtpHeader::new(0, 7, 1111, 100), vec![1u8; 32]);
         bridge.rewrite_packet(&mut packet);
+        drop(guard);
 
         assert_eq!(packet.header.ssrc, 1000);
         assert_eq!(packet.header.payload_type, 96);
         assert_eq!(packet.header.sequence_number, 32000);
         assert_eq!(packet.header.timestamp, 1111 + 12345);
     }
+
 }

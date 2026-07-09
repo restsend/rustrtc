@@ -25,7 +25,7 @@ static LOCAL_IP_CACHE: OnceLock<Mutex<Option<LocalIpCacheEntry>>> = OnceLock::ne
 
 #[async_trait]
 pub trait PacketReceiver: Send + Sync {
-    async fn receive(&self, packet: Bytes, addr: SocketAddr);
+    async fn receive(&self, packet: Bytes, addr: SocketAddr, marshal_buf: &mut Vec<u8>);
 }
 
 pub fn get_local_ip() -> Result<IpAddr, anyhow::Error> {

@@ -3,6 +3,7 @@ use crate::{
     rtp::RtpPacket,
 };
 use aes::Aes128;
+use bytes::Bytes;
 use aes_gcm::{
     Aes128Gcm, Nonce,
     aead::{Aead, KeyInit, Payload},
@@ -565,7 +566,7 @@ impl SrtpContext {
             packet.payload = original_payload;
 
             let payload = Payload {
-                msg: &packet.payload,
+                msg: packet.payload.as_ref(),
                 aad: &aad,
             };
 
@@ -573,7 +574,7 @@ impl SrtpContext {
                 .encrypt(Nonce::from_slice(&nonce), payload)
                 .map_err(|_| SrtpError::AuthenticationFailed)?;
 
-            packet.payload = ciphertext;
+            packet.payload = Bytes::from(ciphertext);
             self.update(packet.header.sequence_number, roc);
             return Ok(());
         }
@@ -581,7 +582,9 @@ impl SrtpContext {
         self.cipher_payload(packet, roc)?;
         let auth_input = packet.marshal()?;
         let tag = self.auth_tag(&auth_input, roc)?;
-        packet.payload.extend_from_slice(&tag);
+        let mut with_tag = packet.payload.to_vec();
+        with_tag.extend_from_slice(&tag);
+        packet.payload = Bytes::from(with_tag);
         self.update(packet.header.sequence_number, roc);
         Ok(())
     }
@@ -607,7 +610,7 @@ impl SrtpContext {
             packet.payload = original_payload;
 
             let payload = Payload {
-                msg: &packet.payload,
+                msg: packet.payload.as_ref(),
                 aad: &aad,
             };
 
@@ -615,14 +618,15 @@ impl SrtpContext {
                 .decrypt(Nonce::from_slice(&nonce), payload)
                 .map_err(|_| SrtpError::AuthenticationFailed)?;
 
-            packet.payload = plaintext;
+            packet.payload = Bytes::from(plaintext);
             self.update(packet.header.sequence_number, roc);
             return Ok(());
         }
 
         let split = packet.payload.len() - tag_len;
         let tag = packet.payload[split..].to_vec();
-        packet.payload.truncate(split);
+        // Truncate the auth tag via a zero-copy slice (Bytes is immutable).
+        packet.payload = packet.payload.slice(..split);
         let auth_input = packet.marshal()?;
         let expected = self.auth_tag(&auth_input, roc)?;
         if !constant_time_eq(&tag, &expected) {
@@ -643,7 +647,12 @@ impl SrtpContext {
                 let iv = self.build_iv(packet.header.sequence_number, roc);
                 let mut cipher = Aes128Ctr::new_from_slices(&self.rtp_keys.cipher_key[..16], &iv)
                     .map_err(|_| SrtpError::UnsupportedProfile)?;
-                cipher.apply_keystream(&mut packet.payload);
+                // `Bytes` is immutable; copy into a mutable buffer, apply the
+                // keystream, then write back. SRTP is the WebRTC-only path so
+                // this copy does not affect the plain-RTP forwarding hot path.
+                let mut buf = packet.payload.to_vec();
+                cipher.apply_keystream(&mut buf);
+                packet.payload = Bytes::from(buf);
                 Ok(())
             }
             _ => Err(SrtpError::UnsupportedProfile),
@@ -806,7 +815,10 @@ mod tests {
         .unwrap();
         let mut packet = sample_packet(1);
         ctx.protect(&mut packet).unwrap();
-        packet.payload[0] ^= 0xFF;
+        // Tamper with the first payload byte (must copy since Bytes is immutable).
+        let mut tampered = packet.payload.to_vec();
+        tampered[0] ^= 0xFF;
+        packet.payload = Bytes::from(tampered);
         let err = ctx.unprotect(&mut packet).unwrap_err();
         assert!(matches!(err, SrtpError::AuthenticationFailed));
     }

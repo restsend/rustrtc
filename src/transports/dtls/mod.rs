@@ -1930,7 +1930,7 @@ use std::net::SocketAddr;
 
 #[async_trait::async_trait]
 impl PacketReceiver for DtlsTransport {
-    async fn receive(&self, packet: Bytes, _addr: SocketAddr) {
+    async fn receive(&self, packet: Bytes, _addr: SocketAddr, _marshal_buf: &mut Vec<u8>) {
         if self.inner.handshake_rx_feeder.send(packet).is_err() {
             warn!("DTLS handshake channel closed, dropping inbound packet");
         }

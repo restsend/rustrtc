@@ -11,10 +11,11 @@ use tokio::sync::watch;
 fn spawn_socket_pump(socket: Arc<UdpSocket>, conn: Arc<IceConn>) {
     tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];
+        let mut marshal_buf = Vec::new();
         loop {
             if let Ok((len, addr)) = socket.recv_from(&mut buf).await {
                 let packet = Bytes::copy_from_slice(&buf[..len]);
-                conn.receive(packet, addr).await;
+                conn.receive(packet, addr, &mut marshal_buf).await;
             }
         }
     });
@@ -98,10 +99,11 @@ async fn test_dtls_handshake_server_hello() -> Result<()> {
     let server_conn_clone = server_conn.clone();
     tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];
+        let mut marshal_buf = Vec::new();
         loop {
             if let Ok((len, addr)) = server_socket_clone.recv_from(&mut buf).await {
                 let packet = Bytes::copy_from_slice(&buf[..len]);
-                server_conn_clone.receive(packet, addr).await;
+                server_conn_clone.receive(packet, addr, &mut marshal_buf).await;
             }
         }
     });

@@ -5423,6 +5423,11 @@ pub struct RtpReceiver {
     track_ready_event_tx: Mutex<Option<mpsc::UnboundedSender<PeerConnectionEvent>>>,
     track_ready_transceiver: Mutex<Option<Weak<RtpTransceiver>>>,
     track_event_sent: AtomicBool,
+    /// Lock-free clock-rate cache keyed by payload type. The mapping is static
+    /// after SDP negotiation, so the per-packet receive path can skip the
+    /// `payload_map` RwLock + `params` Mutex on every RTP packet.
+    clock_rate_cache_pt: AtomicU8,
+    clock_rate_cache: AtomicU32,
     pub depacketizer_factory: Arc<dyn DepacketizerFactory>,
 }
 
@@ -5509,6 +5514,8 @@ impl RtpReceiverBuilder {
             track_ready_event_tx: Mutex::new(None),
             track_ready_transceiver: Mutex::new(None),
             track_event_sent: AtomicBool::new(false),
+            clock_rate_cache_pt: AtomicU8::new(u8::MAX),
+            clock_rate_cache: AtomicU32::new(0),
             depacketizer_factory: self.depacketizer_factory.unwrap_or_else(|| {
                 Arc::new(crate::media::depacketizer::DefaultDepacketizerFactory)
             }),
@@ -5561,6 +5568,8 @@ impl RtpReceiver {
             track_ready_event_tx: Mutex::new(None),
             track_ready_transceiver: Mutex::new(None),
             track_event_sent: AtomicBool::new(false),
+            clock_rate_cache_pt: AtomicU8::new(u8::MAX),
+            clock_rate_cache: AtomicU32::new(0),
             depacketizer_factory: Arc::new(crate::media::depacketizer::DefaultDepacketizerFactory),
         }
     }
@@ -5633,12 +5642,36 @@ impl RtpReceiver {
         self.packet_tx.lock().clone()
     }
 
+    #[allow(dead_code)]
     fn codec_params_for_payload_type(&self, payload_type: u8) -> RtpCodecParameters {
         self.payload_map
             .read()
             .get(&payload_type)
             .cloned()
             .unwrap_or_else(|| self.params.lock().clone())
+    }
+
+    /// Lock-free clock-rate lookup for the per-packet receive path. The
+    /// payload-type → clock-rate mapping is immutable after SDP negotiation,
+    /// so a couple of atomic loads replace a RwLock + Mutex acquisition on
+    /// every RTP packet. Misses populate the cache from the slow path.
+    fn clock_rate_for_payload_type(&self, payload_type: u8) -> u32 {
+        let cached_pt = self.clock_rate_cache_pt.load(Ordering::Relaxed);
+        if cached_pt == payload_type {
+            let cached = self.clock_rate_cache.load(Ordering::Relaxed);
+            if cached != 0 {
+                return cached;
+            }
+        }
+        let rate = self
+            .payload_map
+            .read()
+            .get(&payload_type)
+            .map(|p| p.clock_rate)
+            .unwrap_or_else(|| self.params.lock().clock_rate);
+        self.clock_rate_cache_pt.store(payload_type, Ordering::Relaxed);
+        self.clock_rate_cache.store(rate, Ordering::Relaxed);
+        rate
     }
 
     pub fn rtx_ssrc(&self) -> Option<u32> {
@@ -5918,8 +5951,10 @@ impl RtpReceiver {
                                                 }
                                             }
 
-                                            let params = this.codec_params_for_payload_type(packet.header.payload_type);
-                                            let clock_rate = params.clock_rate;
+                                            let clock_rate =
+                                                this.clock_rate_for_payload_type(
+                                                    packet.header.payload_type,
+                                                );
 
                                             // Track depacketizer drop count changes
                                             let prev_drop = depacketizer.drop_count();
@@ -6084,6 +6119,7 @@ mod tests {
         let conn = IceConn::new(socket_rx, initial_addr, None);
         conn.enable_latch_on_rtp();
 
+        let mut marshal_buf = Vec::new();
         conn.receive(
             bytes::Bytes::from_static(&[
                 0x80, 0x80, // V=2, marker=true
@@ -6092,6 +6128,7 @@ mod tests {
                 0x00, 0x00, 0x00, 0x01, // ssrc=1
             ]),
             rtp_src,
+            &mut marshal_buf,
         )
         .await;
         assert!(conn.rtp_latched.load(Ordering::Relaxed));

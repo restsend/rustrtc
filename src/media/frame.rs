@@ -143,7 +143,14 @@ impl MediaSample {
         header.csrcs = csrcs;
         header.extension = extension;
 
-        RtpPacket::new(header, payload.to_vec())
+        // `payload` is already a `Bytes` (cheap to clone / refcount). Building
+        // the packet directly avoids a `to_vec()` copy on every transmitted
+        // packet — the receive path already produces zero-copy `Bytes` slices.
+        RtpPacket {
+            header,
+            payload,
+            padding_len: 0,
+        }
     }
 
     pub fn from_rtp_packet(

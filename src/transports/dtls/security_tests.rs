@@ -52,10 +52,11 @@ async fn test_dtls_handshake_with_fingerprint_verification() -> Result<()> {
         let conn = client_conn.clone();
         async move {
             let mut buf = vec![0u8; 2048];
+            let mut marshal_buf = Vec::new();
             loop {
                 if let Ok((len, addr)) = socket.recv_from(&mut buf).await {
                     let packet = Bytes::copy_from_slice(&buf[..len]);
-                    conn.receive(packet, addr).await;
+                    conn.receive(packet, addr, &mut marshal_buf).await;
                 }
             }
         }
@@ -65,10 +66,11 @@ async fn test_dtls_handshake_with_fingerprint_verification() -> Result<()> {
         let conn = server_conn.clone();
         async move {
             let mut buf = vec![0u8; 2048];
+            let mut marshal_buf = Vec::new();
             loop {
                 if let Ok((len, addr)) = socket.recv_from(&mut buf).await {
                     let packet = Bytes::copy_from_slice(&buf[..len]);
-                    conn.receive(packet, addr).await;
+                    conn.receive(packet, addr, &mut marshal_buf).await;
                 }
             }
         }
@@ -152,10 +154,11 @@ async fn test_dtls_handshake_rejects_wrong_fingerprint() -> Result<()> {
         let conn = client_conn.clone();
         async move {
             let mut buf = vec![0u8; 2048];
+            let mut marshal_buf = Vec::new();
             loop {
                 if let Ok((len, addr)) = socket.recv_from(&mut buf).await {
                     let packet = Bytes::copy_from_slice(&buf[..len]);
-                    conn.receive(packet, addr).await;
+                    conn.receive(packet, addr, &mut marshal_buf).await;
                 }
             }
         }
@@ -165,10 +168,11 @@ async fn test_dtls_handshake_rejects_wrong_fingerprint() -> Result<()> {
         let conn = server_conn.clone();
         async move {
             let mut buf = vec![0u8; 2048];
+            let mut marshal_buf = Vec::new();
             loop {
                 if let Ok((len, addr)) = socket.recv_from(&mut buf).await {
                     let packet = Bytes::copy_from_slice(&buf[..len]);
-                    conn.receive(packet, addr).await;
+                    conn.receive(packet, addr, &mut marshal_buf).await;
                 }
             }
         }
@@ -237,10 +241,11 @@ async fn test_dtls_encrypted_data_exchange() -> Result<()> {
         let conn = client_conn.clone();
         async move {
             let mut buf = vec![0u8; 2048];
+            let mut marshal_buf = Vec::new();
             loop {
                 if let Ok((len, addr)) = socket.recv_from(&mut buf).await {
                     let packet = Bytes::copy_from_slice(&buf[..len]);
-                    conn.receive(packet, addr).await;
+                    conn.receive(packet, addr, &mut marshal_buf).await;
                 }
             }
         }
@@ -250,10 +255,11 @@ async fn test_dtls_encrypted_data_exchange() -> Result<()> {
         let conn = server_conn.clone();
         async move {
             let mut buf = vec![0u8; 2048];
+            let mut marshal_buf = Vec::new();
             loop {
                 if let Ok((len, addr)) = socket.recv_from(&mut buf).await {
                     let packet = Bytes::copy_from_slice(&buf[..len]);
-                    conn.receive(packet, addr).await;
+                    conn.receive(packet, addr, &mut marshal_buf).await;
                 }
             }
         }

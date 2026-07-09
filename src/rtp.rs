@@ -1,4 +1,5 @@
 use crate::errors::{RtpError, RtpResult};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::time::SystemTime;
@@ -24,12 +25,15 @@ pub const RTCP_PSFB_APP: u8 = 15; // REMB lives under APP-format payload feedbac
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RtpHeaderExtension {
     pub profile: u16,
-    pub data: Vec<u8>,
+    pub data: Bytes,
 }
 
 impl RtpHeaderExtension {
     pub fn new(profile: u16, data: Vec<u8>) -> Self {
-        Self { profile, data }
+        Self {
+            profile,
+            data: Bytes::from(data),
+        }
     }
 }
 
@@ -57,7 +61,7 @@ impl RtpHeader {
         }
     }
 
-    pub fn get_extension(&self, id: u8) -> Option<Vec<u8>> {
+    pub fn get_extension(&self, id: u8) -> Option<Bytes> {
         if let Some(ext) = &self.extension {
             if ext.profile == 0xBEDE {
                 let mut offset = 0;
@@ -77,7 +81,7 @@ impl RtpHeader {
 
                     if ext_id == id {
                         if offset + len <= ext.data.len() {
-                            return Some(ext.data[offset..offset + len].to_vec());
+                            return Some(ext.data.slice(offset..offset + len));
                         } else {
                             return None;
                         }
@@ -102,7 +106,7 @@ impl RtpHeader {
 
                     if ext_id == id {
                         if offset + len <= ext.data.len() {
-                            return Some(ext.data[offset..offset + len].to_vec());
+                            return Some(ext.data.slice(offset..offset + len));
                         } else {
                             return None;
                         }
@@ -177,7 +181,7 @@ impl RtpHeader {
             new_data.push(0);
         }
 
-        ext.data = new_data;
+        ext.data = Bytes::from(new_data);
         self.extension = Some(ext);
         Ok(())
     }
@@ -200,7 +204,7 @@ impl RtpHeader {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RtpPacket {
     pub header: RtpHeader,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
     pub padding_len: u8,
 }
 
@@ -208,12 +212,20 @@ impl RtpPacket {
     pub fn new(header: RtpHeader, payload: Vec<u8>) -> Self {
         Self {
             header,
-            payload,
+            payload: Bytes::from(payload),
             padding_len: 0,
         }
     }
 
     pub fn parse(raw: &[u8]) -> RtpResult<Self> {
+        Self::parse_bytes(Bytes::copy_from_slice(raw))
+    }
+
+    /// Zero-copy parse: the returned packet's payload and extension data are
+    /// cheap (`Bytes`) slices of `buf` rather than independent heap allocations.
+    /// Use this on the receive hot path when you already own the packet bytes.
+    pub fn parse_bytes(buf: Bytes) -> RtpResult<Self> {
+        let raw: &[u8] = buf.as_ref();
         if raw.len() < 12 {
             return Err(RtpError::PacketTooShort);
         }
@@ -261,10 +273,10 @@ impl RtpPacket {
             if raw.len() < offset + extension_len {
                 return Err(RtpError::PacketTooShort);
             }
-            extension_header = Some(RtpHeaderExtension::new(
+            extension_header = Some(RtpHeaderExtension {
                 profile,
-                raw[offset..offset + extension_len].to_vec(),
-            ));
+                data: buf.slice(offset..offset + extension_len),
+            });
             offset += extension_len;
         }
 
@@ -277,7 +289,7 @@ impl RtpPacket {
             }
             payload_end -= padding_len as usize;
         }
-        let payload = raw[offset..payload_end].to_vec();
+        let payload = buf.slice(offset..payload_end);
 
         let header = RtpHeader {
             marker,
@@ -298,41 +310,54 @@ impl RtpPacket {
 
     pub fn marshal(&self) -> RtpResult<Vec<u8>> {
         self.header.validate()?;
-        let mut buffer = Vec::with_capacity(12 + self.header.csrcs.len() * 4 + self.payload.len());
+        let mut buf = Vec::new();
+        Self::marshal_impl(self, &mut buf);
+        Ok(buf)
+    }
+
+    /// Serialize into a pre-allocated buffer, reusing its capacity across
+    /// calls. Avoids the per-packet `Vec::with_capacity` + grow cycle in
+    /// `marshal()` — used by the RTP bridge fast-path.
+    pub fn marshal_into(&self, buf: &mut Vec<u8>) {
+        buf.clear();
+        Self::marshal_impl(self, buf);
+    }
+
+    fn marshal_impl(packet: &RtpPacket, buffer: &mut Vec<u8>) {
+        buffer.reserve(12 + packet.header.csrcs.len() * 4 + packet.payload.len() as usize);
         let mut b0 = RTP_VERSION << 6;
-        if self.padding_len > 0 {
+        if packet.padding_len > 0 {
             b0 |= 0x20;
         }
-        if self.header.extension.is_some() {
+        if packet.header.extension.is_some() {
             b0 |= 0x10;
         }
-        b0 |= (self.header.csrcs.len() & 0x0F) as u8;
-        let mut b1 = self.header.payload_type & 0x7F;
-        if self.header.marker {
+        b0 |= (packet.header.csrcs.len() & 0x0F) as u8;
+        let mut b1 = packet.header.payload_type & 0x7F;
+        if packet.header.marker {
             b1 |= 0x80;
         }
         buffer.push(b0);
         buffer.push(b1);
-        buffer.extend_from_slice(&self.header.sequence_number.to_be_bytes());
-        buffer.extend_from_slice(&self.header.timestamp.to_be_bytes());
-        buffer.extend_from_slice(&self.header.ssrc.to_be_bytes());
-        for csrc in &self.header.csrcs {
+        buffer.extend_from_slice(&packet.header.sequence_number.to_be_bytes());
+        buffer.extend_from_slice(&packet.header.timestamp.to_be_bytes());
+        buffer.extend_from_slice(&packet.header.ssrc.to_be_bytes());
+        for csrc in &packet.header.csrcs {
             buffer.extend_from_slice(&csrc.to_be_bytes());
         }
-        if let Some(extension) = &self.header.extension {
+        if let Some(extension) = &packet.header.extension {
             let length_words = (extension.data.len() / 4) as u16;
             buffer.extend_from_slice(&extension.profile.to_be_bytes());
             buffer.extend_from_slice(&length_words.to_be_bytes());
             buffer.extend_from_slice(&extension.data);
         }
-        buffer.extend_from_slice(&self.payload);
-        if self.padding_len > 0 {
+        buffer.extend_from_slice(&packet.payload);
+        if packet.padding_len > 0 {
             buffer.extend(std::iter::repeat_n(
-                self.padding_len,
-                self.padding_len as usize,
+                packet.padding_len,
+                packet.padding_len as usize,
             ));
         }
-        Ok(buffer)
     }
 }
 
@@ -1037,7 +1062,7 @@ mod tests {
         header.extension = Some(RtpHeaderExtension::new(0xBEDE, vec![0, 1, 2, 3]));
         let packet = RtpPacket {
             header,
-            payload: vec![9, 8, 7, 6],
+            payload: Bytes::from(vec![9, 8, 7, 6]),
             padding_len: 0,
         };
         let serialized = packet.marshal().unwrap();
@@ -1176,8 +1201,8 @@ mod tests {
         // Total: 11 11 22 20 FF -> pad to 8 bytes: 11 11 22 20 FF 00 00 00
         assert!(header.get_extension(1).is_some());
         assert!(header.get_extension(2).is_some());
-        assert_eq!(header.get_extension(1).unwrap(), vec![0x11, 0x22]);
-        assert_eq!(header.get_extension(2).unwrap(), vec![0xFF]);
+        assert_eq!(header.get_extension(1).unwrap(), Bytes::from_static(&[0x11, 0x22]));
+        assert_eq!(header.get_extension(2).unwrap(), Bytes::from_static(&[0xFF]));
     }
 
     #[test]

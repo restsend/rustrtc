@@ -316,6 +316,7 @@ impl IceTransportRunner {
 
     async fn run_udp_read_loop(socket: Arc<UdpSocket>, inner: Arc<IceTransportInner>) {
         let mut buf = [0u8; 1500];
+        let mut marshal_buf = Vec::with_capacity(200);
         let mut state_rx = inner.state.subscribe();
         let sender = IceSocketWrapper::Udp(socket.clone());
         trace!("Read loop started for {:?}", socket.local_addr());
@@ -346,6 +347,7 @@ impl IceTransportRunner {
                                 addr,
                                 inner.clone(),
                                 sender.clone(),
+                                &mut marshal_buf,
                             )
                             .await;
                         }
@@ -369,6 +371,7 @@ impl IceTransportRunner {
         inner: Arc<IceTransportInner>,
     ) {
         let mut state_rx = inner.state.subscribe();
+        let mut marshal_buf = Vec::with_capacity(200);
         let sender = IceSocketWrapper::SharedUdp(handle.clone());
         trace!("Shared UDP read loop started");
         loop {
@@ -390,7 +393,7 @@ impl IceTransportRunner {
             };
             match packet_opt {
                 Some((packet, addr)) => {
-                    handle_packet(&packet, addr, inner.clone(), sender.clone()).await;
+                    handle_packet(&packet, addr, inner.clone(), sender.clone(), &mut marshal_buf).await;
                 }
                 None => break,
             }
@@ -403,6 +406,7 @@ impl IceTransportRunner {
         inner: Arc<IceTransportInner>,
     ) {
         let mut buf = [0u8; 1500];
+        let mut marshal_buf = Vec::with_capacity(200);
         let mut state_rx = inner.state.subscribe();
         trace!("Read loop started for TURN client {}", relayed_addr);
         loop {
@@ -413,7 +417,7 @@ impl IceTransportRunner {
                     match result {
                         Ok(len) => {
                             if len > 0 {
-                                IceTransport::handle_turn_packet(&buf[..len], &inner, &client, relayed_addr).await;
+                                IceTransport::handle_turn_packet(&buf[..len], &inner, &client, relayed_addr, &mut marshal_buf).await;
                             }
                         }
                         Err(e) => {
@@ -478,6 +482,7 @@ impl IceTransportRunner {
         inner: Arc<IceTransportInner>,
     ) {
         let mut buf = [0u8; 65_535];
+        let mut marshal_buf = Vec::with_capacity(200);
         let mut state_rx = inner.state.subscribe();
         let sender = IceSocketWrapper::TcpStream(read, write, peer_addr);
         trace!("TCP read loop started for peer {}", peer_addr);
@@ -492,6 +497,7 @@ impl IceTransportRunner {
                                     addr,
                                     inner.clone(),
                                     sender.clone(),
+                                    &mut marshal_buf,
                                 )
                                 .await;
                             }
@@ -1513,8 +1519,9 @@ impl IceTransport {
             buffer.drain(..).collect()
         };
 
+        let mut marshal_buf = Vec::new();
         for (packet, addr) in packets {
-            receiver.receive(Bytes::from(packet), addr).await;
+            receiver.receive(Bytes::from(packet), addr, &mut marshal_buf).await;
         }
     }
 
@@ -1527,6 +1534,7 @@ impl IceTransport {
         inner: &Arc<IceTransportInner>,
         client: &Arc<TurnClient>,
         relayed_addr: SocketAddr,
+        marshal_buf: &mut Vec<u8>,
     ) {
         // Check for ChannelData (0x4000 - 0x7FFF)
         if packet.len() >= 4 {
@@ -1541,6 +1549,7 @@ impl IceTransport {
                             peer_addr,
                             inner.clone(),
                             IceSocketWrapper::Turn(client.clone(), relayed_addr),
+                            marshal_buf,
                         )
                         .await;
                     }
@@ -1559,6 +1568,7 @@ impl IceTransport {
                         peer_addr,
                         inner.clone(),
                         IceSocketWrapper::Turn(client.clone(), relayed_addr),
+                        marshal_buf,
                     )
                     .await;
                 }
@@ -1569,6 +1579,7 @@ impl IceTransport {
                     relayed_addr,
                     inner.clone(),
                     IceSocketWrapper::Turn(client.clone(), relayed_addr),
+                    marshal_buf,
                 )
                 .await;
             }
@@ -2073,6 +2084,7 @@ async fn handle_packet(
     addr: SocketAddr,
     inner: Arc<IceTransportInner>,
     sender: IceSocketWrapper,
+    marshal_buf: &mut Vec<u8>,
 ) {
     if should_drop_packet() {
         return;
@@ -2140,7 +2152,7 @@ async fn handle_packet(
         // DTLS or RTP
         let receiver = inner.data_receiver.lock().clone();
         if let Some(rx) = receiver {
-            rx.receive(Bytes::copy_from_slice(packet), addr).await;
+            rx.receive(Bytes::copy_from_slice(packet), addr, marshal_buf).await;
         } else {
             let mut buffer = inner.buffered_packets.lock();
             let stats = inner.buffer_stats.clone();
@@ -2686,7 +2698,8 @@ pub(crate) async fn attach_demuxed_tcp_stream(
         .gatherer
         .store_tcp_stream(listen_addr, wrapper.clone());
     let _ = inner.gatherer.socket_tx.send(wrapper.clone());
-    handle_packet(&first_packet, peer_addr, inner, wrapper).await;
+    let mut marshal_buf = Vec::new();
+    handle_packet(&first_packet, peer_addr, inner, wrapper, &mut marshal_buf).await;
 }
 
 pub(crate) async fn tcp_write_all(write: &Arc<Mutex<TcpWriteHalf>>, data: &[u8]) -> Result<()> {
@@ -4280,6 +4293,29 @@ impl IceSocketWrapper {
             ),
             IceSocketWrapper::TcpStream(_, _, peer) => format!("tcp-stream:peer={peer}"),
             IceSocketWrapper::Turn(_, addr) => format!("turn:{addr}"),
+        }
+    }
+
+    /// Non-blocking variant of `send_to`: calls `try_send_to` once and returns
+    /// immediately on `WouldBlock` / `ENOBUFS` instead of parking on
+    /// `writable()`. Used by the RTP bridge fast-path.
+    pub fn try_send_to(&self, data: &[u8], addr: SocketAddr) -> Result<usize> {
+        match self {
+            IceSocketWrapper::Udp(s) => match s.try_send_to(data, addr) {
+                Ok(len) => Ok(len),
+                Err(e) => {
+                    let reason = match s.local_addr() {
+                        Ok(local) => format!("UDP {} -> {} failed: {}", local, addr, e),
+                        Err(_) => format!("UDP -> {} failed: {}", addr, e),
+                    };
+                    Err(anyhow!(reason))
+                }
+            },
+            // Non-UDP transports (TCP/TLS/TURN) are not used by the bridge
+            // fast-path; fall back to the async variant.
+            _ => Err(anyhow::anyhow!(
+                "IceSocketWrapper::try_send_to not supported for this transport variant"
+            )),
         }
     }
 

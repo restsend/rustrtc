@@ -71,11 +71,12 @@ async fn test_interop_rustrtc_client_webrtc_server() -> Result<()> {
     let reader_clone = socket_reader.clone();
     tokio::spawn(async move {
         let mut buf = [0u8; 1500];
+        let mut marshal_buf = Vec::new();
         loop {
             match reader_clone.recv_from(&mut buf).await {
                 Ok((len, addr)) => {
                     let packet = Bytes::copy_from_slice(&buf[..len]);
-                    conn_clone.receive(packet, addr).await;
+                    conn_clone.receive(packet, addr, &mut marshal_buf).await;
                 }
                 Err(e) => {
                     error!("Client socket read error: {}", e);
@@ -226,11 +227,12 @@ async fn test_interop_rustrtc_client_openssl_server() -> Result<()> {
     let reader_clone = socket_reader.clone();
     tokio::spawn(async move {
         let mut buf = [0u8; 1500];
+        let mut marshal_buf = Vec::new();
         loop {
             match reader_clone.recv_from(&mut buf).await {
                 Ok((len, addr)) => {
                     let packet = Bytes::copy_from_slice(&buf[..len]);
-                    conn_clone.receive(packet, addr).await;
+                    conn_clone.receive(packet, addr, &mut marshal_buf).await;
                 }
                 Err(e) => {
                     error!("Client socket read error: {}", e);

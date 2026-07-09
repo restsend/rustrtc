@@ -95,10 +95,11 @@ async fn bench_dtls() {
     let conn1_clone = conn1.clone();
     tokio::spawn(async move {
         let mut buf = [0u8; 2000];
+        let mut marshal_buf = Vec::new();
         loop {
             if let Ok((len, addr)) = s1_clone.recv_from(&mut buf).await {
                 let packet = Bytes::copy_from_slice(&buf[..len]);
-                conn1_clone.receive(packet, addr).await;
+                conn1_clone.receive(packet, addr, &mut marshal_buf).await;
             }
         }
     });
@@ -107,10 +108,11 @@ async fn bench_dtls() {
     let conn2_clone = conn2.clone();
     tokio::spawn(async move {
         let mut buf = [0u8; 2000];
+        let mut marshal_buf = Vec::new();
         loop {
             if let Ok((len, addr)) = s2_clone.recv_from(&mut buf).await {
                 let packet = Bytes::copy_from_slice(&buf[..len]);
-                conn2_clone.receive(packet, addr).await;
+                conn2_clone.receive(packet, addr, &mut marshal_buf).await;
             }
         }
     });

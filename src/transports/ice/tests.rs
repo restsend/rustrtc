@@ -326,7 +326,7 @@ async fn turn_connection_relay_to_host() -> Result<()> {
     struct TestReceiver(tokio::sync::mpsc::Sender<Bytes>);
     #[async_trait::async_trait]
     impl PacketReceiver for TestReceiver {
-        async fn receive(&self, packet: Bytes, _addr: SocketAddr) {
+        async fn receive(&self, packet: Bytes, _addr: SocketAddr, _buf: &mut Vec<u8>) {
             let _ = self.0.send(packet).await;
         }
     }
@@ -755,7 +755,7 @@ async fn test_ice_lite_connectivity_establishment() -> Result<()> {
 
     #[async_trait::async_trait]
     impl PacketReceiver for DataReceiver {
-        async fn receive(&self, packet: Bytes, _addr: SocketAddr) {
+        async fn receive(&self, packet: Bytes, _addr: SocketAddr, _buf: &mut Vec<u8>) {
             // Filter out STUN packets (first byte is 0x00 or 0x01)
             // RTP/data packets have first byte >= 0x80 or are text data
             if !packet.is_empty() && packet[0] >= 2 {
@@ -1966,7 +1966,7 @@ async fn test_dtls_proceeds_after_nomination_timeout() -> Result<()> {
     struct Chan(tokio::sync::mpsc::UnboundedSender<bytes::Bytes>);
     #[async_trait::async_trait]
     impl PacketReceiver for Chan {
-        async fn receive(&self, packet: bytes::Bytes, _addr: std::net::SocketAddr) {
+        async fn receive(&self, packet: bytes::Bytes, _addr: std::net::SocketAddr, _buf: &mut Vec<u8>) {
             let _ = self.0.send(packet);
         }
     }
@@ -2872,7 +2872,7 @@ async fn test_buffered_dtls_packets_delivered_when_dtls_receiver_registered_firs
     struct DtlsRecorder(tokio::sync::mpsc::UnboundedSender<Bytes>);
     #[async_trait::async_trait]
     impl PacketReceiver for DtlsRecorder {
-        async fn receive(&self, packet: Bytes, _addr: SocketAddr) {
+        async fn receive(&self, packet: Bytes, _addr: SocketAddr, _buf: &mut Vec<u8>) {
             let _ = self.0.send(packet);
         }
     }
@@ -3798,8 +3798,8 @@ async fn test_handle_packet_dispatches_error_response_to_pending_transactions() 
     let dummy_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let sender = IceSocketWrapper::Udp(dummy_sock);
     let addr: SocketAddr = "127.0.0.1:3478".parse().unwrap();
-
-    handle_packet(&packet, addr, transport.inner.clone(), sender).await;
+    let mut marshal_buf = Vec::new();
+    handle_packet(&packet, addr, transport.inner.clone(), sender, &mut marshal_buf).await;
 
     // The oneshot MUST have been resolved immediately — no timeout path.
     let result = timeout(Duration::from_millis(200), rx).await;
@@ -3840,8 +3840,8 @@ async fn test_handle_packet_dispatches_401_to_pending_transactions() {
     let dummy_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let sender = IceSocketWrapper::Udp(dummy_sock);
     let addr: SocketAddr = "127.0.0.1:3478".parse().unwrap();
-
-    handle_packet(&packet, addr, transport.inner.clone(), sender).await;
+    let mut marshal_buf = Vec::new();
+    handle_packet(&packet, addr, transport.inner.clone(), sender, &mut marshal_buf).await;
 
     let result = timeout(Duration::from_millis(200), rx).await;
     assert!(
@@ -3877,8 +3877,8 @@ async fn test_handle_packet_ignores_unmatched_error_response() {
     let dummy_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let sender = IceSocketWrapper::Udp(dummy_sock);
     let addr: SocketAddr = "127.0.0.1:3478".parse().unwrap();
-
-    handle_packet(&packet, addr, transport.inner.clone(), sender).await;
+    let mut marshal_buf = Vec::new();
+    handle_packet(&packet, addr, transport.inner.clone(), sender, &mut marshal_buf).await;
 
     // The registered channel must NOT have received anything.
     let result = timeout(Duration::from_millis(50), rx).await;
