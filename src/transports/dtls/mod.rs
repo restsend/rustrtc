@@ -41,6 +41,7 @@ use self::record::{ContentType, DtlsRecord, ProtocolVersion};
 use crate::transports::ice::conn::IceConn;
 use tracing::{debug, info, trace, warn};
 
+/// Generate a fresh self-signed DTLS certificate (EC keypair + PEM round-trip).
 pub fn generate_certificate() -> Result<Certificate> {
     let cert = generate_simple_self_signed(vec!["localhost".to_string()])?;
     let pem = cert.signing_key.serialize_pem();
@@ -153,7 +154,7 @@ pub fn get_client_hello_cipher_suites() -> Vec<u16> {
     ]
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Certificate {
     pub certificate: Vec<Vec<u8>>,
     pub private_key: String, // PEM encoded key

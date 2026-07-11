@@ -373,9 +373,16 @@ impl PeerConnection {
     pub fn new(config: RtcConfiguration) -> Self {
         let is_rtp_mode = config.transport_mode == TransportMode::Rtp;
         let (ice_transport, ice_runner) = IceTransport::new(config.clone());
-        let certificate =
-            Arc::new(dtls::generate_certificate().expect("failed to generate certificate"));
-        let dtls_fingerprint = dtls::fingerprint(&certificate);
+        // Only WebRtc/Srtp modes use DTLS. Skip the expensive EC keypair
+        // generation + PEM round-trip for plain RTP mode.
+        let (certificate, dtls_fingerprint) = if is_rtp_mode {
+            (Arc::new(dtls::Certificate::default()), String::new())
+        } else {
+            let cert =
+                Arc::new(dtls::generate_certificate().expect("failed to generate certificate"));
+            let fp = dtls::fingerprint(&cert);
+            (cert, fp)
+        };
 
         let (signaling_state_tx, signaling_state_rx) = watch::channel(SignalingState::Stable);
         let (peer_state_tx, peer_state_rx) = watch::channel(PeerConnectionState::New);
