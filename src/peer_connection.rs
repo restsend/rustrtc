@@ -32,7 +32,7 @@ use std::{
     },
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tracing::{debug, info, trace, warn};
 
 use async_trait::async_trait;
@@ -40,6 +40,32 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Weak;
+
+/// Guard stored inside a spawned transport-loop task: fires
+/// `Notify::notify_one` when dropped so the "first-done" future always wakes —
+/// even if the loop ends by panicking.
+struct TransportLoopDone(Arc<Notify>);
+impl Drop for TransportLoopDone {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
+/// Owns the `JoinHandle`s of the spawned transport-loop tasks and aborts every
+/// one of them when dropped. It lives inside the future returned by
+/// `spawn_transport_loops`, so dropping that returned future (e.g. when the
+/// caller returns on ICE disconnect, or when the connection task is itself
+/// aborted on `Drop`) hard-cancels every remaining loop — replicating the old
+/// "drop the combined `select!` future" semantics without needing a
+/// cancellation token or a per-task `select!` branch.
+struct LoopsGuard(Vec<tokio::task::JoinHandle<()>>);
+impl Drop for LoopsGuard {
+    fn drop(&mut self) {
+        for handle in self.0.drain(..) {
+            handle.abort();
+        }
+    }
+}
 
 #[async_trait]
 pub trait RtpSenderInterceptor: Send + Sync {
@@ -1459,6 +1485,46 @@ impl PeerConnection {
         Ok(())
     }
 
+    /// Spawn each transport loop (RTCP reader, SCTP runner, DataChannel
+    /// listener, pair monitor, …) as its own background task and return a single
+    /// lightweight future that resolves as soon as the *first* loop exits.
+    ///
+    /// Previously these loops were fused into one `select!` future polled deep
+    /// inside the connection state machine, which nested the SCTP transmit /
+    /// DTLS send call chain under `handle_connected_state`'s poll stack.
+    /// Moving each loop onto its own task truncates that poll depth (each heavy
+    /// future is now polled on a standalone worker stack instead of being
+    /// resumed inline several `await` frames down).
+    ///
+    /// The returned future owns a `LoopsGuard` holding every task's
+    /// `JoinHandle`: when it is dropped — because the caller returns (ICE
+    /// disconnect) or because the connection task is aborted on `Drop` — every
+    /// remaining loop is hard-aborted, exactly like dropping the old combined
+    /// `select!` future used to cancel its branches. No cancellation token or
+    /// per-task `select!` is needed: `JoinHandle::abort` cancels at the next
+    /// `await` point, the same place a dropped future stops.
+    fn spawn_transport_loops(
+        &self,
+        loops: Vec<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let done = Arc::new(Notify::new());
+        let mut handles = Vec::with_capacity(loops.len());
+
+        for fut in loops {
+            let done = done.clone();
+            let handle = tokio::spawn(async move {
+                let _done = TransportLoopDone(done);
+                fut.await;
+            });
+            handles.push(handle);
+        }
+
+        Box::pin(async move {
+            let _guard = LoopsGuard(handles);
+            done.notified().await;
+        })
+    }
+
     pub(crate) async fn start_dtls(
         &self,
         is_client: bool,
@@ -1550,13 +1616,10 @@ impl PeerConnection {
                 self.inner.stats_collector.clone(),
             );
             let pair_monitor = Self::create_pair_monitor(pair_rx.clone(), ice_conn_monitor.clone());
-            let combined_loop = async move {
-                tokio::select! {
-                    _ = rtcp_loop => {},
-                    _ = pair_monitor => {},
-                }
-            };
-            return Ok(Box::pin(combined_loop) as Pin<Box<dyn Future<Output = ()> + Send>>);
+            return Ok(self.spawn_transport_loops(vec![
+                Box::pin(rtcp_loop),
+                Box::pin(pair_monitor),
+            ]));
         }
 
         if self.config().transport_mode == TransportMode::Rtp {
@@ -1582,13 +1645,10 @@ impl PeerConnection {
                 self.attach_rtp_transport_to_transceiver(t, selected_transport);
             }
             let pair_monitor = Self::create_pair_monitor(pair_rx.clone(), ice_conn_monitor.clone());
-            let combined_loop = async move {
-                tokio::select! {
-                    _ = rtcp_loop => {},
-                    _ = pair_monitor => {},
-                }
-            };
-            return Ok(Box::pin(combined_loop) as Pin<Box<dyn Future<Output = ()> + Send>>);
+            return Ok(self.spawn_transport_loops(vec![
+                Box::pin(rtcp_loop),
+                Box::pin(pair_monitor),
+            ]));
         }
 
         let remote_dtls_fingerprint = self.inner.remote_dtls_fingerprint.lock().clone();
@@ -1708,15 +1768,12 @@ impl PeerConnection {
                     let pair_monitor =
                         Self::create_pair_monitor(pair_rx.clone(), ice_conn_monitor.clone());
 
-                    let combined: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
-                        tokio::select! {
-                            _ = rtcp_loop => {},
-                            _ = sctp_runner => {},
-                            _ = dc_listener => {},
-                            _ = pair_monitor => {},
-                        }
-                    });
-                    return Ok(combined);
+                    return Ok(self.spawn_transport_loops(vec![
+                        Box::pin(rtcp_loop),
+                        sctp_runner,
+                        dc_listener,
+                        Box::pin(pair_monitor),
+                    ]));
                 }
                 crate::transports::dtls::DtlsState::Failed => {
                     return Err(RtcError::Internal("DTLS handshake failed".into()));
