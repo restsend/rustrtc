@@ -10,8 +10,8 @@ use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use tokio::sync::mpsc;
 use tracing::{info, trace, warn};
 
@@ -455,7 +455,11 @@ impl RtpTransport {
         self.transport.send_rtcp(&protected).await
     }
 
-    fn try_bridge_rewrite_rtp(&self, mut packet: RtpPacket, marshal_buf: &mut Vec<u8>) -> Option<RtpPacket> {
+    fn try_bridge_rewrite_rtp(
+        &self,
+        mut packet: RtpPacket,
+        marshal_buf: &mut Vec<u8>,
+    ) -> Option<RtpPacket> {
         if !self.has_bridge.load(Ordering::Acquire) {
             return Some(packet);
         }
@@ -519,9 +523,7 @@ impl PacketReceiver for RtpTransport {
                     }
                 } else {
                     if self.srtp_required {
-                        trace!(
-                            "Dropping packet because SRTP is required but session is not ready"
-                        );
+                        trace!("Dropping packet because SRTP is required but session is not ready");
                         return;
                     }
                     packet.to_vec()
@@ -570,9 +572,7 @@ impl PacketReceiver for RtpTransport {
                     }
                 } else {
                     if self.srtp_required {
-                        trace!(
-                            "Dropping packet because SRTP is required but session is not ready"
-                        );
+                        trace!("Dropping packet because SRTP is required but session is not ready");
                         return;
                     }
                     // Plain-RTP fast path: zero-copy parse — the packet's
@@ -656,9 +656,7 @@ impl PacketReceiver for RtpTransport {
             } else {
                 trace!(
                     "No listener found for packet SSRC: {} PT: {} from {}",
-                    ssrc,
-                    pt,
-                    addr
+                    ssrc, pt, addr
                 );
             }
         }
@@ -745,7 +743,9 @@ mod tests {
         let packet1 = crate::rtp::RtpPacket::new(header1, vec![0u8; 160]);
         let bytes1 = packet1.marshal().unwrap();
         let mut marshal_buf = Vec::new();
-        transport.receive(Bytes::from(bytes1), addr, &mut marshal_buf).await;
+        transport
+            .receive(Bytes::from(bytes1), addr, &mut marshal_buf)
+            .await;
 
         let received1 = rx.recv().await.expect("Should receive packet 1");
         assert_eq!(received1.0.header.ssrc, ssrc1);
@@ -764,7 +764,9 @@ mod tests {
         let packet2 = crate::rtp::RtpPacket::new(header2, vec![1u8; 160]);
         let bytes2 = packet2.marshal().unwrap();
 
-        transport.receive(Bytes::from(bytes2), addr, &mut marshal_buf).await;
+        transport
+            .receive(Bytes::from(bytes2), addr, &mut marshal_buf)
+            .await;
 
         let received2 = rx.recv().await.expect("Should receive packet 2 (new SSRC)");
         assert_eq!(received2.0.header.ssrc, ssrc2);
@@ -775,7 +777,9 @@ mod tests {
         let packet3 = crate::rtp::RtpPacket::new(header3, vec![2u8; 160]);
         let bytes3 = packet3.marshal().unwrap();
 
-        transport.receive(Bytes::from(bytes3), addr, &mut marshal_buf).await;
+        transport
+            .receive(Bytes::from(bytes3), addr, &mut marshal_buf)
+            .await;
 
         let received3 = rx
             .recv()
@@ -963,11 +967,8 @@ mod tests {
             },
         );
 
-        let mut guard = src_transport
-            .rewrite_bridge
-            .lock();
-        let bridge = guard.as_mut()
-            .expect("rewrite bridge should be configured");
+        let mut guard = src_transport.rewrite_bridge.lock();
+        let bridge = guard.as_mut().expect("rewrite bridge should be configured");
 
         let mut packet = RtpPacket::new(crate::rtp::RtpHeader::new(0, 7, 1111, 100), vec![1u8; 32]);
         bridge.rewrite_packet(&mut packet);
@@ -978,5 +979,4 @@ mod tests {
         assert_eq!(packet.header.sequence_number, 32000);
         assert_eq!(packet.header.timestamp, 1111 + 12345);
     }
-
 }

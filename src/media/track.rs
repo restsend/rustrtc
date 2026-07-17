@@ -826,7 +826,8 @@ mod tests {
         source.send_audio(AudioFrame::default()).unwrap();
 
         let _pop_lock = source.pop_lock.lock();
-        source.send_audio(AudioFrame::default())
+        source
+            .send_audio(AudioFrame::default())
             .expect("send should not block while receiver lock is held");
     }
 

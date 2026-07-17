@@ -1966,7 +1966,12 @@ async fn test_dtls_proceeds_after_nomination_timeout() -> Result<()> {
     struct Chan(tokio::sync::mpsc::UnboundedSender<bytes::Bytes>);
     #[async_trait::async_trait]
     impl PacketReceiver for Chan {
-        async fn receive(&self, packet: bytes::Bytes, _addr: std::net::SocketAddr, _buf: &mut Vec<u8>) {
+        async fn receive(
+            &self,
+            packet: bytes::Bytes,
+            _addr: std::net::SocketAddr,
+            _buf: &mut Vec<u8>,
+        ) {
             let _ = self.0.send(packet);
         }
     }
@@ -3796,7 +3801,14 @@ async fn test_handle_packet_dispatches_error_response_to_pending_transactions() 
     let sender = IceSocketWrapper::Udp(dummy_sock);
     let addr: SocketAddr = "127.0.0.1:3478".parse().unwrap();
     let mut marshal_buf = Vec::new();
-    handle_packet(&packet, addr, transport.inner.clone(), sender, &mut marshal_buf).await;
+    handle_packet(
+        &packet,
+        addr,
+        transport.inner.clone(),
+        sender,
+        &mut marshal_buf,
+    )
+    .await;
 
     // The oneshot MUST have been resolved immediately — no timeout path.
     let result = timeout(Duration::from_millis(200), rx).await;
@@ -3838,7 +3850,14 @@ async fn test_handle_packet_dispatches_401_to_pending_transactions() {
     let sender = IceSocketWrapper::Udp(dummy_sock);
     let addr: SocketAddr = "127.0.0.1:3478".parse().unwrap();
     let mut marshal_buf = Vec::new();
-    handle_packet(&packet, addr, transport.inner.clone(), sender, &mut marshal_buf).await;
+    handle_packet(
+        &packet,
+        addr,
+        transport.inner.clone(),
+        sender,
+        &mut marshal_buf,
+    )
+    .await;
 
     let result = timeout(Duration::from_millis(200), rx).await;
     assert!(
@@ -3875,7 +3894,14 @@ async fn test_handle_packet_ignores_unmatched_error_response() {
     let sender = IceSocketWrapper::Udp(dummy_sock);
     let addr: SocketAddr = "127.0.0.1:3478".parse().unwrap();
     let mut marshal_buf = Vec::new();
-    handle_packet(&packet, addr, transport.inner.clone(), sender, &mut marshal_buf).await;
+    handle_packet(
+        &packet,
+        addr,
+        transport.inner.clone(),
+        sender,
+        &mut marshal_buf,
+    )
+    .await;
 
     // The registered channel must NOT have received anything.
     let result = timeout(Duration::from_millis(50), rx).await;

@@ -177,7 +177,12 @@ pub struct DefaultRtpSenderNackHandler {
     buffer: Mutex<VecDeque<RtpPacket>>,
     max_size: usize,
     pub nack_recv_count: AtomicU64,
-    rtx: Mutex<Option<crate::rtx::RtxSenderConfig>>,
+    rtx_config: Mutex<Option<crate::rtx::RtxSenderConfig>>,
+    /// Lock-free mirror of `rtx_config.rtx_ssrc` for the per-packet hot path.
+    /// `0` means RTX is disabled; any non-zero value is the active RTX SSRC.
+    /// Written under `rtx_config`'s mutex in `set_rtx`, read lock-free in
+    /// `on_packet_sent` so the send hot path never acquires the mutex.
+    rtx_ssrc_fast: AtomicU32,
     rtx_seq: AtomicU16,
     rtx_sent_count: AtomicU64,
 }
@@ -211,7 +216,8 @@ impl DefaultRtpSenderNackHandler {
             buffer: Mutex::new(VecDeque::with_capacity(max_size)),
             max_size,
             nack_recv_count: AtomicU64::new(0),
-            rtx: Mutex::new(None),
+            rtx_config: Mutex::new(None),
+            rtx_ssrc_fast: AtomicU32::new(0),
             rtx_seq: AtomicU16::new(random_u32() as u16),
             rtx_sent_count: AtomicU64::new(0),
         }
@@ -220,22 +226,26 @@ impl DefaultRtpSenderNackHandler {
     /// Enable or disable RFC 4588 RTX retransmission for NACK responses.
     /// When `None`, falls back to plain clone-resend of the original packet.
     pub fn set_rtx(&self, config: Option<crate::rtx::RtxSenderConfig>) {
-        *self.rtx.lock() = config;
+        let fast_ssrc = config.map(|c| c.rtx_ssrc).unwrap_or(0);
+        // Write the full config first, then publish the fast-path SSRC. Readers
+        // of the fast path only need the SSRC; the NACK path reads the mutex.
+        *self.rtx_config.lock() = config;
+        self.rtx_ssrc_fast.store(fast_ssrc, Ordering::Release);
     }
 
     pub fn rtx_config(&self) -> Option<crate::rtx::RtxSenderConfig> {
-        *self.rtx.lock()
+        *self.rtx_config.lock()
     }
 }
 
 #[async_trait]
 impl RtpSenderInterceptor for DefaultRtpSenderNackHandler {
     async fn on_packet_sent(&self, packet: &RtpPacket) {
-        // Do not buffer RTX retransmissions (they bypass this path today, but
-        // guard in case a future caller routes them through interceptors).
-        if let Some(rtx) = *self.rtx.lock()
-            && packet.header.ssrc == rtx.rtx_ssrc
-        {
+        // Do not buffer RTX retransmissions. They are sent directly through the
+        // transport (not the interceptor chain), but guard in case a future
+        // caller routes them here. Lock-free check: 0 means RTX is disabled.
+        let rtx_ssrc = self.rtx_ssrc_fast.load(Ordering::Acquire);
+        if rtx_ssrc != 0 && packet.header.ssrc == rtx_ssrc {
             return;
         }
         let mut buffer = self.buffer.lock();
@@ -265,7 +275,7 @@ impl RtpSenderInterceptor for DefaultRtpSenderNackHandler {
                 packets
             };
 
-            let rtx = *self.rtx.lock();
+            let rtx = *self.rtx_config.lock();
             for packet in to_resend {
                 let seq_num = packet.header.sequence_number;
                 if let Some(cfg) = rtx {
@@ -5454,13 +5464,22 @@ impl RtpSender {
 
     /// Configure RFC 4588 RTX retransmission on the sender NACK interceptor.
     /// Pass `None` to fall back to plain clone-resend of original packets.
-    pub fn set_rtx(&self, config: Option<crate::rtx::RtxSenderConfig>) {
+    ///
+    /// Returns `true` when an RTX-capable NACK handler was found and updated,
+    /// `false` if no attached interceptor implements RTX (the call is a no-op
+    /// in that case, e.g. a custom sender without `DefaultRtpSenderNackHandler`).
+    pub fn set_rtx(&self, config: Option<crate::rtx::RtxSenderConfig>) -> bool {
         for interceptor in &self.interceptors {
             if let Some(handler) = interceptor.clone().as_sender_nack_handler() {
                 handler.set_rtx(config);
-                return;
+                return true;
             }
         }
+        tracing::warn!(
+            track_id = %self.track_id,
+            "set_rtx: no RTX-capable NACK interceptor on sender; RTX not enabled"
+        );
+        false
     }
 
     pub fn set_transport(&self, transport: Arc<RtpTransport>) {
@@ -6092,19 +6111,38 @@ impl RtpReceiver {
 
     /// If `packet` is an RTX retransmission for this receiver, unwrap it to the
     /// primary media packet. Returns `None` when the packet is RTX but cannot be
-    /// safely restored (unknown primary SSRC or truncated OSN) — callers must
-    /// drop it rather than feed RTX wire format to the depacketizer.
+    /// safely restored (unknown primary SSRC, unrecognized payload type, or
+    /// truncated OSN) — callers must drop it rather than feed RTX wire format
+    /// to the depacketizer.
+    ///
+    /// RTX is identified positively by the payload type being present in the
+    /// apt map (`PT → primary PT`). A packet arriving on the negotiated RTX
+    /// SSRC but carrying an unmapped payload type is dropped: guessing the
+    /// primary PT would risk misreading two media payload bytes as the OSN
+    /// header and corrupting the frame.
+    ///
+    /// *Limitation:* the primary SSRC used for restoration is the main track's
+    /// latched SSRC (`self.ssrc`). Simulcast layers each have their own RTX
+    /// SSRC/primary SSRC, so RTX for a non-primary layer is not currently
+    /// restored here and will be dropped once the main SSRC has latched.
     fn maybe_unwrap_rtx(&self, packet: RtpPacket) -> Option<RtpPacket> {
-        let (primary_pt_from_map, is_rtx_ssrc) = {
-            let apt_map = self.rtx_apt.lock();
-            let primary_pt = apt_map.get(&packet.header.payload_type).copied();
-            let is_rtx_ssrc = *self.rtx_ssrc.lock() == Some(packet.header.ssrc);
-            (primary_pt, is_rtx_ssrc)
-        };
+        // Identify RTX positively via the apt map (PT → primary PT). Arriving
+        // on the negotiated RTX SSRC is a secondary signal used to tolerate SDP
+        // that omitted `a=fmtp apt=`. If neither signal fires, this is a
+        // primary media packet — pass it through unchanged.
+        let primary_pt_from_map = self
+            .rtx_apt
+            .lock()
+            .get(&packet.header.payload_type)
+            .copied();
+        let is_rtx_ssrc = *self.rtx_ssrc.lock() == Some(packet.header.ssrc);
         if primary_pt_from_map.is_none() && !is_rtx_ssrc {
             return Some(packet);
         }
-        let primary_pt = primary_pt_from_map.unwrap_or_else(|| self.params.lock().payload_type);
+        // Refuse to guess the primary PT when the PT is not a known RTX PT:
+        // treating a primary packet's first two payload bytes as the OSN would
+        // corrupt media. Drop instead.
+        let primary_pt = primary_pt_from_map?;
 
         let primary_ssrc = {
             let s = *self.ssrc.lock();
@@ -6344,44 +6382,40 @@ impl RtpReceiver {
                                             *s = Some(packet.header.ssrc);
                                         }
                                     } else {
-                                        // Main track: Update SSRC if it matched via provisional listener
+                                        // Main track: latch the primary SSRC. `maybe_unwrap_rtx`
+                                        // already restored the primary SSRC for RTX packets, so
+                                        // every packet reaching here carries the primary SSRC.
                                         let mut s = this.ssrc.lock();
                                         let old_ssrc = *s;
                                         if old_ssrc != packet.header.ssrc {
-                                            // Ignore RTX SSRC latching — primary SSRC only.
-                                            // After unwrap, packet SSRC is already primary.
-                                            let is_rtx = this.rtx_ssrc.lock().as_ref()
-                                                == Some(&packet.header.ssrc);
-                                            if !is_rtx {
-                                                trace!(
-                                                    "RTP main track SSRC changed from {} to {}",
-                                                    old_ssrc, packet.header.ssrc
-                                                );
-                                                *s = packet.header.ssrc;
+                                            trace!(
+                                                "RTP main track SSRC changed from {} to {}",
+                                                old_ssrc, packet.header.ssrc
+                                            );
+                                            *s = packet.header.ssrc;
 
-                                                // Send Track event after learning the first real SSRC.
-                                                if old_ssrc == 0 {
-                                                    tracing::info!(
-                                                        ssrc = packet.header.ssrc,
-                                                        pt = packet.header.payload_type,
-                                                        src = %addr,
-                                                        "RTP run_loop: first packet — SSRC learned, sending Track event",
-                                                    );
-                                                    // Use swap to atomically check and set the flag
-                                                    if !this.track_event_sent.swap(true, Ordering::SeqCst)
-                                                        && let Some(ref event_tx) = *this.track_ready_event_tx.lock()
+                                            // Send Track event after learning the first real SSRC.
+                                            if old_ssrc == 0 {
+                                                tracing::info!(
+                                                    ssrc = packet.header.ssrc,
+                                                    pt = packet.header.payload_type,
+                                                    src = %addr,
+                                                    "RTP run_loop: first packet — SSRC learned, sending Track event",
+                                                );
+                                                // Use swap to atomically check and set the flag
+                                                if !this.track_event_sent.swap(true, Ordering::SeqCst)
+                                                    && let Some(ref event_tx) = *this.track_ready_event_tx.lock()
+                                                {
+                                                    let transceiver = this.track_ready_transceiver.lock();
+                                                    if let Some(transceiver) =
+                                                        transceiver.as_ref().and_then(|t| t.upgrade())
                                                     {
-                                                        let transceiver = this.track_ready_transceiver.lock();
-                                                        if let Some(transceiver) =
-                                                            transceiver.as_ref().and_then(|t| t.upgrade())
-                                                        {
-                                                            let _ = event_tx.send(
-                                                                PeerConnectionEvent::Track(transceiver.clone()),
-                                                            );
-                                                            trace!(
-                                                                "RTP mode: Sent Track event after SSRC latching complete"
-                                                            );
-                                                        }
+                                                        let _ = event_tx.send(
+                                                            PeerConnectionEvent::Track(transceiver.clone()),
+                                                        );
+                                                        trace!(
+                                                            "RTP mode: Sent Track event after SSRC latching complete"
+                                                        );
                                                     }
                                                 }
                                             }
@@ -7507,6 +7541,145 @@ a=ssrc:67890 cname:foo\r\n";
             rtx_payload_type: 97,
         }));
         assert!(handler.rtx_config().is_some());
+        assert_eq!(handler.rtx_ssrc_fast.load(Ordering::Relaxed), 2);
+
+        // Disabling RTX resets the lock-free fast-path SSRC to 0.
+        handler.set_rtx(None);
+        assert!(handler.rtx_config().is_none());
+        assert_eq!(handler.rtx_ssrc_fast.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn nack_handler_rtx_fast_path_ssrc_mirrors_config() {
+        // The hot-path atomic must always reflect the mutex-guarded config.
+        let handler = DefaultRtpSenderNackHandler::new(16);
+        assert_eq!(handler.rtx_ssrc_fast.load(Ordering::Relaxed), 0);
+
+        handler.set_rtx(Some(crate::rtx::RtxSenderConfig {
+            rtx_ssrc: 0xDEAD,
+            rtx_payload_type: 97,
+        }));
+        assert_eq!(handler.rtx_ssrc_fast.load(Ordering::Relaxed), 0xDEAD);
+
+        handler.set_rtx(Some(crate::rtx::RtxSenderConfig {
+            rtx_ssrc: 0xBEEF,
+            rtx_payload_type: 98,
+        }));
+        assert_eq!(handler.rtx_ssrc_fast.load(Ordering::Relaxed), 0xBEEF);
+
+        handler.set_rtx(None);
+        assert_eq!(handler.rtx_ssrc_fast.load(Ordering::Relaxed), 0);
+    }
+
+    /// Verify that RtpSender::set_rtx returns `true` when an RTX-capable
+    /// interceptor is attached (the common case for `DefaultRtpSenderNackHandler`).
+    #[tokio::test]
+    async fn sender_set_rtx_returns_true_with_default_handler() {
+        use crate::config::{MediaCapabilities, VideoCapability};
+
+        let mut config = RtcConfiguration::default();
+        config.media_capabilities = Some(MediaCapabilities {
+            audio: vec![],
+            video: vec![VideoCapability::vp8_with_rtx(97)],
+            application: None,
+            image: vec![],
+        });
+        let pc = PeerConnection::new(config);
+        let (_source, track, _) =
+            crate::media::track::sample_track(crate::media::frame::MediaKind::Video, 8);
+        let params = RtpCodecParameters {
+            payload_type: 96,
+            clock_rate: 90000,
+            channels: 0,
+        };
+        let sender = pc.add_track(track, params).unwrap();
+        assert!(
+            sender.set_rtx(Some(crate::rtx::RtxSenderConfig {
+                rtx_ssrc: 4242,
+                rtx_payload_type: 97,
+            })),
+            "set_rtx on default sender must return true"
+        );
+    }
+
+    /// Verify that maybe_unwrap_rtx drops an RTX payload whose PT is not in
+    /// the apt map (safety guard: don't misinterpret 2 payload bytes as OSN).
+    #[tokio::test]
+    async fn maybe_unwrap_rtx_drops_unmapped_pt_on_rtx_ssrc() {
+        let pc = PeerConnection::new(RtcConfiguration::default());
+        let sdp_str = "v=0\r\n\
+o=- 123456 123456 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\n\
+c=IN IP4 127.0.0.1\r\n\
+a=mid:0\r\n\
+a=sendrecv\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+a=rtpmap:97 rtx/90000\r\n\
+a=fmtp:97 apt=96\r\n\
+a=fingerprint:sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99\r\n\
+a=setup:passive\r\n\
+a=ssrc-group:FID 12345 67890\r\n\
+a=ssrc:12345 cname:foo\r\n\
+a=ssrc:67890 cname:foo\r\n";
+
+        let sdp =
+            crate::sdp::SessionDescription::parse(crate::sdp::SdpType::Offer, sdp_str).unwrap();
+        pc.set_remote_description(sdp).await.unwrap();
+        let receiver = pc.get_transceivers()[0].receiver().unwrap();
+
+        // A packet landing on the RTX SSRC (67890) with a PT NOT in the apt
+        // map (e.g. the primary PT 96) must be dropped — no corruption.
+        let bad_rtx = crate::rtp::RtpPacket {
+            header: crate::rtp::RtpHeader::new(96, 1, 0, 67890),
+            payload: bytes::Bytes::from_static(&[0xDE, 0xAD, 0xBE, 0xEF]),
+            padding_len: 0,
+        };
+        assert!(
+            receiver.maybe_unwrap_rtx(bad_rtx).is_none(),
+            "RTX SSRC packet with unmapped PT must be dropped, not guessed"
+        );
+    }
+
+    /// Verify that maybe_unwrap_rtx passes through a primary packet unchanged.
+    #[tokio::test]
+    async fn maybe_unwrap_rtx_passes_through_primary_packet() {
+        let pc = PeerConnection::new(RtcConfiguration::default());
+        let sdp_str = "v=0\r\n\
+o=- 123456 123456 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\n\
+c=IN IP4 127.0.0.1\r\n\
+a=mid:0\r\n\
+a=sendrecv\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+a=rtpmap:97 rtx/90000\r\n\
+a=fmtp:97 apt=96\r\n\
+a=fingerprint:sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99\r\n\
+a=setup:passive\r\n\
+a=ssrc-group:FID 12345 67890\r\n\
+a=ssrc:12345 cname:foo\r\n\
+a=ssrc:67890 cname:foo\r\n";
+
+        let sdp =
+            crate::sdp::SessionDescription::parse(crate::sdp::SdpType::Offer, sdp_str).unwrap();
+        pc.set_remote_description(sdp).await.unwrap();
+        let receiver = pc.get_transceivers()[0].receiver().unwrap();
+
+        // A normal primary packet (neither RTX PT nor RTX SSRC) passes through.
+        let primary = crate::rtp::RtpPacket {
+            header: crate::rtp::RtpHeader::new(96, 100, 42_000, 12345),
+            payload: bytes::Bytes::from_static(&[1, 2, 3, 4]),
+            padding_len: 0,
+        };
+        let result = receiver.maybe_unwrap_rtx(primary.clone());
+        assert!(result.is_some(), "primary packet must pass through");
+        let restored = result.unwrap();
+        assert_eq!(restored.header.sequence_number, 100);
+        assert_eq!(restored.header.ssrc, 12345);
+        assert_eq!(&restored.payload[..], &[1, 2, 3, 4]);
     }
 
     #[test]

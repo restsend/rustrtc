@@ -103,7 +103,9 @@ async fn test_dtls_handshake_server_hello() -> Result<()> {
         loop {
             if let Ok((len, addr)) = server_socket_clone.recv_from(&mut buf).await {
                 let packet = Bytes::copy_from_slice(&buf[..len]);
-                server_conn_clone.receive(packet, addr, &mut marshal_buf).await;
+                server_conn_clone
+                    .receive(packet, addr, &mut marshal_buf)
+                    .await;
             }
         }
     });

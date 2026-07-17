@@ -88,26 +88,10 @@ pub fn parse_apt(fmtp: &str) -> Option<u8> {
 
 /// Build RTX PT → primary PT map from media-section attributes.
 ///
-/// Looks for `a=rtpmap:<pt> rtx/...` plus `a=fmtp:<pt> apt=<primary>`.
+/// Looks for `a=fmtp:<pt> apt=<primary>`. RFC 4588 reserves the `apt=` fmtp
+/// parameter for RTX, so any fmtp line carrying `apt=` is treated as an RTX
+/// association regardless of the ordering of its `a=rtpmap` line.
 pub fn extract_rtx_apt_map(attributes: &[(String, Option<String>)]) -> RtxAptMap {
-    let mut rtx_pts = Vec::new();
-    for (key, value) in attributes {
-        if key != "rtpmap" {
-            continue;
-        }
-        let Some(val) = value else { continue };
-        let mut parts = val.split_whitespace();
-        let Some(pt_str) = parts.next() else { continue };
-        let Some(codec) = parts.next() else { continue };
-        let Ok(pt) = pt_str.parse::<u8>() else {
-            continue;
-        };
-        let codec_name = codec.split('/').next().unwrap_or("");
-        if codec_name.eq_ignore_ascii_case("rtx") {
-            rtx_pts.push(pt);
-        }
-    }
-
     let mut map = RtxAptMap::new();
     for (key, value) in attributes {
         if key != "fmtp" {
@@ -120,12 +104,6 @@ pub fn extract_rtx_apt_map(attributes: &[(String, Option<String>)]) -> RtxAptMap
         let Ok(pt) = pt_str.parse::<u8>() else {
             continue;
         };
-        if !rtx_pts.contains(&pt) {
-            // Still accept apt= even if rtpmap order differs / was missed.
-            if parse_apt(fmtp).is_none() {
-                continue;
-            }
-        }
         if let Some(primary) = parse_apt(fmtp) {
             map.insert(pt, primary);
         }
@@ -291,5 +269,72 @@ mod tests {
         assert_eq!(allocate_rtx_payload_type(&[96, 97]), Some(98));
         let all: Vec<u8> = (96..=127).collect();
         assert_eq!(allocate_rtx_payload_type(&all), None);
+    }
+
+    #[test]
+    fn extract_apt_map_ignores_non_rtx_fmtp() {
+        // fmtp lines without apt= (e.g. H264 sprop/sps) must not pollute the map.
+        let attrs = vec![
+            ("rtpmap".into(), Some("96 VP8/90000".into())),
+            ("rtpmap".into(), Some("97 rtx/90000".into())),
+            ("fmtp".into(), Some("96 max-fs=1200".into())),
+            ("fmtp".into(), Some("97 apt=96".into())),
+        ];
+        let map = extract_rtx_apt_map(&attrs);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&97), Some(&96));
+        assert!(rtx_pt_for_primary(&map, 96).is_some());
+    }
+
+    #[test]
+    fn extract_apt_map_multi_codec_is_deterministic() {
+        // Two primaries (VP8 96, H264 102) each with their own RTX PT.
+        let attrs = vec![
+            ("fmtp".into(), Some("97 apt=96".into())),
+            ("fmtp".into(), Some("103 apt=102".into())),
+        ];
+        let map = extract_rtx_apt_map(&attrs);
+        assert_eq!(map.get(&97), Some(&96));
+        assert_eq!(map.get(&103), Some(&102));
+        assert_eq!(rtx_pt_for_primary(&map, 96), Some(97));
+        assert_eq!(rtx_pt_for_primary(&map, 102), Some(103));
+    }
+
+    #[test]
+    fn append_rtx_to_section_is_idempotent() {
+        let mut formats = vec!["96".to_string()];
+        let mut attrs = Vec::new();
+        append_rtx_to_section(&mut formats, &mut attrs, 96, 97, 90_000);
+        // Calling again must not duplicate formats or rtpmap/fmtp lines.
+        append_rtx_to_section(&mut formats, &mut attrs, 96, 97, 90_000);
+        assert_eq!(formats.iter().filter(|f| *f == "97").count(), 1);
+        let rtpmap_count = attrs
+            .iter()
+            .filter(|a| a.key == "rtpmap" && a.value.as_deref() == Some("97 rtx/90000"))
+            .count();
+        assert_eq!(rtpmap_count, 1);
+        let fmtp_count = attrs
+            .iter()
+            .filter(|a| a.key == "fmtp" && a.value.as_deref() == Some("97 apt=96"))
+            .count();
+        assert_eq!(fmtp_count, 1);
+    }
+
+    #[test]
+    fn wrap_unwrap_preserves_payload_bytes() {
+        // Payload beginning with bytes that look like an OSN must round-trip intact.
+        let original = RtpPacket {
+            header: RtpHeader::new(96, 200, 1_000, 0xCAFE),
+            payload: bytes::Bytes::from_static(&[0x00, 0x64, 0xFF, 0xEE]),
+            padding_len: 0,
+        };
+        let cfg = RtxSenderConfig {
+            rtx_ssrc: 0xBEEF,
+            rtx_payload_type: 97,
+        };
+        let rtx = wrap_rtx_packet(&original, &cfg, 5);
+        assert_eq!(decode_osn(&rtx.payload), Some(200));
+        let restored = unwrap_rtx_packet(&rtx, 0xCAFE, 96).unwrap();
+        assert_eq!(&restored.payload[..], &[0x00, 0x64, 0xFF, 0xEE]);
     }
 }

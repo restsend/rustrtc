@@ -393,7 +393,14 @@ impl IceTransportRunner {
             };
             match packet_opt {
                 Some((packet, addr)) => {
-                    handle_packet(&packet, addr, inner.clone(), sender.clone(), &mut marshal_buf).await;
+                    handle_packet(
+                        &packet,
+                        addr,
+                        inner.clone(),
+                        sender.clone(),
+                        &mut marshal_buf,
+                    )
+                    .await;
                 }
                 None => break,
             }
@@ -1521,7 +1528,9 @@ impl IceTransport {
 
         let mut marshal_buf = Vec::new();
         for (packet, addr) in packets {
-            receiver.receive(Bytes::from(packet), addr, &mut marshal_buf).await;
+            receiver
+                .receive(Bytes::from(packet), addr, &mut marshal_buf)
+                .await;
         }
     }
 
@@ -2152,7 +2161,8 @@ async fn handle_packet(
         // DTLS or RTP
         let receiver = inner.data_receiver.lock().clone();
         if let Some(rx) = receiver {
-            rx.receive(Bytes::copy_from_slice(packet), addr, marshal_buf).await;
+            rx.receive(Bytes::copy_from_slice(packet), addr, marshal_buf)
+                .await;
         } else {
             let mut buffer = inner.buffered_packets.lock();
             let stats = inner.buffer_stats.clone();

@@ -1201,8 +1201,14 @@ mod tests {
         // Total: 11 11 22 20 FF -> pad to 8 bytes: 11 11 22 20 FF 00 00 00
         assert!(header.get_extension(1).is_some());
         assert!(header.get_extension(2).is_some());
-        assert_eq!(header.get_extension(1).unwrap(), Bytes::from_static(&[0x11, 0x22]));
-        assert_eq!(header.get_extension(2).unwrap(), Bytes::from_static(&[0xFF]));
+        assert_eq!(
+            header.get_extension(1).unwrap(),
+            Bytes::from_static(&[0x11, 0x22])
+        );
+        assert_eq!(
+            header.get_extension(2).unwrap(),
+            Bytes::from_static(&[0xFF])
+        );
     }
 
     #[test]

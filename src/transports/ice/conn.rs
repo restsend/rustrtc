@@ -550,9 +550,7 @@ impl PacketReceiver for IceConn {
                                 trace!(
                                     "IceConn: RTP latched to {} after probation \
                                          (expected_ssrc={}, total_obs={})",
-                                    win_addr,
-                                    expected,
-                                    total
+                                    win_addr, expected, total
                                 );
                             }
                         } else {
@@ -566,8 +564,7 @@ impl PacketReceiver for IceConn {
                             trace!(
                                 "IceConn: RTP latched to {} immediately \
                                      (expected_ssrc={})",
-                                addr,
-                                expected
+                                addr, expected
                             );
                         }
                     }
@@ -739,8 +736,12 @@ mod tests {
         assert!(conn.rtp_latched.load(Ordering::Relaxed));
 
         let rtcp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5001);
-        conn.receive(Bytes::from_static(&[0x80, 0xC8, 0x00, 0x00]), rtcp_src, &mut marshal_buf)
-            .await;
+        conn.receive(
+            Bytes::from_static(&[0x80, 0xC8, 0x00, 0x00]),
+            rtcp_src,
+            &mut marshal_buf,
+        )
+        .await;
 
         assert_eq!(
             *conn.remote_addr.read(),
@@ -767,8 +768,12 @@ mod tests {
         conn.receive(rtp_pkt, rtp_src, &mut marshal_buf).await;
 
         let rtcp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5001);
-        conn.receive(Bytes::from_static(&[0x80, 0xC8, 0x00, 0x00]), rtcp_src, &mut marshal_buf)
-            .await;
+        conn.receive(
+            Bytes::from_static(&[0x80, 0xC8, 0x00, 0x00]),
+            rtcp_src,
+            &mut marshal_buf,
+        )
+        .await;
 
         assert_eq!(
             *conn.remote_rtcp_addr.read(),
@@ -795,8 +800,12 @@ mod tests {
         conn.receive(rtp_pkt, rtp_src, &mut marshal_buf).await;
 
         let rtcp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5001);
-        conn.receive(Bytes::from_static(&[0x80, 0xC8, 0x00, 0x00]), rtcp_src, &mut marshal_buf)
-            .await;
+        conn.receive(
+            Bytes::from_static(&[0x80, 0xC8, 0x00, 0x00]),
+            rtcp_src,
+            &mut marshal_buf,
+        )
+        .await;
         assert_eq!(*conn.remote_rtcp_addr.read(), Some(rtcp_src));
 
         let rogue_rtcp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6001);
@@ -830,8 +839,12 @@ mod tests {
         conn.receive(rtp_pkt, rtp_src, &mut marshal_buf).await;
         assert_eq!(*conn.remote_addr.read(), rtp_src);
 
-        conn.receive(Bytes::from_static(&[0x80, 0xC8, 0x00, 0x00]), rtp_src, &mut marshal_buf)
-            .await;
+        conn.receive(
+            Bytes::from_static(&[0x80, 0xC8, 0x00, 0x00]),
+            rtp_src,
+            &mut marshal_buf,
+        )
+        .await;
         assert_eq!(*conn.remote_addr.read(), rtp_src);
         assert!(
             conn.remote_rtcp_addr.read().is_none(),
@@ -863,13 +876,16 @@ mod tests {
         let mut pkt2 = vec![0x80u8, 0x00, 0x10, 0x99, 0x00, 0x00, 0x00, 0xa1];
         pkt2.extend_from_slice(&expected_ssrc.to_be_bytes());
         let mut marshal_buf = Vec::new();
-        conn.receive(Bytes::from(pkt.clone()), real_addr, &mut marshal_buf).await;
-        conn.receive(Bytes::from(pkt2.clone()), real_addr, &mut marshal_buf).await;
+        conn.receive(Bytes::from(pkt.clone()), real_addr, &mut marshal_buf)
+            .await;
+        conn.receive(Bytes::from(pkt2.clone()), real_addr, &mut marshal_buf)
+            .await;
 
         // Third packet: seq=0x109a
         let mut pkt3 = vec![0x80u8, 0x00, 0x10, 0x9a, 0x00, 0x00, 0x00, 0xa2];
         pkt3.extend_from_slice(&expected_ssrc.to_be_bytes());
-        conn.receive(Bytes::from(pkt3), real_addr, &mut marshal_buf).await;
+        conn.receive(Bytes::from(pkt3), real_addr, &mut marshal_buf)
+            .await;
 
         assert_eq!(
             *conn.remote_addr.read(),
@@ -900,7 +916,8 @@ mod tests {
         pkt.extend_from_slice(&wrong_ssrc.to_be_bytes());
 
         let mut marshal_buf = Vec::new();
-        conn.receive(Bytes::from(pkt), rogue_addr, &mut marshal_buf).await;
+        conn.receive(Bytes::from(pkt), rogue_addr, &mut marshal_buf)
+            .await;
 
         assert_eq!(
             *conn.remote_addr.read(),
@@ -973,7 +990,8 @@ mod tests {
         let mut pkt_4114 = vec![0x80u8, 0x08, 0x53, 0xCA, 0x00, 0x00, 0x00, 0xA0];
         pkt_4114.extend_from_slice(&ssrc.to_be_bytes());
         let mut marshal_buf = Vec::new();
-        conn.receive(Bytes::from(pkt_4114), port_4114, &mut marshal_buf).await;
+        conn.receive(Bytes::from(pkt_4114), port_4114, &mut marshal_buf)
+            .await;
 
         // Latch should NOT have fired yet (only 1 packet, no marker)
         assert!(
@@ -984,7 +1002,8 @@ mod tests {
         // Frame 508078: port 4014, seq=21465 (lower!), marker=true  (real start)
         let mut pkt_4014 = vec![0x80u8, 0x88, 0x53, 0xC9, 0x00, 0x00, 0x00, 0xA0];
         pkt_4014.extend_from_slice(&ssrc.to_be_bytes());
-        conn.receive(Bytes::from(pkt_4014), port_4014, &mut marshal_buf).await;
+        conn.receive(Bytes::from(pkt_4014), port_4014, &mut marshal_buf)
+            .await;
 
         assert!(
             conn.rtp_latched.load(Ordering::Relaxed),

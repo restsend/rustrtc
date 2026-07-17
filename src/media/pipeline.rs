@@ -225,9 +225,7 @@ impl MediaSink for ChannelMediaSink {
                 actual: sample.kind(),
             });
         }
-        self.sender
-            .send(sample)
-            .map_err(|_| MediaError::Closed)
+        self.sender.send(sample).map_err(|_| MediaError::Closed)
     }
 }
 
@@ -412,9 +410,7 @@ mod tests {
         let sink: Arc<DynMediaSink> = Arc::new(sink_impl);
         let pump = spawn_media_pump(source, sink).unwrap();
 
-        source_handle
-            .send_audio(AudioFrame::default())
-            .unwrap();
+        source_handle.send_audio(AudioFrame::default()).unwrap();
 
         let err = pump.await.unwrap().unwrap_err();
         assert!(matches!(err, MediaError::Closed));
