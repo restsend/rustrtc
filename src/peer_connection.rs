@@ -41,6 +41,74 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Weak;
 
+fn section_has_rtx(section: &MediaSection) -> bool {
+    !crate::rtx::extract_rtx_apt_map_from_attrs(&section.attributes).is_empty()
+}
+
+/// RTX payload type for the first primary (non-RTX) format that has an `apt=` association.
+/// Prefer format order over `HashMap` iteration so multi-codec sections stay deterministic.
+fn primary_rtx_payload_type(section: &MediaSection) -> Option<u8> {
+    let apt_map = crate::rtx::extract_rtx_apt_map_from_attrs(&section.attributes);
+    for fmt in &section.formats {
+        let Ok(pt) = fmt.parse::<u8>() else {
+            continue;
+        };
+        if apt_map.contains_key(&pt) {
+            continue;
+        }
+        if let Some(rtx_pt) = crate::rtx::rtx_pt_for_primary(&apt_map, pt) {
+            return Some(rtx_pt);
+        }
+    }
+    None
+}
+
+/// Remove RTX payload types / rtpmap / fmtp that local config may have injected.
+/// Used on answers before echoing the remote offer's RTX mapping.
+fn strip_rtx_from_section(section: &mut MediaSection) {
+    let apt_map = crate::rtx::extract_rtx_apt_map_from_attrs(&section.attributes);
+    let mut rtx_pts: Vec<u8> = apt_map.keys().copied().collect();
+    for attr in &section.attributes {
+        if attr.key != "rtpmap" {
+            continue;
+        }
+        let Some(val) = &attr.value else { continue };
+        let mut parts = val.split_whitespace();
+        let Some(pt_str) = parts.next() else { continue };
+        let Some(codec) = parts.next() else { continue };
+        let Ok(pt) = pt_str.parse::<u8>() else {
+            continue;
+        };
+        let codec_name = codec.split('/').next().unwrap_or("");
+        if codec_name.eq_ignore_ascii_case("rtx") && !rtx_pts.contains(&pt) {
+            rtx_pts.push(pt);
+        }
+    }
+    if rtx_pts.is_empty() {
+        return;
+    }
+    section.formats.retain(|f| {
+        f.parse::<u8>()
+            .map(|pt| !rtx_pts.contains(&pt))
+            .unwrap_or(true)
+    });
+    section.attributes.retain(|attr| {
+        if !matches!(attr.key.as_str(), "rtpmap" | "fmtp" | "rtcp-fb") {
+            return true;
+        }
+        let Some(val) = &attr.value else {
+            return true;
+        };
+        let Some(pt_str) = val.split_whitespace().next() else {
+            return true;
+        };
+        let Ok(pt) = pt_str.parse::<u8>() else {
+            return true;
+        };
+        !rtx_pts.contains(&pt)
+    });
+}
+
 /// Guard stored inside a spawned transport-loop task: fires
 /// `Notify::notify_one` when dropped so the "first-done" future always wakes —
 /// even if the loop ends by panicking.
@@ -74,6 +142,9 @@ pub trait RtpSenderInterceptor: Send + Sync {
     fn as_nack_stats(self: Arc<Self>) -> Option<Arc<dyn NackStats>> {
         None
     }
+    fn as_sender_nack_handler(self: Arc<Self>) -> Option<Arc<DefaultRtpSenderNackHandler>> {
+        None
+    }
 }
 
 #[async_trait]
@@ -95,12 +166,20 @@ pub trait NackStats: Send + Sync {
     fn get_recovered_count(&self) -> u64 {
         0
     }
+    /// Number of RTX (RFC 4588) retransmission packets sent. Default 0 for
+    /// implementors that only track plain NACK clone-resend.
+    fn get_rtx_sent_count(&self) -> u64 {
+        0
+    }
 }
 
 pub struct DefaultRtpSenderNackHandler {
     buffer: Mutex<VecDeque<RtpPacket>>,
     max_size: usize,
     pub nack_recv_count: AtomicU64,
+    rtx: Mutex<Option<crate::rtx::RtxSenderConfig>>,
+    rtx_seq: AtomicU16,
+    rtx_sent_count: AtomicU64,
 }
 
 pub struct DefaultRtpSenderBitrateHandler;
@@ -132,13 +211,33 @@ impl DefaultRtpSenderNackHandler {
             buffer: Mutex::new(VecDeque::with_capacity(max_size)),
             max_size,
             nack_recv_count: AtomicU64::new(0),
+            rtx: Mutex::new(None),
+            rtx_seq: AtomicU16::new(random_u32() as u16),
+            rtx_sent_count: AtomicU64::new(0),
         }
+    }
+
+    /// Enable or disable RFC 4588 RTX retransmission for NACK responses.
+    /// When `None`, falls back to plain clone-resend of the original packet.
+    pub fn set_rtx(&self, config: Option<crate::rtx::RtxSenderConfig>) {
+        *self.rtx.lock() = config;
+    }
+
+    pub fn rtx_config(&self) -> Option<crate::rtx::RtxSenderConfig> {
+        *self.rtx.lock()
     }
 }
 
 #[async_trait]
 impl RtpSenderInterceptor for DefaultRtpSenderNackHandler {
     async fn on_packet_sent(&self, packet: &RtpPacket) {
+        // Do not buffer RTX retransmissions (they bypass this path today, but
+        // guard in case a future caller routes them through interceptors).
+        if let Some(rtx) = *self.rtx.lock()
+            && packet.header.ssrc == rtx.rtx_ssrc
+        {
+            return;
+        }
         let mut buffer = self.buffer.lock();
         buffer.push_back(packet.clone());
         if buffer.len() > self.max_size {
@@ -166,10 +265,23 @@ impl RtpSenderInterceptor for DefaultRtpSenderNackHandler {
                 packets
             };
 
+            let rtx = *self.rtx.lock();
             for packet in to_resend {
                 let seq_num = packet.header.sequence_number;
-                trace!("NACK: retransmitting packet seq={}", seq_num);
-                let _ = transport.send_rtp(packet).await;
+                if let Some(cfg) = rtx {
+                    let rtx_seq = self.rtx_seq.fetch_add(1, Ordering::Relaxed);
+                    let rtx_packet = crate::rtx::wrap_rtx_packet(&packet, &cfg, rtx_seq);
+                    trace!(
+                        "NACK: RTX retransmit primary_seq={} rtx_seq={} rtx_ssrc={}",
+                        seq_num, rtx_seq, cfg.rtx_ssrc
+                    );
+                    if transport.send_rtp(rtx_packet).await.is_ok() {
+                        self.rtx_sent_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else {
+                    trace!("NACK: retransmitting packet seq={}", seq_num);
+                    let _ = transport.send_rtp(packet).await;
+                }
             }
         }
     }
@@ -177,11 +289,19 @@ impl RtpSenderInterceptor for DefaultRtpSenderNackHandler {
     fn as_nack_stats(self: Arc<Self>) -> Option<Arc<dyn NackStats>> {
         Some(self)
     }
+
+    fn as_sender_nack_handler(self: Arc<Self>) -> Option<Arc<DefaultRtpSenderNackHandler>> {
+        Some(self)
+    }
 }
 
 impl NackStats for DefaultRtpSenderNackHandler {
     fn get_nack_count(&self) -> u64 {
         self.nack_recv_count.load(Ordering::Relaxed)
+    }
+
+    fn get_rtx_sent_count(&self) -> u64 {
+        self.rtx_sent_count.load(Ordering::Relaxed)
     }
 }
 
@@ -1206,6 +1326,7 @@ impl PeerConnection {
                 let mut abs_send_time_ext_id = None;
                 let mut fid_group = None;
                 let mut rtx_ssrc = None;
+                let rtx_apt = crate::rtx::extract_rtx_apt_map_from_attrs(&section.attributes);
 
                 // First pass: check for ssrc-group FID
                 for attr in &section.attributes {
@@ -1300,6 +1421,9 @@ impl PeerConnection {
                         if let Some(rtx) = rtx_ssrc {
                             rx.set_rtx_ssrc(rtx);
                         }
+                        if !rtx_apt.is_empty() {
+                            rx.set_rtx_apt_map(rtx_apt.clone());
+                        }
 
                         // Handle Simulcast
                         if let Some(sim) = &simulcast {
@@ -1365,6 +1489,9 @@ impl PeerConnection {
                     let receiver = builder.build();
                     if let Some(rtx) = rtx_ssrc {
                         receiver.set_rtx_ssrc(rtx);
+                    }
+                    if !rtx_apt.is_empty() {
+                        receiver.set_rtx_apt_map(rtx_apt.clone());
                     }
 
                     // If transport is already active (renegotiation), attach it to the new receiver.
@@ -1616,10 +1743,9 @@ impl PeerConnection {
                 self.inner.stats_collector.clone(),
             );
             let pair_monitor = Self::create_pair_monitor(pair_rx.clone(), ice_conn_monitor.clone());
-            return Ok(self.spawn_transport_loops(vec![
-                Box::pin(rtcp_loop),
-                Box::pin(pair_monitor),
-            ]));
+            return Ok(
+                self.spawn_transport_loops(vec![Box::pin(rtcp_loop), Box::pin(pair_monitor)])
+            );
         }
 
         if self.config().transport_mode == TransportMode::Rtp {
@@ -1645,10 +1771,9 @@ impl PeerConnection {
                 self.attach_rtp_transport_to_transceiver(t, selected_transport);
             }
             let pair_monitor = Self::create_pair_monitor(pair_rx.clone(), ice_conn_monitor.clone());
-            return Ok(self.spawn_transport_loops(vec![
-                Box::pin(rtcp_loop),
-                Box::pin(pair_monitor),
-            ]));
+            return Ok(
+                self.spawn_transport_loops(vec![Box::pin(rtcp_loop), Box::pin(pair_monitor)])
+            );
         }
 
         let remote_dtls_fingerprint = self.inner.remote_dtls_fingerprint.lock().clone();
@@ -3116,8 +3241,7 @@ fn update_local_description_on_gather(
 ) -> bool {
     if inner.config.transport_mode == TransportMode::WebRtc {
         let candidates = ice_transport.local_candidates();
-        let candidate_strs: Vec<String> =
-            candidates.iter().map(|c| c.to_sdp()).collect();
+        let candidate_strs: Vec<String> = candidates.iter().map(|c| c.to_sdp()).collect();
         let mut local_guard = inner.local_description.lock();
         if let Some(desc) = local_guard.as_mut() {
             desc.add_candidates(&candidate_strs);
@@ -4043,6 +4167,45 @@ impl PeerConnectionInner {
                     .attributes
                     .push(Attribute::new("rtcp", Some(rtcp_addr.port().to_string())));
             }
+
+            // When this section advertises RTX and we send, allocate a local RTX SSRC
+            // and configure the NACK handler for RFC 4588 retransmission.
+            let sender_rtx_ssrc = if direction.sends()
+                && transceiver.kind() == MediaKind::Video
+                && section_has_rtx(&section)
+            {
+                let apt_map = crate::rtx::extract_rtx_apt_map_from_attrs(&section.attributes);
+                // Prefer the sender's negotiated primary PT; fall back to first primary with apt=.
+                let rtx_pt = transceiver
+                    .sender
+                    .lock()
+                    .as_ref()
+                    .map(|s| s.params().payload_type)
+                    .and_then(|primary| crate::rtx::rtx_pt_for_primary(&apt_map, primary))
+                    .or_else(|| primary_rtx_payload_type(&section));
+                if let Some(pt) = rtx_pt {
+                    *transceiver.sender_rtx_payload_type.lock() = Some(pt);
+                }
+                let rtx_ssrc = {
+                    let mut slot = transceiver.sender_rtx_ssrc.lock();
+                    if slot.is_none() {
+                        *slot = Some(self.ssrc_generator.fetch_add(1, Ordering::Relaxed));
+                    }
+                    *slot
+                };
+                if let (Some(rtx_ssrc), Some(rtx_pt)) = (rtx_ssrc, rtx_pt)
+                    && let Some(sender) = transceiver.sender.lock().as_ref()
+                {
+                    sender.set_rtx(Some(crate::rtx::RtxSenderConfig {
+                        rtx_ssrc,
+                        rtx_payload_type: rtx_pt,
+                    }));
+                }
+                rtx_ssrc
+            } else {
+                None
+            };
+
             if let Some(sender) = sender_info {
                 Self::attach_sender_attributes(
                     &mut section,
@@ -4051,6 +4214,7 @@ impl PeerConnectionInner {
                     sender.stream_id(),
                     sender.track_id(),
                     &mode,
+                    sender_rtx_ssrc,
                 );
             } else if direction.sends()
                 && let Some(ssrc) = *transceiver.sender_ssrc.lock()
@@ -4077,6 +4241,7 @@ impl PeerConnectionInner {
                     &stream_id,
                     &track_id,
                     &mode,
+                    sender_rtx_ssrc,
                 );
             }
 
@@ -4144,11 +4309,19 @@ impl PeerConnectionInner {
         stream_id: &str,
         track_id: &str,
         mode: &TransportMode,
+        rtx_ssrc: Option<u32>,
     ) {
         if *mode == TransportMode::WebRtc {
             section.attributes.push(Attribute::new(
                 "msid",
                 Some(format!("{} {}", stream_id, track_id)),
+            ));
+        }
+
+        if let Some(rtx) = rtx_ssrc {
+            section.attributes.push(Attribute::new(
+                "ssrc-group",
+                Some(format!("FID {} {}", ssrc, rtx)),
             ));
         }
 
@@ -4162,6 +4335,19 @@ impl PeerConnectionInner {
                 "ssrc",
                 Some(format!("{} msid:{} {}", ssrc, stream_id, track_id)),
             ));
+        }
+
+        if let Some(rtx) = rtx_ssrc {
+            section.attributes.push(Attribute::new(
+                "ssrc",
+                Some(format!("{} cname:{}", rtx, cname)),
+            ));
+            if *mode == TransportMode::WebRtc {
+                section.attributes.push(Attribute::new(
+                    "ssrc",
+                    Some(format!("{} msid:{} {}", rtx, stream_id, track_id)),
+                ));
+            }
         }
     }
 
@@ -4200,6 +4386,13 @@ impl PeerConnectionInner {
         section.apply_config(&self.config);
         if let Some(caps) = self.reinvite_answer_audio_capabilities(&section.mid, kind, sdp_type) {
             Self::apply_audio_capabilities(section, &caps);
+        }
+
+        // Answerer: strip any local-config RTX (apply_config may inject it), then
+        // echo only RTX from the remote offer when apt= maps to an answered primary PT.
+        if sdp_type == SdpType::Answer && kind == MediaKind::Video {
+            strip_rtx_from_section(section);
+            self.merge_remote_rtx_into_answer(section);
         }
 
         // Add extmap for Video
@@ -4389,6 +4582,57 @@ impl PeerConnectionInner {
                     "rtcp-fb",
                     Some(format!("{} {}", audio.payload_type, fb)),
                 ));
+            }
+        }
+    }
+
+    /// Echo remote-offered RTX payload types into a local answer when the
+    /// associated primary PT is present in the answer media section.
+    fn merge_remote_rtx_into_answer(&self, section: &mut MediaSection) {
+        let remote = self.remote_description.lock();
+        let Some(desc) = remote.as_ref() else {
+            return;
+        };
+        let Some(remote_section) = desc
+            .media_sections
+            .iter()
+            .find(|s| s.mid == section.mid)
+            .or_else(|| {
+                desc.media_sections
+                    .iter()
+                    .find(|s| s.kind == MediaKind::Video)
+            })
+        else {
+            return;
+        };
+
+        let apt_map = crate::rtx::extract_rtx_apt_map_from_attrs(&remote_section.attributes);
+        if apt_map.is_empty() {
+            return;
+        }
+
+        let local_primary_pts: Vec<u8> = section
+            .formats
+            .iter()
+            .filter_map(|f| f.parse().ok())
+            .filter(|pt| !apt_map.contains_key(pt))
+            .collect();
+
+        for primary_pt in local_primary_pts {
+            if let Some(rtx_pt) = crate::rtx::rtx_pt_for_primary(&apt_map, primary_pt) {
+                let clock_rate = remote_section
+                    .to_video_capabilities()
+                    .into_iter()
+                    .find(|c| c.payload_type == primary_pt)
+                    .map(|c| c.clock_rate)
+                    .unwrap_or(90_000);
+                crate::rtx::append_rtx_to_section(
+                    &mut section.formats,
+                    &mut section.attributes,
+                    primary_pt,
+                    rtx_pt,
+                    clock_rate,
+                );
             }
         }
     }
@@ -4753,6 +4997,8 @@ pub struct RtpTransceiver {
     rtp_transport: Mutex<Option<Weak<RtpTransport>>>,
     udtl_transport: Mutex<Option<Arc<UdtlTransport>>>,
     sender_ssrc: Mutex<Option<u32>>,
+    sender_rtx_ssrc: Mutex<Option<u32>>,
+    sender_rtx_payload_type: Mutex<Option<u8>>,
     sender_stream_id: Mutex<Option<String>>,
     sender_track_id: Mutex<Option<String>>,
     payload_map: Arc<RwLock<HashMap<u8, RtpCodecParameters>>>,
@@ -4774,6 +5020,8 @@ impl RtpTransceiver {
             rtp_transport: Mutex::new(None),
             udtl_transport: Mutex::new(None),
             sender_ssrc: Mutex::new(None),
+            sender_rtx_ssrc: Mutex::new(None),
+            sender_rtx_payload_type: Mutex::new(None),
             sender_stream_id: Mutex::new(None),
             sender_track_id: Mutex::new(None),
             payload_map: Arc::new(RwLock::new(HashMap::new())),
@@ -4798,6 +5046,10 @@ impl RtpTransceiver {
 
     pub fn sender_ssrc(&self) -> Option<u32> {
         *self.sender_ssrc.lock()
+    }
+
+    pub fn sender_rtx_ssrc(&self) -> Option<u32> {
+        *self.sender_rtx_ssrc.lock()
     }
 
     pub fn sender_stream_id(&self) -> Option<String> {
@@ -4867,6 +5119,17 @@ impl RtpTransceiver {
             *self.sender_ssrc.lock() = Some(s.ssrc());
             *self.sender_stream_id.lock() = Some(s.stream_id().to_string());
             *self.sender_track_id.lock() = Some(s.track_id().to_string());
+
+            // Apply deferred RTX config from SDP generation that ran before add_track.
+            if let (Some(rtx_ssrc), Some(rtx_pt)) = (
+                *self.sender_rtx_ssrc.lock(),
+                *self.sender_rtx_payload_type.lock(),
+            ) {
+                s.set_rtx(Some(crate::rtx::RtxSenderConfig {
+                    rtx_ssrc,
+                    rtx_payload_type: rtx_pt,
+                }));
+            }
 
             // Apply any negotiated sdes:mid configuration to replacement senders too.
             let pending_sdes_mid = self.pending_sdes_mid.lock().take();
@@ -5189,6 +5452,17 @@ impl RtpSender {
         None
     }
 
+    /// Configure RFC 4588 RTX retransmission on the sender NACK interceptor.
+    /// Pass `None` to fall back to plain clone-resend of original packets.
+    pub fn set_rtx(&self, config: Option<crate::rtx::RtxSenderConfig>) {
+        for interceptor in &self.interceptors {
+            if let Some(handler) = interceptor.clone().as_sender_nack_handler() {
+                handler.set_rtx(config);
+                return;
+            }
+        }
+    }
+
     pub fn set_transport(&self, transport: Arc<RtpTransport>) {
         {
             let track_id = self.track_id.clone();
@@ -5470,6 +5744,8 @@ pub struct RtpReceiver {
     packet_tx: Mutex<Option<mpsc::Sender<(crate::rtp::RtpPacket, std::net::SocketAddr)>>>,
     rtcp_feedback_ssrc: Mutex<Option<u32>>,
     rtx_ssrc: Mutex<Option<u32>>,
+    /// RTX payload type → primary payload type (from SDP `a=fmtp:<rtx> apt=<primary>`).
+    rtx_apt: Mutex<HashMap<u8, u8>>,
     fir_seq: AtomicU8,
     feedback_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<crate::media::track::FeedbackEvent>>>,
     simulcast_tracks: Mutex<
@@ -5571,6 +5847,7 @@ impl RtpReceiverBuilder {
             packet_tx: Mutex::new(None),
             rtcp_feedback_ssrc: Mutex::new(None),
             rtx_ssrc: Mutex::new(None),
+            rtx_apt: Mutex::new(HashMap::new()),
             fir_seq: AtomicU8::new(0),
             feedback_rx: Arc::new(tokio::sync::Mutex::new(feedback_rx)),
             simulcast_tracks: Mutex::new(HashMap::new()),
@@ -5625,6 +5902,7 @@ impl RtpReceiver {
             packet_tx: Mutex::new(None),
             rtcp_feedback_ssrc: Mutex::new(None),
             rtx_ssrc: Mutex::new(None),
+            rtx_apt: Mutex::new(HashMap::new()),
             fir_seq: AtomicU8::new(0),
             feedback_rx: Arc::new(tokio::sync::Mutex::new(feedback_rx)),
             simulcast_tracks: Mutex::new(HashMap::new()),
@@ -5734,7 +6012,8 @@ impl RtpReceiver {
             .get(&payload_type)
             .map(|p| p.clock_rate)
             .unwrap_or_else(|| self.params.lock().clock_rate);
-        self.clock_rate_cache_pt.store(payload_type, Ordering::Relaxed);
+        self.clock_rate_cache_pt
+            .store(payload_type, Ordering::Relaxed);
         self.clock_rate_cache.store(rate, Ordering::Relaxed);
         rate
     }
@@ -5769,6 +6048,84 @@ impl RtpReceiver {
 
     pub fn set_rtx_ssrc(&self, ssrc: u32) {
         *self.rtx_ssrc.lock() = Some(ssrc);
+        let transport = self.transport.lock().clone();
+        let packet_tx = self.packet_tx.lock().clone();
+        if let Some(transport) = transport
+            && let Some(tx) = packet_tx
+        {
+            transport.register_listener_sync(ssrc, tx);
+        }
+    }
+
+    /// Store RTX→primary payload-type associations from SDP `apt=` and register
+    /// the RTX payload types on the transport so retransmissions are demuxed.
+    pub fn set_rtx_apt_map(&self, apt_map: HashMap<u8, u8>) {
+        if apt_map.is_empty() {
+            return;
+        }
+        let all_pts: Vec<u8> = {
+            let default_pt = self.params.lock().payload_type;
+            let mut pts = vec![default_pt];
+            for pt in self.payload_map.read().keys().copied() {
+                if !pts.contains(&pt) {
+                    pts.push(pt);
+                }
+            }
+            for pt in apt_map.keys().copied() {
+                if !pts.contains(&pt) {
+                    pts.push(pt);
+                }
+            }
+            pts
+        };
+        *self.rtx_apt.lock() = apt_map;
+
+        let transport = self.transport.lock().clone();
+        let packet_tx = self.packet_tx.lock().clone();
+        if let Some(transport) = transport
+            && let Some(tx) = packet_tx
+        {
+            // register_payload_list_listener replaces the PT list — pass the full set.
+            transport.register_payload_list_listener(all_pts, tx);
+        }
+    }
+
+    /// If `packet` is an RTX retransmission for this receiver, unwrap it to the
+    /// primary media packet. Returns `None` when the packet is RTX but cannot be
+    /// safely restored (unknown primary SSRC or truncated OSN) — callers must
+    /// drop it rather than feed RTX wire format to the depacketizer.
+    fn maybe_unwrap_rtx(&self, packet: RtpPacket) -> Option<RtpPacket> {
+        let (primary_pt_from_map, is_rtx_ssrc) = {
+            let apt_map = self.rtx_apt.lock();
+            let primary_pt = apt_map.get(&packet.header.payload_type).copied();
+            let is_rtx_ssrc = *self.rtx_ssrc.lock() == Some(packet.header.ssrc);
+            (primary_pt, is_rtx_ssrc)
+        };
+        if primary_pt_from_map.is_none() && !is_rtx_ssrc {
+            return Some(packet);
+        }
+        let primary_pt = primary_pt_from_map.unwrap_or_else(|| self.params.lock().payload_type);
+
+        let primary_ssrc = {
+            let s = *self.ssrc.lock();
+            if s != 0 {
+                s
+            } else {
+                // Primary SSRC not latched yet; do not pass RTX bytes to depacketizer.
+                return None;
+            }
+        };
+
+        match crate::rtx::unwrap_rtx_packet(&packet, primary_ssrc, primary_pt) {
+            Some(restored) => Some(restored),
+            None => {
+                trace!(
+                    "RTX: short payload on ssrc={} pt={}, dropping packet",
+                    packet.header.ssrc, packet.header.payload_type
+                );
+                None
+            }
+        }
     }
 
     pub fn set_transport(
@@ -5836,7 +6193,15 @@ impl RtpReceiver {
                 payload_types.push(pt);
             }
         }
+        for pt in self.rtx_apt.lock().keys().copied() {
+            if !payload_types.contains(&pt) {
+                payload_types.push(pt);
+            }
+        }
         transport.register_payload_list_listener(payload_types.clone(), tx.clone());
+        if let Some(rtx_ssrc) = *self.rtx_ssrc.lock() {
+            transport.register_listener_sync(rtx_ssrc, tx.clone());
+        }
         debug!(
             transport_id = format_args!("{:p}", Arc::as_ptr(&transport)),
             transceiver_id = route_transceiver.as_ref().map(|t| t.id()),
@@ -5957,18 +6322,37 @@ impl RtpReceiver {
                         match event {
                             LoopEvent::Packet(packet_opt, rid, packet_rx, mut depacketizer) => {
                                 if let Some((packet, addr)) = packet_opt
-                                    && let Some((source, simulcast_ssrc, _)) = tracks.get(&rid) {
-                                        let this = weak_self.upgrade();
-                                        if rid.is_some() {
-                                            let mut s = simulcast_ssrc.lock();
-                                            if s.is_none() {
-                                                *s = Some(packet.header.ssrc);
-                                            }
-                                        } else if let Some(ref this) = this {
-                                            // Main track: Update SSRC if it matched via provisional listener
-                                            let mut s = this.ssrc.lock();
-                                            let old_ssrc = *s;
-                                            if old_ssrc != packet.header.ssrc {
+                                    && let Some((source, simulcast_ssrc, _)) = tracks.get(&rid)
+                                {
+                                    let Some(this) = weak_self.upgrade() else {
+                                        break;
+                                    };
+                                    let Some(packet) = this.maybe_unwrap_rtx(packet) else {
+                                        // Dropped truncated/unrestorable RTX — keep listening.
+                                        let rid_clone = rid.clone();
+                                        futures.push(Box::pin(async move {
+                                            let mut rx = packet_rx;
+                                            let packet = rx.recv().await;
+                                            LoopEvent::Packet(packet, rid_clone, rx, depacketizer)
+                                        }));
+                                        continue;
+                                    };
+
+                                    if rid.is_some() {
+                                        let mut s = simulcast_ssrc.lock();
+                                        if s.is_none() {
+                                            *s = Some(packet.header.ssrc);
+                                        }
+                                    } else {
+                                        // Main track: Update SSRC if it matched via provisional listener
+                                        let mut s = this.ssrc.lock();
+                                        let old_ssrc = *s;
+                                        if old_ssrc != packet.header.ssrc {
+                                            // Ignore RTX SSRC latching — primary SSRC only.
+                                            // After unwrap, packet SSRC is already primary.
+                                            let is_rtx = this.rtx_ssrc.lock().as_ref()
+                                                == Some(&packet.header.ssrc);
+                                            if !is_rtx {
                                                 trace!(
                                                     "RTP main track SSRC changed from {} to {}",
                                                     old_ssrc, packet.header.ssrc
@@ -5985,63 +6369,73 @@ impl RtpReceiver {
                                                     );
                                                     // Use swap to atomically check and set the flag
                                                     if !this.track_event_sent.swap(true, Ordering::SeqCst)
-                                                        && let Some(ref event_tx) = *this.track_ready_event_tx.lock() {
-                                                            let transceiver = this.track_ready_transceiver.lock();
-                                                            if let Some(transceiver) = transceiver.as_ref().and_then(|t| t.upgrade()) {
-                                                                let _ = event_tx.send(PeerConnectionEvent::Track(transceiver.clone()));
-                                                                trace!("RTP mode: Sent Track event after SSRC latching complete");
-                                                            }
-                                                        }
-                                                }
-                                            }
-                                        }
-
-                                        if let Some(ref this) = this {
-                                            let transport = this.transport.lock().clone();
-                                            for interceptor in &this.interceptors {
-                                                if let Some(mut rtcp_packet) = interceptor.on_packet_received(&packet).await {
-                                                    if let RtcpPacket::GenericNack(ref mut nack) = rtcp_packet {
-                                                        let sender_ssrc = this.rtcp_feedback_ssrc.lock().unwrap_or(0);
-                                                        if sender_ssrc != 0 {
-                                                            nack.sender_ssrc = sender_ssrc;
-                                                        } else {
-                                                            trace!("NACK: skipping sender_ssrc update because it is 0");
+                                                        && let Some(ref event_tx) = *this.track_ready_event_tx.lock()
+                                                    {
+                                                        let transceiver = this.track_ready_transceiver.lock();
+                                                        if let Some(transceiver) =
+                                                            transceiver.as_ref().and_then(|t| t.upgrade())
+                                                        {
+                                                            let _ = event_tx.send(
+                                                                PeerConnectionEvent::Track(transceiver.clone()),
+                                                            );
+                                                            trace!(
+                                                                "RTP mode: Sent Track event after SSRC latching complete"
+                                                            );
                                                         }
                                                     }
-
-                                                    if let Some(ref transport) = transport {
-                                                        let _ = transport.send_rtcp(&[rtcp_packet]).await;
-                                                    }
                                                 }
                                             }
-
-                                            let clock_rate =
-                                                this.clock_rate_for_payload_type(
-                                                    packet.header.payload_type,
-                                                );
-
-                                            // Track depacketizer drop count changes
-                                            let prev_drop = depacketizer.drop_count();
-                                            // Fix: Use Depacketizer to handle frames correctly
-                                            if let Ok(samples) = depacketizer.push(packet, clock_rate, addr, source.kind()) {
-                                                if depacketizer.drop_count() > prev_drop {
-                                                    source.increment_drop_count();
-                                                }
-                                                if let Err(e) = source.send_many(samples) {
-                                                    tracing::warn!("Failed to send media sample batch: {}", e);
-                                                }
-                                            }
-
-                                            let rid_clone = rid.clone();
-                                            futures.push(Box::pin(async move {
-                                                let mut rx = packet_rx;
-                                                let packet = rx.recv().await;
-                                                LoopEvent::Packet(packet, rid_clone, rx, depacketizer)
-                                            }));
-                                        } else {
-                                            break;
                                         }
                                     }
+
+                                    let transport = this.transport.lock().clone();
+                                    for interceptor in &this.interceptors {
+                                        if let Some(mut rtcp_packet) =
+                                            interceptor.on_packet_received(&packet).await
+                                        {
+                                            if let RtcpPacket::GenericNack(ref mut nack) = rtcp_packet
+                                            {
+                                                let sender_ssrc =
+                                                    this.rtcp_feedback_ssrc.lock().unwrap_or(0);
+                                                if sender_ssrc != 0 {
+                                                    nack.sender_ssrc = sender_ssrc;
+                                                } else {
+                                                    trace!(
+                                                        "NACK: skipping sender_ssrc update because it is 0"
+                                                    );
+                                                }
+                                            }
+
+                                            if let Some(ref transport) = transport {
+                                                let _ = transport.send_rtcp(&[rtcp_packet]).await;
+                                            }
+                                        }
+                                    }
+
+                                    let clock_rate =
+                                        this.clock_rate_for_payload_type(packet.header.payload_type);
+
+                                    // Track depacketizer drop count changes
+                                    let prev_drop = depacketizer.drop_count();
+                                    // Fix: Use Depacketizer to handle frames correctly
+                                    if let Ok(samples) =
+                                        depacketizer.push(packet, clock_rate, addr, source.kind())
+                                    {
+                                        if depacketizer.drop_count() > prev_drop {
+                                            source.increment_drop_count();
+                                        }
+                                        if let Err(e) = source.send_many(samples) {
+                                            tracing::warn!("Failed to send media sample batch: {}", e);
+                                        }
+                                    }
+
+                                    let rid_clone = rid.clone();
+                                    futures.push(Box::pin(async move {
+                                        let mut rx = packet_rx;
+                                        let packet = rx.recv().await;
+                                        LoopEvent::Packet(packet, rid_clone, rx, depacketizer)
+                                    }));
+                                }
                             }
                             LoopEvent::Feedback(event_opt, rid) => {
                                 if let Some(event) = event_opt
@@ -6857,6 +7251,262 @@ a=ssrc-group:FID 12345 67890\r\n";
         println!("RTX SSRC: {:?}", receiver.rtx_ssrc());
         assert_eq!(receiver.ssrc(), 12345); // Should be Primary
         assert_eq!(receiver.rtx_ssrc(), Some(67890));
+    }
+
+    #[tokio::test]
+    async fn offer_with_rtx_capability_emits_rtpmap_fmtp_and_fid() {
+        use crate::config::{MediaCapabilities, VideoCapability};
+
+        let mut config = RtcConfiguration::default();
+        config.media_capabilities = Some(MediaCapabilities {
+            audio: vec![],
+            video: vec![VideoCapability::vp8_with_rtx(97)],
+            application: None,
+            image: vec![],
+        });
+        let pc = PeerConnection::new(config);
+        let (source, track, _) =
+            crate::media::track::sample_track(crate::media::frame::MediaKind::Video, 8);
+        let _ = source;
+        let params = RtpCodecParameters {
+            payload_type: 96,
+            clock_rate: 90000,
+            channels: 0,
+        };
+        let sender = pc.add_track(track, params).unwrap();
+
+        let offer = pc.create_offer().await.unwrap();
+        let section = &offer.media_sections[0];
+        assert!(
+            section.formats.iter().any(|f| f == "97"),
+            "formats should include RTX PT 97, got {:?}",
+            section.formats
+        );
+        assert!(
+            section
+                .attributes
+                .iter()
+                .any(|a| { a.key == "rtpmap" && a.value.as_deref() == Some("97 rtx/90000") })
+        );
+        assert!(
+            section
+                .attributes
+                .iter()
+                .any(|a| { a.key == "fmtp" && a.value.as_deref() == Some("97 apt=96") })
+        );
+        assert!(
+            section.attributes.iter().any(|a| a.key == "ssrc-group"
+                && a.value
+                    .as_deref()
+                    .map(|v| v.starts_with("FID "))
+                    .unwrap_or(false)),
+            "send offer must include a=ssrc-group:FID"
+        );
+        assert!(sender.nack_handler().is_some());
+        let t = &pc.get_transceivers()[0];
+        assert!(t.sender_rtx_ssrc().is_some());
+    }
+
+    #[tokio::test]
+    async fn answer_echoes_remote_rtx_when_offered() {
+        let pc = PeerConnection::new(RtcConfiguration::default());
+        pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
+
+        let offer_sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\n\
+c=IN IP4 127.0.0.1\r\n\
+a=mid:0\r\n\
+a=sendrecv\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+a=rtpmap:97 rtx/90000\r\n\
+a=fmtp:97 apt=96\r\n\
+a=rtcp-fb:96 nack\r\n\
+a=fingerprint:sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99\r\n\
+a=setup:actpass\r\n\
+a=ice-ufrag:test\r\n\
+a=ice-pwd:testpassword12345678901\r\n";
+
+        let offer =
+            crate::sdp::SessionDescription::parse(crate::sdp::SdpType::Offer, offer_sdp).unwrap();
+        pc.set_remote_description(offer).await.unwrap();
+
+        let answer = pc.create_answer().await.unwrap();
+        let section = &answer.media_sections[0];
+        assert!(
+            section.formats.iter().any(|f| f == "97"),
+            "answer should echo RTX PT, got {:?}",
+            section.formats
+        );
+        assert!(
+            section
+                .attributes
+                .iter()
+                .any(|a| { a.key == "fmtp" && a.value.as_deref() == Some("97 apt=96") })
+        );
+    }
+
+    #[tokio::test]
+    async fn answer_does_not_echo_rtx_when_remote_omits_it() {
+        use crate::config::{MediaCapabilities, VideoCapability};
+
+        // Local config enables RTX, but remote offer has none — answer must not invent RTX.
+        let mut config = RtcConfiguration::default();
+        config.media_capabilities = Some(MediaCapabilities {
+            audio: vec![],
+            video: vec![VideoCapability::vp8_with_rtx(97)],
+            application: None,
+            image: vec![],
+        });
+        let pc = PeerConnection::new(config);
+        pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
+
+        let offer_sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+c=IN IP4 127.0.0.1\r\n\
+a=mid:0\r\n\
+a=sendrecv\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+a=rtcp-fb:96 nack\r\n\
+a=fingerprint:sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99\r\n\
+a=setup:actpass\r\n\
+a=ice-ufrag:test\r\n\
+a=ice-pwd:testpassword12345678901\r\n";
+
+        let offer =
+            crate::sdp::SessionDescription::parse(crate::sdp::SdpType::Offer, offer_sdp).unwrap();
+        pc.set_remote_description(offer).await.unwrap();
+
+        let answer = pc.create_answer().await.unwrap();
+        let section = &answer.media_sections[0];
+        assert!(
+            !section.formats.iter().any(|f| f == "97"),
+            "answer must not advertise RTX when remote offer omitted it, formats={:?}",
+            section.formats
+        );
+        assert!(
+            section.attributes.iter().all(|a| {
+                a.key != "rtpmap"
+                    || !a
+                        .value
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_ascii_lowercase()
+                        .contains(" rtx/")
+            }),
+            "answer must not contain rtx rtpmap"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_offer_has_no_rtx_without_capability() {
+        let pc = PeerConnection::new(RtcConfiguration::default());
+        let (source, track, _) =
+            crate::media::track::sample_track(crate::media::frame::MediaKind::Video, 8);
+        let _ = source;
+        let params = RtpCodecParameters {
+            payload_type: 96,
+            clock_rate: 90000,
+            channels: 0,
+        };
+        let _ = pc.add_track(track, params).unwrap();
+        let offer = pc.create_offer().await.unwrap();
+        let section = &offer.media_sections[0];
+        assert!(
+            section.attributes.iter().all(|a| {
+                a.key != "rtpmap"
+                    || !a
+                        .value
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_ascii_lowercase()
+                        .contains(" rtx/")
+            }),
+            "default VideoCapability must not emit RTX"
+        );
+        assert!(
+            section
+                .attributes
+                .iter()
+                .all(|a| a.key != "ssrc-group"
+                    || !a.value.as_deref().unwrap_or("").starts_with("FID ")),
+            "default offer must not emit FID without RTX"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_rtx_apt_map_stored_on_receiver() {
+        let pc = PeerConnection::new(RtcConfiguration::default());
+        let sdp_str = "v=0\r\n\
+o=- 123456 123456 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\n\
+c=IN IP4 127.0.0.1\r\n\
+a=mid:0\r\n\
+a=sendrecv\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+a=rtpmap:97 rtx/90000\r\n\
+a=fmtp:97 apt=96\r\n\
+a=fingerprint:sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99\r\n\
+a=setup:passive\r\n\
+a=ssrc-group:FID 12345 67890\r\n\
+a=ssrc:12345 cname:foo\r\n\
+a=ssrc:67890 cname:foo\r\n";
+
+        let sdp =
+            crate::sdp::SessionDescription::parse(crate::sdp::SdpType::Offer, sdp_str).unwrap();
+        pc.set_remote_description(sdp).await.unwrap();
+        let receiver = pc.get_transceivers()[0].receiver().unwrap();
+        assert_eq!(receiver.rtx_ssrc(), Some(67890));
+        // Unwrap path: synthesize RTX packet and restore.
+        let rtx = crate::rtx::wrap_rtx_packet(
+            &crate::rtp::RtpPacket {
+                header: {
+                    let mut h = crate::rtp::RtpHeader::new(96, 42, 1000, 12345);
+                    h.marker = true;
+                    h
+                },
+                payload: bytes::Bytes::from_static(&[9, 8, 7]),
+                padding_len: 0,
+            },
+            &crate::rtx::RtxSenderConfig {
+                rtx_ssrc: 67890,
+                rtx_payload_type: 97,
+            },
+            1,
+        );
+        let restored = receiver.maybe_unwrap_rtx(rtx).expect("RTX unwrap");
+        assert_eq!(restored.header.ssrc, 12345);
+        assert_eq!(restored.header.payload_type, 96);
+        assert_eq!(restored.header.sequence_number, 42);
+        assert_eq!(&restored.payload[..], &[9, 8, 7]);
+
+        let short = crate::rtp::RtpPacket {
+            header: crate::rtp::RtpHeader::new(97, 1, 0, 67890),
+            payload: bytes::Bytes::from_static(&[0x00]),
+            padding_len: 0,
+        };
+        assert!(
+            receiver.maybe_unwrap_rtx(short).is_none(),
+            "truncated RTX must be dropped, not passed to depacketizer"
+        );
+    }
+
+    #[test]
+    fn nack_handler_rtx_stats_default_zero() {
+        let handler = DefaultRtpSenderNackHandler::new(16);
+        assert_eq!(handler.get_rtx_sent_count(), 0);
+        handler.set_rtx(Some(crate::rtx::RtxSenderConfig {
+            rtx_ssrc: 2,
+            rtx_payload_type: 97,
+        }));
+        assert!(handler.rtx_config().is_some());
     }
 
     #[test]

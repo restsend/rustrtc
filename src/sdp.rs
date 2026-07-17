@@ -866,13 +866,27 @@ impl MediaSection {
                 }
             }
 
+            // RTX is not a primary media codec; associate it onto the apt target below.
+            if codec_name.eq_ignore_ascii_case("rtx") {
+                continue;
+            }
+
             capabilities.push(crate::config::VideoCapability {
                 payload_type,
                 codec_name,
                 clock_rate,
                 fmtp,
                 rtcp_fbs,
+                rtx_payload_type: None,
             });
+        }
+
+        // Attach RTX payload types via fmtp apt= onto the matching primary codec.
+        let apt_map = crate::rtx::extract_rtx_apt_map_from_attrs(&self.attributes);
+        for cap in &mut capabilities {
+            if let Some(rtx_pt) = crate::rtx::rtx_pt_for_primary(&apt_map, cap.payload_type) {
+                cap.rtx_payload_type = Some(rtx_pt);
+            }
         }
 
         capabilities
@@ -1074,6 +1088,15 @@ impl MediaSection {
                     "rtcp-fb",
                     Some(format!("{} {}", video.payload_type, fb)),
                 ));
+            }
+            if let Some(rtx_pt) = video.rtx_payload_type {
+                crate::rtx::append_rtx_to_section(
+                    &mut self.formats,
+                    &mut self.attributes,
+                    video.payload_type,
+                    rtx_pt,
+                    video.clock_rate,
+                );
             }
         }
     }
@@ -1451,6 +1474,7 @@ a=fingerprint:sha-256 AA:BB:CC:EE\r\n";
             clock_rate: 90000,
             fmtp: Some("packetization-mode=1;profile-level-id=42e01f".to_string()),
             rtcp_fbs: vec![],
+            rtx_payload_type: None,
         };
 
         let caps = MediaCapabilities {
@@ -1539,6 +1563,7 @@ a=fingerprint:sha-256 AA:BB:CC:EE\r\n";
             clock_rate: 90000,
             fmtp: None,
             rtcp_fbs: vec!["nack pli".to_string(), "ccm fir".to_string()],
+            rtx_payload_type: None,
         };
         let caps = MediaCapabilities {
             audio: vec![],
@@ -1762,6 +1787,46 @@ a=rtcp-fb:97 nack pli\r\n";
             "packetization-mode=1;profile-level-id=42e01f"
         );
         assert_eq!(caps[1].rtcp_fbs, vec!["nack pli"]);
+    }
+
+    #[test]
+    fn test_parse_video_capabilities_attaches_rtx_via_apt() {
+        let sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\n\
+a=mid:0\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+a=rtpmap:97 rtx/90000\r\n\
+a=fmtp:97 apt=96\r\n";
+
+        let desc = SessionDescription::parse(SdpType::Offer, sdp).unwrap();
+        let caps = desc.to_video_capabilities();
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].payload_type, 96);
+        assert_eq!(caps[0].rtx_payload_type, Some(97));
+    }
+
+    #[test]
+    fn apply_video_config_emits_rtx_when_configured() {
+        use crate::config::{MediaCapabilities, SdpCompatibilityMode, VideoCapability};
+
+        let caps = MediaCapabilities {
+            audio: vec![],
+            video: vec![VideoCapability::vp8_with_rtx(97)],
+            application: None,
+            image: vec![],
+        };
+        let mut section = MediaSection::new(MediaKind::Video, "0");
+        section.apply_config(&make_config(caps, SdpCompatibilityMode::Standard));
+        assert!(section.formats.iter().any(|f| f == "97"));
+        assert!(
+            section
+                .attributes
+                .iter()
+                .any(|a| a.key == "fmtp" && a.value.as_deref() == Some("97 apt=96"))
+        );
     }
 
     #[test]

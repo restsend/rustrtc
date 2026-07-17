@@ -203,6 +203,11 @@ pub struct VideoCapability {
     pub clock_rate: u32,
     pub fmtp: Option<String>,
     pub rtcp_fbs: Vec<String>,
+    /// Associated RTX payload type (RFC 4588). When set, SDP offers include
+    /// `a=rtpmap:<pt> rtx/<clock_rate>` and `a=fmtp:<pt> apt=<primary>`.
+    /// Default `None` preserves single-codec SDP; answers still accept remote RTX.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtx_payload_type: Option<u8>,
 }
 
 impl Default for VideoCapability {
@@ -219,6 +224,7 @@ impl Default for VideoCapability {
                 "goog-remb".to_string(),
                 "transport-cc".to_string(),
             ],
+            rtx_payload_type: None,
         }
     }
 }
@@ -231,6 +237,15 @@ impl VideoCapability {
             clock_rate: 90000,
             fmtp: Some("packetization-mode=1;profile-level-id=42e01f".to_string()),
             rtcp_fbs: vec!["nack pli".to_string(), "ccm fir".to_string()],
+            rtx_payload_type: None,
+        }
+    }
+
+    /// VP8 with RTX enabled (common browser interop profile).
+    pub fn vp8_with_rtx(rtx_payload_type: u8) -> Self {
+        Self {
+            rtx_payload_type: Some(rtx_payload_type),
+            ..Self::default()
         }
     }
 }

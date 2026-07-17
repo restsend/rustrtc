@@ -17,6 +17,7 @@ pub mod errors;
 pub mod media;
 pub mod peer_connection;
 pub mod rtp;
+pub mod rtx;
 pub mod sdp;
 pub mod srtp;
 pub mod stats;
