@@ -161,6 +161,18 @@ impl IceConn {
         self.rtcp_latched.store(false, Ordering::Relaxed);
     }
 
+    /// Returns the local socket address (the bind address of the current
+    /// ICE socket). Returns `0.0.0.0:0` when the socket is not yet available
+    /// (e.g., during ICE candidate gathering).
+    pub fn local_addr(&self) -> SocketAddr {
+        let socket = self.socket_rx.borrow();
+        match socket.as_ref() {
+            Some(IceSocketWrapper::Udp(s)) => s.local_addr().unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0))),
+            Some(IceSocketWrapper::SharedUdp(h)) => h.local_addr().unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0))),
+            _ => SocketAddr::from(([0, 0, 0, 0], 0)),
+        }
+    }
+
     pub(crate) fn set_remote_addr_from_signaling(&self, addr: SocketAddr, reason: &'static str) {
         let current = *self.remote_addr.read();
         if self.latch_on_rtp.load(Ordering::Relaxed)

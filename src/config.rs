@@ -1,4 +1,5 @@
 use crate::media::depacketizer::{DefaultDepacketizerFactory, DepacketizerFactory};
+use crate::peer_connection::{RtpReceiverInterceptor, RtpSenderInterceptor};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
@@ -514,6 +515,12 @@ pub struct RtcConfiguration {
     pub label: Option<String>,
     #[serde(skip, default)]
     pub cname: Option<String>,
+    /// Recording / tapping interceptors installed on every transceiver
+    /// created by this PC. Receiver interceptors fire on incoming RTP
+    /// (pre-depacketize); sender interceptors fire on outgoing RTP
+    /// (post seq/timestamp rewrite, pre-wire).
+    #[serde(skip, default)]
+    pub recorder_interceptors: RecorderInterceptors,
 }
 
 impl Default for RtcConfiguration {
@@ -567,6 +574,7 @@ impl Default for RtcConfiguration {
             sdp_compatibility: SdpCompatibilityMode::default(),
             label: None,
             cname: None,
+            recorder_interceptors: RecorderInterceptors::default(),
         }
     }
 }
@@ -580,6 +588,33 @@ impl Default for RtcConfigurationBuilder {
         Self::new()
     }
 }
+
+/// Wrapper for interceptor lists so that `RtcConfiguration` can still derive
+/// `Debug / Clone / PartialEq / Eq` — the actual interceptor trait objects
+/// are opaque and only compared by count.
+#[derive(Clone, Default)]
+pub struct RecorderInterceptors {
+    pub receivers: Vec<Arc<dyn RtpReceiverInterceptor>>,
+    pub senders: Vec<Arc<dyn RtpSenderInterceptor>>,
+}
+
+impl Debug for RecorderInterceptors {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecorderInterceptors")
+            .field("receivers_len", &self.receivers.len())
+            .field("senders_len", &self.senders.len())
+            .finish()
+    }
+}
+
+impl PartialEq for RecorderInterceptors {
+    fn eq(&self, other: &Self) -> bool {
+        self.receivers.len() == other.receivers.len()
+            && self.senders.len() == other.senders.len()
+    }
+}
+
+impl Eq for RecorderInterceptors {}
 
 impl RtcConfigurationBuilder {
     pub fn new() -> Self {
@@ -806,6 +841,26 @@ impl RtcConfigurationBuilder {
 
     pub fn cname(mut self, cname: String) -> Self {
         self.inner.cname = Some(cname);
+        self
+    }
+
+    /// Append a receiver interceptor (fires on every incoming RTP packet,
+    /// pre-depacketize).
+    pub fn receiver_interceptor(
+        mut self,
+        interceptor: Arc<dyn RtpReceiverInterceptor>,
+    ) -> Self {
+        self.inner.recorder_interceptors.receivers.push(interceptor);
+        self
+    }
+
+    /// Append a sender interceptor (fires on every outgoing RTP packet,
+    /// post seq/timestamp rewrite).
+    pub fn sender_interceptor(
+        mut self,
+        interceptor: Arc<dyn RtpSenderInterceptor>,
+    ) -> Self {
+        self.inner.recorder_interceptors.senders.push(interceptor);
         self
     }
 

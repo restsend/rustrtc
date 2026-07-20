@@ -105,7 +105,12 @@ impl StatsCollector {
 
 #[async_trait]
 impl RtpSenderInterceptor for StatsCollector {
-    async fn on_packet_sent(&self, packet: &RtpPacket) {
+    async fn on_packet_sent(
+        &self,
+        packet: &RtpPacket,
+        _dst_addr: std::net::SocketAddr,
+        _local_addr: std::net::SocketAddr,
+    ) {
         let size = Self::packet_size(packet);
         let mut outbound = self.local_outbound.lock();
         let stats = outbound.entry(packet.header.ssrc).or_default();
@@ -116,7 +121,12 @@ impl RtpSenderInterceptor for StatsCollector {
 
 #[async_trait]
 impl RtpReceiverInterceptor for StatsCollector {
-    async fn on_packet_received(&self, packet: &RtpPacket) -> Option<RtcpPacket> {
+    async fn on_packet_received(
+        &self,
+        packet: &RtpPacket,
+        _src_addr: std::net::SocketAddr,
+        _local_addr: std::net::SocketAddr,
+    ) -> Option<RtcpPacket> {
         let size = Self::packet_size(packet);
         let mut inbound = self.local_inbound.lock();
         let stats = inbound.entry(packet.header.ssrc).or_default();

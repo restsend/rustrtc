@@ -137,7 +137,16 @@ impl Drop for LoopsGuard {
 
 #[async_trait]
 pub trait RtpSenderInterceptor: Send + Sync {
-    async fn on_packet_sent(&self, _packet: &RtpPacket) {}
+    /// Fires on every outgoing RTP packet, post seq/timestamp rewrite,
+    /// pre-wire. `dst_addr` is the remote peer address, `local_addr` is
+    /// the local socket address.
+    async fn on_packet_sent(
+        &self,
+        _packet: &RtpPacket,
+        _dst_addr: std::net::SocketAddr,
+        _local_addr: std::net::SocketAddr,
+    ) {
+    }
     async fn on_rtcp_received(&self, _packet: &RtcpPacket, _transport: Arc<RtpTransport>) {}
     fn as_nack_stats(self: Arc<Self>) -> Option<Arc<dyn NackStats>> {
         None
@@ -149,7 +158,15 @@ pub trait RtpSenderInterceptor: Send + Sync {
 
 #[async_trait]
 pub trait RtpReceiverInterceptor: Send + Sync {
-    async fn on_packet_received(&self, _packet: &RtpPacket) -> Option<RtcpPacket> {
+    /// Fires on every incoming RTP packet, pre-depacketize.
+    /// `src_addr` is the remote peer address, `local_addr` is the local
+    /// socket address on which the packet was received.
+    async fn on_packet_received(
+        &self,
+        _packet: &RtpPacket,
+        _src_addr: std::net::SocketAddr,
+        _local_addr: std::net::SocketAddr,
+    ) -> Option<RtcpPacket> {
         None
     }
     async fn on_rtcp_received(&self, _packet: &RtcpPacket, _transport: Arc<RtpTransport>) {}
@@ -240,7 +257,12 @@ impl DefaultRtpSenderNackHandler {
 
 #[async_trait]
 impl RtpSenderInterceptor for DefaultRtpSenderNackHandler {
-    async fn on_packet_sent(&self, packet: &RtpPacket) {
+    async fn on_packet_sent(
+        &self,
+        packet: &RtpPacket,
+        _dst_addr: std::net::SocketAddr,
+        _local_addr: std::net::SocketAddr,
+    ) {
         // Do not buffer RTX retransmissions. They are sent directly through the
         // transport (not the interceptor chain), but guard in case a future
         // caller routes them here. Lock-free check: 0 means RTX is disabled.
@@ -343,7 +365,12 @@ impl DefaultRtpReceiverNackHandler {
 
 #[async_trait]
 impl RtpReceiverInterceptor for DefaultRtpReceiverNackHandler {
-    async fn on_packet_received(&self, packet: &RtpPacket) -> Option<RtcpPacket> {
+    async fn on_packet_received(
+        &self,
+        packet: &RtpPacket,
+        _src_addr: std::net::SocketAddr,
+        _local_addr: std::net::SocketAddr,
+    ) -> Option<RtcpPacket> {
         let seq = packet.header.sequence_number;
         let ssrc = packet.header.ssrc;
 
@@ -745,6 +772,9 @@ impl PeerConnection {
             .payload_map(transceiver.payload_map.clone())
             .interceptor(self.inner.stats_collector.clone())
             .depacketizer_factory(self.inner.config.depacketizer_strategy.factory.clone());
+        for i in &self.inner.config.recorder_interceptors.receivers {
+            builder = builder.interceptor(i.clone());
+        }
 
         let nack_enabled = if let Some(caps) = &self.inner.config.media_capabilities {
             match kind {
@@ -839,6 +869,9 @@ impl PeerConnection {
             .stream_id(stream_id)
             .params(params)
             .interceptor(self.inner.stats_collector.clone());
+        for i in &self.inner.config.recorder_interceptors.senders {
+            builder = builder.interceptor(i.clone());
+        }
 
         if let Some(ref cname) = self.inner.config.cname {
             builder = builder.cname(cname.clone());
@@ -5670,8 +5703,12 @@ impl RtpSender {
                                     packet.header.sequence_number = next_seq.fetch_add(1, Ordering::Relaxed);
                                 }
 
+                                let dst_addr = transport.remote_addr();
+                                let local_addr = transport.local_addr();
                                 for interceptor in &interceptors {
-                                    interceptor.on_packet_sent(&packet).await;
+                                    interceptor
+                                        .on_packet_sent(&packet, dst_addr, local_addr)
+                                        .await;
                                 }
 
                                 // Auto-inject sdes:mid header extension when negotiated (RFC 8843 / BUNDLE).
@@ -6423,9 +6460,15 @@ impl RtpReceiver {
                                     }
 
                                     let transport = this.transport.lock().clone();
+                                    let local_addr = transport
+                                        .as_ref()
+                                        .map(|t| t.local_addr())
+                                        .unwrap_or(std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
                                     for interceptor in &this.interceptors {
                                         if let Some(mut rtcp_packet) =
-                                            interceptor.on_packet_received(&packet).await
+                                            interceptor
+                                                .on_packet_received(&packet, addr, local_addr)
+                                                .await
                                         {
                                             if let RtcpPacket::GenericNack(ref mut nack) = rtcp_packet
                                             {

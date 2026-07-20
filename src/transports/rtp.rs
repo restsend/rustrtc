@@ -341,6 +341,18 @@ impl RtpTransport {
             .store(encode_ext_id(id), Ordering::Relaxed);
     }
 
+    /// Returns the remote peer's socket address (the nominated ICE candidate
+    /// or the configured RTP destination).
+    pub fn remote_addr(&self) -> std::net::SocketAddr {
+        *self.transport.remote_addr.read()
+    }
+
+    /// Returns the local socket address (the ICE socket's bind address).
+    /// Returns `0.0.0.0:0` when the socket is not yet available.
+    pub fn local_addr(&self) -> std::net::SocketAddr {
+        self.transport.local_addr()
+    }
+
     pub fn register_rtcp_listener(&self, tx: mpsc::Sender<Vec<RtcpPacket>>) {
         let mut listener = self.rtcp_listener.lock();
         *listener = Some(tx);
