@@ -4438,6 +4438,9 @@ impl PeerConnectionInner {
             self.merge_remote_rtx_into_answer(section);
         }
 
+        // Browsers reject descriptions with duplicate extension ids.
+        let mut used_extmap_ids = self.get_remote_extmap_ids(&section.mid);
+
         // Add extmap for Video
         if kind == MediaKind::Video {
             let (mut rid_id, mut repaired_rid_id) = self.get_remote_video_extmap_ids(&section.mid);
@@ -4445,10 +4448,10 @@ impl PeerConnectionInner {
             if sdp_type == SdpType::Offer && self.config.transport_mode != TransportMode::Rtp {
                 // If not found in remote (new transceiver), use defaults
                 if rid_id.is_none() {
-                    rid_id = Some("1".to_string());
+                    rid_id = Some(Self::claim_free_extmap_id(&mut used_extmap_ids, 1));
                 }
                 if repaired_rid_id.is_none() {
-                    repaired_rid_id = Some("2".to_string());
+                    repaired_rid_id = Some(Self::claim_free_extmap_id(&mut used_extmap_ids, 2));
                 }
             }
 
@@ -4462,7 +4465,7 @@ impl PeerConnectionInner {
             && abs_send_time_id.is_none()
             && self.config.transport_mode != TransportMode::Rtp
         {
-            abs_send_time_id = Some("3".to_string()); // Default ID for abs-send-time
+            abs_send_time_id = Some(Self::claim_free_extmap_id(&mut used_extmap_ids, 3));
         }
         if let Some(id) = abs_send_time_id {
             section.attributes.push(crate::sdp::Attribute::new(
@@ -4480,7 +4483,7 @@ impl PeerConnectionInner {
                 && sdes_mid_id.is_none()
                 && self.config.transport_mode != TransportMode::Rtp
             {
-                sdes_mid_id = Some("4".to_string());
+                sdes_mid_id = Some(Self::claim_free_extmap_id(&mut used_extmap_ids, 4));
             }
             if let Some(id) = sdes_mid_id {
                 section.attributes.push(crate::sdp::Attribute::new(
@@ -4707,6 +4710,40 @@ impl PeerConnectionInner {
             }
         }
         None
+    }
+
+    /// All extension ids the remote has mapped on the given m-line.
+    fn get_remote_extmap_ids(&self, mid: &str) -> std::collections::HashSet<u8> {
+        let mut ids = std::collections::HashSet::new();
+        let remote = self.remote_description.lock();
+        if let Some(desc) = &*remote
+            && let Some(remote_section) = desc.media_sections.iter().find(|s| s.mid == mid)
+        {
+            for attr in &remote_section.attributes {
+                if attr.key == "extmap"
+                    && let Some(val) = &attr.value
+                    && let Some(id_str) = val.split_whitespace().next()
+                    && let Ok(id) = id_str.parse::<u8>()
+                {
+                    ids.insert(id);
+                }
+            }
+        }
+        ids
+    }
+
+    /// Pick `preferred` if free, otherwise the lowest free one-byte
+    /// extension id (RFC 8285: 1-14), and mark it as used.
+    fn claim_free_extmap_id(used: &mut std::collections::HashSet<u8>, preferred: u8) -> String {
+        let id = if used.contains(&preferred) {
+            (1..=14u8)
+                .find(|candidate| !used.contains(candidate))
+                .unwrap_or(preferred)
+        } else {
+            preferred
+        };
+        used.insert(id);
+        id.to_string()
     }
 
     fn close_with_reason(&self, reason: DisconnectReason) {
@@ -6633,6 +6670,13 @@ impl PeerConnection {
 
 #[cfg(test)]
 mod tests {
+
+    fn test_addr() -> std::net::SocketAddr {
+        std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            5000,
+        )
+    }
     use super::*;
     use crate::transports::ice::IceTransportState;
     use crate::{Direction, MediaKind, RtcConfiguration};
@@ -7806,18 +7850,28 @@ a=sendrecv\r\n";
         let packet1 = RtpPacket::new(header.clone(), vec![1, 2, 3]);
 
         // First packet initializes
-        assert!(handler.on_packet_received(&packet1).await.is_none());
+        assert!(
+            handler
+                .on_packet_received(&packet1, test_addr(), test_addr())
+                .await
+                .is_none()
+        );
 
         // Consecutive packet
         header.sequence_number = 101;
         let packet2 = RtpPacket::new(header.clone(), vec![4, 5, 6]);
-        assert!(handler.on_packet_received(&packet2).await.is_none());
+        assert!(
+            handler
+                .on_packet_received(&packet2, test_addr(), test_addr())
+                .await
+                .is_none()
+        );
 
         // Gap detected (102 missing)
         header.sequence_number = 103;
         let packet3 = RtpPacket::new(header.clone(), vec![7, 8, 9]);
         let res = handler
-            .on_packet_received(&packet3)
+            .on_packet_received(&packet3, test_addr(), test_addr())
             .await
             .expect("Should generate NACK");
         if let RtcpPacket::GenericNack(nack) = res {
@@ -7831,7 +7885,7 @@ a=sendrecv\r\n";
         header.sequence_number = 106;
         let packet4 = RtpPacket::new(header.clone(), vec![10]);
         let res = handler
-            .on_packet_received(&packet4)
+            .on_packet_received(&packet4, test_addr(), test_addr())
             .await
             .expect("Should generate NACK");
         if let RtcpPacket::GenericNack(nack) = res {
@@ -7852,7 +7906,9 @@ a=sendrecv\r\n";
         let mut header = RtpHeader::new(96, 100, 0, 1234);
         let packet1 = RtpPacket::new(header.clone(), vec![1, 2, 3]);
 
-        handler.on_packet_sent(&packet1).await;
+        handler
+            .on_packet_sent(&packet1, test_addr(), test_addr())
+            .await;
 
         // Mock transport (we just need it to not crash, though it won't actually send)
         let (_, socket_rx) = tokio::sync::watch::channel(None);
@@ -7875,7 +7931,11 @@ a=sendrecv\r\n";
         for i in 101..115 {
             header.sequence_number = i;
             handler
-                .on_packet_sent(&RtpPacket::new(header.clone(), vec![0]))
+                .on_packet_sent(
+                    &RtpPacket::new(header.clone(), vec![0]),
+                    test_addr(),
+                    test_addr(),
+                )
                 .await;
         }
 
@@ -11156,5 +11216,66 @@ a=mid:0
             1,
             "Should create a new transceiver when no offer transceiver exists"
         );
+    }
+
+    #[tokio::test]
+    async fn renegotiation_offer_has_unique_extmap_ids() {
+        use crate::{SdpType, SessionDescription};
+        let pc = PeerConnection::new(RtcConfiguration::default());
+
+        // Firefox-style audio offer: sdes:mid on id 3, no abs-send-time.
+        let sdp_str = "v=0\r\n\
+                       o=- 123456 0 IN IP4 127.0.0.1\r\n\
+                       s=-\r\n\
+                       t=0 0\r\n\
+                       a=group:BUNDLE 0\r\n\
+                       a=fingerprint:sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99\r\n\
+                       a=setup:actpass\r\n\
+                       c=IN IP4 127.0.0.1\r\n\
+                       m=audio 9 UDP/TLS/RTP/SAVPF 109\r\n\
+                       a=mid:0\r\n\
+                       a=rtpmap:109 opus/48000/2\r\n\
+                       a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level\r\n\
+                       a=extmap:3 urn:ietf:params:rtp-hdrext:sdes:mid\r\n\
+                       a=ice-ufrag:abcd\r\n\
+                       a=ice-pwd:abcdefghijklmnopqrstuvwx\r\n\
+                       a=sendrecv\r\n";
+        let offer = SessionDescription::parse(SdpType::Offer, sdp_str).unwrap();
+        pc.set_remote_description(offer).await.unwrap();
+        let answer = pc.create_answer().await.unwrap();
+        pc.set_local_description(answer).unwrap();
+
+        let reoffer = pc.create_offer().await.unwrap();
+        for section in &reoffer.media_sections {
+            let mut seen = std::collections::HashSet::new();
+            for attr in &section.attributes {
+                if attr.key == "extmap" {
+                    let id: u8 = attr
+                        .value
+                        .as_ref()
+                        .and_then(|v| v.split_whitespace().next())
+                        .and_then(|v| v.parse().ok())
+                        .expect("extmap id");
+                    assert!(
+                        seen.insert(id),
+                        "duplicate extmap id {id} in m-section {}",
+                        section.mid
+                    );
+                }
+            }
+        }
+
+        let audio = &reoffer.media_sections[0];
+        let extmap_value = |uri: &str| -> String {
+            audio
+                .attributes
+                .iter()
+                .filter(|a| a.key == "extmap")
+                .filter_map(|a| a.value.clone())
+                .find(|v| v.contains(uri))
+                .unwrap_or_else(|| panic!("missing extmap for {uri}"))
+        };
+        assert!(extmap_value(crate::sdp::SDES_MID_URI).starts_with("3 "));
+        assert!(!extmap_value(crate::sdp::ABS_SEND_TIME_URI).starts_with("3 "));
     }
 }
