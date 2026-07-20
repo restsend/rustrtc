@@ -23,14 +23,14 @@ use crate::{
 };
 use base64::prelude::*;
 use parking_lot::{Mutex, RwLock};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tracing::{debug, info, trace, warn};
@@ -178,6 +178,14 @@ pub trait RtpReceiverInterceptor: Send + Sync {
 const RTP_RECEIVER_SAMPLE_CAPACITY: usize = 64;
 const RTP_RECEIVER_PACKET_CAPACITY: usize = 64;
 
+/// Minimum interval before the same primary sequence may be retransmitted again
+/// in response to duplicate NACK reports (browser retry bursts).
+const NACK_RESEND_COOLDOWN: Duration = Duration::from_millis(25);
+
+/// Cap receiver-generated NACK lists so a large gap cannot allocate tens of
+/// thousands of sequence numbers in one RTCP feedback.
+const MAX_RECEIVER_NACK_GAP: usize = 128;
+
 pub trait NackStats: Send + Sync {
     fn get_nack_count(&self) -> u64;
     fn get_recovered_count(&self) -> u64 {
@@ -190,10 +198,52 @@ pub trait NackStats: Send + Sync {
     }
 }
 
+/// Bounded retransmission store: FIFO eviction + O(1) seq lookup.
+struct NackSendBuffer {
+    order: VecDeque<u16>,
+    packets: HashMap<u16, RtpPacket>,
+}
+
+impl NackSendBuffer {
+    fn with_capacity(max_size: usize) -> Self {
+        Self {
+            order: VecDeque::with_capacity(max_size),
+            packets: HashMap::with_capacity(max_size),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.packets.len()
+    }
+
+    fn push(&mut self, packet: RtpPacket, max_size: usize) {
+        let seq = packet.header.sequence_number;
+        if self.packets.insert(seq, packet).is_some() {
+            // Same seq already buffered (rare wrap / retransmit path) — keep map
+            // entry updated without growing the FIFO.
+            return;
+        }
+        self.order.push_back(seq);
+        while self.order.len() > max_size {
+            if let Some(old) = self.order.pop_front() {
+                self.packets.remove(&old);
+            }
+        }
+    }
+
+    fn get(&self, seq: u16) -> Option<&RtpPacket> {
+        self.packets.get(&seq)
+    }
+}
+
 pub struct DefaultRtpSenderNackHandler {
-    buffer: Mutex<VecDeque<RtpPacket>>,
+    buffer: Mutex<NackSendBuffer>,
+    /// Last time we accepted a retransmit for a given primary sequence.
+    recent_resends: Mutex<HashMap<u16, Instant>>,
     max_size: usize,
     pub nack_recv_count: AtomicU64,
+    /// Retransmits skipped because the same seq was resent within the cooldown.
+    pub retransmit_suppressed_count: AtomicU64,
     rtx_config: Mutex<Option<crate::rtx::RtxSenderConfig>>,
     /// Lock-free mirror of `rtx_config.rtx_ssrc` for the per-packet hot path.
     /// `0` means RTX is disabled; any non-zero value is the active RTX SSRC.
@@ -229,10 +279,13 @@ impl RtpSenderInterceptor for DefaultRtpSenderBitrateHandler {
 
 impl DefaultRtpSenderNackHandler {
     pub fn new(max_size: usize) -> Self {
+        let max_size = max_size.max(1);
         Self {
-            buffer: Mutex::new(VecDeque::with_capacity(max_size)),
+            buffer: Mutex::new(NackSendBuffer::with_capacity(max_size)),
+            recent_resends: Mutex::new(HashMap::with_capacity(max_size)),
             max_size,
             nack_recv_count: AtomicU64::new(0),
+            retransmit_suppressed_count: AtomicU64::new(0),
             rtx_config: Mutex::new(None),
             rtx_ssrc_fast: AtomicU32::new(0),
             rtx_seq: AtomicU16::new(random_u32() as u16),
@@ -253,6 +306,47 @@ impl DefaultRtpSenderNackHandler {
     pub fn rtx_config(&self) -> Option<crate::rtx::RtxSenderConfig> {
         *self.rtx_config.lock()
     }
+
+    /// Number of primary packets currently retained for NACK retransmission.
+    pub fn buffered_packet_count(&self) -> usize {
+        self.buffer.lock().len()
+    }
+
+    /// Select buffered packets eligible for retransmission.
+    /// Duplicate requests for the same sequence within [`NACK_RESEND_COOLDOWN`]
+    /// are suppressed (counted in `retransmit_suppressed_count`).
+    pub fn packets_for_nack(&self, seqs: &[u16], now: Instant) -> Vec<RtpPacket> {
+        let buffer = self.buffer.lock();
+        let mut recent = self.recent_resends.lock();
+        let mut out = Vec::new();
+        let mut seen = HashSet::with_capacity(seqs.len());
+
+        for &seq in seqs {
+            if !seen.insert(seq) {
+                self.retransmit_suppressed_count
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if let Some(last) = recent.get(&seq)
+                && now.duration_since(*last) < NACK_RESEND_COOLDOWN
+            {
+                self.retransmit_suppressed_count
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if let Some(packet) = buffer.get(seq) {
+                recent.insert(seq, now);
+                out.push(packet.clone());
+            }
+        }
+
+        // Keep the cooldown map bounded roughly to the send buffer size.
+        if recent.len() > self.max_size.saturating_mul(2) {
+            recent.retain(|_, t| now.duration_since(*t) < NACK_RESEND_COOLDOWN);
+        }
+
+        out
+    }
 }
 
 #[async_trait]
@@ -270,11 +364,7 @@ impl RtpSenderInterceptor for DefaultRtpSenderNackHandler {
         if rtx_ssrc != 0 && packet.header.ssrc == rtx_ssrc {
             return;
         }
-        let mut buffer = self.buffer.lock();
-        buffer.push_back(packet.clone());
-        if buffer.len() > self.max_size {
-            buffer.pop_front();
-        }
+        self.buffer.lock().push(packet.clone(), self.max_size);
     }
 
     async fn on_rtcp_received(&self, packet: &RtcpPacket, transport: Arc<RtpTransport>) {
@@ -286,17 +376,7 @@ impl RtpSenderInterceptor for DefaultRtpSenderNackHandler {
             self.nack_recv_count
                 .fetch_add(nack.lost_packets.len() as u64, Ordering::Relaxed);
 
-            let to_resend = {
-                let buffer = self.buffer.lock();
-                let mut packets = Vec::new();
-                for seq in &nack.lost_packets {
-                    if let Some(packet) = buffer.iter().find(|p| p.header.sequence_number == *seq) {
-                        packets.push(packet.clone());
-                    }
-                }
-                packets
-            };
-
+            let to_resend = self.packets_for_nack(&nack.lost_packets, Instant::now());
             let rtx = *self.rtx_config.lock();
             for packet in to_resend {
                 let seq_num = packet.header.sequence_number;
@@ -341,6 +421,8 @@ pub struct DefaultRtpReceiverNackHandler {
     last_seq: AtomicU16,
     last_ssrc: AtomicU32,
     initialized: std::sync::atomic::AtomicBool,
+    /// Sequences we have already requested via NACK; used for safer recovery accounting.
+    pending_nacks: Mutex<HashSet<u16>>,
     pub nack_sent_count: AtomicU64,
     pub nack_recovered_count: AtomicU64,
 }
@@ -357,9 +439,14 @@ impl DefaultRtpReceiverNackHandler {
             last_seq: AtomicU16::new(0),
             last_ssrc: AtomicU32::new(0),
             initialized: std::sync::atomic::AtomicBool::new(false),
+            pending_nacks: Mutex::new(HashSet::new()),
             nack_sent_count: AtomicU64::new(0),
             nack_recovered_count: AtomicU64::new(0),
         }
+    }
+
+    fn reset_pending(&self) {
+        self.pending_nacks.lock().clear();
     }
 }
 
@@ -383,6 +470,7 @@ impl RtpReceiverInterceptor for DefaultRtpReceiverNackHandler {
             );
             self.last_ssrc.store(ssrc, Ordering::SeqCst);
             self.last_seq.store(seq, Ordering::SeqCst);
+            self.reset_pending();
             return None; // Don't send NACK on stream switch
         }
 
@@ -392,22 +480,52 @@ impl RtpReceiverInterceptor for DefaultRtpReceiverNackHandler {
             return None;
         }
 
+        // Late / reordered packet that fills a previously NACKed hole.
+        {
+            let mut pending = self.pending_nacks.lock();
+            if pending.remove(&seq) {
+                self.nack_recovered_count.fetch_add(1, Ordering::Relaxed);
+                trace!("NACK: recovered pending seq={}", seq);
+                return None;
+            }
+        }
+
         let last = self.last_seq.load(Ordering::SeqCst);
         let diff = seq.wrapping_sub(last);
 
         if diff > 1 && diff < 32768 {
-            let mut lost = Vec::new();
-            let mut s = last.wrapping_add(1);
+            let gap = (diff as usize) - 1;
+            // Prefer the most recent missing packets when the gap is huge —
+            // older ones are unlikely to still be in the remote send buffer.
+            let skip = gap.saturating_sub(MAX_RECEIVER_NACK_GAP);
+            let mut lost = Vec::with_capacity(gap.min(MAX_RECEIVER_NACK_GAP));
+            let mut s = last.wrapping_add(1).wrapping_add(skip as u16);
             while s != seq {
                 lost.push(s);
                 s = s.wrapping_add(1);
             }
             trace!(
-                "NACK: detected gap from {} to {}, lost {} packets",
+                "NACK: detected gap from {} to {}, lost {} packets (capped from {})",
                 last,
                 seq,
-                lost.len()
+                lost.len(),
+                gap
             );
+            {
+                let mut pending = self.pending_nacks.lock();
+                for &lost_seq in &lost {
+                    pending.insert(lost_seq);
+                }
+                // Bound pending set similarly to the gap cap.
+                if pending.len() > MAX_RECEIVER_NACK_GAP.saturating_mul(2) {
+                    // Drop arbitrary older entries; recovery accounting stays best-effort.
+                    let excess = pending.len() - MAX_RECEIVER_NACK_GAP;
+                    let drain: Vec<u16> = pending.iter().copied().take(excess).collect();
+                    for seq in drain {
+                        pending.remove(&seq);
+                    }
+                }
+            }
             self.nack_sent_count
                 .fetch_add(lost.len() as u64, Ordering::Relaxed);
             self.last_seq.store(seq, Ordering::SeqCst);
@@ -421,8 +539,8 @@ impl RtpReceiverInterceptor for DefaultRtpReceiverNackHandler {
         if diff < 32768 {
             self.last_seq.store(seq, Ordering::SeqCst);
         } else if diff > 32768 {
+            // Old packet that was not in the pending set — ignore for recovery stats.
             trace!("NACK: received old packet seq={}, last={}", seq, last);
-            self.nack_recovered_count.fetch_add(1, Ordering::Relaxed);
         }
         None
     }
@@ -7853,6 +7971,7 @@ a=sendrecv\r\n";
         let packet1 = RtpPacket::new(header.clone(), vec![1, 2, 3]);
 
         handler.on_packet_sent(&packet1).await;
+        assert_eq!(handler.buffered_packet_count(), 1);
 
         // Mock transport (we just need it to not crash, though it won't actually send)
         let (_, socket_rx) = tokio::sync::watch::channel(None);
@@ -7878,6 +7997,11 @@ a=sendrecv\r\n";
                 .on_packet_sent(&RtpPacket::new(header.clone(), vec![0]))
                 .await;
         }
+        assert_eq!(
+            handler.buffered_packet_count(),
+            10,
+            "send buffer must stay bounded by max_size"
+        );
 
         // Packet 100 should be gone now (buffer size 10, we sent 14 more)
         let nack_old = GenericNack {
@@ -7894,6 +8018,120 @@ a=sendrecv\r\n";
         handler
             .on_rtcp_received(&RtcpPacket::GenericNack(nack_old), transport2)
             .await;
+
+        let now = Instant::now();
+        assert!(
+            handler.packets_for_nack(&[100], now).is_empty(),
+            "evicted seq must not be retransmittable"
+        );
+    }
+
+    #[test]
+    fn sender_nack_buffer_bounded_and_indexed() {
+        use crate::rtp::RtpHeader;
+
+        let handler = DefaultRtpSenderNackHandler::new(4);
+        let mut header = RtpHeader::new(96, 1, 0, 42);
+        for seq in 1u16..=10 {
+            header.sequence_number = seq;
+            let packet = RtpPacket::new(header.clone(), vec![seq as u8]);
+            // sync path via buffer push through the public helper used by interceptor
+            handler.buffer.lock().push(packet, 4);
+        }
+        assert_eq!(handler.buffered_packet_count(), 4);
+
+        let now = Instant::now();
+        let found = handler.packets_for_nack(&[7, 8, 9, 10], now);
+        assert_eq!(found.len(), 4);
+        assert!(handler.packets_for_nack(&[1, 2, 3, 4, 5, 6], now).is_empty());
+    }
+
+    #[test]
+    fn sender_nack_suppresses_duplicate_resend_within_cooldown() {
+        use crate::rtp::RtpHeader;
+
+        let handler = DefaultRtpSenderNackHandler::new(8);
+        let header = RtpHeader::new(96, 50, 0, 7);
+        handler
+            .buffer
+            .lock()
+            .push(RtpPacket::new(header, vec![1]), 8);
+
+        let t0 = Instant::now();
+        let first = handler.packets_for_nack(&[50, 50], t0);
+        assert_eq!(first.len(), 1, "first unique seq should resend once");
+        assert!(
+            handler.retransmit_suppressed_count.load(Ordering::Relaxed) >= 1,
+            "duplicate seq in same report should be suppressed"
+        );
+
+        let second = handler.packets_for_nack(&[50], t0 + Duration::from_millis(5));
+        assert!(
+            second.is_empty(),
+            "same seq inside cooldown must not resend"
+        );
+        assert!(handler.retransmit_suppressed_count.load(Ordering::Relaxed) >= 2);
+
+        let third = handler.packets_for_nack(&[50], t0 + NACK_RESEND_COOLDOWN + Duration::from_millis(1));
+        assert_eq!(
+            third.len(),
+            1,
+            "after cooldown the same seq may be resent again"
+        );
+    }
+
+    #[tokio::test]
+    async fn receiver_nack_gap_capped_and_recovery_tracks_pending() {
+        use crate::rtp::RtpHeader;
+
+        let handler = DefaultRtpReceiverNackHandler::new();
+        let mut header = RtpHeader::new(96, 100, 0, 1234);
+        assert!(
+            handler
+                .on_packet_received(&RtpPacket::new(header.clone(), vec![1]))
+                .await
+                .is_none()
+        );
+
+        // Huge gap: only the most recent MAX_RECEIVER_NACK_GAP seqs are NACKed.
+        header.sequence_number = 100 + 1 + (MAX_RECEIVER_NACK_GAP as u16) + 50;
+        let nack = handler
+            .on_packet_received(&RtpPacket::new(header.clone(), vec![2]))
+            .await
+            .expect("gap should produce NACK");
+        let RtcpPacket::GenericNack(nack) = nack else {
+            panic!("expected GenericNack");
+        };
+        assert_eq!(nack.lost_packets.len(), MAX_RECEIVER_NACK_GAP);
+        assert_eq!(
+            nack.lost_packets.first().copied(),
+            Some(header.sequence_number.wrapping_sub(MAX_RECEIVER_NACK_GAP as u16)),
+        );
+        assert_eq!(
+            nack.lost_packets.last().copied(),
+            Some(header.sequence_number.wrapping_sub(1)),
+        );
+
+        let recovered_seq = nack.lost_packets[0];
+        header.sequence_number = recovered_seq;
+        assert!(
+            handler
+                .on_packet_received(&RtpPacket::new(header, vec![3]))
+                .await
+                .is_none()
+        );
+        assert_eq!(handler.get_recovered_count(), 1);
+
+        // An old packet that was never NACKed must not inflate recovery.
+        let mut junk = RtpHeader::new(96, 1, 0, 1234);
+        junk.sequence_number = 1;
+        assert!(
+            handler
+                .on_packet_received(&RtpPacket::new(junk, vec![9]))
+                .await
+                .is_none()
+        );
+        assert_eq!(handler.get_recovered_count(), 1);
     }
 
     #[tokio::test]
