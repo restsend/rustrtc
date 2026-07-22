@@ -3318,20 +3318,20 @@ async fn run_gathering_loop(
 ) {
     let mut rx = ice_transport.subscribe_gathering_state();
     let mut ice_state_rx = ice_transport.subscribe_state();
+    let mut cand_rx = ice_transport.subscribe_candidates();
     loop {
         let state = *rx.borrow_and_update();
         if state == crate::transports::ice::IceGathererState::Complete
             && let Some(inner) = inner_weak.upgrade()
+            && !update_local_description_on_gather(&inner, &ice_transport)
         {
-            if !update_local_description_on_gather(&inner, &ice_transport) {
-                let mut sig_rx = inner.signaling_state.subscribe();
-                loop {
-                    if update_local_description_on_gather(&inner, &ice_transport) {
-                        break;
-                    }
-                    if sig_rx.changed().await.is_err() {
-                        break;
-                    }
+            let mut sig_rx = inner.signaling_state.subscribe();
+            loop {
+                if update_local_description_on_gather(&inner, &ice_transport) {
+                    break;
+                }
+                if sig_rx.changed().await.is_err() {
+                    break;
                 }
             }
         }
@@ -3356,6 +3356,21 @@ async fn run_gathering_loop(
                 if res.is_err() { break; }
                 if matches!(*ice_state_rx.borrow(), crate::transports::ice::IceTransportState::Closed | crate::transports::ice::IceTransportState::Failed) {
                     break;
+                }
+            }
+            _ = cand_rx.recv() => {
+                if let Some(inner) = inner_weak.upgrade()
+                    && inner.config.transport_mode == TransportMode::WebRtc
+                {
+                    let strs: Vec<String> = ice_transport
+                        .local_candidates()
+                        .iter()
+                        .map(|c| c.to_sdp())
+                        .collect();
+                    let mut guard = inner.local_description.lock();
+                    if let Some(desc) = guard.as_mut() {
+                        desc.add_candidates_incremental(&strs);
+                    }
                 }
             }
         }
@@ -7806,18 +7821,19 @@ a=sendrecv\r\n";
         let packet1 = RtpPacket::new(header.clone(), vec![1, 2, 3]);
 
         // First packet initializes
-        assert!(handler.on_packet_received(&packet1).await.is_none());
+        let dummy = "0.0.0.0:0".parse().unwrap();
+        assert!(handler.on_packet_received(&packet1, dummy, dummy).await.is_none());
 
         // Consecutive packet
         header.sequence_number = 101;
         let packet2 = RtpPacket::new(header.clone(), vec![4, 5, 6]);
-        assert!(handler.on_packet_received(&packet2).await.is_none());
+        assert!(handler.on_packet_received(&packet2, dummy, dummy).await.is_none());
 
         // Gap detected (102 missing)
         header.sequence_number = 103;
         let packet3 = RtpPacket::new(header.clone(), vec![7, 8, 9]);
         let res = handler
-            .on_packet_received(&packet3)
+            .on_packet_received(&packet3, dummy, dummy)
             .await
             .expect("Should generate NACK");
         if let RtcpPacket::GenericNack(nack) = res {
@@ -7831,7 +7847,7 @@ a=sendrecv\r\n";
         header.sequence_number = 106;
         let packet4 = RtpPacket::new(header.clone(), vec![10]);
         let res = handler
-            .on_packet_received(&packet4)
+            .on_packet_received(&packet4, dummy, dummy)
             .await
             .expect("Should generate NACK");
         if let RtcpPacket::GenericNack(nack) = res {
@@ -7851,8 +7867,9 @@ a=sendrecv\r\n";
         let handler = DefaultRtpSenderNackHandler::new(10);
         let mut header = RtpHeader::new(96, 100, 0, 1234);
         let packet1 = RtpPacket::new(header.clone(), vec![1, 2, 3]);
+        let dummy = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0);
 
-        handler.on_packet_sent(&packet1).await;
+        handler.on_packet_sent(&packet1, dummy, dummy).await;
 
         // Mock transport (we just need it to not crash, though it won't actually send)
         let (_, socket_rx) = tokio::sync::watch::channel(None);
@@ -7875,7 +7892,7 @@ a=sendrecv\r\n";
         for i in 101..115 {
             header.sequence_number = i;
             handler
-                .on_packet_sent(&RtpPacket::new(header.clone(), vec![0]))
+                .on_packet_sent(&RtpPacket::new(header.clone(), vec![0]), dummy, dummy)
                 .await;
         }
 

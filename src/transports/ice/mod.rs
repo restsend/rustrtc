@@ -3831,6 +3831,8 @@ impl IceGatherer {
 
     async fn gather_upnp_candidates(&self, stun_public_ip: Option<IpAddr>) -> Result<()> {
         let sockets = self.sockets.lock().clone();
+        let timeout = self.config.upnp_discovery_timeout;
+        let mut tasks = FuturesUnordered::new();
 
         for socket in sockets {
             let local_addr = match socket.local_addr() {
@@ -3848,64 +3850,71 @@ impl IceGatherer {
                 continue;
             }
 
-            // Create mapper with configured lease duration
-            let mut mapper =
-                UpnpPortMapper::with_lease_duration(local_addr, self.config.upnp_lease_duration);
+            let this = self.clone();
+            let stun_ip = stun_public_ip;
+            tasks.push(async move {
+                // Create mapper with configured lease duration
+                let mut mapper = UpnpPortMapper::with_lease_duration(
+                    local_addr,
+                    this.config.upnp_lease_duration,
+                );
 
-            // Try to discover gateway
-            if let Err(e) = mapper.discover().await {
-                trace!("UPnP discovery failed for {}: {}", local_addr, e);
-                continue;
-            }
+                // Try to discover gateway
+                if let Err(e) = mapper.discover_with_timeout(timeout).await {
+                    trace!("UPnP discovery failed for {}: {}", local_addr, e);
+                    return;
+                }
 
-            // Try to add port mapping (0 = use same port as local)
-            match mapper.add_mapping(0).await {
-                Ok(external_addr) => {
-                    // Check if UPnP returned a private IP (double-NAT scenario)
-                    let is_private = is_private_ip(&external_addr.ip());
+                // Try to add port mapping (0 = use same port as local)
+                match mapper.add_mapping(0).await {
+                    Ok(external_addr) => {
+                        // Check if UPnP returned a private IP (double-NAT scenario)
+                        let is_private = is_private_ip(&external_addr.ip());
 
-                    // Final address for the candidate
-                    let candidate_addr = if is_private {
-                        if let Some(public_ip) = stun_public_ip {
-                            // Double-NAT: use STUN's public IP with UPnP's port
-                            let mut addr = external_addr;
-                            addr.set_ip(public_ip);
-                            debug!(
-                                "UPnP double-NAT detected: {} is private, using STUN public IP {} -> {}",
-                                external_addr.ip(),
-                                public_ip,
+                        // Final address for the candidate
+                        let candidate_addr = if is_private {
+                            if let Some(public_ip) = stun_ip {
+                                let mut addr = external_addr;
+                                addr.set_ip(public_ip);
+                                debug!(
+                                    "UPnP double-NAT detected: {} is private, using STUN public IP {} -> {}",
+                                    external_addr.ip(),
+                                    public_ip,
+                                    addr
+                                );
                                 addr
-                            );
-                            addr
-                        } else {
-                            // No STUN public IP available, use as-is (may not work)
-                            debug!(
-                                "UPnP returned private IP {} but no STUN public IP available",
+                            } else {
+                                debug!(
+                                    "UPnP returned private IP {} but no STUN public IP available",
+                                    external_addr.ip()
+                                );
                                 external_addr
-                            );
+                            }
+                        } else {
                             external_addr
-                        }
-                    } else {
-                        external_addr
-                    };
+                        };
 
-                    // Create server reflexive candidate for the mapping
-                    let candidate = IceCandidate::server_reflexive(local_addr, candidate_addr, 1);
-                    self.push_candidate(candidate);
+                        // Create server reflexive candidate for the mapping
+                        let candidate =
+                            IceCandidate::server_reflexive(local_addr, candidate_addr, 1);
+                        this.push_candidate(candidate);
 
-                    // Store mapper for later cleanup
-                    self.upnp_mappers.lock().push(mapper);
+                        // Store mapper for later cleanup
+                        this.upnp_mappers.lock().push(mapper);
 
-                    debug!(
-                        "UPnP candidate gathered: {} -> {}",
-                        local_addr, candidate_addr
-                    );
+                        debug!(
+                            "UPnP candidate gathered: {} -> {}",
+                            local_addr, candidate_addr
+                        );
+                    }
+                    Err(e) => {
+                        debug!("UPnP mapping failed for {}: {}", local_addr, e);
+                    }
                 }
-                Err(e) => {
-                    debug!("UPnP mapping failed for {}: {}", local_addr, e);
-                }
-            }
+            });
         }
+
+        while tasks.next().await.is_some() {}
 
         Ok(())
     }

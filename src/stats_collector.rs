@@ -261,17 +261,18 @@ mod tests {
         let mut header = crate::rtp::RtpHeader::new(96, 0, 0, 12345);
         let payload = vec![0u8; 100];
         let packet = RtpPacket::new(header.clone(), payload.clone());
+        let dummy = "0.0.0.0:0".parse().unwrap();
 
         // Test outbound interception
-        collector.on_packet_sent(&packet).await;
+        collector.on_packet_sent(&packet, dummy, dummy).await;
 
         // Send another one
-        collector.on_packet_sent(&packet).await;
+        collector.on_packet_sent(&packet, dummy, dummy).await;
 
         // Test inbound interception
         header.ssrc = 67890;
         let packet_in = RtpPacket::new(header, payload);
-        collector.on_packet_received(&packet_in).await;
+        collector.on_packet_received(&packet_in, dummy, dummy).await;
 
         let stats = collector.collect().await.unwrap();
 

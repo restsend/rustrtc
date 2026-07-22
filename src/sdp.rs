@@ -61,6 +61,15 @@ impl SessionDescription {
         }
     }
 
+    pub fn add_candidates_incremental(&mut self, candidates: &[String]) {
+        for section in &mut self.media_sections {
+            section.attributes.retain(|a| a.key != "candidate" && a.key != "end-of-candidates");
+            for c in candidates {
+                section.attributes.push(Attribute::new("candidate", Some(c.clone())));
+            }
+        }
+    }
+
     pub fn parse(sdp_type: SdpType, raw: &str) -> SdpResult<Self> {
         let mut session = SessionSection::default();
         let mut current_media: Option<MediaSection> = None;

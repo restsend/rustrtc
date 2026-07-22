@@ -411,6 +411,10 @@ fn default_upnp_lease_duration() -> u32 {
     3600
 }
 
+fn default_upnp_discovery_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(1)
+}
+
 /// Primary configuration for a `PeerConnection`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RtcConfiguration {
@@ -481,6 +485,9 @@ pub struct RtcConfiguration {
     /// UPnP port mapping lease duration in seconds
     #[serde(default = "default_upnp_lease_duration")]
     pub upnp_lease_duration: u32,
+    /// UPnP gateway discovery timeout
+    #[serde(default = "default_upnp_discovery_timeout")]
+    pub upnp_discovery_timeout: std::time::Duration,
     #[serde(skip, default)]
     pub depacketizer_strategy: DepacketizerStrategy,
     #[serde(default = "default_rtp_buffer_capacity")]
@@ -564,6 +571,7 @@ impl Default for RtcConfiguration {
             prefer_srflx_over_natted_host: false,
             enable_upnp: default_enable_upnp(),
             upnp_lease_duration: default_upnp_lease_duration(),
+            upnp_discovery_timeout: default_upnp_discovery_timeout(),
             depacketizer_strategy: DepacketizerStrategy::default(),
             rtp_buffer_capacity: default_rtp_buffer_capacity(),
             buffer_drop_strategy: BufferDropStrategy::default(),
@@ -650,6 +658,11 @@ impl RtcConfigurationBuilder {
 
     pub fn upnp_lease_duration(mut self, duration_secs: u32) -> Self {
         self.inner.upnp_lease_duration = duration_secs;
+        self
+    }
+
+    pub fn upnp_discovery_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.inner.upnp_discovery_timeout = timeout;
         self
     }
 
