@@ -700,6 +700,22 @@ impl PeerConnection {
         }
     }
 
+    /// Cumulative count of inbound RTP packets accepted at the transport
+    /// layer across the primary and muxed media transports. Monotonically
+    /// increasing; safe to poll concurrently. Used by the host to detect RTP
+    /// inactivity (e.g. media-proxy rtp-timeout) regardless of the active
+    /// forwarding mode (rewrite-bridge fast-path or depacketize chain).
+    pub fn received_rtp_packets(&self) -> u64 {
+        let mut total = 0u64;
+        if let Some(transport) = self.inner.rtp_transport.lock().clone() {
+            total += transport.received_rtp_packets();
+        }
+        for transport in self.inner.rtp_media_transports.lock().values() {
+            total += transport.received_rtp_packets();
+        }
+        total
+    }
+
     pub async fn wait_for_rtp_transport_ready(
         &self,
         timeout: std::time::Duration,

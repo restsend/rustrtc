@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use tokio::sync::mpsc;
 use tracing::{info, trace, warn};
 
@@ -251,6 +251,12 @@ pub struct RtpTransport {
     has_bridge: AtomicBool,
     srtp_required: bool,
     has_sent_first_packet: AtomicBool,
+    /// Cumulative count of inbound RTP packets accepted at the transport
+    /// layer (after successful parse, before any forwarding/relay). This is
+    /// the common chokepoint that all downstream paths (rewrite-bridge
+    /// fast-path, listener/track chain) share, so it can be polled to detect
+    /// RTP inactivity regardless of the active forwarding mode.
+    received_rtp_packets: AtomicU64,
 }
 
 impl RtpTransport {
@@ -275,7 +281,14 @@ impl RtpTransport {
             has_bridge: AtomicBool::new(false),
             srtp_required,
             has_sent_first_packet: AtomicBool::new(false),
+            received_rtp_packets: AtomicU64::new(0),
         }
+    }
+
+    /// Cumulative count of inbound RTP packets accepted at the transport
+    /// layer. Monotonically increasing; safe to poll concurrently.
+    pub fn received_rtp_packets(&self) -> u64 {
+        self.received_rtp_packets.load(Ordering::Relaxed)
     }
 
     pub fn ice_conn(&self) -> Arc<IceConn> {
@@ -599,6 +612,11 @@ impl PacketReceiver for RtpTransport {
                     }
                 }
             };
+
+            // Count every accepted inbound RTP packet at the transport layer.
+            // This runs before the rewrite-bridge fast-path early-return, so
+            // the counter advances for both relayed and depacketized packets.
+            self.received_rtp_packets.fetch_add(1, Ordering::Relaxed);
 
             let Some(rtp_packet) = self.try_bridge_rewrite_rtp(rtp_packet, marshal_buf) else {
                 return;
@@ -990,5 +1008,130 @@ mod tests {
         assert_eq!(packet.header.payload_type, 96);
         assert_eq!(packet.header.sequence_number, 32000);
         assert_eq!(packet.header.timestamp, 1111 + 12345);
+    }
+
+    #[tokio::test]
+    async fn test_received_rtp_packets_counter_advances_on_slow_path() {
+        use crate::transports::ice::IceSocketWrapper;
+        use tokio::net::UdpSocket;
+        use tokio::sync::watch;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_tx, rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(socket))));
+        let conn = IceConn::new(rx, "127.0.0.1:9".parse().unwrap(), None);
+        let transport = RtpTransport::new(conn, false);
+
+        let mut marshal_buf = Vec::with_capacity(1500);
+        let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        assert_eq!(transport.received_rtp_packets(), 0, "counter starts at zero");
+
+        for seq in 1..=3u16 {
+            let header = crate::rtp::RtpHeader::new(0, seq, 160, 1234);
+            let packet = crate::rtp::RtpPacket::new(header, vec![1u8; 160]);
+            transport
+                .receive(Bytes::from(packet.marshal().unwrap()), addr, &mut marshal_buf)
+                .await;
+        }
+
+        assert_eq!(
+            transport.received_rtp_packets(),
+            3,
+            "counter must advance by one per accepted inbound RTP packet"
+        );
+    }
+
+    /// Critical regression: when the rewrite-bridge fast-path relay is active,
+    /// inbound packets are forwarded directly and the receive() path
+    /// early-returns BEFORE dispatching to listeners (and therefore before the
+    /// PeerConnection track/depacketizer interceptor chain). The transport
+    /// counter must still advance so the host can detect RTP inactivity.
+    #[tokio::test]
+    async fn test_received_rtp_packets_counter_advances_on_fast_path_relay() {
+        use crate::transports::ice::IceSocketWrapper;
+        use tokio::net::UdpSocket;
+        use tokio::sync::watch;
+
+        // Source transport (where packets arrive) with a registered listener.
+        let src_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_src_tx, src_rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(src_socket))));
+        let src_conn = IceConn::new(src_rx, "127.0.0.1:9".parse().unwrap(), None);
+        let src_transport = Arc::new(RtpTransport::new(src_conn, false));
+
+        let ssrc = 4242u32;
+        let (listener_tx, mut listener_rx) = mpsc::channel::<(RtpPacket, SocketAddr)>(8);
+        src_transport.register_listener_sync(ssrc, listener_tx);
+
+        // Destination transport (rewrite-bridge target).
+        let dst_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_dst_tx, dst_rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(dst_socket))));
+        let dst_conn = IceConn::new(dst_rx, "127.0.0.1:9".parse().unwrap(), None);
+        let dst_transport = Arc::new(RtpTransport::new(dst_conn, false));
+
+        // Activate the fast-path rewrite bridge (this is the wholesale
+        // zero-CPU relay path).
+        src_transport.bridge_rewrite_to(
+            dst_transport.clone(),
+            RtpRewriteBridgeParams {
+                ssrc_offset: 0,
+                payload_type: None,
+                initial_sequence_number: None,
+                initial_timestamp_offset: None,
+            },
+        );
+        assert!(src_transport.has_bridge.load(Ordering::SeqCst));
+
+        assert_eq!(src_transport.received_rtp_packets(), 0);
+        assert_eq!(dst_transport.received_rtp_packets(), 0);
+
+        let mut marshal_buf = Vec::with_capacity(1500);
+        let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        // Feed two RTP packets into the source transport.
+        for seq in 1..=2u16 {
+            let header = crate::rtp::RtpHeader::new(0, seq, 160, ssrc);
+            let packet = crate::rtp::RtpPacket::new(header, vec![1u8; 160]);
+            src_transport
+                .receive(
+                    Bytes::from(packet.marshal().unwrap()),
+                    addr,
+                    &mut marshal_buf,
+                )
+                .await;
+        }
+
+        // (1) The counter on the source transport advanced even though the
+        //     fast-path relay consumed the packet. This is the guarantee the
+        //     host relies on for rtp-timeout detection.
+        assert_eq!(
+            src_transport.received_rtp_packets(),
+            2,
+            "source counter must advance on the fast-path relay"
+        );
+
+        // (2) The destination transport did NOT count the relayed packet,
+        //     because it arrived via its own ICE socket (outbound), not via
+        //     receive(). This confirms the counter only measures *inbound*
+        //     packets accepted at the transport layer.
+        assert_eq!(
+            dst_transport.received_rtp_packets(),
+            0,
+            "relayed packet must not be counted as inbound on the destination"
+        );
+
+        // (3) The registered listener must NOT have received anything: the
+        //     fast-path relay early-returns before listener dispatch. This is
+        //     exactly why the PeerConnection interceptor chain (which lives on
+        //     the listener/track path) cannot observe fast-path packets, and
+        //     why the transport counter is required.
+        let attempt = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            listener_rx.recv(),
+        )
+        .await;
+        assert!(
+            attempt.is_err(),
+            "listener must NOT receive on the fast-path relay (interceptor path is bypassed)"
+        );
     }
 }
