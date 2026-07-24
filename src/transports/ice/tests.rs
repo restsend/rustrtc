@@ -2762,6 +2762,23 @@ async fn use_candidate_no_renomination_after_nomination() -> Result<()> {
     .await
     .context("timed out waiting for ICE connection")??;
 
+    // Connected only means the controlled side picked a provisional pair;
+    // the controlling agent's USE-CANDIDATE (which may switch that pair)
+    // can still be in flight. Wait for actual nomination before sampling.
+    let mut nom_rx = t2.subscribe_nomination_complete();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if nom_rx.borrow_and_update().is_some() {
+                return Ok::<_, anyhow::Error>(());
+            }
+            if nom_rx.changed().await.is_err() {
+                anyhow::bail!("nomination channel closed");
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for nomination")??;
+
     // 2. Record the nominated pair and subscribe to future pair changes.
     let nominated_pair = t2
         .get_selected_pair()

@@ -1843,6 +1843,15 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         // Controlled side: select best pair but don't nominate.
         // nomination_complete is signalled when we receive USE-CANDIDATE
         // from the controlling agent.
+        //
+        // Once the peer has nominated a pair, that choice is authoritative
+        // and this selection must not run again: check rounds re-triggered
+        // by late (e.g. peer-reflexive) candidates would otherwise stomp the
+        // nominated pair with a locally-preferred one the peer never chose.
+        if inner.nomination_complete.borrow().is_some() {
+            debug!("ICE checks complete (controlled): keeping peer-nominated pair");
+            return;
+        }
         let pair = &successful_pairs[0];
         *inner.selected_pair.lock() = Some(pair.clone());
         let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
@@ -2324,23 +2333,22 @@ async fn handle_stun_request(
             if matches!(sender, IceSocketWrapper::TcpStream(_, _, _)) {
                 return;
             }
-            // RFC 8445 §7.3.1.5: once a pair is already nominated, subsequent
+            // RFC 8445 §7.3.1.5: once a pair has been nominated, subsequent
             // USE-CANDIDATE (e.g. keepalives from other candidates) must not
             // trigger re-nomination.  Guard here to prevent pair_monitor churn.
-            if inner.selected_pair.lock().is_some() {
-                if inner.nomination_complete.borrow().is_none() {
-                    trace!(
-                        "Controlled agent: pair already selected, signalling nomination_complete via UseCandidate from {}",
-                        addr
-                    );
-                    let _ = inner.nomination_complete.send(Some(true));
-                } else {
-                    trace!(
-                        "Controlled agent ignoring UseCandidate from {} – pair already nominated",
-                        addr
-                    );
-                }
+            if inner.nomination_complete.borrow().is_some() {
+                trace!(
+                    "Controlled agent ignoring UseCandidate from {} – pair already nominated",
+                    addr
+                );
             } else {
+                // The controlling agent's nomination is authoritative. A pair
+                // selected earlier by our own check completion is only
+                // provisional: on a multihomed host it can differ from the
+                // pair the peer actually validated - it may even be a path
+                // that only works in one direction (e.g. a source address the
+                // peer's network drops on the return leg) - so it must be
+                // replaced by the pair this request arrived on.
                 let local_addr: SocketAddr = match sender {
                     IceSocketWrapper::Udp(s) => s
                         .local_addr()
@@ -2373,13 +2381,27 @@ async fn handle_stun_request(
                 };
 
                 if let Some(pair) = pair {
-                    trace!(
-                        "Controlled agent selected pair via UseCandidate: {} -> {}",
-                        pair.local.address, pair.remote.address
-                    );
-                    *inner.selected_pair.lock() = Some(pair.clone());
-                    let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
-                    publish_selected_socket(&inner, &pair, Some(sender));
+                    let already_selected = {
+                        let selected = inner.selected_pair.lock();
+                        selected.as_ref().is_some_and(|s| {
+                            s.local.address == pair.local.address
+                                && s.remote.address == pair.remote.address
+                        })
+                    };
+                    if already_selected {
+                        trace!(
+                            "Controlled agent: UseCandidate confirms already-selected pair {} -> {}",
+                            pair.local.address, pair.remote.address
+                        );
+                    } else {
+                        debug!(
+                            "Controlled agent selected pair via UseCandidate: {} -> {}",
+                            pair.local.address, pair.remote.address
+                        );
+                        *inner.selected_pair.lock() = Some(pair.clone());
+                        let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
+                        publish_selected_socket(&inner, &pair, Some(sender));
+                    }
                     let _ = inner.state.send(IceTransportState::Connected);
                     let _ = inner.nomination_complete.send(Some(true));
                 } else {
