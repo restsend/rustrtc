@@ -3696,8 +3696,24 @@ async fn handle_connected_state_no_dtls(
                             if is_ice_failed_or_closed(new_state) {
                                 return true;
                             }
-                            if new_state == crate::transports::ice::IceTransportState::Disconnected {
-                                debug!("ICE Disconnected (tolerating), keeping SCTP/DTLS alive");
+                            // Surface the recoverable Disconnected state to the
+                            // application (so it can run a grace timer / reconnect)
+                            // WITHOUT tearing down SCTP/DTLS. When traffic resumes
+                            // the state flips back to Connected.
+                            match new_state {
+                                crate::transports::ice::IceTransportState::Disconnected => {
+                                    if let Some(inner) = inner_weak.upgrade() {
+                                        let _ = inner.peer_state.send(PeerConnectionState::Disconnected);
+                                    }
+                                    debug!("ICE Disconnected (tolerating), keeping SCTP/DTLS alive");
+                                }
+                                crate::transports::ice::IceTransportState::Connected
+                                | crate::transports::ice::IceTransportState::Completed => {
+                                    if let Some(inner) = inner_weak.upgrade() {
+                                        let _ = inner.peer_state.send(PeerConnectionState::Connected);
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -3758,8 +3774,22 @@ async fn handle_connected_state(
                                         if is_ice_failed_or_closed(new_state) {
                                             return true;
                                         }
-                                        if new_state == crate::transports::ice::IceTransportState::Disconnected {
-                                            debug!("ICE Disconnected (tolerating), keeping SCTP/DTLS alive");
+                                        // Surface Disconnected/Connected to the app
+                                        // (grace timer / reconnect) without tearing down
+                                        // SCTP/DTLS. This mirrors browser PC connectionState.
+                                        match new_state {
+                                            crate::transports::ice::IceTransportState::Disconnected => {
+                                                let _ = inner.peer_state.send(PeerConnectionState::Disconnected);
+                                                let _ = ice_connection_state_tx.send(IceConnectionState::Disconnected);
+                                                debug!("ICE Disconnected (tolerating), keeping SCTP/DTLS alive");
+                                            }
+                                            crate::transports::ice::IceTransportState::Connected
+                                            | crate::transports::ice::IceTransportState::Completed => {
+                                                let _ = inner.peer_state.send(PeerConnectionState::Connected);
+                                                let _ = ice_connection_state_tx.send(IceConnectionState::Connected);
+                                                debug!("ICE recovered, SCTP/DTLS association preserved");
+                                            }
+                                            _ => {}
                                         }
                                     }
                                     res = dtls_rx.changed() => {
@@ -3799,8 +3829,19 @@ async fn handle_connected_state(
                                         if is_ice_failed_or_closed(new_state) {
                                             return true;
                                         }
-                                        if new_state == crate::transports::ice::IceTransportState::Disconnected {
-                                            debug!("ICE Disconnected (tolerating), keeping SCTP/DTLS alive");
+                                        match new_state {
+                                            crate::transports::ice::IceTransportState::Disconnected => {
+                                                let _ = inner.peer_state.send(PeerConnectionState::Disconnected);
+                                                let _ = ice_connection_state_tx.send(IceConnectionState::Disconnected);
+                                                debug!("ICE Disconnected (tolerating), keeping SCTP/DTLS alive");
+                                            }
+                                            crate::transports::ice::IceTransportState::Connected
+                                            | crate::transports::ice::IceTransportState::Completed => {
+                                                let _ = inner.peer_state.send(PeerConnectionState::Connected);
+                                                let _ = ice_connection_state_tx.send(IceConnectionState::Connected);
+                                                debug!("ICE recovered, SCTP/DTLS association preserved");
+                                            }
+                                            _ => {}
                                         }
                                     }
                                 }

@@ -3198,14 +3198,23 @@ async fn test_tcp_write_all_large_data() {
 
     let (mut server, _) = listener.accept().await.unwrap();
 
-    // 1 MB payload to exercise partial writes
+    // 1 MB payload to exercise partial writes. The reader MUST run concurrently
+    // with the writer: tcp_write_all awaits writability once the kernel socket
+    // buffer fills, so a sequential write-then-read would deadlock (writer waits
+    // for the reader to drain, reader waits for the writer to finish).
     let payload = vec![0xABu8; 1024 * 1024];
-    tcp_write_all(&client_write, &payload).await.unwrap();
+    let read_handle = {
+        let payload_len = payload.len();
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buf = vec![0u8; payload_len];
+            server.read_exact(&mut buf).await.unwrap();
+            buf
+        })
+    };
 
-    use tokio::io::AsyncReadExt;
-    let mut buf = vec![0u8; payload.len()];
-    let s = &mut server;
-    s.read_exact(&mut buf).await.unwrap();
+    tcp_write_all(&client_write, &payload).await.unwrap();
+    let buf = read_handle.await.unwrap();
     assert_eq!(buf.len(), payload.len());
     assert_eq!(buf[0], 0xAB);
     assert_eq!(buf[payload.len() - 1], 0xAB);
