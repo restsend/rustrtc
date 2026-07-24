@@ -3693,8 +3693,11 @@ async fn handle_connected_state_no_dtls(
                         res = ice_state_rx.changed() => {
                             if res.is_err() { return false; }
                             let new_state = *ice_state_rx.borrow();
-                            if is_ice_disconnected(new_state) {
+                            if is_ice_failed_or_closed(new_state) {
                                 return true;
+                            }
+                            if new_state == crate::transports::ice::IceTransportState::Disconnected {
+                                debug!("ICE Disconnected (tolerating), keeping SCTP/DTLS alive");
                             }
                         }
                     }
@@ -3752,8 +3755,11 @@ async fn handle_connected_state(
                                     res = ice_state_rx.changed() => {
                                         if res.is_err() { return false; }
                                         let new_state = *ice_state_rx.borrow();
-                                        if is_ice_disconnected(new_state) {
+                                        if is_ice_failed_or_closed(new_state) {
                                             return true;
+                                        }
+                                        if new_state == crate::transports::ice::IceTransportState::Disconnected {
+                                            debug!("ICE Disconnected (tolerating), keeping SCTP/DTLS alive");
                                         }
                                     }
                                     res = dtls_rx.changed() => {
@@ -3790,8 +3796,11 @@ async fn handle_connected_state(
                                     res = ice_state_rx.changed() => {
                                         if res.is_err() { return false; }
                                         let new_state = *ice_state_rx.borrow();
-                                        if is_ice_disconnected(new_state) {
+                                        if is_ice_failed_or_closed(new_state) {
                                             return true;
+                                        }
+                                        if new_state == crate::transports::ice::IceTransportState::Disconnected {
+                                            debug!("ICE Disconnected (tolerating), keeping SCTP/DTLS alive");
                                         }
                                     }
                                 }
@@ -3802,7 +3811,7 @@ async fn handle_connected_state(
             }
 
             let state = *ice_state_rx.borrow();
-            if is_ice_disconnected(state) {
+            if is_ice_failed_or_closed(state) {
                 return true;
             }
             return false;
@@ -3815,7 +3824,7 @@ async fn handle_connected_state(
             res = ice_state_rx.changed() => {
                 if res.is_err() { return false; }
                 let new_state = *ice_state_rx.borrow();
-                if is_ice_disconnected(new_state) {
+                if is_ice_failed_or_closed(new_state) {
                     return true;
                 }
             }
@@ -3823,12 +3832,19 @@ async fn handle_connected_state(
     }
 }
 
-fn is_ice_disconnected(state: crate::transports::ice::IceTransportState) -> bool {
+/// Hard, non-recoverable ICE states. Unlike `Disconnected` (which is transient
+/// and recoverable), `Failed`/`Closed` mean the transport is gone for good.
+///
+/// The connected-state loops only bail out (and thus tear down / re-init DTLS +
+/// SCTP) on these states. A transient `Disconnected` is tolerated so that the
+/// SCTP association survives brief network blackouts — matching pion/webrtc-rs
+/// behaviour and giving long-lived tunnels (e.g. SSH port-forwarding) the same
+/// robustness as a plain TCP relay (frp) on a flaky link.
+fn is_ice_failed_or_closed(state: crate::transports::ice::IceTransportState) -> bool {
     matches!(
         state,
         crate::transports::ice::IceTransportState::Failed
             | crate::transports::ice::IceTransportState::Closed
-            | crate::transports::ice::IceTransportState::Disconnected
     )
 }
 

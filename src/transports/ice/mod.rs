@@ -545,7 +545,7 @@ impl IceTransportRunner {
                 let disconnect_threshold = if tcp_selected {
                     ice_conn_timeout.saturating_sub(Duration::from_secs(1))
                 } else {
-                    Duration::from_secs(5)
+                    inner.config.ice_disconnect_threshold
                 };
                 if elapsed > ice_conn_timeout {
                     let _ = inner.state.send(IceTransportState::Failed);

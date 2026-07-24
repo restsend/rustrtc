@@ -452,6 +452,18 @@ pub struct RtcConfiguration {
     /// and reduce the probability of nomination failures under packet loss.
     pub nomination_timeout: std::time::Duration,
     pub ice_connection_timeout: std::time::Duration,
+    /// How long without receiving any packet (STUN/DTLS/SCTP) before the ICE
+    /// transport is demoted from `Connected` to `Disconnected`.
+    ///
+    /// `Disconnected` is a recoverable state — the SCTP association is **not**
+    /// torn down (see `peer_connection.rs`); the transport waits for traffic to
+    /// resume. Keep this comfortably below `ice_connection_timeout`, which is
+    /// the hard, non-recoverable failure threshold.
+    ///
+    /// Default: 5s (standard heuristic). Raise it (e.g. 120s) for long-lived
+    /// tunnels (SSH/port-forwarding) over lossy links where brief blackouts are
+    /// expected and must not even flap the SCTP association.
+    pub ice_disconnect_threshold: std::time::Duration,
     pub sctp_rto_initial: std::time::Duration,
     pub sctp_rto_min: std::time::Duration,
     pub sctp_rto_max: std::time::Duration,
@@ -549,6 +561,7 @@ impl Default for RtcConfiguration {
             stun_timeout: std::time::Duration::from_secs(5),
             nomination_timeout: std::time::Duration::from_secs(10),
             ice_connection_timeout: std::time::Duration::from_secs(30),
+            ice_disconnect_threshold: std::time::Duration::from_secs(5),
             sctp_rto_initial: std::time::Duration::from_secs(3),
             sctp_rto_min: std::time::Duration::from_secs(1),
             sctp_rto_max: std::time::Duration::from_secs(60),
@@ -814,6 +827,11 @@ impl RtcConfigurationBuilder {
         self
     }
 
+    pub fn ice_disconnect_threshold(mut self, threshold: std::time::Duration) -> Self {
+        self.inner.ice_disconnect_threshold = threshold;
+        self
+    }
+
     pub fn rtp_buffer_capacity(mut self, capacity: usize) -> Self {
         self.inner.rtp_buffer_capacity = capacity;
         self
@@ -897,6 +915,7 @@ mod tests {
     fn test_rtc_configuration_defaults() {
         let config = RtcConfiguration::default();
         assert_eq!(config.ice_connection_timeout, Duration::from_secs(30));
+        assert_eq!(config.ice_disconnect_threshold, Duration::from_secs(5));
         assert_eq!(config.sctp_rto_initial, Duration::from_secs(3));
         assert_eq!(config.sctp_rto_min, Duration::from_secs(1));
         assert_eq!(config.sctp_rto_max, Duration::from_secs(60));
