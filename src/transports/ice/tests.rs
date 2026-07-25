@@ -4006,3 +4006,57 @@ async fn test_run_turn_refresh_succeeds_after_stale_nonce_via_inner() -> Result<
     turn_server.stop().await?;
     Ok(())
 }
+
+/// Fix4 verification: UPnP port mappings must be cleaned up on
+/// IceTransport::stop(). The fire-and-forget task clears mappers asynchronously.
+#[tokio::test]
+async fn test_upnp_mappings_cleaned_on_stop() -> Result<()> {
+    let mut config = RtcConfiguration::default();
+    config.enable_upnp = true;
+    let (transport, runner) = IceTransportBuilder::new(config).build();
+    tokio::spawn(runner);
+
+    // Let UPnP probing finish.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // UPnP may or may not find a router in CI; either is fine — what matters
+    // is that stop() clears whatever state exists.
+    transport.stop();
+    // The fire-and-forget cleanup runs in ~50ms; give it a generous window.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mappers = transport.inner.gatherer.upnp_mappers.lock();
+    assert!(
+        mappers.is_empty(),
+        "Fix4: upnp_mappers must be empty after stop() (got {})",
+        mappers.len()
+    );
+    // Verify ICE state is Closed.
+    assert_eq!(
+        transport.state(),
+        IceTransportState::Closed,
+        "Fix4: transport state must be Closed after stop()"
+    );
+    Ok(())
+}
+
+/// Fix5 verification: the shared-UDP socket handle must be released on
+/// IceTransport::stop() so the demux port's per-session state is cleaned
+/// immediately rather than waiting for Arc<IceTransportInner> release.
+#[tokio::test]
+async fn test_shared_udp_socket_cleared_on_stop() {
+    let config = RtcConfiguration::default();
+    let (transport, runner) = IceTransportBuilder::new(config).build();
+    tokio::spawn(runner);
+
+    // Let gathering complete so shared_udp_socket is populated.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    transport.stop();
+    let handle = transport.inner.gatherer.shared_udp_socket.lock();
+    assert!(
+        handle.is_none(),
+        "Fix5: shared_udp_socket must be None after stop()"
+    );
+    assert_eq!(transport.state(), IceTransportState::Closed);
+}

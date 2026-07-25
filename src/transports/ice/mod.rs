@@ -1452,6 +1452,13 @@ impl IceTransport {
         // detached task races the read-loop shutdown.
         self.destroy_turn_allocations_best_effort();
 
+        // Best-effort UPnP port mapping cleanup. Fire-and-forget so it does
+        // not block the close path on a slow/unreachable router.
+        let upnp_clone = self.inner.gatherer.clone();
+        tokio::spawn(async move {
+            upnp_clone.cleanup_upnp_mappings().await;
+        });
+
         let _ = self.inner.state.send(IceTransportState::Closed);
         let _ = self.inner.selected_socket.send(None);
         let _ = self.inner.selected_rtcp_socket.send(None);
@@ -1463,6 +1470,9 @@ impl IceTransport {
         self.inner.gatherer.shared_tcp_regs.lock().clear();
         self.inner.gatherer.shared_udp_regs.lock().clear();
         self.inner.gatherer.turn_clients.lock().clear();
+        // Drop the shared-UDP handle so the demux port's per-session state is
+        // released immediately instead of waiting for Arc<IceTransportInner>.
+        *self.inner.gatherer.shared_udp_socket.lock() = None;
     }
 
     /// Force the ICE transport into a specific state (test-only).

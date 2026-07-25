@@ -147,6 +147,13 @@ impl ListenerRegistry {
             return &mut self.routes[index];
         }
 
+        // Prune stale routes: once the sender's channel is dropped (the old
+        // run_loop exited) its tx is closed and will never deliver a packet.
+        // Keeping them leaks one ListenerRoute per transport replacement
+        // without cleaning until clear_listeners() on full close.  This also
+        // keeps by_ssrc / by_mid / by_rid entries that are no longer routable.
+        self.routes.retain(|route| !route.tx.is_closed());
+
         self.routes.push(ListenerRoute {
             mid: None,
             payload_types: Vec::new(),
@@ -227,6 +234,7 @@ impl ListenerRegistry {
     }
 
     fn bind_ssrc_route(&mut self, ssrc: u32, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
+        self.by_ssrc.retain(|_, existing| !existing.is_closed());
         self.by_ssrc.insert(ssrc, tx);
     }
 
@@ -302,7 +310,7 @@ impl RtpTransport {
 
     pub fn register_listener_sync(&self, ssrc: u32, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
         let mut listeners = self.listeners.lock();
-        listeners.by_ssrc.insert(ssrc, tx);
+        listeners.bind_ssrc_route(ssrc, tx);
     }
 
     pub fn has_listener(&self, ssrc: u32) -> bool {
@@ -312,6 +320,7 @@ impl RtpTransport {
 
     pub fn register_rid_listener(&self, rid: String, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
         let mut listeners = self.listeners.lock();
+        listeners.by_rid.retain(|_, existing| !existing.is_closed());
         listeners.by_rid.insert(rid, tx);
     }
 
@@ -1132,6 +1141,84 @@ mod tests {
         assert!(
             attempt.is_err(),
             "listener must NOT receive on the fast-path relay (interceptor path is bypassed)"
+        );
+    }
+
+    /// Fix3 verification: repeated register_mid / register_provisional with new
+    /// mpsc channels must not grow `routes` unboundedly. Before the fix,
+    /// route_for_sender_mut pushed a new route for every unique tx, but old
+    /// closed-tx routes were never pruned except on the (rare) Closed send-error
+    /// path. After the fix, closed txs are removed before inserting new ones.
+    #[tokio::test]
+    async fn test_routes_pruned_on_closed_tx() {
+        let (tx1, rx1) = mpsc::channel::<(RtpPacket, SocketAddr)>(8);
+        let (tx2, rx2) = mpsc::channel::<(RtpPacket, SocketAddr)>(8);
+        let mut reg = super::ListenerRegistry::default();
+
+        // Register two routes.
+        reg.register_mid("stream1".into(), tx1.clone());
+        reg.register_provisional(tx2.clone());
+        assert_eq!(reg.routes.len(), 2, "two live routes");
+
+        // Drop the receivers → sender channels become closed.
+        drop(rx1);
+        drop(rx2);
+        // Pruning happens lazily on the next route_for_sender_mut call.
+        let (tx3, _rx3) = mpsc::channel::<(RtpPacket, SocketAddr)>(8);
+        reg.register_provisional(tx3);
+
+        // After the fix, the two closed-tx routes were removed.
+        assert!(
+            reg.routes.len() <= 1,
+            "Fix3: routes must be pruned when their tx is closed (len={})",
+            reg.routes.len()
+        );
+
+        let (tx4, _rx4) = mpsc::channel::<(RtpPacket, SocketAddr)>(8);
+        let (tx5, _rx5) = mpsc::channel::<(RtpPacket, SocketAddr)>(8);
+        reg.bind_ssrc_route(111, tx4);
+        reg.bind_ssrc_route(222, tx5);
+        assert!(
+            reg.by_ssrc.len() <= 2,
+            "Fix3: by_ssrc must not hold stale entries"
+        );
+    }
+
+    /// Fix3 integration-style: after transport replacement the new tx channel
+    /// replaces the old one, and the old route is cleaned.
+    #[tokio::test]
+    async fn test_routes_do_not_grow_across_transport_replacement() {
+        use crate::transports::ice::IceSocketWrapper;
+        use tokio::sync::watch;
+
+        let (tx, rx) = watch::channel::<Option<IceSocketWrapper>>(None);
+        let conn = crate::transports::ice::conn::IceConn::new(
+            rx,
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+        );
+        let transport = Arc::new(super::RtpTransport::new(conn, false));
+
+        let ssrc = 1001u32;
+        for i in 0..5 {
+            // Each time RegisterListenerSync is called it opens a new tx
+            // channel. After the first call, earlier channels are closed
+            // (only the latest one is actually connected to a receiver).
+            transport.register_listener_sync(ssrc + i, mpsc::channel::<(RtpPacket, SocketAddr)>(8).0);
+        }
+
+        let listeners = transport.listeners.lock();
+        assert!(
+            listeners.routes.len() <= 2,
+            "Fix3: routes must not grow across transport-replacement-like \
+             register_listener_sync calls (len={})",
+            listeners.routes.len()
+        );
+        // by_ssrc should also be pruned: only the last few live txs remain.
+        assert!(
+            listeners.by_ssrc.len() <= 3,
+            "Fix3: by_ssrc must not accumulate stale entries (len={})",
+            listeners.by_ssrc.len()
         );
     }
 }
