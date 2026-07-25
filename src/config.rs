@@ -563,7 +563,7 @@ impl Default for RtcConfiguration {
             ice_connection_timeout: std::time::Duration::from_secs(30),
             ice_disconnect_threshold: std::time::Duration::from_secs(5),
             sctp_rto_initial: std::time::Duration::from_secs(3),
-            sctp_rto_min: std::time::Duration::from_secs(1),
+            sctp_rto_min: std::time::Duration::from_millis(200),
             sctp_rto_max: std::time::Duration::from_secs(60),
             sctp_max_association_retransmits: 20,
             sctp_receive_window: 128 * 1024, // 128KB - reduced for lower memory footprint
@@ -917,7 +917,7 @@ mod tests {
         assert_eq!(config.ice_connection_timeout, Duration::from_secs(30));
         assert_eq!(config.ice_disconnect_threshold, Duration::from_secs(5));
         assert_eq!(config.sctp_rto_initial, Duration::from_secs(3));
-        assert_eq!(config.sctp_rto_min, Duration::from_secs(1));
+        assert_eq!(config.sctp_rto_min, Duration::from_millis(200));
         assert_eq!(config.sctp_rto_max, Duration::from_secs(60));
         assert_eq!(config.sctp_max_association_retransmits, 20);
         assert_eq!(config.sctp_heartbeat_interval, Duration::from_secs(15));
@@ -983,7 +983,7 @@ mod tests {
         // Verify a TURN-optimized configuration can be expressed cleanly
         let config = RtcConfigurationBuilder::new()
             .sctp_rto_initial(Duration::from_millis(500))
-            .sctp_rto_min(Duration::from_millis(200))
+            .sctp_rto_min(Duration::from_millis(100))
             .sctp_rto_max(Duration::from_secs(10))
             .sctp_max_association_retransmits(30)
             .sctp_max_heartbeat_failures(8)

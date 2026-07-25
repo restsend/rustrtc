@@ -355,7 +355,8 @@ impl IceTransportRunner {
                 }
                 res = state_rx.changed() => {
                     if res.is_err() || matches!(*state_rx.borrow(), IceTransportState::Closed | IceTransportState::Failed) {
-                        debug!("Read loop stopping (IceTransport Closed or Failed)");
+                        // routine teardown; one line per read loop is noisy at debug
+                        trace!("Read loop stopping (IceTransport Closed or Failed)");
                         break;
                     }
                 }
@@ -438,7 +439,7 @@ impl IceTransportRunner {
                 }
                 res = state_rx.changed() => {
                     if res.is_err() || matches!(*state_rx.borrow(), IceTransportState::Closed | IceTransportState::Failed) {
-                        debug!("TURN Read loop stopping (IceTransport Closed or Failed)");
+                        trace!("TURN Read loop stopping (IceTransport Closed or Failed)");
                         break;
                     }
                 }
@@ -1406,7 +1407,7 @@ impl IceTransport {
                 inner.pending_transactions.lock().remove(&tx_id);
                 return;
             }
-            match timeout(Duration::from_secs(2), rx).await {
+            match timeout(Duration::from_millis(250), rx).await {
                 Ok(Ok(msg)) if msg.class == StunClass::SuccessResponse => {
                     debug!("TURN allocation destroyed (Refresh LIFETIME=0)");
                     return;
@@ -1427,11 +1428,13 @@ impl IceTransport {
                     return;
                 }
                 _ => {
-                    // Timeout or read-loop already shut down (state -> Closed).
-                    // The server still destroys the allocation on request receipt.
+                    // Timeout (250ms) or read-loop already shut down (state ->
+                    // Closed). The server still destroys the allocation on
+                    // request receipt, so this is best-effort — don't block the
+                    // close path for a full response.
                     inner.pending_transactions.lock().remove(&tx_id);
-                    debug!(
-                        "TURN destroy: no response within 2s (best-effort; \
+                    trace!(
+                        "TURN destroy: no response within 250ms (best-effort; \
                          allocation is released server-side on receipt)"
                     );
                     return;

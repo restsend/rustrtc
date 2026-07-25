@@ -227,7 +227,7 @@ impl IceConn {
             let mut socket_rx = self.socket_rx.clone();
             let socket = socket_rx.borrow_and_update().clone();
             let Some(socket) = socket else {
-                tracing::debug!("IceConn: try_send failed - no selected socket");
+                tracing::trace!("IceConn: try_send failed - no selected socket");
                 return Err(anyhow::anyhow!("No selected socket"));
             };
             return Self::do_try_send(socket, buf, &self.remote_addr);
@@ -281,7 +281,7 @@ impl IceConn {
                 self.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
                 Ok(n)
             } else {
-                tracing::debug!("IceConn: send failed - no selected socket");
+                tracing::trace!("IceConn: send failed - no selected socket");
                 Err(anyhow::anyhow!("No selected socket"))
             }
         }
@@ -310,7 +310,7 @@ impl IceConn {
         }
 
         let Some(socket) = socket_opt else {
-            tracing::debug!("IceConn: send_dtls_record_batch failed - no selected socket");
+            tracing::trace!("IceConn: send_dtls_record_batch failed - no selected socket");
             return Err(anyhow::anyhow!("No selected socket"));
         };
 
@@ -379,7 +379,7 @@ impl IceConn {
             self.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
             Ok(n)
         } else {
-            tracing::debug!("IceConn: send_rtcp failed - no selected socket");
+            tracing::trace!("IceConn: send_rtcp failed - no selected socket");
             Err(anyhow::anyhow!("No selected socket"))
         }
     }
