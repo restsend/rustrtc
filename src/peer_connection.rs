@@ -5762,7 +5762,6 @@ impl RtpSender {
         // Wake any previous send-loop task so it (and the Arc<RtpTransport> +
         // interceptors it holds) can drain immediately instead of potentially
         // blocking on a stalled source track.
-        self.stop();
 
         let track_id = self.track_id.clone();
         let track = self.track.clone();
