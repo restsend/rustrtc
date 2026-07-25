@@ -50,7 +50,7 @@ const SCTP_MAX_INIT_RETRANS: u32 = 8;
 // at least every 2nd in-order DATA chunk. We use 100ms to stay safely below the
 // minimum RTO (avoids spurious T3 retransmits). Coalesces one-SACK-per-DATA
 // into ~half as many on symmetric/bursty traffic.
-const SACK_DELAY: Duration = Duration::from_millis(100);
+const SACK_DELAY: Duration = Duration::from_millis(0);
 // Max chunks retransmitted per T3 (RTO) cycle. RFC 4960 §7.2.3 collapses cwnd
 // to ~4*MTU after an RTO; retransmitting a matching burst recovers a burst of
 // losses in one cycle instead of one-packet-per-RTO (which, combined with RTO
@@ -1327,7 +1327,7 @@ impl SctpInner {
                         record.transmit_count += 1;
                         record.sent_time = now;
                         retransmit_count += 1;
-                        debug!(
+                        trace!(
                             "T3 retransmit: marking TSN {} for retransmission (transmit #{})",
                             tsn, record.transmit_count
                         );
@@ -2861,7 +2861,7 @@ impl SctpInner {
             }
             self.tlp_probe_sent.store(true, Ordering::Relaxed);
             self.stats_tlp_probes.fetch_add(1, Ordering::Relaxed);
-            debug!("TLP: probing tail TSN {} (transmit #{})", tail_tsn, record.transmit_count);
+            trace!("TLP: probing tail TSN {} (transmit #{})", tail_tsn, record.transmit_count);
             self.timer_notify.notify_one();
             return true;
         }

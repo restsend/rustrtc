@@ -1191,7 +1191,7 @@ mod tests {
         use crate::transports::ice::IceSocketWrapper;
         use tokio::sync::watch;
 
-        let (tx, rx) = watch::channel::<Option<IceSocketWrapper>>(None);
+        let (_tx, rx) = watch::channel::<Option<IceSocketWrapper>>(None);
         let conn = crate::transports::ice::conn::IceConn::new(
             rx,
             "127.0.0.1:0".parse().unwrap(),
