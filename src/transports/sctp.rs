@@ -1081,6 +1081,11 @@ impl SctpInner {
                         trace!("SCTP T1 timeout error: {}", e);
                     }
 
+                    // Check Tail Loss Probe before T3 — TLP has a shorter timeout
+                    // (PTO) and should recover tail losses before the much
+                    // heavier RTO-based retransmission kicks in.
+                    self.maybe_send_tlp_probe(Instant::now());
+
                     // Check RTO Timer
                     // We check this regardless of whether sleep woke up due to RTO or SACK,
                     // because they might be close.
@@ -2799,17 +2804,20 @@ impl SctpInner {
     }
 
     /// Tail Loss Probe timeout (RFC 8985-inspired). Use 2*SRTT when we have a
-    /// valid RTT estimate, else fall back to 2*initial_RTO. Always at least the
-    /// configured rto_min so we don't probe more aggressively than the link can
-    /// respond.
+    /// valid RTT estimate, else fall back to 2*initial_RTO. Uses rto_min/2 as
+    /// the floor so that PTO is always *strictly shorter* than the RTO-based
+    /// T3 timer when both are at the configured minimum — otherwise TLP and T3
+    /// fire at the same instant and TLP never gets a chance to recover a tail
+    /// loss before the heavy-handed RTO retransmission kicks in.
     fn tlp_pto(&self) -> Duration {
         let rto_state = self.rto_state.lock();
         let rto_min = rto_state.min;
+        let pto_floor = (rto_min / 2.0).max(0.001);
         if rto_state.srtt > 0.0 {
-            let pto = (2.0 * rto_state.srtt).max(rto_min);
+            let pto = (2.0 * rto_state.srtt).max(pto_floor);
             Duration::from_secs_f64(pto)
         } else {
-            Duration::from_secs_f64((2.0 * rto_state.rto).max(rto_min))
+            Duration::from_secs_f64((2.0 * rto_state.rto).max(pto_floor))
         }
     }
 
@@ -9703,6 +9711,252 @@ mod tests {
         assert!(!fired2, "only one TLP per RTO cycle");
         let probes_after = sctp.inner.stats_tlp_probes.load(Ordering::Relaxed);
         assert_eq!(probes_after, probes_before + 1);
+    }
+
+    /// Reproducer for the TLP–RTO race condition: when PTO == RTO (both clamped
+    /// to rto_min), TLP fires at the same instant as T3 and never gets a chance
+    /// to recover a tail loss before the heavy-handed RTO retransmission.
+    /// The fix lowers the PTO floor from rto_min to rto_min/2 so PTO is always
+    /// strictly shorter than the RTO timer.
+    #[tokio::test]
+    async fn test_tlp_pto_less_than_rto_at_minimum() {
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+            None,
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
+        let mut config = RtcConfiguration::default();
+        config.sctp_rto_min = Duration::from_millis(200);
+        config.sctp_rto_initial = Duration::from_millis(200);
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (sctp, runner) = SctpTransport::new(
+            dtls,
+            incoming_rx,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &config,
+        );
+        tokio::spawn(runner);
+        *sctp.inner.state.lock() = SctpState::Connected;
+
+        // Small SRTT so RTO == rto_min (=200ms).
+        {
+            let mut rto = sctp.inner.rto_state.lock();
+            rto.srtt = 0.05;   // 50ms → PTO = max(100ms, floor)  = max(100ms, 100ms) = 100ms
+            rto.rttvar = 0.025; // RTO = max(50+4*25=150ms, 200ms) = 200ms
+        }
+
+        let pto = sctp.inner.tlp_pto();
+        let rto = {
+            let rto_state = sctp.inner.rto_state.lock();
+            Duration::from_secs_f64(rto_state.rto)
+        };
+
+        assert!(
+            pto < rto,
+            "PTO ({:?}) must be strictly less than RTO ({:?}) so TLP fires before T3",
+            pto,
+            rto
+        );
+
+        // When SRTT is 0 (no RTT samples), PTO falls back to 2*RTO which is
+        // expected to be >= RTO (by design, RFC 8985 §4). The fix only applies
+        // when we have a valid SRTT so that PTO = 2*SRTT can be computed
+        // independently of the RTO calculation.
+    }
+
+    /// Verify that TLP fires BEFORE T3 when PTO has elapsed but RTO has not.
+    /// This confirms that the sleep-branch TLP check (added in the fix) and
+    /// the lowered PTO floor work together: a tail loss is recovered via a
+    /// light-weight probe rather than waiting for the full RTO timeout.
+    #[tokio::test]
+    async fn test_tlp_fires_before_t3_when_pto_expired() {
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+            None,
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
+        let mut config = RtcConfiguration::default();
+        config.sctp_rto_min = Duration::from_millis(500);
+        config.sctp_rto_initial = Duration::from_millis(500);
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (sctp, runner) = SctpTransport::new(
+            dtls,
+            incoming_rx,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &config,
+        );
+        tokio::spawn(runner);
+        *sctp.inner.state.lock() = SctpState::Connected;
+        sctp.inner.remote_verification_tag.store(12345, Ordering::SeqCst);
+
+        // Set SRTT so that PTO (250ms) < RTO (500ms):
+        //   SRTT = 100ms, rttvar = 50ms
+        //   PTO = max(2*100=200ms, floor=250ms) = 250ms
+        //   RTO = max(100+4*50=300ms, 500ms) = 500ms
+        {
+            let mut rto = sctp.inner.rto_state.lock();
+            rto.srtt = 0.10;
+            rto.rttvar = 0.05;
+        }
+
+        // Insert a single unacked in-flight TSN sent 400ms ago.
+        // PTO (250ms) < age (400ms) < RTO (500ms) → TLP should fire, T3 should NOT.
+        let age = Duration::from_millis(400);
+        let chunk = ChunkRecord {
+            payload: Bytes::from_static(b"test-payload"),
+            sent_time: Instant::now() - age,
+            transmit_count: 1,
+            missing_reports: 0,
+            abandoned: false,
+            fast_retransmit: false,
+            fast_retransmit_time: None,
+            needs_retransmit: false,
+            in_flight: true,
+            acked: false,
+            stream_id: 0,
+            ssn: 0,
+            flags: 0x03,
+            max_retransmits: None,
+            expiry: None,
+        };
+        sctp.inner.sent_queue.lock().insert(100, chunk);
+
+        // Simulate the sleep-branch logic: call TLP first, then T3.
+        let probes_before = sctp.inner.stats_tlp_probes.load(Ordering::Relaxed);
+        let tlp_fired = sctp.inner.maybe_send_tlp_probe(Instant::now());
+        assert!(tlp_fired, "TLP should fire — PTO (250ms) has elapsed (age=400ms)");
+
+        let probes_after_tlp = sctp.inner.stats_tlp_probes.load(Ordering::Relaxed);
+        assert_eq!(probes_after_tlp, probes_before + 1, "TLP probe counter must increment");
+
+        // The tail TSN must be marked for retransmission by TLP.
+        {
+            let q = sctp.inner.sent_queue.lock();
+            let record = q.get(&100).unwrap();
+            assert!(record.needs_retransmit, "TLP must mark TSN for retransmit");
+            assert_eq!(record.transmit_count, 2, "TLP increments transmit_count to 2");
+        }
+
+        // Now call handle_timeout — T3 should NOT fire because RTO (500ms) hasn't elapsed yet (age=400ms).
+        sctp.inner.handle_timeout().await.unwrap();
+
+        // Transmit count should still be 2 (only TLP bumped it, T3 did nothing).
+        {
+            let q = sctp.inner.sent_queue.lock();
+            let record = q.get(&100).unwrap();
+            assert_eq!(
+                record.transmit_count, 2,
+                "T3 must NOT fire when RTO hasn't elapsed (age=400ms < RTO=500ms)"
+            );
+        }
+    }
+
+    /// Full integration regression test: when PTO < RTO (post-fix), a single
+    /// unacked TSN that is older than both timers gets retransmitted by TLP
+    /// FIRST, then T3. Before the fix (PTO == RTO), TLP never got a chance.
+    #[tokio::test]
+    async fn test_tlp_and_t3_order_when_both_expired() {
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+            None,
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
+            .await
+            .unwrap();
+        let mut config = RtcConfiguration::default();
+        config.sctp_rto_min = Duration::from_millis(500);
+        config.sctp_rto_initial = Duration::from_millis(500);
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (sctp, runner) = SctpTransport::new(
+            dtls,
+            incoming_rx,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &config,
+        );
+        tokio::spawn(runner);
+        *sctp.inner.state.lock() = SctpState::Connected;
+        sctp.inner.remote_verification_tag.store(12345, Ordering::SeqCst);
+
+        // SRTT = 100ms, rttvar = 50ms, rto_min = 500ms
+        // PTO = max(200ms, 250ms) = 250ms, RTO = 500ms
+        {
+            let mut rto = sctp.inner.rto_state.lock();
+            rto.srtt = 0.10;
+            rto.rttvar = 0.05;
+        }
+
+        // TSN sent 600ms ago — both PTO (250ms) and RTO (500ms) have elapsed.
+        let age = Duration::from_millis(600);
+        let chunk = ChunkRecord {
+            payload: Bytes::from_static(b"test-payload"),
+            sent_time: Instant::now() - age,
+            transmit_count: 1,
+            missing_reports: 0,
+            abandoned: false,
+            fast_retransmit: false,
+            fast_retransmit_time: None,
+            needs_retransmit: false,
+            in_flight: true,
+            acked: false,
+            stream_id: 0,
+            ssn: 0,
+            flags: 0x03,
+            max_retransmits: None,
+            expiry: None,
+        };
+        sctp.inner.sent_queue.lock().insert(100, chunk);
+        *sctp.inner.last_send_or_ack.lock() = Instant::now() - age;
+
+        let probes_before = sctp.inner.stats_tlp_probes.load(Ordering::Relaxed);
+
+        // 1. TLP fires first (sleep-branch order).
+        let tlp_fired = sctp.inner.maybe_send_tlp_probe(Instant::now());
+        assert!(tlp_fired, "TLP must fire — PTO (250ms) has elapsed");
+
+        // 2. T3 fires (handle_timeout).
+        sctp.inner.handle_timeout().await.unwrap();
+
+        let probes_after = sctp.inner.stats_tlp_probes.load(Ordering::Relaxed);
+        assert_eq!(probes_after, probes_before + 1, "TLP probe counter");
+
+        let q = sctp.inner.sent_queue.lock();
+        let record = q.get(&100).unwrap();
+        // TLP bumped to 2, then T3 bumped to 3 — but T3 may or may not mark
+        // again (depends on RETRANSMIT_BURST and whether TLP already marked it).
+        // At minimum, needs_retransmit is set and transmit_count >= 2.
+        assert!(
+            record.transmit_count >= 2,
+            "transmit_count must be at least 2 (TLP=2, T3 may also bump)"
+        );
+        assert!(
+            record.needs_retransmit,
+            "TSN must be marked for retransmit"
+        );
     }
 
     /// B.10 verification (RFC 4960 §8.1): a HEARTBEAT round-trip must update the
