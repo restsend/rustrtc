@@ -1803,49 +1803,71 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     successful_pairs.sort_by_key(|p| std::cmp::Reverse(p.priority(role)));
 
     if role == IceRole::Controlling {
-        // Try nomination on each successful pair in priority order.
-        // First successful nomination wins; fall through to next pair on failure.
-        let mut nominated = false;
+        // Signal Connected so the PeerConnection starts waiting for nomination_complete.
+        let _ = inner.state.send(IceTransportState::Connected);
+
+        // Launch ALL nomination checks in parallel — first success wins.
+        // This avoids the N × nomination_timeout latency of sequential
+        // nomination when the highest-priority pairs are unreachable
+        // (e.g. host/srflx → relay pairs behind NAT).
+        let mut nom_checks = futures::stream::FuturesUnordered::new();
         for pair in &successful_pairs {
-            *inner.selected_pair.lock() = Some(pair.clone());
-            let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
-            if let Some(socket) = resolve_socket(&inner, pair) {
-                let _ = inner.selected_socket.send(Some(socket.clone()));
-                publish_selected_rtcp_socket(&inner, Some(socket));
-            }
-            let _ = inner.state.send(IceTransportState::Connected);
-            debug!(
-                "ICE checks complete. Selected pair: {} -> {}",
-                pair.local.address, pair.remote.address
-            );
+            let inner_c = inner.clone();
+            let local = pair.local.clone();
+            let remote = pair.remote.clone();
             debug!(
                 "Controlling agent nominating pair: {} -> {}",
-                pair.local.address, pair.remote.address
+                local.address, remote.address
             );
+            nom_checks.push(async move {
+                let result = perform_binding_check(&local, &remote, &inner_c, role, true).await;
+                (IceCandidatePair::new(local, remote), result)
+            });
+        }
 
-            let result = perform_binding_check(&pair.local, &pair.remote, &inner, role, true).await;
-            match &result {
+        // Wait for the first successful nomination.
+        // Remaining futures are dropped (TransactionGuard cleans up).
+        let mut nominated_pair: Option<IceCandidatePair> = None;
+        while let Some((pair, result)) = nom_checks.next().await {
+            match result {
                 Ok(_) => {
                     debug!(
                         "Nomination succeeded: {} -> {}",
                         pair.local.address, pair.remote.address
                     );
-                    let _ = inner.nomination_complete.send(Some(true));
-                    nominated = true;
+                    nominated_pair = Some(pair);
                     break;
                 }
                 Err(e) => {
                     debug!(
-                        "Failed to send nomination for {} -> {}: {}",
+                        "Nomination failed for {} -> {}: {}",
                         pair.local.address, pair.remote.address, e
                     );
-                    // Fall through to next pair
                 }
             }
         }
-        if !nominated {
+
+        // Set selected_pair: use the winning pair on success, or the
+        // highest-priority pair on all-fail (for best-effort data flow).
+        let final_pair = nominated_pair
+            .clone()
+            .unwrap_or_else(|| successful_pairs[0].clone());
+        *inner.selected_pair.lock() = Some(final_pair.clone());
+        let _ = inner.selected_pair_notifier.send(Some(final_pair.clone()));
+        if let Some(socket) = resolve_socket(&inner, &final_pair) {
+            let _ = inner.selected_socket.send(Some(socket.clone()));
+            publish_selected_rtcp_socket(&inner, Some(socket));
+        }
+        debug!(
+            "ICE checks complete. Selected pair: {} -> {}",
+            final_pair.local.address, final_pair.remote.address
+        );
+
+        if nominated_pair.is_some() {
+            let _ = inner.nomination_complete.send(Some(true));
+        } else {
             debug!(
-                "All nomination attempts failed ({} pairs tried)",
+                "All {} nomination attempts failed",
                 successful_pairs.len()
             );
             let _ = inner.nomination_complete.send(Some(false));

@@ -2228,6 +2228,98 @@ async fn test_nomination_fallback_all_pairs_fail() -> Result<()> {
     Ok(())
 }
 
+/// Test that parallel nomination completes within a single `nomination_timeout`
+/// period even when an unreachable candidate is present alongside reachable
+/// ones.
+///
+/// With sequential nomination (pre-0.3.104) the unreachable pair would be
+/// nominated first and waste a full `nomination_timeout` before falling through
+/// to the reachable pair.  With parallel nomination all pairs are nominated
+/// concurrently, so the reachable pair's response arrives immediately.
+#[tokio::test]
+#[serial]
+async fn test_parallel_nomination_with_unreachable_candidate() -> Result<()> {
+    let config = RtcConfiguration::default();
+
+    let (controlling, runner_c) = IceTransportBuilder::new(config.clone())
+        .role(IceRole::Controlling)
+        .build();
+    tokio::spawn(runner_c);
+
+    let (controlled, runner_d) = IceTransportBuilder::new(config)
+        .role(IceRole::Controlled)
+        .build();
+    tokio::spawn(runner_d);
+
+    // Forward candidates both ways
+    let ctrl_clone = controlling.clone();
+    let ctrd_clone = controlled.clone();
+    let mut rx_ctrl = controlling.subscribe_candidates();
+    let mut rx_ctrd = controlled.subscribe_candidates();
+    tokio::spawn(async move {
+        while let Ok(c) = rx_ctrl.recv().await {
+            ctrd_clone.add_remote_candidate(c);
+        }
+    });
+    tokio::spawn(async move {
+        while let Ok(c) = rx_ctrd.recv().await {
+            ctrl_clone.add_remote_candidate(c);
+        }
+    });
+
+    // Add an UNREACHABLE remote candidate to the controlling side first
+    // (127.0.0.2 — nothing listening there).
+    let bad_remote = IceCandidate::host("127.0.0.2:9999".parse().unwrap(), 1);
+    controlling.add_remote_candidate(bad_remote);
+
+    // Start both transports
+    controlling.start(controlled.local_parameters())?;
+    controlled.start(controlling.local_parameters())?;
+
+    let ctrl_state = controlling.subscribe_state();
+    let mut ctrl_nom_rx = controlling.subscribe_nomination_complete();
+
+    // Both should reach Connected.  The bad pair will fail its connectivity
+    // check, but the good pairs (once candidates are exchanged) will succeed.
+    assert!(
+        wait_ice_connected(ctrl_state, Duration::from_secs(10)).await,
+        "ICE should connect despite unreachable candidate"
+    );
+
+    // Nomination should succeed — with parallel nomination the reachable pair's
+    // USE-CANDIDATE response arrives in <1 s on localhost, independent of the
+    // unreachable pair that would block sequential nomination for 10 s.
+    let nom_result = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(v) = *ctrl_nom_rx.borrow() {
+                return v;
+            }
+            if ctrl_nom_rx.changed().await.is_err() {
+                return false;
+            }
+        }
+    })
+    .await;
+
+    assert!(nom_result.is_ok(), "nomination_complete must fire");
+    assert!(
+        nom_result.unwrap(),
+        "Nomination should succeed (parallel — reachable pair wins)"
+    );
+
+    // Selected pair should be a reachable one, not the bad candidate.
+    let pair = controlling.get_selected_pair();
+    assert!(pair.is_some(), "Selected pair should exist");
+    let pair = pair.unwrap();
+    assert_ne!(
+        pair.remote.address,
+        "127.0.0.2:9999".parse::<SocketAddr>().unwrap(),
+        "Selected pair should not be the unreachable candidate"
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 #[serial]
 async fn test_nomination_fallback_controlled_side_works() -> Result<()> {

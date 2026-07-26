@@ -1,6 +1,6 @@
 [package]
 name = "rustrtc"
-version = "0.3.103"
+version = "0.3.104"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 repository = "https://github.com/restsend/rustrtc"
