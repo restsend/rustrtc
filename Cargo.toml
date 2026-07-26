@@ -1,6 +1,6 @@
 [package]
 name = "rustrtc"
-version = "0.3.93"
+version = "0.3.104"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 repository = "https://github.com/restsend/rustrtc"
@@ -88,3 +88,13 @@ tower-http = { version = "0.6", features = ["fs"] }
 default = []
 simulator = []
 t38 = ["dep:spandsp-sys"]
+
+# Local dev/test build speedups. These only apply when rustrtc is the root crate
+# (e.g. `cargo test` here); downstream consumers use their own profiles. The big
+# win is `split-debuginfo = "unpacked"`, which moves debug info out of the
+# binary and dramatically cuts link time for the large test binary.
+[profile.dev]
+split-debuginfo = "unpacked"
+
+[profile.test]
+split-debuginfo = "unpacked"

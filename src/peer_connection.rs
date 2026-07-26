@@ -147,6 +147,10 @@ pub trait RtpSenderInterceptor: Send + Sync {
         _local_addr: std::net::SocketAddr,
     ) {
     }
+    /// Fires after a Sender Report (RTCP SR) has been built and sent.
+    /// Carries the outgoing SSRC and the NTP least field so the receiver
+    /// can compute RTT from the LSR/DLSR on the return path.
+    fn on_sr_sent(&self, _ssrc: u32, _ntp_least: u32) {}
     async fn on_rtcp_received(&self, _packet: &RtcpPacket, _transport: Arc<RtpTransport>) {}
     fn as_nack_stats(self: Arc<Self>) -> Option<Arc<dyn NackStats>> {
         None
@@ -700,6 +704,22 @@ impl PeerConnection {
         }
     }
 
+    /// Cumulative count of inbound RTP packets accepted at the transport
+    /// layer across the primary and muxed media transports. Monotonically
+    /// increasing; safe to poll concurrently. Used by the host to detect RTP
+    /// inactivity (e.g. media-proxy rtp-timeout) regardless of the active
+    /// forwarding mode (rewrite-bridge fast-path or depacketize chain).
+    pub fn received_rtp_packets(&self) -> u64 {
+        let mut total = 0u64;
+        if let Some(transport) = self.inner.rtp_transport.lock().clone() {
+            total += transport.received_rtp_packets();
+        }
+        for transport in self.inner.rtp_media_transports.lock().values() {
+            total += transport.received_rtp_packets();
+        }
+        total
+    }
+
     pub async fn wait_for_rtp_transport_ready(
         &self,
         timeout: std::time::Duration,
@@ -1143,10 +1163,12 @@ impl PeerConnection {
                 (SdpType::Offer, SignalingState::Stable) => {
                     debug!("Answerer: applying reinvite from offer");
                     self.handle_reinvite(&desc).await?;
+                    self.cleanup_orphaned_extra_transports(&desc);
                 }
                 (SdpType::Answer | SdpType::Pranswer, SignalingState::HaveLocalOffer) => {
                     debug!("Offerer: applying reinvite from answer/pranswer");
                     self.handle_reinvite(&desc).await?;
+                    self.cleanup_orphaned_extra_transports(&desc);
                 }
                 // Invalid states for reinvite
                 (SdpType::Offer, _) => {
@@ -3108,6 +3130,45 @@ impl PeerConnection {
         Ok(())
     }
 
+    /// Remove extra ICE / RTP transports whose transceiver no longer appears
+    /// in `new_desc` (media section was removed by the remote peer).  Without
+    /// this cleanup the per-transceiver ICE transport (sockets, TURN allocs,
+    /// runner task) survives until the next full close(), leaking resources
+    /// across non-BUNDLE renegotiations.
+    fn cleanup_orphaned_extra_transports(&self, new_desc: &SessionDescription) {
+        let mids: std::collections::HashSet<&str> =
+            new_desc.media_sections.iter().map(|s| s.mid.as_str()).collect();
+
+        // Collect orphan transceiver IDs (transport key).
+        let mut orphan_ids = Vec::new();
+        let transceivers = self.inner.transceivers.lock();
+        for t in transceivers.iter() {
+            if let Some(mid) = t.mid() {
+                if !mids.contains(mid.as_str()) {
+                    orphan_ids.push(t.id());
+                }
+            }
+        }
+        drop(transceivers);
+
+        if orphan_ids.is_empty() {
+            return;
+        }
+        debug!(
+            "Cleaning up {} orphaned extra transport(s) (removed m= sections)",
+            orphan_ids.len()
+        );
+
+        for id in &orphan_ids {
+            if let Some(t) = self.inner.rtp_media_transports.lock().remove(id) {
+                t.clear_listeners();
+            }
+            if let Some(t) = self.inner.rtp_media_ice_transports.lock().remove(id) {
+                t.stop();
+            }
+        }
+    }
+
     /// Extract payload type to codec parameters mapping from media section
     fn extract_payload_map(section: &crate::MediaSection) -> HashMap<u8, RtpCodecParameters> {
         let mut payload_map = HashMap::new();
@@ -3318,20 +3379,20 @@ async fn run_gathering_loop(
 ) {
     let mut rx = ice_transport.subscribe_gathering_state();
     let mut ice_state_rx = ice_transport.subscribe_state();
+    let mut cand_rx = ice_transport.subscribe_candidates();
     loop {
         let state = *rx.borrow_and_update();
         if state == crate::transports::ice::IceGathererState::Complete
             && let Some(inner) = inner_weak.upgrade()
+            && !update_local_description_on_gather(&inner, &ice_transport)
         {
-            if !update_local_description_on_gather(&inner, &ice_transport) {
-                let mut sig_rx = inner.signaling_state.subscribe();
-                loop {
-                    if update_local_description_on_gather(&inner, &ice_transport) {
-                        break;
-                    }
-                    if sig_rx.changed().await.is_err() {
-                        break;
-                    }
+            let mut sig_rx = inner.signaling_state.subscribe();
+            loop {
+                if update_local_description_on_gather(&inner, &ice_transport) {
+                    break;
+                }
+                if sig_rx.changed().await.is_err() {
+                    break;
                 }
             }
         }
@@ -3356,6 +3417,21 @@ async fn run_gathering_loop(
                 if res.is_err() { break; }
                 if matches!(*ice_state_rx.borrow(), crate::transports::ice::IceTransportState::Closed | crate::transports::ice::IceTransportState::Failed) {
                     break;
+                }
+            }
+            _ = cand_rx.recv() => {
+                if let Some(inner) = inner_weak.upgrade()
+                    && inner.config.transport_mode == TransportMode::WebRtc
+                {
+                    let strs: Vec<String> = ice_transport
+                        .local_candidates()
+                        .iter()
+                        .map(|c| c.to_sdp())
+                        .collect();
+                    let mut guard = inner.local_description.lock();
+                    if let Some(desc) = guard.as_mut() {
+                        desc.add_candidates_incremental(&strs);
+                    }
                 }
             }
         }
@@ -3651,20 +3727,70 @@ async fn handle_connected_state_no_dtls(
             }
             Ok(mut rtcp_loop) => {
                 let _ = inner.peer_state.send(PeerConnectionState::Connected);
+                let grace = inner.config.ice_disconnect_grace;
+                drop(inner);
+
+                let (grace_tx, mut grace_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+                let mut disconnect_epoch: u64 = 0;
+
                 loop {
                     tokio::select! {
                         _ = &mut rtcp_loop => {
-                            // Combined loop exited (SCTP/DTLS/RTCP runner finished)
-                            // Check SCTP close reason and propagate it
-                            propagate_sctp_close_reason(&inner);
+                            if let Some(inner) = inner_weak.upgrade() {
+                                propagate_sctp_close_reason(&inner);
+                            }
                             break;
                         }
                         res = ice_state_rx.changed() => {
                             if res.is_err() { return false; }
                             let new_state = *ice_state_rx.borrow();
-                            if is_ice_disconnected(new_state) {
+                            if is_ice_failed_or_closed(new_state) {
                                 return true;
                             }
+                            match new_state {
+                                crate::transports::ice::IceTransportState::Disconnected => {
+                                    if let Some(inner) = inner_weak.upgrade() {
+                                        let _ = inner.peer_state.send(PeerConnectionState::Disconnected);
+                                    }
+                                    let epoch = disconnect_epoch;
+                                    let tx = grace_tx.clone();
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(grace).await;
+                                        let _ = tx.send(epoch);
+                                    });
+                                    debug!("ICE Disconnected, grace timer started ({:.1}s, epoch {})", grace.as_secs_f64(), epoch);
+                                }
+                                crate::transports::ice::IceTransportState::Connected
+                                | crate::transports::ice::IceTransportState::Completed => {
+                                    disconnect_epoch += 1;
+                                    if let Some(inner) = inner_weak.upgrade() {
+                                        let _ = inner.peer_state.send(PeerConnectionState::Connected);
+                                    }
+                                    debug!("ICE recovered (epoch {}), grace cancelled", disconnect_epoch);
+                                }
+                                _ => {}
+                            }
+                        }
+                        Some(epoch) = grace_rx.recv() => {
+                            if epoch == disconnect_epoch {
+                                if let Some(inner) = inner_weak.upgrade() {
+                                    let _ = inner.disconnect_reason.send_if_modified(|cur| {
+                                        if cur.is_none() {
+                                            *cur = Some(DisconnectReason::IceDisconnected);
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    });
+                                    let _ = inner.peer_state.send(PeerConnectionState::Disconnected);
+                                    if let Some(sctp) = inner.sctp_transport.lock().as_ref() {
+                                        sctp.close();
+                                    }
+                                }
+                                debug!("ICE disconnect grace expired, cycling transport");
+                                return true;
+                            }
+                            // Stale timer from a previous disconnect epoch — ignore.
                         }
                     }
                 }
@@ -3711,18 +3837,41 @@ async fn handle_connected_state(
                         };
 
                         if let Some(mut dtls_rx) = dtls_state_rx {
+                            let grace = inner.config.ice_disconnect_grace;
+                            let (grace_tx, mut grace_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+                            let mut disconnect_epoch: u64 = 0;
                             loop {
                                 tokio::select! {
                                     _ = &mut rtcp_loop => {
-                                        // Combined loop exited (SCTP/DTLS/RTCP runner finished)
                                         propagate_sctp_close_reason(&inner);
                                         break;
                                     }
                                     res = ice_state_rx.changed() => {
                                         if res.is_err() { return false; }
                                         let new_state = *ice_state_rx.borrow();
-                                        if is_ice_disconnected(new_state) {
+                                        if is_ice_failed_or_closed(new_state) {
                                             return true;
+                                        }
+                                        match new_state {
+                                            crate::transports::ice::IceTransportState::Disconnected => {
+                                                let _ = inner.peer_state.send(PeerConnectionState::Disconnected);
+                                                let _ = ice_connection_state_tx.send(IceConnectionState::Disconnected);
+                                                let epoch = disconnect_epoch;
+                                                let tx = grace_tx.clone();
+                                                tokio::spawn(async move {
+                                                    tokio::time::sleep(grace).await;
+                                                    let _ = tx.send(epoch);
+                                                });
+                                                debug!("ICE Disconnected, grace timer started ({:.1}s, epoch {})", grace.as_secs_f64(), epoch);
+                                            }
+                                            crate::transports::ice::IceTransportState::Connected
+                                            | crate::transports::ice::IceTransportState::Completed => {
+                                                disconnect_epoch += 1;
+                                                let _ = inner.peer_state.send(PeerConnectionState::Connected);
+                                                let _ = ice_connection_state_tx.send(IceConnectionState::Connected);
+                                                debug!("ICE recovered (epoch {}), grace cancelled", disconnect_epoch);
+                                            }
+                                            _ => {}
                                         }
                                     }
                                     res = dtls_rx.changed() => {
@@ -3746,20 +3895,81 @@ async fn handle_connected_state(
                                             break;
                                         }
                                     }
+                                    Some(epoch) = grace_rx.recv() => {
+                                        if epoch == disconnect_epoch {
+                                            let _ = inner.disconnect_reason.send_if_modified(|cur| {
+                                                if cur.is_none() {
+                                                    *cur = Some(DisconnectReason::IceDisconnected);
+                                                    true
+                                                } else {
+                                                    false
+                                                }
+                                            });
+                                            let _ = inner.peer_state.send(PeerConnectionState::Disconnected);
+                                            let _ = ice_connection_state_tx.send(IceConnectionState::Disconnected);
+                                            if let Some(sctp) = inner.sctp_transport.lock().as_ref() {
+                                                sctp.close();
+                                            }
+                                            debug!("ICE disconnect grace expired, cycling transport");
+                                            return true;
+                                        }
+                                    }
                                 }
                             }
                         } else {
+                            let grace = inner.config.ice_disconnect_grace;
+                            let (grace_tx, mut grace_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+                            let mut disconnect_epoch: u64 = 0;
                             loop {
                                 tokio::select! {
                                     _ = &mut rtcp_loop => {
-                                        // Combined loop exited (SCTP/DTLS/RTCP runner finished)
                                         propagate_sctp_close_reason(&inner);
                                         break;
                                     }
                                     res = ice_state_rx.changed() => {
                                         if res.is_err() { return false; }
                                         let new_state = *ice_state_rx.borrow();
-                                        if is_ice_disconnected(new_state) {
+                                        if is_ice_failed_or_closed(new_state) {
+                                            return true;
+                                        }
+                                        match new_state {
+                                            crate::transports::ice::IceTransportState::Disconnected => {
+                                                let _ = inner.peer_state.send(PeerConnectionState::Disconnected);
+                                                let _ = ice_connection_state_tx.send(IceConnectionState::Disconnected);
+                                                let epoch = disconnect_epoch;
+                                                let tx = grace_tx.clone();
+                                                tokio::spawn(async move {
+                                                    tokio::time::sleep(grace).await;
+                                                    let _ = tx.send(epoch);
+                                                });
+                                                debug!("ICE Disconnected, grace timer started ({:.1}s, epoch {})", grace.as_secs_f64(), epoch);
+                                            }
+                                            crate::transports::ice::IceTransportState::Connected
+                                            | crate::transports::ice::IceTransportState::Completed => {
+                                                disconnect_epoch += 1;
+                                                let _ = inner.peer_state.send(PeerConnectionState::Connected);
+                                                let _ = ice_connection_state_tx.send(IceConnectionState::Connected);
+                                                debug!("ICE recovered (epoch {}), grace cancelled", disconnect_epoch);
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    Some(epoch) = grace_rx.recv() => {
+                                        if epoch == disconnect_epoch {
+                                            let _ = inner.disconnect_reason.send_if_modified(|cur| {
+                                                if cur.is_none() {
+                                                    *cur = Some(DisconnectReason::IceDisconnected);
+                                                    true
+                                                } else {
+                                                    false
+                                                }
+                                            });
+                                            let _ = inner.peer_state.send(PeerConnectionState::Disconnected);
+                                            let _ = ice_connection_state_tx.send(IceConnectionState::Disconnected);
+                                            if let Some(sctp) = inner.sctp_transport.lock().as_ref() {
+                                                sctp.close();
+                                            }
+                                            debug!("ICE disconnect grace expired, cycling transport");
                                             return true;
                                         }
                                     }
@@ -3771,7 +3981,7 @@ async fn handle_connected_state(
             }
 
             let state = *ice_state_rx.borrow();
-            if is_ice_disconnected(state) {
+            if is_ice_failed_or_closed(state) {
                 return true;
             }
             return false;
@@ -3784,7 +3994,7 @@ async fn handle_connected_state(
             res = ice_state_rx.changed() => {
                 if res.is_err() { return false; }
                 let new_state = *ice_state_rx.borrow();
-                if is_ice_disconnected(new_state) {
+                if is_ice_failed_or_closed(new_state) {
                     return true;
                 }
             }
@@ -3792,12 +4002,20 @@ async fn handle_connected_state(
     }
 }
 
-fn is_ice_disconnected(state: crate::transports::ice::IceTransportState) -> bool {
+/// Hard, non-recoverable ICE states. Unlike `Disconnected` (which is transient
+/// and recoverable), `Failed`/`Closed` mean the transport is gone for good.
+///
+/// The connected-state loops only bail out (and thus tear down / re-init DTLS +
+/// SCTP) on these states. A transient `Disconnected` is tolerated within the
+/// `ice_disconnect_grace` period so that the SCTP association survives brief
+/// network blackouts — matching pion/webrtc-rs behaviour and giving long-lived
+/// tunnels (e.g. SSH port-forwarding) the same robustness as a plain TCP relay
+/// (frp) on a flaky link.
+fn is_ice_failed_or_closed(state: crate::transports::ice::IceTransportState) -> bool {
     matches!(
         state,
         crate::transports::ice::IceTransportState::Failed
             | crate::transports::ice::IceTransportState::Closed
-            | crate::transports::ice::IceTransportState::Disconnected
     )
 }
 
@@ -5577,6 +5795,11 @@ impl RtpSender {
         let _ = self.transport_change_tx.send(generation);
 
         *self.transport.lock() = Some(transport.clone());
+
+        // Wake any previous send-loop task so it (and the Arc<RtpTransport> +
+        // interceptors it holds) can drain immediately instead of potentially
+        // blocking on a stalled source track.
+
         let track_id = self.track_id.clone();
         let track = self.track.clone();
         let ssrc = self.ssrc;
@@ -5644,11 +5867,15 @@ impl RtpSender {
                             SystemTime::now(),
                         );
 
+                        let ntp_least = report.ntp_least;
                         if let Err(e) = transport
                             .send_rtcp(&[RtcpPacket::SenderReport(report)])
                             .await
                         {
                             trace!("Failed to send Sender Report: {}", e);
+                        }
+                        for interceptor in &*interceptors {
+                            interceptor.on_sr_sent(ssrc, ntp_least);
                         }
                     }
                     rtcp = rtcp_rx.recv() => {
@@ -7905,6 +8132,7 @@ a=sendrecv\r\n";
         let handler = DefaultRtpSenderNackHandler::new(10);
         let mut header = RtpHeader::new(96, 100, 0, 1234);
         let packet1 = RtpPacket::new(header.clone(), vec![1, 2, 3]);
+        let dummy = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0);
 
         handler
             .on_packet_sent(&packet1, test_addr(), test_addr())
@@ -8408,6 +8636,144 @@ a=mid:0
         // Local candidate should still have external port
         assert_eq!(pair.local.address.port(), 30000);
         assert_eq!(pair.remote.address.port(), 6000);
+    }
+
+    /// Fix2 verification: calling set_transport twice must not leak the old
+    /// send-loop task. Before the fix the old loop could block indefinitely on
+    /// a stalled source track; after the fix self.stop() is called before
+    /// spawning the new loop, so the old Notified->break path fires immediately.
+    #[tokio::test]
+    async fn test_sender_set_transport_releases_old_task() {
+        use crate::media::track::sample_track;
+        use crate::transports::ice::conn::IceConn;
+        use crate::transports::ice::IceSocketWrapper;
+        use crate::transports::rtp::RtpTransport;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::watch;
+
+        let (_source, track, _feedback_rx) =
+            sample_track(crate::media::frame::MediaKind::Audio, 48000);
+        let params = RtpCodecParameters {
+            payload_type: 111,
+            clock_rate: 48000,
+            channels: 2,
+        };
+        let sender = RtpSender::builder(track, 12345)
+            .stream_id("stream".to_string())
+            .params(params)
+            .build();
+
+        let make_transport = || {
+            // We keep the Sender alive so the Receiver stays open (dropping
+            // the only Sender closes the channel, which would break recv).
+            let (_tx, rx) = watch::channel::<Option<IceSocketWrapper>>(None);
+            Arc::new(RtpTransport::new(
+                IceConn::new(rx, "127.0.0.1:0".parse().unwrap(), None),
+                false,
+            ))
+        };
+        let transport_a = make_transport();
+        let transport_b = make_transport();
+
+        // First set_transport starts a send-loop.
+        sender.set_transport(transport_a.clone());
+
+        // Second set_transport replaces the loop: with the fix it immediately
+        // wakes the old loop via stop_tx.notify_one().
+        sender.set_transport(transport_b.clone());
+
+        // Both loops should be short-lived because transport_generation changes.
+        // After a brief sleep, transport_a should only be held by the test code.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let refcnt = Arc::strong_count(&transport_a);
+        // transport_a is held by the test variable; any additional strong refs
+        // from the (now exited) old send-loop must have been released.
+        assert!(
+            refcnt == 1,
+            "Fix2: old send-loop leaked Arc<RtpTransport> (refcnt={})",
+            refcnt
+        );
+
+        // source is dropped at end of scope; no explicit stop needed on source.
+    }
+
+    /// Fix1 verification: cleanup_orphaned_extra_transports must stop and
+    /// remove extra ICE/RTP transports whose transceiver no longer has a
+    /// matching media section in the new SDP (non-BUNDLE re-INVITE removing
+    /// a media section). Without this fix the orphan transport (sockets, TURN
+    /// allocations, runner task) survives until full close().
+    #[tokio::test]
+    async fn test_cleanup_orphaned_extra_transports() {
+        let pc = PeerConnection::new(RtcConfiguration::default());
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
+
+        // Simulate extra transports created for both transceivers.
+        let transceivers = pc.inner.transceivers.lock();
+        let t0_id = transceivers[0].id();
+        // Set MID on the first transceiver so it matches the surviving m= section.
+        transceivers[0].set_mid("0".into());
+        let t1_id = transceivers[1].id();
+        // Set a different MID on the second transceiver (will be orphaned).
+        transceivers[1].set_mid("1".into());
+        drop(transceivers);
+
+        let dummy_ice = pc.inner.ice_transport.clone();
+        pc.inner
+            .rtp_media_ice_transports
+            .lock()
+            .insert(t0_id, dummy_ice.clone());
+        pc.inner
+            .rtp_media_ice_transports
+            .lock()
+            .insert(t1_id, dummy_ice.clone());
+        assert_eq!(
+            pc.inner.rtp_media_ice_transports.lock().len(),
+            2,
+            "two extra transports before cleanup"
+        );
+
+        // New SDP with only ONE media section (matches t0, not t1).
+        use crate::sdp::{Attribute as SdpAttr, Direction as SdpDir, MediaSection as MediaSec,
+                         SdpType as SdpTyp, SessionDescription as SessionDesc,
+                         SessionSection as SessionSec};
+        let desc = SessionDesc {
+            sdp_type: SdpTyp::Offer,
+            session: SessionSec::default(),
+            media_sections: vec![MediaSec {
+                kind: MediaKind::Audio,
+                mid: "0".into(),
+                port: 9,
+                protocol: "UDP/DTLS/SCTP".into(),
+                formats: vec!["0".into()],
+                direction: SdpDir::SendRecv,
+                connection: None,
+                attributes: vec![
+                    SdpAttr::new("ice-ufrag", Some("ufrag".into())),
+                    SdpAttr::new("ice-pwd", Some("pwd".into())),
+                    SdpAttr::new("mid", Some("0".into())),
+                    SdpAttr::new("ssrc", Some("100 cname:test".into())),
+                ],
+            }],
+        };
+
+        pc.cleanup_orphaned_extra_transports(&desc);
+
+        let remaining = pc.inner.rtp_media_ice_transports.lock().len();
+        assert_eq!(
+            remaining, 1,
+            "Fix1: only one extra transport should remain after cleanup (got {})",
+            remaining
+        );
+        assert!(
+            pc.inner.rtp_media_ice_transports.lock().contains_key(&t0_id),
+            "Fix1: the transport matching the surviving section must not be removed"
+        );
+        assert!(
+            !pc.inner.rtp_media_ice_transports.lock().contains_key(&t1_id),
+            "Fix1: the orphan transport must be removed"
+        );
     }
 
     #[tokio::test]
@@ -10976,6 +11342,7 @@ a=rtpmap:8 PCMA/8000\r\n";
 
         let mut config = RtcConfiguration::default();
         config.transport_mode = TransportMode::Rtp;
+        config.ice_disconnect_grace = std::time::Duration::from_millis(1);
 
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::RecvOnly);
@@ -11030,8 +11397,9 @@ a=rtpmap:8 PCMA/8000\r\n";
         // silence; in RTP mode it is triggered by an explicit reconnect or
         // network change.  We drive it directly via the test-only hook.
         ice.force_state_for_test(IceTransportState::Disconnected);
-        // Let handle_connected_state_no_dtls see the state change and return true.
-        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        // Wait for grace timer to expire (1ms) and handle_connected_state_no_dtls
+        // to return true, so the outer loop re-evaluates ICE state.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Recovery: outer run_rtp_direct_loop sees Connected →
         // calls handle_connected_state_no_dtls again → start_dtls →

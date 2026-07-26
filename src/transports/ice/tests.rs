@@ -909,6 +909,104 @@ async fn wait_ice_connected(
     result.unwrap_or(false)
 }
 
+/// Test that ICE does NOT transition to Failed when the first batch of
+/// connectivity checks yields no successful pairs (e.g. initial host-only
+/// remote candidates are unreachable).  After adding the correct (reachable)
+/// remote candidates via `add_remote_candidate`, both sides should connect.
+///
+/// Without the fix in `perform_connectivity_checks_async`, the first empty
+/// batch would set `IceTransportState::Failed` and any subsequent trickle
+/// arrivals would be silently ignored (the PeerConnection state machine stops
+/// watching the ICE state).
+#[tokio::test]
+#[serial]
+async fn test_trickle_ice_no_premature_failure() -> Result<()> {
+    let config = RtcConfiguration::default();
+
+    // Build two transports
+    let (controlling, runner_c) = IceTransportBuilder::new(config.clone())
+        .role(IceRole::Controlling)
+        .build();
+    tokio::spawn(runner_c);
+
+    let (controlled, runner_d) = IceTransportBuilder::new(config)
+        .role(IceRole::Controlled)
+        .build();
+    tokio::spawn(runner_d);
+
+    // Subscribe to state changes
+    let mut ctrl_state = controlling.subscribe_state();
+    let mut ctrd_state = controlled.subscribe_state();
+
+    // Step 1: Add an unreachable remote candidate to the controlling side
+    // pointing to 127.0.0.2 (nothing listening there).
+    let bad_remote = IceCandidate::host("127.0.0.2:9999".parse().unwrap(), 1);
+    controlling.add_remote_candidate(bad_remote);
+
+    // Step 2: Start both transports
+    let ctrl_params = controlled.local_parameters();
+    let ctrd_params = controlling.local_parameters();
+    controlling.start(ctrl_params)?;
+    controlled.start(ctrd_params)?;
+
+    assert_eq!(*ctrl_state.borrow(), IceTransportState::Checking);
+    assert_eq!(*ctrd_state.borrow(), IceTransportState::Checking);
+    debug!("Both sides in Checking — good.");
+
+    // Step 3: Wait long enough for the stun_timeout (5s) to fire on the bad
+    // pair so the first batch of connectivity checks completes with no
+    // successful pairs.
+    tokio::time::sleep(Duration::from_secs(7)).await;
+
+    // Step 4: THE KEY ASSERTION — neither side should have transitioned to
+    // Failed.  Without the fix the controlling side would be Failed now.
+    let ctrl_state_val = *ctrl_state.borrow_and_update();
+    let ctrd_state_val = *ctrd_state.borrow_and_update();
+    debug!(
+        "After first batch (all pairs unreachable): controlling={:?}, controlled={:?}",
+        ctrl_state_val, ctrd_state_val,
+    );
+    assert!(
+        !matches!(
+            ctrl_state_val,
+            IceTransportState::Failed | IceTransportState::Closed
+        ),
+        "Controlling should NOT be Failed after first empty batch"
+    );
+    assert!(
+        !matches!(
+            ctrd_state_val,
+            IceTransportState::Failed | IceTransportState::Closed
+        ),
+        "Controlled should NOT be Failed after first empty batch"
+    );
+
+    // Step 5: Add the CORRECT remote candidates so that both sides have
+    // real, reachable pairs to check.
+    for c in controlled.local_candidates() {
+        controlling.add_remote_candidate(c);
+    }
+    for c in controlling.local_candidates() {
+        controlled.add_remote_candidate(c);
+    }
+
+    // Step 6: Both sides should now connect within 10 s.
+    let (ok1, ok2) = tokio::join!(
+        wait_ice_connected(ctrl_state, Duration::from_secs(10)),
+        wait_ice_connected(ctrd_state, Duration::from_secs(10)),
+    );
+    assert!(
+        ok1,
+        "Controlling should connect after correct remote added"
+    );
+    assert!(
+        ok2,
+        "Controlled should connect after correct remote added"
+    );
+
+    Ok(())
+}
+
 /// End-to-end test: two host ICE agents establish a connection and the
 /// `nomination_complete` signal on the controlling side fires `Some(true)`.
 /// The controlled side also fires `Some(true)` once USE-CANDIDATE is received.
@@ -2130,6 +2228,98 @@ async fn test_nomination_fallback_all_pairs_fail() -> Result<()> {
     Ok(())
 }
 
+/// Test that parallel nomination completes within a single `nomination_timeout`
+/// period even when an unreachable candidate is present alongside reachable
+/// ones.
+///
+/// With sequential nomination (pre-0.3.104) the unreachable pair would be
+/// nominated first and waste a full `nomination_timeout` before falling through
+/// to the reachable pair.  With parallel nomination all pairs are nominated
+/// concurrently, so the reachable pair's response arrives immediately.
+#[tokio::test]
+#[serial]
+async fn test_parallel_nomination_with_unreachable_candidate() -> Result<()> {
+    let config = RtcConfiguration::default();
+
+    let (controlling, runner_c) = IceTransportBuilder::new(config.clone())
+        .role(IceRole::Controlling)
+        .build();
+    tokio::spawn(runner_c);
+
+    let (controlled, runner_d) = IceTransportBuilder::new(config)
+        .role(IceRole::Controlled)
+        .build();
+    tokio::spawn(runner_d);
+
+    // Forward candidates both ways
+    let ctrl_clone = controlling.clone();
+    let ctrd_clone = controlled.clone();
+    let mut rx_ctrl = controlling.subscribe_candidates();
+    let mut rx_ctrd = controlled.subscribe_candidates();
+    tokio::spawn(async move {
+        while let Ok(c) = rx_ctrl.recv().await {
+            ctrd_clone.add_remote_candidate(c);
+        }
+    });
+    tokio::spawn(async move {
+        while let Ok(c) = rx_ctrd.recv().await {
+            ctrl_clone.add_remote_candidate(c);
+        }
+    });
+
+    // Add an UNREACHABLE remote candidate to the controlling side first
+    // (127.0.0.2 — nothing listening there).
+    let bad_remote = IceCandidate::host("127.0.0.2:9999".parse().unwrap(), 1);
+    controlling.add_remote_candidate(bad_remote);
+
+    // Start both transports
+    controlling.start(controlled.local_parameters())?;
+    controlled.start(controlling.local_parameters())?;
+
+    let ctrl_state = controlling.subscribe_state();
+    let mut ctrl_nom_rx = controlling.subscribe_nomination_complete();
+
+    // Both should reach Connected.  The bad pair will fail its connectivity
+    // check, but the good pairs (once candidates are exchanged) will succeed.
+    assert!(
+        wait_ice_connected(ctrl_state, Duration::from_secs(10)).await,
+        "ICE should connect despite unreachable candidate"
+    );
+
+    // Nomination should succeed — with parallel nomination the reachable pair's
+    // USE-CANDIDATE response arrives in <1 s on localhost, independent of the
+    // unreachable pair that would block sequential nomination for 10 s.
+    let nom_result = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(v) = *ctrl_nom_rx.borrow() {
+                return v;
+            }
+            if ctrl_nom_rx.changed().await.is_err() {
+                return false;
+            }
+        }
+    })
+    .await;
+
+    assert!(nom_result.is_ok(), "nomination_complete must fire");
+    assert!(
+        nom_result.unwrap(),
+        "Nomination should succeed (parallel — reachable pair wins)"
+    );
+
+    // Selected pair should be a reachable one, not the bad candidate.
+    let pair = controlling.get_selected_pair();
+    assert!(pair.is_some(), "Selected pair should exist");
+    let pair = pair.unwrap();
+    assert_ne!(
+        pair.remote.address,
+        "127.0.0.2:9999".parse::<SocketAddr>().unwrap(),
+        "Selected pair should not be the unreachable candidate"
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 #[serial]
 async fn test_nomination_fallback_controlled_side_works() -> Result<()> {
@@ -2762,6 +2952,23 @@ async fn use_candidate_no_renomination_after_nomination() -> Result<()> {
     .await
     .context("timed out waiting for ICE connection")??;
 
+    // Connected only means the controlled side picked a provisional pair;
+    // the controlling agent's USE-CANDIDATE (which may switch that pair)
+    // can still be in flight. Wait for actual nomination before sampling.
+    let mut nom_rx = t2.subscribe_nomination_complete();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if nom_rx.borrow_and_update().is_some() {
+                return Ok::<_, anyhow::Error>(());
+            }
+            if nom_rx.changed().await.is_err() {
+                anyhow::bail!("nomination channel closed");
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for nomination")??;
+
     // 2. Record the nominated pair and subscribe to future pair changes.
     let nominated_pair = t2
         .get_selected_pair()
@@ -3198,14 +3405,23 @@ async fn test_tcp_write_all_large_data() {
 
     let (mut server, _) = listener.accept().await.unwrap();
 
-    // 1 MB payload to exercise partial writes
+    // 1 MB payload to exercise partial writes. The reader MUST run concurrently
+    // with the writer: tcp_write_all awaits writability once the kernel socket
+    // buffer fills, so a sequential write-then-read would deadlock (writer waits
+    // for the reader to drain, reader waits for the writer to finish).
     let payload = vec![0xABu8; 1024 * 1024];
-    tcp_write_all(&client_write, &payload).await.unwrap();
+    let read_handle = {
+        let payload_len = payload.len();
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buf = vec![0u8; payload_len];
+            server.read_exact(&mut buf).await.unwrap();
+            buf
+        })
+    };
 
-    use tokio::io::AsyncReadExt;
-    let mut buf = vec![0u8; payload.len()];
-    let s = &mut server;
-    s.read_exact(&mut buf).await.unwrap();
+    tcp_write_all(&client_write, &payload).await.unwrap();
+    let buf = read_handle.await.unwrap();
     assert_eq!(buf.len(), payload.len());
     assert_eq!(buf[0], 0xAB);
     assert_eq!(buf[payload.len() - 1], 0xAB);
@@ -3996,4 +4212,58 @@ async fn test_run_turn_refresh_succeeds_after_stale_nonce_via_inner() -> Result<
 
     turn_server.stop().await?;
     Ok(())
+}
+
+/// Fix4 verification: UPnP port mappings must be cleaned up on
+/// IceTransport::stop(). The fire-and-forget task clears mappers asynchronously.
+#[tokio::test]
+async fn test_upnp_mappings_cleaned_on_stop() -> Result<()> {
+    let mut config = RtcConfiguration::default();
+    config.enable_upnp = true;
+    let (transport, runner) = IceTransportBuilder::new(config).build();
+    tokio::spawn(runner);
+
+    // Let UPnP probing finish.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // UPnP may or may not find a router in CI; either is fine — what matters
+    // is that stop() clears whatever state exists.
+    transport.stop();
+    // The fire-and-forget cleanup runs in ~50ms; give it a generous window.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mappers = transport.inner.gatherer.upnp_mappers.lock();
+    assert!(
+        mappers.is_empty(),
+        "Fix4: upnp_mappers must be empty after stop() (got {})",
+        mappers.len()
+    );
+    // Verify ICE state is Closed.
+    assert_eq!(
+        transport.state(),
+        IceTransportState::Closed,
+        "Fix4: transport state must be Closed after stop()"
+    );
+    Ok(())
+}
+
+/// Fix5 verification: the shared-UDP socket handle must be released on
+/// IceTransport::stop() so the demux port's per-session state is cleaned
+/// immediately rather than waiting for Arc<IceTransportInner> release.
+#[tokio::test]
+async fn test_shared_udp_socket_cleared_on_stop() {
+    let config = RtcConfiguration::default();
+    let (transport, runner) = IceTransportBuilder::new(config).build();
+    tokio::spawn(runner);
+
+    // Let gathering complete so shared_udp_socket is populated.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    transport.stop();
+    let handle = transport.inner.gatherer.shared_udp_socket.lock();
+    assert!(
+        handle.is_none(),
+        "Fix5: shared_udp_socket must be None after stop()"
+    );
+    assert_eq!(transport.state(), IceTransportState::Closed);
 }

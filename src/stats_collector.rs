@@ -40,6 +40,9 @@ pub struct StatsCollector {
     remote_outbound: Mutex<HashMap<u32, RemoteOutboundStats>>,
     local_inbound: Mutex<HashMap<u32, LocalInboundStats>>,
     local_outbound: Mutex<HashMap<u32, LocalOutboundStats>>,
+    /// Maps ntp_least → Instant for outgoing Sender Reports, used to compute
+    /// round-trip time from the LSR/DLSR fields of incoming Receiver Reports.
+    sent_sr_times: Mutex<HashMap<u32, std::time::Instant>>,
 }
 
 impl StatsCollector {
@@ -53,6 +56,17 @@ impl StatsCollector {
             RtcpPacket::ReceiverReport(rr) => self.handle_rr(rr),
             _ => {}
         }
+    }
+
+    // Delay units are 1/65536 seconds as per RFC 3550 §6.4.1
+    fn dlsr_to_secs(dlsr: u32) -> f64 {
+        dlsr as f64 / 65536.0
+    }
+
+    pub fn record_sr_sent(&self, _ssrc: u32, ntp_least: u32) {
+        self.sent_sr_times
+            .lock()
+            .insert(ntp_least, std::time::Instant::now());
     }
 
     fn handle_sr(&self, sr: &SenderReport) {
@@ -82,12 +96,18 @@ impl StatsCollector {
             stats.fraction_lost = block.fraction_lost;
             stats.jitter = block.jitter;
 
-            // Calculate RTT if possible
-            // delay_since_last_sender_report is in units of 1/65536 seconds
+            // Compute RTT from LSR / DLSR (RFC 3550 §6.4.1):
+            //   RTT = now - when_we_sent_sr_with_this_ntp - DLSR
+            //   where DLSR is in 1/65536-second units.
             if block.last_sender_report != 0 {
-                // We need to know when we sent the SR with NTP timestamp `last_sender_report`.
-                // This requires keeping a history of sent SRs.
-                // For now, we skip RTT calculation here or implement a simplified version if we had the send time.
+                let sent_times = self.sent_sr_times.lock();
+                if let Some(&sent_instant) = sent_times.get(&block.last_sender_report) {
+                    let dlsr = Self::dlsr_to_secs(block.delay_since_last_sender_report);
+                    let rtt = sent_instant.elapsed().as_secs_f64() - dlsr;
+                    if rtt > 0.0 {
+                        stats.round_trip_time = Some(rtt);
+                    }
+                }
             }
         }
     }
@@ -116,6 +136,10 @@ impl RtpSenderInterceptor for StatsCollector {
         let stats = outbound.entry(packet.header.ssrc).or_default();
         stats.packets_sent += 1;
         stats.bytes_sent += size;
+    }
+
+    fn on_sr_sent(&self, ssrc: u32, ntp_least: u32) {
+        self.record_sr_sent(ssrc, ntp_least);
     }
 }
 
@@ -268,6 +292,7 @@ mod tests {
         let mut header = crate::rtp::RtpHeader::new(96, 0, 0, 12345);
         let payload = vec![0u8; 100];
         let packet = RtpPacket::new(header.clone(), payload.clone());
+        let dummy = "0.0.0.0:0".parse().unwrap();
 
         // Test outbound interception
         collector

@@ -39,7 +39,7 @@ use self::handshake::{
 };
 use self::record::{ContentType, DtlsRecord, ProtocolVersion};
 use crate::transports::ice::conn::IceConn;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 
 /// Generate a fresh self-signed DTLS certificate (EC keypair + PEM round-trip).
 pub fn generate_certificate() -> Result<Certificate> {
@@ -287,7 +287,7 @@ impl DtlsTransport {
                 )
                 .await
             {
-                warn!("DTLS handshake failed: {}", e);
+                debug!("DTLS handshake failed: {e} (remote={})", inner_clone.conn.remote_addr.read());
                 *inner_clone.state.lock() = DtlsState::Failed;
                 let _ = inner_clone.state_tx.send(DtlsState::Failed);
             }
@@ -1288,7 +1288,7 @@ impl DtlsInner {
                 self.write_epoch.store(ctx.epoch, Ordering::SeqCst);
                 self.write_seq.store(ctx.sequence_number, Ordering::SeqCst);
                 let _ = self.state_tx.send(state);
-                info!("DTLS handshake complete (server role)");
+                debug!("DTLS handshake complete (server role) (remote={})", self.conn.remote_addr.read());
                 // Clear ephemeral secret as handshake is complete
                 ctx.local_secret = None;
             } else {
@@ -1795,10 +1795,7 @@ impl DtlsInner {
                 }
                 // Handshake timeout — abort if the peer never responds.
                 _ = &mut handshake_timeout, if matches!(*self.state.lock(), DtlsState::Handshaking) => {
-                    warn!(
-                        "DTLS handshake timed out after {}s — aborting",
-                        DTLS_HANDSHAKE_TIMEOUT.as_secs()
-                    );
+                    debug!("DTLS handshake timed out after {}s — aborting (remote={})", DTLS_HANDSHAKE_TIMEOUT.as_secs(), self.conn.remote_addr.read());
                     *self.state.lock() = DtlsState::Failed;
                     let _ = self.state_tx.send(DtlsState::Failed);
                     return Err(anyhow::anyhow!(
