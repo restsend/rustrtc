@@ -232,6 +232,13 @@ impl StatsProvider for StatsCollector {
 
 #[cfg(test)]
 mod tests {
+
+    fn test_addr() -> std::net::SocketAddr {
+        std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            5000,
+        )
+    }
     use super::*;
     use crate::rtp::{ReportBlock, SenderReport};
 
@@ -288,15 +295,21 @@ mod tests {
         let dummy = "0.0.0.0:0".parse().unwrap();
 
         // Test outbound interception
-        collector.on_packet_sent(&packet, dummy, dummy).await;
+        collector
+            .on_packet_sent(&packet, test_addr(), test_addr())
+            .await;
 
         // Send another one
-        collector.on_packet_sent(&packet, dummy, dummy).await;
+        collector
+            .on_packet_sent(&packet, test_addr(), test_addr())
+            .await;
 
         // Test inbound interception
         header.ssrc = 67890;
         let packet_in = RtpPacket::new(header, payload);
-        collector.on_packet_received(&packet_in, dummy, dummy).await;
+        collector
+            .on_packet_received(&packet_in, test_addr(), test_addr())
+            .await;
 
         let stats = collector.collect().await.unwrap();
 
