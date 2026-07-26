@@ -53,5 +53,5 @@ pub use transports::ice::{
     MAX_LEASE_DURATION, MIN_LEASE_DURATION, TcpType, UpnpPortMapper,
 };
 pub use transports::rtp::RtpRewriteBridgeParams;
-pub use transports::sctp::{DataChannelEvent, DataChannelState};
+pub use transports::sctp::{DataChannelEvent, DataChannelState, SctpLinkStats};
 pub use transports::udptl::{UdtlConfig, UdtlReceiveBuffer, UdtlTransport};

@@ -654,6 +654,41 @@ impl<'a> Drop for SctpCleanupGuard<'a> {
     }
 }
 
+/// Snapshot of SCTP association link statistics for periodic logging.
+///
+/// `srtt` is the smoothed round-trip time (the best latency estimate), while
+/// `rto` is the retransmission timeout derived from it. `bytes_sent` /
+/// `bytes_received` are cumulative since the association was created.
+#[derive(Debug, Clone, Copy)]
+pub struct SctpLinkStats {
+    /// Total bytes handed to SCTP for transmission since association start.
+    pub bytes_sent: u64,
+    /// Total bytes received from the peer since association start.
+    pub bytes_received: u64,
+    /// Smoothed round-trip time (RFC 4960 RTO calculator SRTT).
+    pub srtt: Duration,
+    /// Retransmission timeout (derived from SRTT + RTTVAR).
+    pub rto: Duration,
+    /// Number of TSN retransmissions so far.
+    pub retransmissions: u64,
+    /// Time elapsed since the association was created.
+    pub duration: Duration,
+}
+
+impl SctpLinkStats {
+    fn from_transport(t: &SctpTransport) -> Self {
+        let rto_state = t.inner.rto_state.lock();
+        Self {
+            bytes_sent: t.inner.stats_bytes_sent.load(Ordering::SeqCst),
+            bytes_received: t.inner.stats_bytes_received.load(Ordering::SeqCst),
+            srtt: Duration::from_secs_f64(rto_state.srtt),
+            rto: Duration::from_secs_f64(rto_state.rto),
+            retransmissions: t.inner.stats_retransmissions.load(Ordering::SeqCst),
+            duration: t.inner.stats_created_time.elapsed(),
+        }
+    }
+}
+
 pub struct SctpTransport {
     inner: Arc<SctpInner>,
     close_tx: Arc<tokio::sync::Notify>,
@@ -851,6 +886,13 @@ impl SctpTransport {
                 .map(|r| format!(", close_reason={}", r))
                 .unwrap_or_default(),
         )
+    }
+
+    /// Snapshot of the SCTP association's key link statistics, suitable for
+    /// periodic logging of throughput, round-trip time and retransmission
+    /// health. See [`SctpTransport::link_stats`].
+    pub fn link_stats(&self) -> SctpLinkStats {
+        SctpLinkStats::from_transport(self)
     }
 
     pub fn close(&self) {

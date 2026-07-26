@@ -15,7 +15,7 @@ use crate::transports::get_local_ip;
 use crate::transports::ice::stun::random_u32;
 use crate::transports::ice::{IceCandidate, IceGathererState, IceTransport, conn::IceConn};
 use crate::transports::rtp::{RtpRewriteBridgeParams, RtpTransport};
-use crate::transports::sctp::SctpTransport;
+use crate::transports::sctp::{SctpLinkStats, SctpTransport};
 use crate::transports::udptl::UdtlTransport;
 use crate::{
     Attribute, AudioCapability, Direction, MediaKind, MediaSection, Origin, RtcConfiguration,
@@ -3079,6 +3079,25 @@ impl PeerConnection {
         } else {
             0
         }
+    }
+
+    /// Returns the SCTP transport's diagnostic summary, if an SCTP association
+    /// has been established. Covers duration, rto (RTT estimate), sent/recv
+    /// bytes, retransmits, heartbeat failures and association error count.
+    /// Returns `None` when there is no SCTP transport (e.g. RTP-only sessions).
+    pub fn sctp_diagnostic_info(&self) -> Option<String> {
+        self.inner
+            .sctp_transport
+            .lock()
+            .as_ref()
+            .map(|t| t.diagnostic_info())
+    }
+
+    /// Returns a snapshot of the SCTP transport's key link statistics, if an
+    /// SCTP association has been established. Useful for structured periodic
+    /// logging of bytes sent/received and round-trip time.
+    pub fn sctp_link_stats(&self) -> Option<SctpLinkStats> {
+        self.inner.sctp_transport.lock().as_ref().map(|t| t.link_stats())
     }
 
     #[allow(clippy::cloned_ref_to_slice_refs)]
