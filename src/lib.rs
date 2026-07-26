@@ -28,15 +28,15 @@ pub mod transports;
 
 pub use config::{
     ApplicationCapability, AudioCapability, BundlePolicy, CertificateConfig, IceCredentialType,
-    IceServer, IceTcpPolicy, IceTransportPolicy, MediaCapabilities, RtcConfiguration,
-    RtcConfigurationBuilder, RtcpMuxPolicy, SdpCompatibilityMode, T38Capability,
+    IceServer, IceTcpPolicy, IceTransportPolicy, MediaCapabilities, RecorderInterceptors,
+    RtcConfiguration, RtcConfigurationBuilder, RtcpMuxPolicy, SdpCompatibilityMode, T38Capability,
     T38FaxRateManagement, T38UdpEC, TransportMode, VideoCapability,
 };
 pub use errors::{RtcError, RtcResult, SdpError, SdpResult};
 pub use peer_connection::{
     DisconnectReason, IceConnectionState, IceGatheringState, PeerConnection, PeerConnectionEvent,
-    PeerConnectionState, RtpCodecParameters, RtpSender, RtpTransceiver, SignalingState,
-    TransceiverDirection,
+    PeerConnectionState, RtpCodecParameters, RtpReceiverInterceptor, RtpSender,
+    RtpSenderInterceptor, RtpTransceiver, SignalingState, TransceiverDirection,
 };
 pub use sdp::{
     AddressType, Attribute, Direction, MediaKind, MediaSection, NetworkType, Origin, SDES_MID_URI,

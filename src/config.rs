@@ -1,4 +1,5 @@
 use crate::media::depacketizer::{DefaultDepacketizerFactory, DepacketizerFactory};
+use crate::peer_connection::{RtpReceiverInterceptor, RtpSenderInterceptor};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
@@ -410,6 +411,10 @@ fn default_upnp_lease_duration() -> u32 {
     3600
 }
 
+fn default_upnp_discovery_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(1)
+}
+
 /// Primary configuration for a `PeerConnection`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RtcConfiguration {
@@ -447,6 +452,30 @@ pub struct RtcConfiguration {
     /// and reduce the probability of nomination failures under packet loss.
     pub nomination_timeout: std::time::Duration,
     pub ice_connection_timeout: std::time::Duration,
+    /// How long without receiving any packet (STUN/DTLS/SCTP) before the ICE
+    /// transport is demoted from `Connected` to `Disconnected`.
+    ///
+    /// `Disconnected` is a recoverable state — the SCTP association is **not**
+    /// torn down (see `peer_connection.rs`); the transport waits for traffic to
+    /// resume. Keep this comfortably below `ice_connection_timeout`, which is
+    /// the hard, non-recoverable failure threshold.
+    ///
+    /// Default: 5s (standard heuristic). Raise it (e.g. 120s) for long-lived
+    /// tunnels (SSH/port-forwarding) over lossy links where brief blackouts are
+    /// expected and must not even flap the SCTP association.
+    pub ice_disconnect_threshold: std::time::Duration,
+    /// How long to wait in `Disconnected` state before tearing down the
+    /// PeerConnection (SCTP/DTLS). When ICE goes `Disconnected` the transport
+    /// is given this long to recover before the connection is closed.
+    ///
+    /// This is distinct from `ice_connection_timeout` which operates at the
+    /// ICE transport layer. This grace period gives the application a chance
+    /// to observe `PeerConnectionState::Disconnected` and react, while still
+    /// bounding how long a dead connection lingers.
+    ///
+    /// Set to 0 to tear down immediately on ICE Disconnected.
+    /// Default: 15s
+    pub ice_disconnect_grace: std::time::Duration,
     pub sctp_rto_initial: std::time::Duration,
     pub sctp_rto_min: std::time::Duration,
     pub sctp_rto_max: std::time::Duration,
@@ -480,6 +509,9 @@ pub struct RtcConfiguration {
     /// UPnP port mapping lease duration in seconds
     #[serde(default = "default_upnp_lease_duration")]
     pub upnp_lease_duration: u32,
+    /// UPnP gateway discovery timeout
+    #[serde(default = "default_upnp_discovery_timeout")]
+    pub upnp_discovery_timeout: std::time::Duration,
     #[serde(skip, default)]
     pub depacketizer_strategy: DepacketizerStrategy,
     #[serde(default = "default_rtp_buffer_capacity")]
@@ -514,6 +546,12 @@ pub struct RtcConfiguration {
     pub label: Option<String>,
     #[serde(skip, default)]
     pub cname: Option<String>,
+    /// Recording / tapping interceptors installed on every transceiver
+    /// created by this PC. Receiver interceptors fire on incoming RTP
+    /// (pre-depacketize); sender interceptors fire on outgoing RTP
+    /// (post seq/timestamp rewrite, pre-wire).
+    #[serde(skip, default)]
+    pub recorder_interceptors: RecorderInterceptors,
 }
 
 impl Default for RtcConfiguration {
@@ -535,8 +573,10 @@ impl Default for RtcConfiguration {
             stun_timeout: std::time::Duration::from_secs(5),
             nomination_timeout: std::time::Duration::from_secs(10),
             ice_connection_timeout: std::time::Duration::from_secs(30),
+            ice_disconnect_threshold: std::time::Duration::from_secs(5),
+            ice_disconnect_grace: std::time::Duration::from_secs(15),
             sctp_rto_initial: std::time::Duration::from_secs(3),
-            sctp_rto_min: std::time::Duration::from_secs(1),
+            sctp_rto_min: std::time::Duration::from_millis(200),
             sctp_rto_max: std::time::Duration::from_secs(60),
             sctp_max_association_retransmits: 20,
             sctp_receive_window: 128 * 1024, // 128KB - reduced for lower memory footprint
@@ -557,6 +597,7 @@ impl Default for RtcConfiguration {
             prefer_srflx_over_natted_host: false,
             enable_upnp: default_enable_upnp(),
             upnp_lease_duration: default_upnp_lease_duration(),
+            upnp_discovery_timeout: default_upnp_discovery_timeout(),
             depacketizer_strategy: DepacketizerStrategy::default(),
             rtp_buffer_capacity: default_rtp_buffer_capacity(),
             buffer_drop_strategy: BufferDropStrategy::default(),
@@ -567,6 +608,7 @@ impl Default for RtcConfiguration {
             sdp_compatibility: SdpCompatibilityMode::default(),
             label: None,
             cname: None,
+            recorder_interceptors: RecorderInterceptors::default(),
         }
     }
 }
@@ -580,6 +622,33 @@ impl Default for RtcConfigurationBuilder {
         Self::new()
     }
 }
+
+/// Wrapper for interceptor lists so that `RtcConfiguration` can still derive
+/// `Debug / Clone / PartialEq / Eq` — the actual interceptor trait objects
+/// are opaque and only compared by count.
+#[derive(Clone, Default)]
+pub struct RecorderInterceptors {
+    pub receivers: Vec<Arc<dyn RtpReceiverInterceptor>>,
+    pub senders: Vec<Arc<dyn RtpSenderInterceptor>>,
+}
+
+impl Debug for RecorderInterceptors {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecorderInterceptors")
+            .field("receivers_len", &self.receivers.len())
+            .field("senders_len", &self.senders.len())
+            .finish()
+    }
+}
+
+impl PartialEq for RecorderInterceptors {
+    fn eq(&self, other: &Self) -> bool {
+        self.receivers.len() == other.receivers.len()
+            && self.senders.len() == other.senders.len()
+    }
+}
+
+impl Eq for RecorderInterceptors {}
 
 impl RtcConfigurationBuilder {
     pub fn new() -> Self {
@@ -615,6 +684,11 @@ impl RtcConfigurationBuilder {
 
     pub fn upnp_lease_duration(mut self, duration_secs: u32) -> Self {
         self.inner.upnp_lease_duration = duration_secs;
+        self
+    }
+
+    pub fn upnp_discovery_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.inner.upnp_discovery_timeout = timeout;
         self
     }
 
@@ -766,6 +840,16 @@ impl RtcConfigurationBuilder {
         self
     }
 
+    pub fn ice_disconnect_threshold(mut self, threshold: std::time::Duration) -> Self {
+        self.inner.ice_disconnect_threshold = threshold;
+        self
+    }
+
+    pub fn ice_disconnect_grace(mut self, grace: std::time::Duration) -> Self {
+        self.inner.ice_disconnect_grace = grace;
+        self
+    }
+
     pub fn rtp_buffer_capacity(mut self, capacity: usize) -> Self {
         self.inner.rtp_buffer_capacity = capacity;
         self
@@ -809,6 +893,26 @@ impl RtcConfigurationBuilder {
         self
     }
 
+    /// Append a receiver interceptor (fires on every incoming RTP packet,
+    /// pre-depacketize).
+    pub fn receiver_interceptor(
+        mut self,
+        interceptor: Arc<dyn RtpReceiverInterceptor>,
+    ) -> Self {
+        self.inner.recorder_interceptors.receivers.push(interceptor);
+        self
+    }
+
+    /// Append a sender interceptor (fires on every outgoing RTP packet,
+    /// post seq/timestamp rewrite).
+    pub fn sender_interceptor(
+        mut self,
+        interceptor: Arc<dyn RtpSenderInterceptor>,
+    ) -> Self {
+        self.inner.recorder_interceptors.senders.push(interceptor);
+        self
+    }
+
     pub fn build(self) -> RtcConfiguration {
         self.inner
     }
@@ -829,8 +933,10 @@ mod tests {
     fn test_rtc_configuration_defaults() {
         let config = RtcConfiguration::default();
         assert_eq!(config.ice_connection_timeout, Duration::from_secs(30));
+        assert_eq!(config.ice_disconnect_threshold, Duration::from_secs(5));
+        assert_eq!(config.ice_disconnect_grace, Duration::from_secs(15));
         assert_eq!(config.sctp_rto_initial, Duration::from_secs(3));
-        assert_eq!(config.sctp_rto_min, Duration::from_secs(1));
+        assert_eq!(config.sctp_rto_min, Duration::from_millis(200));
         assert_eq!(config.sctp_rto_max, Duration::from_secs(60));
         assert_eq!(config.sctp_max_association_retransmits, 20);
         assert_eq!(config.sctp_heartbeat_interval, Duration::from_secs(15));
@@ -896,7 +1002,7 @@ mod tests {
         // Verify a TURN-optimized configuration can be expressed cleanly
         let config = RtcConfigurationBuilder::new()
             .sctp_rto_initial(Duration::from_millis(500))
-            .sctp_rto_min(Duration::from_millis(200))
+            .sctp_rto_min(Duration::from_millis(100))
             .sctp_rto_max(Duration::from_secs(10))
             .sctp_max_association_retransmits(30)
             .sctp_max_heartbeat_failures(8)

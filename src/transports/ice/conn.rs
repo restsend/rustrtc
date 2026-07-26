@@ -161,6 +161,18 @@ impl IceConn {
         self.rtcp_latched.store(false, Ordering::Relaxed);
     }
 
+    /// Returns the local socket address (the bind address of the current
+    /// ICE socket). Returns `0.0.0.0:0` when the socket is not yet available
+    /// (e.g., during ICE candidate gathering).
+    pub fn local_addr(&self) -> SocketAddr {
+        let socket = self.socket_rx.borrow();
+        match socket.as_ref() {
+            Some(IceSocketWrapper::Udp(s)) => s.local_addr().unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0))),
+            Some(IceSocketWrapper::SharedUdp(h)) => h.local_addr().unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0))),
+            _ => SocketAddr::from(([0, 0, 0, 0], 0)),
+        }
+    }
+
     pub(crate) fn set_remote_addr_from_signaling(&self, addr: SocketAddr, reason: &'static str) {
         let current = *self.remote_addr.read();
         if self.latch_on_rtp.load(Ordering::Relaxed)
@@ -215,7 +227,7 @@ impl IceConn {
             let mut socket_rx = self.socket_rx.clone();
             let socket = socket_rx.borrow_and_update().clone();
             let Some(socket) = socket else {
-                tracing::debug!("IceConn: try_send failed - no selected socket");
+                tracing::trace!("IceConn: try_send failed - no selected socket");
                 return Err(anyhow::anyhow!("No selected socket"));
             };
             return Self::do_try_send(socket, buf, &self.remote_addr);
@@ -269,7 +281,7 @@ impl IceConn {
                 self.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
                 Ok(n)
             } else {
-                tracing::debug!("IceConn: send failed - no selected socket");
+                tracing::trace!("IceConn: send failed - no selected socket");
                 Err(anyhow::anyhow!("No selected socket"))
             }
         }
@@ -298,7 +310,7 @@ impl IceConn {
         }
 
         let Some(socket) = socket_opt else {
-            tracing::debug!("IceConn: send_dtls_record_batch failed - no selected socket");
+            tracing::trace!("IceConn: send_dtls_record_batch failed - no selected socket");
             return Err(anyhow::anyhow!("No selected socket"));
         };
 
@@ -367,7 +379,7 @@ impl IceConn {
             self.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
             Ok(n)
         } else {
-            tracing::debug!("IceConn: send_rtcp failed - no selected socket");
+            tracing::trace!("IceConn: send_rtcp failed - no selected socket");
             Err(anyhow::anyhow!("No selected socket"))
         }
     }
