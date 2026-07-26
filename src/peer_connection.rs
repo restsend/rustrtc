@@ -8250,7 +8250,6 @@ a=sendrecv\r\n";
         let handler = DefaultRtpSenderNackHandler::new(10);
         let mut header = RtpHeader::new(96, 100, 0, 1234);
         let packet1 = RtpPacket::new(header.clone(), vec![1, 2, 3]);
-        let dummy = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0);
 
         handler
             .on_packet_sent(&packet1, test_addr(), test_addr())
@@ -8375,7 +8374,7 @@ a=sendrecv\r\n";
         let mut header = RtpHeader::new(96, 100, 0, 1234);
         assert!(
             handler
-                .on_packet_received(&RtpPacket::new(header.clone(), vec![1]))
+                .on_packet_received(&RtpPacket::new(header.clone(), vec![1]), test_addr(), test_addr())
                 .await
                 .is_none()
         );
@@ -8383,7 +8382,7 @@ a=sendrecv\r\n";
         // Huge gap: only the most recent MAX_RECEIVER_NACK_GAP seqs are NACKed.
         header.sequence_number = 100 + 1 + (MAX_RECEIVER_NACK_GAP as u16) + 50;
         let nack = handler
-            .on_packet_received(&RtpPacket::new(header.clone(), vec![2]))
+            .on_packet_received(&RtpPacket::new(header.clone(), vec![2]), test_addr(), test_addr())
             .await
             .expect("gap should produce NACK");
         let RtcpPacket::GenericNack(nack) = nack else {
@@ -8403,7 +8402,7 @@ a=sendrecv\r\n";
         header.sequence_number = recovered_seq;
         assert!(
             handler
-                .on_packet_received(&RtpPacket::new(header, vec![3]))
+                .on_packet_received(&RtpPacket::new(header, vec![3]), test_addr(), test_addr())
                 .await
                 .is_none()
         );
@@ -8414,7 +8413,7 @@ a=sendrecv\r\n";
         junk.sequence_number = 1;
         assert!(
             handler
-                .on_packet_received(&RtpPacket::new(junk, vec![9]))
+                .on_packet_received(&RtpPacket::new(junk, vec![9]), test_addr(), test_addr())
                 .await
                 .is_none()
         );

@@ -292,7 +292,6 @@ mod tests {
         let mut header = crate::rtp::RtpHeader::new(96, 0, 0, 12345);
         let payload = vec![0u8; 100];
         let packet = RtpPacket::new(header.clone(), payload.clone());
-        let dummy = "0.0.0.0:0".parse().unwrap();
 
         // Test outbound interception
         collector
