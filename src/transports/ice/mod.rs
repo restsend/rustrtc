@@ -1792,11 +1792,10 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     }
 
     if successful_pairs.is_empty() {
-        let state = *inner.state.borrow();
-        let has_selected_pair = inner.selected_pair.lock().is_some();
-        if state != IceTransportState::Connected && !has_selected_pair {
-            let _ = inner.state.send(IceTransportState::Failed);
-        }
+        // Don't transition to Failed — trickle ICE candidates may arrive
+        // later via add_remote_candidate and trigger new connectivity checks.
+        // The disconnect monitor (ice_connection_timeout) handles long-term
+        // connectivity failure.
         return;
     }
 

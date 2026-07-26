@@ -909,6 +909,104 @@ async fn wait_ice_connected(
     result.unwrap_or(false)
 }
 
+/// Test that ICE does NOT transition to Failed when the first batch of
+/// connectivity checks yields no successful pairs (e.g. initial host-only
+/// remote candidates are unreachable).  After adding the correct (reachable)
+/// remote candidates via `add_remote_candidate`, both sides should connect.
+///
+/// Without the fix in `perform_connectivity_checks_async`, the first empty
+/// batch would set `IceTransportState::Failed` and any subsequent trickle
+/// arrivals would be silently ignored (the PeerConnection state machine stops
+/// watching the ICE state).
+#[tokio::test]
+#[serial]
+async fn test_trickle_ice_no_premature_failure() -> Result<()> {
+    let config = RtcConfiguration::default();
+
+    // Build two transports
+    let (controlling, runner_c) = IceTransportBuilder::new(config.clone())
+        .role(IceRole::Controlling)
+        .build();
+    tokio::spawn(runner_c);
+
+    let (controlled, runner_d) = IceTransportBuilder::new(config)
+        .role(IceRole::Controlled)
+        .build();
+    tokio::spawn(runner_d);
+
+    // Subscribe to state changes
+    let mut ctrl_state = controlling.subscribe_state();
+    let mut ctrd_state = controlled.subscribe_state();
+
+    // Step 1: Add an unreachable remote candidate to the controlling side
+    // pointing to 127.0.0.2 (nothing listening there).
+    let bad_remote = IceCandidate::host("127.0.0.2:9999".parse().unwrap(), 1);
+    controlling.add_remote_candidate(bad_remote);
+
+    // Step 2: Start both transports
+    let ctrl_params = controlled.local_parameters();
+    let ctrd_params = controlling.local_parameters();
+    controlling.start(ctrl_params)?;
+    controlled.start(ctrd_params)?;
+
+    assert_eq!(*ctrl_state.borrow(), IceTransportState::Checking);
+    assert_eq!(*ctrd_state.borrow(), IceTransportState::Checking);
+    debug!("Both sides in Checking — good.");
+
+    // Step 3: Wait long enough for the stun_timeout (5s) to fire on the bad
+    // pair so the first batch of connectivity checks completes with no
+    // successful pairs.
+    tokio::time::sleep(Duration::from_secs(7)).await;
+
+    // Step 4: THE KEY ASSERTION — neither side should have transitioned to
+    // Failed.  Without the fix the controlling side would be Failed now.
+    let ctrl_state_val = *ctrl_state.borrow_and_update();
+    let ctrd_state_val = *ctrd_state.borrow_and_update();
+    debug!(
+        "After first batch (all pairs unreachable): controlling={:?}, controlled={:?}",
+        ctrl_state_val, ctrd_state_val,
+    );
+    assert!(
+        !matches!(
+            ctrl_state_val,
+            IceTransportState::Failed | IceTransportState::Closed
+        ),
+        "Controlling should NOT be Failed after first empty batch"
+    );
+    assert!(
+        !matches!(
+            ctrd_state_val,
+            IceTransportState::Failed | IceTransportState::Closed
+        ),
+        "Controlled should NOT be Failed after first empty batch"
+    );
+
+    // Step 5: Add the CORRECT remote candidates so that both sides have
+    // real, reachable pairs to check.
+    for c in controlled.local_candidates() {
+        controlling.add_remote_candidate(c);
+    }
+    for c in controlling.local_candidates() {
+        controlled.add_remote_candidate(c);
+    }
+
+    // Step 6: Both sides should now connect within 10 s.
+    let (ok1, ok2) = tokio::join!(
+        wait_ice_connected(ctrl_state, Duration::from_secs(10)),
+        wait_ice_connected(ctrd_state, Duration::from_secs(10)),
+    );
+    assert!(
+        ok1,
+        "Controlling should connect after correct remote added"
+    );
+    assert!(
+        ok2,
+        "Controlled should connect after correct remote added"
+    );
+
+    Ok(())
+}
+
 /// End-to-end test: two host ICE agents establish a connection and the
 /// `nomination_complete` signal on the controlling side fires `Some(true)`.
 /// The controlled side also fires `Some(true)` once USE-CANDIDATE is received.
