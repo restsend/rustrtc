@@ -315,8 +315,9 @@ async fn turn_connection_relay_to_host() -> Result<()> {
     r1?;
     r2?;
 
-    // Verify selected pair on transport 1 is Relay
-    let pair1 = transport1.get_selected_pair().unwrap();
+    // Verify selected pair on transport 1 is Relay. Connected fires before
+    // nomination completes (see wait_for_selected_pair), so wait for the pair.
+    let pair1 = wait_for_selected_pair(&transport1, Duration::from_secs(10)).await?;
     assert_eq!(pair1.local.typ, IceCandidateType::Relay);
 
     // Send data
@@ -909,6 +910,37 @@ async fn wait_ice_connected(
     result.unwrap_or(false)
 }
 
+/// Wait for the transport to publish its selected pair.
+///
+/// The controlling side emits `IceTransportState::Connected` *before*
+/// nomination completes (v0.3.104 parallel nomination signals Connected early
+/// so the PeerConnection can await `nomination_complete`), and `selected_pair`
+/// is only assigned once a nomination check succeeds. Tests that sample
+/// `get_selected_pair()` immediately after `wait_ice_connected` therefore race
+/// against nomination. This helper closes that window by waiting on the
+/// `selected_pair` watch channel directly.
+async fn wait_for_selected_pair(
+    transport: &IceTransport,
+    deadline: Duration,
+) -> Result<IceCandidatePair> {
+    let mut rx = transport.subscribe_selected_pair();
+    if let Some(p) = rx.borrow_and_update().clone() {
+        return Ok(p);
+    }
+    timeout(deadline, async {
+        loop {
+            if rx.changed().await.is_err() {
+                anyhow::bail!("selected_pair channel closed");
+            }
+            if let Some(p) = rx.borrow().clone() {
+                return Ok(p);
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for selected pair")?
+}
+
 /// Test that ICE does NOT transition to Failed when the first batch of
 /// connectivity checks yields no successful pairs (e.g. initial host-only
 /// remote candidates are unreachable).  After adding the correct (reachable)
@@ -1328,18 +1360,14 @@ async fn test_ice_connection_with_external_ip() -> Result<()> {
         "Controlled agent failed to reach Connected with external_ip"
     );
 
-    // Verify selected pair exists
-    let selected_pair = controlling.get_selected_pair();
-    assert!(
-        selected_pair.is_some(),
-        "Controlling agent should have a selected pair"
-    );
-
-    let selected_pair = controlled.get_selected_pair();
-    assert!(
-        selected_pair.is_some(),
-        "Controlled agent should have a selected pair"
-    );
+    // Verify selected pair exists. Connected fires before nomination completes
+    // (see wait_for_selected_pair), so wait for the pair to be published.
+    wait_for_selected_pair(&controlling, Duration::from_secs(10))
+        .await
+        .context("Controlling agent should have a selected pair")?;
+    wait_for_selected_pair(&controlled, Duration::from_secs(10))
+        .await
+        .context("Controlled agent should have a selected pair")?;
 
     Ok(())
 }
@@ -1458,13 +1486,11 @@ async fn test_ice_connection_without_external_ip() -> Result<()> {
         "Controlled agent failed to reach Connected without external_ip"
     );
 
-    // Verify selected pair exists and is valid
-    let ctrl_pair = controlling.get_selected_pair();
-    assert!(
-        ctrl_pair.is_some(),
-        "Controlling agent should have a selected pair"
-    );
-    let pair = ctrl_pair.unwrap();
+    // Verify selected pair exists and is valid. Connected fires before
+    // nomination completes (see wait_for_selected_pair), so wait for the pair.
+    let pair = wait_for_selected_pair(&controlling, Duration::from_secs(10))
+        .await
+        .context("Controlling agent should have a selected pair")?;
     // Verify the pair addresses match what we expect
     assert!(
         pair.local.address.port() > 0,
@@ -1475,11 +1501,9 @@ async fn test_ice_connection_without_external_ip() -> Result<()> {
         "Remote address should have valid port"
     );
 
-    let ctrd_pair = controlled.get_selected_pair();
-    assert!(
-        ctrd_pair.is_some(),
-        "Controlled agent should have a selected pair"
-    );
+    wait_for_selected_pair(&controlled, Duration::from_secs(10))
+        .await
+        .context("Controlled agent should have a selected pair")?;
 
     Ok(())
 }
@@ -3069,9 +3093,11 @@ async fn test_buffered_dtls_packets_delivered_when_dtls_receiver_registered_firs
     );
 
     // ---- Simulate the FIXED start_dtls ordering ----
-    // 1. Create IceConn (same as start_dtls does)
-    let selected_pair = ctrl
-        .get_selected_pair()
+    // 1. Create IceConn (same as start_dtls does). Connected fires before
+    //    nomination completes (see wait_for_selected_pair), so wait for the
+    //    pair to be published before sampling it.
+    let selected_pair = wait_for_selected_pair(&ctrl, Duration::from_secs(10))
+        .await
         .expect("Should have selected pair after ICE connected");
     let socket_rx = ctrl.subscribe_selected_socket();
     let ice_conn = IceConn::new(socket_rx, selected_pair.remote.address, None);
@@ -3524,10 +3550,11 @@ async fn test_ice_tcp_end_to_end_connectivity() -> Result<()> {
     assert!(ctrl_ok, "Controlling side should connect over TCP");
     assert!(ctrd_ok, "Controlled side should connect over TCP");
 
-    // Verify the selected pair uses TCP transport
-    let selected_pair = controlling.get_selected_pair();
-    assert!(selected_pair.is_some(), "Should have a selected pair");
-    let pair = selected_pair.unwrap();
+    // Verify the selected pair uses TCP transport. Connected fires before
+    // nomination completes (see wait_for_selected_pair), so wait for the pair.
+    let pair = wait_for_selected_pair(&controlling, Duration::from_secs(10))
+        .await
+        .expect("Should have a selected pair");
     assert_eq!(
         pair.local.transport, "tcp",
         "Selected pair should use TCP transport, got {}",
@@ -3617,9 +3644,14 @@ async fn test_ice_tcp_data_flow_bidirectional() -> Result<()> {
     assert!(ctrl_ok, "Controlling should connect over TCP");
     assert!(ctrd_ok, "Controlled should connect over TCP");
 
-    // Verify both sides selected TCP transport
-    let ctrl_pair = controlling.get_selected_pair().unwrap();
-    let ctrd_pair = controlled.get_selected_pair().unwrap();
+    // Verify both sides selected TCP transport. Connected fires before
+    // nomination completes (see wait_for_selected_pair), so wait for the pair.
+    let ctrl_pair = wait_for_selected_pair(&controlling, Duration::from_secs(10))
+        .await
+        .expect("controlling should have a selected pair");
+    let ctrd_pair = wait_for_selected_pair(&controlled, Duration::from_secs(10))
+        .await
+        .expect("controlled should have a selected pair");
     assert_eq!(ctrl_pair.local.transport, "tcp");
     assert_eq!(ctrd_pair.local.transport, "tcp");
 
