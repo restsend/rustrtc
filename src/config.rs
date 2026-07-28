@@ -416,7 +416,7 @@ fn default_upnp_discovery_timeout() -> std::time::Duration {
 }
 
 /// Primary configuration for a `PeerConnection`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RtcConfiguration {
     pub ice_servers: Vec<IceServer>,
     pub ice_transport_policy: IceTransportPolicy,
@@ -546,6 +546,12 @@ pub struct RtcConfiguration {
     pub label: Option<String>,
     #[serde(skip, default)]
     pub cname: Option<String>,
+    /// Runtime handle for spawning internal tasks (ICE runner, DTLS, RTCP,
+    /// etc.). When set, ALL rustrtc `tokio::spawn` calls use this handle,
+    /// pinning media tasks to a dedicated runtime instead of the caller's.
+    /// Falls back to `Handle::current()` when `None` (backward-compatible).
+    #[serde(skip, default)]
+    pub runtime_handle: Option<tokio::runtime::Handle>,
     /// Recording / tapping interceptors installed on every transceiver
     /// created by this PC. Receiver interceptors fire on incoming RTP
     /// (pre-depacketize); sender interceptors fire on outgoing RTP
@@ -553,6 +559,66 @@ pub struct RtcConfiguration {
     #[serde(skip, default)]
     pub recorder_interceptors: RecorderInterceptors,
 }
+
+impl PartialEq for RtcConfiguration {
+    fn eq(&self, other: &Self) -> bool {
+        // Compare all fields except runtime_handle (Handle does not implement Eq).
+        self.ice_servers == other.ice_servers
+            && self.ice_transport_policy == other.ice_transport_policy
+            && self.bundle_policy == other.bundle_policy
+            && self.rtcp_mux_policy == other.rtcp_mux_policy
+            && self.certificates == other.certificates
+            && self.transport_mode == other.transport_mode
+            && self.nack_buffer_size == other.nack_buffer_size
+            && self.media_capabilities == other.media_capabilities
+            && self.external_ip == other.external_ip
+            && self.external_port == other.external_port
+            && self.bind_ip == other.bind_ip
+            && self.disable_ipv6 == other.disable_ipv6
+            && self.ssrc_start == other.ssrc_start
+            && self.stun_timeout == other.stun_timeout
+            && self.nomination_timeout == other.nomination_timeout
+            && self.ice_connection_timeout == other.ice_connection_timeout
+            && self.ice_disconnect_threshold == other.ice_disconnect_threshold
+            && self.ice_disconnect_grace == other.ice_disconnect_grace
+            && self.sctp_rto_initial == other.sctp_rto_initial
+            && self.sctp_rto_min == other.sctp_rto_min
+            && self.sctp_rto_max == other.sctp_rto_max
+            && self.sctp_max_association_retransmits == other.sctp_max_association_retransmits
+            && self.sctp_receive_window == other.sctp_receive_window
+            && self.sctp_heartbeat_interval == other.sctp_heartbeat_interval
+            && self.sctp_max_heartbeat_failures == other.sctp_max_heartbeat_failures
+            && self.sctp_max_tsn_retransmits == other.sctp_max_tsn_retransmits
+            && self.sctp_max_burst == other.sctp_max_burst
+            && self.sctp_max_cwnd == other.sctp_max_cwnd
+            && self.dtls_buffer_size == other.dtls_buffer_size
+            && self.rtp_start_port == other.rtp_start_port
+            && self.rtp_end_port == other.rtp_end_port
+            && self.ice_gather_udp_hosts == other.ice_gather_udp_hosts
+            && self.tcp_port_range_start == other.tcp_port_range_start
+            && self.tcp_port_range_end == other.tcp_port_range_end
+            && self.enable_latching == other.enable_latching
+            && self.probation_max_packets == other.probation_max_packets
+            && self.enable_ice_lite == other.enable_ice_lite
+            && self.prefer_srflx_over_natted_host == other.prefer_srflx_over_natted_host
+            && self.enable_upnp == other.enable_upnp
+            && self.upnp_lease_duration == other.upnp_lease_duration
+            && self.upnp_discovery_timeout == other.upnp_discovery_timeout
+            && self.depacketizer_strategy == other.depacketizer_strategy
+            && self.rtp_buffer_capacity == other.rtp_buffer_capacity
+            && self.buffer_drop_strategy == other.buffer_drop_strategy
+            && self.buffer_stats_log_interval == other.buffer_stats_log_interval
+            && self.ice_tcp_policy == other.ice_tcp_policy
+            && self.ice_udp_mux == other.ice_udp_mux
+            && self.ice_udp_mux_port == other.ice_udp_mux_port
+            && self.sdp_compatibility == other.sdp_compatibility
+            && self.label == other.label
+            && self.cname == other.cname
+        // runtime_handle is intentionally omitted
+    }
+}
+
+impl Eq for RtcConfiguration {}
 
 impl Default for RtcConfiguration {
     fn default() -> Self {
@@ -608,6 +674,7 @@ impl Default for RtcConfiguration {
             sdp_compatibility: SdpCompatibilityMode::default(),
             label: None,
             cname: None,
+            runtime_handle: None,
             recorder_interceptors: RecorderInterceptors::default(),
         }
     }
@@ -910,6 +977,14 @@ impl RtcConfigurationBuilder {
         interceptor: Arc<dyn RtpSenderInterceptor>,
     ) -> Self {
         self.inner.recorder_interceptors.senders.push(interceptor);
+        self
+    }
+
+    /// Set the runtime handle for spawning internal tasks (ICE runner, DTLS,
+    /// RTCP loops, etc.). When set, all rustrtc-internal tokio::spawn calls
+    /// go through this runtime instead of the ambient tokio runtime.
+    pub fn runtime_handle(mut self, handle: tokio::runtime::Handle) -> Self {
+        self.inner.runtime_handle = Some(handle);
         self
     }
 

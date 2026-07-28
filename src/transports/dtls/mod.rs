@@ -1681,7 +1681,7 @@ impl DtlsInner {
 
         // Watch the ICE socket so we can detect peer disappearance immediately
         // rather than spinning on retransmits forever.
-        let mut socket_rx = self.conn.socket_rx.clone();
+        let socket_rx = self.conn.socket_rx.clone();
 
         // Handshake deadline — prevents the task from living forever if the peer
         // never responds.  Once `Connected` the deadline is disabled.
@@ -1802,13 +1802,6 @@ impl DtlsInner {
                         "DTLS handshake timed out after {}s",
                         DTLS_HANDSHAKE_TIMEOUT.as_secs()
                     ));
-                }
-                // ICE socket watch — just wake up; the top-of-loop borrow()
-                // check makes the actual exit decision.  This avoids the
-                // select!-race where changed() updates the seen version but
-                // another branch wins.
-                _ = socket_rx.changed() => {
-                    // fall through — loop head re-checks socket_rx.borrow()
                 }
                 _ = retransmit_interval.tick() => {
                     self.handle_retransmit(&ctx, is_client).await;
