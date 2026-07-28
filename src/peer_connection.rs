@@ -1267,14 +1267,15 @@ impl PeerConnection {
             None
         };
 
-        // Check if this is a reinvite (not first negotiation)
-        let is_reinvite = {
-            let remote = self.inner.remote_description.lock();
-            remote.is_some()
-        };
+        let previous_remote = self.inner.remote_description.lock().clone();
+        let media_parameters_changed = previous_remote.as_ref().is_none_or(|previous| {
+            previous.session.connection != desc.session.connection
+                || previous.session.attributes != desc.session.attributes
+                || previous.media_sections != desc.media_sections
+        });
 
-        if is_reinvite {
-            // Apply reinvite at correct timing based on role
+        if previous_remote.is_some() && media_parameters_changed {
+            // Apply changed media parameters to the existing transports.
             let current_state = *self.inner.signaling_state.borrow();
             match (desc.sdp_type, current_state) {
                 // Answerer receiving offer: apply immediately
@@ -1339,6 +1340,14 @@ impl PeerConnection {
                     return Err(RtcError::NotImplemented("rollback"));
                 }
             }
+        }
+
+        if previous_remote.is_some() && !media_parameters_changed {
+            *self.inner.remote_description.lock() = Some(desc);
+            debug!(
+                "Remote SDP media parameters unchanged; updated signaling state without reconfiguring transports"
+            );
+            return Ok(());
         }
 
         {
@@ -9724,6 +9733,240 @@ a=mid:0
                 9000
             ),
             "reinvite should update RTP remote address"
+        );
+    }
+
+    #[tokio::test]
+    async fn pranswer_final_same_endpoint_preserves_latched_nat_address() {
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+        config.enable_latching = true;
+        let pc = PeerConnection::new(config);
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+
+        let offer = pc.create_offer().await.unwrap();
+        pc.set_local_description(offer).unwrap();
+        let local_addr = pc
+            .ice_transport()
+            .local_candidates()
+            .into_iter()
+            .find(|candidate| candidate.component == 1)
+            .unwrap()
+            .address;
+
+        let pranswer_sdp = "v=0\r\n\
+            o=- 1 1 IN IP4 10.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 10.0.0.1\r\n\
+            m=audio 8000 RTP/AVP 0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=sendrecv\r\n";
+        let pranswer =
+            SessionDescription::parse(SdpType::Pranswer, pranswer_sdp).unwrap();
+        pc.set_remote_description(pranswer).await.unwrap();
+
+        let transport = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(transport) = pc.inner.rtp_transport.lock().clone() {
+                    return transport;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let ice_conn = transport.ice_conn();
+        let latched_nat_addr = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 20)),
+            42000,
+        );
+        *ice_conn.remote_addr.write() = latched_nat_addr;
+        ice_conn.rtp_latched.store(true, Ordering::Relaxed);
+
+        let answer_sdp = "v=0\r\n\
+            o=- 1 2 IN IP4 10.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 10.0.0.1\r\n\
+            m=audio 8000 RTP/AVP 0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=sendrecv\r\n";
+        let answer = SessionDescription::parse(SdpType::Answer, answer_sdp).unwrap();
+        pc.set_remote_description(answer).await.unwrap();
+
+        assert_eq!(*ice_conn.remote_addr.read(), latched_nat_addr);
+        assert!(ice_conn.rtp_latched.load(Ordering::Relaxed));
+        assert_eq!(
+            pc.ice_transport()
+                .local_candidates()
+                .into_iter()
+                .find(|candidate| candidate.component == 1)
+                .unwrap()
+                .address,
+            local_addr,
+            "an SDP origin/version change must not rebind the local RTP socket"
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_second_pranswer_updates_transport_and_final_answer_only_completes_state() {
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+        let pc = PeerConnection::new(config);
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+
+        let offer = pc.create_offer().await.unwrap();
+        pc.set_local_description(offer).unwrap();
+        let local_addr = pc
+            .ice_transport()
+            .local_candidates()
+            .into_iter()
+            .find(|candidate| candidate.component == 1)
+            .unwrap()
+            .address;
+
+        let first_pranswer_sdp = "v=0\r\n\
+            o=- 1 1 IN IP4 10.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 10.0.0.1\r\n\
+            m=audio 8000 RTP/AVP 8\r\n\
+            a=rtpmap:8 PCMA/8000\r\n\
+            a=sendrecv\r\n";
+        let first_pranswer =
+            SessionDescription::parse(SdpType::Pranswer, first_pranswer_sdp).unwrap();
+        pc.set_remote_description(first_pranswer).await.unwrap();
+        assert_eq!(pc.signaling_state(), SignalingState::HaveLocalOffer);
+
+        let transport = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(transport) = pc.inner.rtp_transport.lock().clone() {
+                    return transport;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let second_pranswer_sdp = "v=0\r\n\
+            o=- 1 2 IN IP4 10.0.0.2\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 10.0.0.2\r\n\
+            m=audio 9000 RTP/AVP 0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=sendrecv\r\n";
+        let second_pranswer =
+            SessionDescription::parse(SdpType::Pranswer, second_pranswer_sdp).unwrap();
+        pc.set_remote_description(second_pranswer).await.unwrap();
+
+        assert_eq!(pc.signaling_state(), SignalingState::HaveLocalOffer);
+        assert!(Arc::ptr_eq(
+            &transport,
+            &pc.inner.rtp_transport.lock().clone().unwrap()
+        ));
+        assert_eq!(
+            *transport.ice_conn().remote_addr.read(),
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2)),
+                9000,
+            )
+        );
+        assert!(
+            pc.get_transceivers()[0]
+                .get_payload_map()
+                .contains_key(&0)
+        );
+
+        let final_answer_sdp = "v=0\r\n\
+            o=- 1 3 IN IP4 10.0.0.2\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 10.0.0.2\r\n\
+            m=audio 9000 RTP/AVP 0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=sendrecv\r\n";
+        let final_answer =
+            SessionDescription::parse(SdpType::Answer, final_answer_sdp).unwrap();
+        pc.set_remote_description(final_answer).await.unwrap();
+
+        assert_eq!(pc.signaling_state(), SignalingState::Stable);
+        assert_eq!(
+            pc.remote_description().unwrap().sdp_type,
+            SdpType::Answer
+        );
+        assert!(Arc::ptr_eq(
+            &transport,
+            &pc.inner.rtp_transport.lock().clone().unwrap()
+        ));
+        assert_eq!(
+            pc.ice_transport()
+                .local_candidates()
+                .into_iter()
+                .find(|candidate| candidate.component == 1)
+                .unwrap()
+                .address,
+            local_addr
+        );
+    }
+
+    #[tokio::test]
+    async fn pranswer_final_codec_change_updates_transceiver_without_rebinding() {
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+        let pc = PeerConnection::new(config);
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+
+        let offer = pc.create_offer().await.unwrap();
+        pc.set_local_description(offer).unwrap();
+        let local_addr = pc
+            .ice_transport()
+            .local_candidates()
+            .into_iter()
+            .find(|candidate| candidate.component == 1)
+            .unwrap()
+            .address;
+        let transceiver = pc.get_transceivers().into_iter().next().unwrap();
+
+        let pranswer_sdp = "v=0\r\n\
+            o=- 1 1 IN IP4 10.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 10.0.0.1\r\n\
+            m=audio 8000 RTP/AVP 8\r\n\
+            a=rtpmap:8 PCMA/8000\r\n\
+            a=sendrecv\r\n";
+        let pranswer =
+            SessionDescription::parse(SdpType::Pranswer, pranswer_sdp).unwrap();
+        pc.set_remote_description(pranswer).await.unwrap();
+        assert!(transceiver.get_payload_map().contains_key(&8));
+
+        let answer_sdp = "v=0\r\n\
+            o=- 1 2 IN IP4 10.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 10.0.0.1\r\n\
+            m=audio 8000 RTP/AVP 0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=sendrecv\r\n";
+        let answer = SessionDescription::parse(SdpType::Answer, answer_sdp).unwrap();
+        pc.set_remote_description(answer).await.unwrap();
+
+        let final_transceiver = pc.get_transceivers().into_iter().next().unwrap();
+        assert!(Arc::ptr_eq(&transceiver, &final_transceiver));
+        assert!(final_transceiver.get_payload_map().contains_key(&0));
+        assert_eq!(pc.signaling_state(), SignalingState::Stable);
+        assert_eq!(
+            pc.ice_transport()
+                .local_candidates()
+                .into_iter()
+                .find(|candidate| candidate.component == 1)
+                .unwrap()
+                .address,
+            local_addr,
+            "a codec-only SDP change must update the existing transceiver and socket"
         );
     }
 
