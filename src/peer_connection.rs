@@ -2137,7 +2137,7 @@ impl PeerConnection {
                 res = pair_rx.changed() => {
                     if res.is_ok()
                         && let Some(pair) = pair_rx.borrow().clone() {
-                            ice_conn_monitor.set_remote_addr_from_signaling(
+                            ice_conn_monitor.set_remote_addr_from_selected_pair(
                                 pair.remote.address,
                                 "dtls pair monitor update",
                             );
@@ -2836,7 +2836,10 @@ impl PeerConnection {
                 old_addr, pair.remote.address
             );
             ice_conn_monitor
-                .set_remote_addr_from_signaling(pair.remote.address, "pair monitor initial update");
+                .set_remote_addr_from_selected_pair(
+                    pair.remote.address,
+                    "pair monitor initial update",
+                );
         }
         while pair_rx.changed().await.is_ok() {
             if let Some(pair) = pair_rx.borrow().clone() {
@@ -2846,7 +2849,7 @@ impl PeerConnection {
                     old_addr, pair.remote.address
                 );
                 ice_conn_monitor
-                    .set_remote_addr_from_signaling(pair.remote.address, "pair monitor update");
+                    .set_remote_addr_from_selected_pair(pair.remote.address, "pair monitor update");
             }
         }
     }
@@ -9806,6 +9809,87 @@ a=mid:0
                 .address,
             local_addr,
             "an SDP origin/version change must not rebind the local RTP socket"
+        );
+    }
+
+    #[tokio::test]
+    async fn pranswer_final_changed_endpoint_resets_latch_without_rebinding() {
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+        config.enable_latching = true;
+        let pc = PeerConnection::new(config);
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+
+        let offer = pc.create_offer().await.unwrap();
+        pc.set_local_description(offer).unwrap();
+        let local_addr = pc
+            .ice_transport()
+            .local_candidates()
+            .into_iter()
+            .find(|candidate| candidate.component == 1)
+            .unwrap()
+            .address;
+
+        let pranswer_sdp = "v=0\r\n\
+            o=- 1 1 IN IP4 10.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 10.0.0.1\r\n\
+            m=audio 8000 RTP/AVP 8\r\n\
+            a=rtpmap:8 PCMA/8000\r\n\
+            a=sendrecv\r\n";
+        let pranswer =
+            SessionDescription::parse(SdpType::Pranswer, pranswer_sdp).unwrap();
+        pc.set_remote_description(pranswer).await.unwrap();
+
+        let transport = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(transport) = pc.inner.rtp_transport.lock().clone() {
+                    return transport;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let ice_conn = transport.ice_conn();
+        let latched_nat_addr = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 20)),
+            42000,
+        );
+        *ice_conn.remote_addr.write() = latched_nat_addr;
+        ice_conn.rtp_latched.store(true, Ordering::Relaxed);
+
+        let answer_sdp = "v=0\r\n\
+            o=- 1 2 IN IP4 10.0.0.2\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 10.0.0.2\r\n\
+            m=audio 9000 RTP/AVP 0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=sendrecv\r\n";
+        let answer = SessionDescription::parse(SdpType::Answer, answer_sdp).unwrap();
+        pc.set_remote_description(answer).await.unwrap();
+
+        let expected_remote = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2)),
+            9000,
+        );
+        assert_eq!(*ice_conn.remote_addr.read(), expected_remote);
+        assert!(!ice_conn.rtp_latched.load(Ordering::Relaxed));
+        assert!(Arc::ptr_eq(
+            &transport,
+            &pc.inner.rtp_transport.lock().clone().unwrap()
+        ));
+        assert_eq!(
+            pc.ice_transport()
+                .local_candidates()
+                .into_iter()
+                .find(|candidate| candidate.component == 1)
+                .unwrap()
+                .address,
+            local_addr,
+            "an SDP endpoint change must reuse the local RTP socket"
         );
     }
 

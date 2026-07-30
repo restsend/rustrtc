@@ -173,14 +173,18 @@ impl IceConn {
         }
     }
 
-    pub(crate) fn set_remote_addr_from_signaling(&self, addr: SocketAddr, reason: &'static str) {
+    pub(crate) fn set_remote_addr_from_selected_pair(
+        &self,
+        addr: SocketAddr,
+        reason: &'static str,
+    ) {
         let current = *self.remote_addr.read();
         if self.latch_on_rtp.load(Ordering::Relaxed)
             && self.rtp_latched.load(Ordering::Relaxed)
             && current != addr
         {
             warn!(
-                "IceConn: preserving latched RTP remote {} instead of signaling remote {} ({})",
+                "IceConn: preserving latched RTP remote {} instead of selected-pair remote {} ({})",
                 current, addr, reason
             );
             return;
@@ -189,8 +193,17 @@ impl IceConn {
         *self.remote_addr.write() = addr;
     }
 
-    /// Reset latching state (called on re-INVITE so a new source can be
-    /// selected).  Clears both the latch flag and any in-progress probation.
+    pub(crate) fn set_remote_addr_from_signaling(&self, addr: SocketAddr, reason: &'static str) {
+        self.reset_latch();
+        *self.remote_addr.write() = addr;
+        trace!(
+            "IceConn: signaling RTP remote set to {} ({}), latch reset",
+            addr, reason
+        );
+    }
+
+    /// Reset latching state before applying a remote SDP so a new source can
+    /// be selected. Clears both the latch flag and any in-progress probation.
     pub fn reset_latch(&self) {
         self.rtp_latched.store(false, Ordering::Relaxed);
         self.rtcp_latched.store(false, Ordering::Relaxed);
@@ -696,6 +709,47 @@ mod tests {
         let (len, rtcp_src) = rtcp_receiver.recv_from(&mut buf).await.unwrap();
         assert_eq!(&buf[..len], b"rtcp");
         assert_eq!(rtcp_src, rtcp_socket_addr);
+    }
+
+    #[tokio::test]
+    async fn test_changed_signaling_remote_resets_latch_and_retargets_send() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let socket_wrapper = IceSocketWrapper::Udp(socket);
+        let (_tx, rx) = watch::channel(Some(socket_wrapper));
+
+        let old_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let old_addr = old_receiver.local_addr().unwrap();
+        let new_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let new_addr = new_receiver.local_addr().unwrap();
+
+        let conn = IceConn::new(rx, old_addr, None);
+        conn.enable_latch_on_rtp();
+        conn.rtp_latched.store(true, Ordering::Relaxed);
+
+        conn.set_remote_addr_from_signaling(new_addr, "test SDP endpoint change");
+
+        assert_eq!(*conn.remote_addr.read(), new_addr);
+        assert!(!conn.rtp_latched.load(Ordering::Relaxed));
+
+        conn.send(b"retargeted").await.unwrap();
+        let mut buf = [0u8; 32];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            new_receiver.recv_from(&mut buf),
+        )
+        .await
+        .expect("new signaling endpoint should receive RTP")
+        .unwrap();
+        assert_eq!(&buf[..len], b"retargeted");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                old_receiver.recv_from(&mut buf),
+            )
+            .await
+            .is_err(),
+            "old signaling endpoint must stop receiving after retarget"
+        );
     }
 
     struct NoopReceiver;
