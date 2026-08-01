@@ -1,5 +1,6 @@
 use crate::rtp::{RtcpPacket, RtpPacket, is_rtcp, marshal_rtcp_packets, parse_rtcp_packets};
 use crate::srtp::SrtpSession;
+use crate::peer_connection::RtpObserver;
 use crate::transports::PacketReceiver;
 use crate::transports::ice::conn::IceConn;
 use crate::transports::ice::stun::random_u32;
@@ -48,9 +49,22 @@ fn try_send_dropping<T>(
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RtpRewriteBridgeParams {
     pub ssrc_offset: u32,
+    /// When `Some`, every forwarded packet's SSRC is fixed to this value
+    /// (overrides `ssrc_offset`). Used for WebRTC ↔ RTP so the destination
+    /// peer sees the SSRC it negotiated in SDP.
+    pub fixed_out_ssrc: Option<u32>,
     pub payload_type: Option<u8>,
+    /// RFC 4733 telephone-event (DTMF) payload-type remap: `(src_pt, dst_pt)`.
+    /// When `Some`, packets whose payload type equals `src_pt` are rewritten
+    /// to `dst_pt` (in addition to the regular audio `payload_type` rewrite).
+    /// Needed when the two legs negotiated different DTMF payload types.
+    pub dtmf_payload_type: Option<(u8, u8)>,
     pub initial_sequence_number: Option<u16>,
     pub initial_timestamp_offset: Option<u32>,
+    /// When `true`, extension headers are stripped before forwarding.
+    /// WebRTC → RTP: the RTP peer doesn't understand WebRTC extensions
+    /// (abs-send-time, audio-level, …) and may misparse the payload.
+    pub strip_extensions: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -62,7 +76,7 @@ struct StreamRewriteState {
 }
 
 struct RewriteBridge {
-    target_ice_conn: Arc<IceConn>,
+    target: Arc<RtpTransport>,
     params: RtpRewriteBridgeParams,
     streams: RefCell<HashMap<u32, StreamRewriteState>>,
 }
@@ -70,7 +84,7 @@ struct RewriteBridge {
 impl RewriteBridge {
     fn new(target: Arc<RtpTransport>, params: RtpRewriteBridgeParams) -> Self {
         Self {
-            target_ice_conn: target.ice_conn(),
+            target,
             params,
             streams: RefCell::new(HashMap::new()),
         }
@@ -80,11 +94,22 @@ impl RewriteBridge {
         let params = self.params;
         let src_ssrc = packet.header.ssrc;
         let src_timestamp = packet.header.timestamp;
+
+        // Strip extension headers (WebRTC → RTP) before any marshaling so the
+        // RTP peer doesn't see WebRTC-specific extensions it can't parse.
+        if params.strip_extensions {
+            packet.header.extension = None;
+        }
+
+        let out_ssrc = params
+            .fixed_out_ssrc
+            .unwrap_or_else(|| src_ssrc.wrapping_add(params.ssrc_offset));
+
         let mut streams = self.streams.borrow_mut();
         let state = streams
             .entry(src_ssrc)
             .or_insert_with(|| StreamRewriteState {
-                out_ssrc: src_ssrc.wrapping_add(params.ssrc_offset),
+                out_ssrc,
                 next_sequence_number: params
                     .initial_sequence_number
                     .unwrap_or(random_u32() as u16),
@@ -92,7 +117,14 @@ impl RewriteBridge {
                 timestamp_offset: params.initial_timestamp_offset.unwrap_or_else(random_u32),
             });
 
-        if let Some(payload_type) = params.payload_type {
+        let raw_pt = packet.header.payload_type;
+        if let Some((src_pt, dst_pt)) = params.dtmf_payload_type {
+            if raw_pt == src_pt {
+                packet.header.payload_type = dst_pt;
+            } else if let Some(payload_type) = params.payload_type {
+                packet.header.payload_type = payload_type;
+            }
+        } else if let Some(payload_type) = params.payload_type {
             packet.header.payload_type = payload_type;
         }
         packet.header.ssrc = state.out_ssrc;
@@ -265,6 +297,13 @@ pub struct RtpTransport {
     /// fast-path, listener/track chain) share, so it can be polled to detect
     /// RTP inactivity regardless of the active forwarding mode.
     received_rtp_packets: AtomicU64,
+    /// Plaintext transport observers — fire on clear RTP for BOTH directions
+    /// and ALL forwarding modes (including the relay fast-path). Inbound fires
+    /// post-SRTP-unprotect / pre-relay; outbound fires pre-SRTP-protect
+    /// (normal send) or pre-push (relay). Empty by default; `has_observers`
+    /// makes the hot-path check a single atomic load (zero cost when unused).
+    observers: Mutex<Vec<Arc<dyn RtpObserver>>>,
+    has_observers: AtomicBool,
 }
 
 impl RtpTransport {
@@ -290,6 +329,8 @@ impl RtpTransport {
             srtp_required,
             has_sent_first_packet: AtomicBool::new(false),
             received_rtp_packets: AtomicU64::new(0),
+            observers: Mutex::new(Vec::new()),
+            has_observers: AtomicBool::new(false),
         }
     }
 
@@ -390,6 +431,58 @@ impl RtpTransport {
         self.has_bridge.store(false, Ordering::Release);
     }
 
+    /// Register a plaintext [`RtpObserver`] that fires on clear RTP for BOTH
+    /// directions: inbound (post-SRTP-unprotect, pre-relay/demux) and outbound
+    /// (pre-SRTP-protect on normal send, pre-push on relay). Covers ALL
+    /// forwarding modes including the relay fast-path.
+    ///
+    /// For NACK / retransmission / RTCP feedback use the existing
+    /// [`crate::peer_connection::RtpReceiverInterceptor`] /
+    /// [`crate::peer_connection::RtpSenderInterceptor`] instead — `RtpObserver`
+    /// is read-only observation (stats / DTMF / recording / sipflow).
+    ///
+    /// When no observer is registered the hot path is a single atomic load
+    /// (zero cost).
+    pub fn add_observer(&self, observer: Arc<dyn RtpObserver>) {
+        self.observers.lock().push(observer);
+        self.has_observers.store(true, Ordering::Release);
+    }
+
+    /// Remove all observers and disable the hot-path checks.
+    pub fn clear_observers(&self) {
+        self.observers.lock().clear();
+        self.has_observers.store(false, Ordering::Release);
+    }
+
+    /// Fire ingress observers on a plaintext inbound packet. The Vec is cloned
+    /// out so the lock is NOT held across any observer work. Zero cost (single
+    /// atomic load) when no observer is registered.
+    #[inline]
+    fn fire_ingress(&self, packet: &RtpPacket, src_addr: SocketAddr) {
+        if !self.has_observers.load(Ordering::Acquire) {
+            return;
+        }
+        let observers = self.observers.lock().clone();
+        for o in &observers {
+            o.on_ingress(packet, src_addr);
+        }
+    }
+
+    /// Fire egress observers on a plaintext outbound packet. `dst_addr` is the
+    /// configured remote peer address (from the underlying ICE connection).
+    /// Same lock-clone pattern as [`Self::fire_ingress`].
+    #[inline]
+    fn fire_egress(&self, packet: &RtpPacket) {
+        if !self.has_observers.load(Ordering::Acquire) {
+            return;
+        }
+        let dst_addr = *self.transport.remote_addr.read();
+        let observers = self.observers.lock().clone();
+        for o in &observers {
+            o.on_egress(packet, dst_addr);
+        }
+    }
+
     pub async fn send(&self, buf: &[u8]) -> Result<usize> {
         let protected = {
             let session_guard = self.srtp_session.lock();
@@ -420,6 +513,11 @@ impl RtpTransport {
     }
 
     pub async fn send_rtp(&self, mut packet: RtpPacket) -> Result<usize> {
+        // Egress observation: fire on the plaintext packet BEFORE SRTP protect
+        // so observers (stats/recording/sipflow) see clear RTP. Zero cost
+        // (single Acquire load) when no observer is registered.
+        self.fire_egress(&packet);
+
         let is_first = !self.has_sent_first_packet.load(Ordering::Relaxed);
         if is_first {
             self.has_sent_first_packet.store(true, Ordering::Relaxed);
@@ -489,6 +587,27 @@ impl RtpTransport {
         self.transport.send_rtcp(&protected).await
     }
 
+    /// Synchronous best-effort RTCP send for the close path, where we must NOT
+    /// spawn or await (tokio runtime may be tearing down). Marshals,
+    /// SRTP-protects if a session exists, then `try_send`s — drops the packet
+    /// if the socket buffer is full. Never panics.
+    pub fn send_rtcp_sync(&self, packets: &[RtcpPacket]) {
+        let Ok(mut raw) = marshal_rtcp_packets(packets) else {
+            return;
+        };
+        {
+            let session_guard = self.srtp_session.lock();
+            if let Some(session) = &*session_guard {
+                if session.lock().protect_rtcp(&mut raw).is_err() {
+                    return;
+                }
+            } else if self.srtp_required {
+                return;
+            }
+        }
+        let _ = self.ice_conn().try_send(&raw);
+    }
+
     fn try_bridge_rewrite_rtp(
         &self,
         mut packet: RtpPacket,
@@ -497,14 +616,36 @@ impl RtpTransport {
         if !self.has_bridge.load(Ordering::Acquire) {
             return Some(packet);
         }
-        let mut guard = self.rewrite_bridge.lock();
-        let Some(bridge) = guard.as_mut() else {
-            return Some(packet);
+        // Rewrite under the bridge lock, then release it.
+        let target = {
+            let mut guard = self.rewrite_bridge.lock();
+            let Some(bridge) = guard.as_mut() else {
+                return Some(packet);
+            };
+            bridge.rewrite_packet(&mut packet);
+            bridge.target.clone()
         };
 
-        bridge.rewrite_packet(&mut packet);
+        // Fire the destination's egress observer on the plaintext packet
+        // (symmetric with the pre-protect hook in send_rtp).
+        target.fire_egress(&packet);
+
+        // SRTP-protect inline (sync) when the destination requires it —
+        // WebRTC / SDES-SRTP targets must receive encrypted RTP.
+        {
+            let session_guard = target.srtp_session.lock();
+            if let Some(session) = &*session_guard {
+                if session.lock().protect_rtp(&mut packet).is_err() {
+                    return None; // drop on protect error
+                }
+            } else if target.srtp_required {
+                return None; // session not ready → drop
+            }
+        }
+
+        // Marshal (buffer reuse) + non-blocking UDP send.
         packet.marshal_into(marshal_buf);
-        let _ = bridge.target_ice_conn.try_send(marshal_buf);
+        let _ = target.ice_conn().try_send(marshal_buf);
         None
     }
 
@@ -626,6 +767,12 @@ impl PacketReceiver for RtpTransport {
             // This runs before the rewrite-bridge fast-path early-return, so
             // the counter advances for both relayed and depacketized packets.
             self.received_rtp_packets.fetch_add(1, Ordering::Relaxed);
+
+            // Ingress observation: fire on the plaintext packet BEFORE the
+            // relay fast-path early-return, so observers (stats/DTMF/recording)
+            // see every inbound packet regardless of forwarding mode. Zero cost
+            // (single Acquire load) when no observer is registered.
+            self.fire_ingress(&rtp_packet, addr);
 
             let Some(rtp_packet) = self.try_bridge_rewrite_rtp(rtp_packet, marshal_buf) else {
                 return;
@@ -1000,9 +1147,12 @@ mod tests {
             dst_transport.clone(),
             RtpRewriteBridgeParams {
                 ssrc_offset: 900,
+                fixed_out_ssrc: None,
                 payload_type: Some(96),
+                dtmf_payload_type: None,
                 initial_sequence_number: Some(32000),
                 initial_timestamp_offset: Some(12345),
+                strip_extensions: false,
             },
         );
 
@@ -1017,6 +1167,51 @@ mod tests {
         assert_eq!(packet.header.payload_type, 96);
         assert_eq!(packet.header.sequence_number, 32000);
         assert_eq!(packet.header.timestamp, 1111 + 12345);
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_packet_remaps_dtmf_payload_type() {
+        use crate::transports::ice::IceSocketWrapper;
+        use tokio::net::UdpSocket;
+        use tokio::sync::watch;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_tx, rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(socket))));
+        let src_conn = IceConn::new(rx, "127.0.0.1:9".parse().unwrap(), None);
+        let src_transport = Arc::new(RtpTransport::new(src_conn, false));
+
+        let dst_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_dst_tx, dst_rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(dst_socket))));
+        let dst_conn = IceConn::new(dst_rx, "127.0.0.1:9".parse().unwrap(), None);
+        let dst_transport = Arc::new(RtpTransport::new(dst_conn, false));
+
+        src_transport.bridge_rewrite_to(
+            dst_transport.clone(),
+            RtpRewriteBridgeParams {
+                ssrc_offset: 900,
+                payload_type: Some(96),
+                // DTMF src PT 101 → dst PT 110
+                dtmf_payload_type: Some((101, 110)),
+                initial_sequence_number: Some(32000),
+                initial_timestamp_offset: Some(12345),
+                fixed_out_ssrc: None,
+                strip_extensions: false,
+            },
+        );
+
+        let mut guard = src_transport.rewrite_bridge.lock();
+        let bridge = guard.as_mut().expect("rewrite bridge should be configured");
+
+        // Audio packet (PT 100) → rewritten to audio dst PT 96.
+        let mut audio = RtpPacket::new(crate::rtp::RtpHeader::new(0, 7, 1111, 100), vec![1u8; 32]);
+        bridge.rewrite_packet(&mut audio);
+        assert_eq!(audio.header.payload_type, 96);
+
+        // DTMF packet (PT 101) → rewritten to DTMF dst PT 110.
+        let mut dtmf = RtpPacket::new(crate::rtp::RtpHeader::new(0, 7, 1111, 101), vec![1u8; 32]);
+        bridge.rewrite_packet(&mut dtmf);
+        assert_eq!(dtmf.header.payload_type, 110);
+        drop(guard);
     }
 
     #[tokio::test]
@@ -1083,9 +1278,12 @@ mod tests {
             dst_transport.clone(),
             RtpRewriteBridgeParams {
                 ssrc_offset: 0,
+                fixed_out_ssrc: None,
                 payload_type: None,
+                dtmf_payload_type: None,
                 initial_sequence_number: None,
                 initial_timestamp_offset: None,
+                strip_extensions: false,
             },
         );
         assert!(src_transport.has_bridge.load(Ordering::SeqCst));
@@ -1220,5 +1418,267 @@ mod tests {
             "Fix3: by_ssrc must not accumulate stale entries (len={})",
             listeners.by_ssrc.len()
         );
+    }
+
+    /// A counting observer that records ingress and egress separately.
+    struct CountingObserver {
+        ingress: std::sync::atomic::AtomicU32,
+        egress: std::sync::atomic::AtomicU32,
+        last_pt: std::sync::atomic::AtomicU8,
+    }
+
+    impl crate::peer_connection::RtpObserver for CountingObserver {
+        fn on_ingress(&self, packet: &RtpPacket, _src_addr: SocketAddr) {
+            self.ingress
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.last_pt.store(
+                packet.header.payload_type,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+
+        fn on_egress(&self, packet: &RtpPacket, _dst_addr: SocketAddr) {
+            self.egress
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.last_pt.store(
+                packet.header.payload_type,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// The ingress observer must fire on EVERY inbound packet even when the
+    /// relay fast-path is active — stats/DTMF/recording work without
+    /// downgrading relay to the depacketize path.
+    #[tokio::test]
+    async fn test_observer_ingress_fires_on_relay_fast_path() {
+        use crate::transports::ice::IceSocketWrapper;
+        use tokio::net::UdpSocket;
+        use tokio::sync::watch;
+
+        let src_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_src_tx, src_rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(src_socket))));
+        let src_conn = IceConn::new(src_rx, "127.0.0.1:9".parse().unwrap(), None);
+        let src_transport = Arc::new(RtpTransport::new(src_conn, false));
+
+        let dst_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_dst_tx, dst_rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(dst_socket))));
+        let dst_conn = IceConn::new(dst_rx, "127.0.0.1:9".parse().unwrap(), None);
+        let dst_transport = Arc::new(RtpTransport::new(dst_conn, false));
+
+        // Activate the relay fast-path.
+        src_transport.bridge_rewrite_to(
+            dst_transport.clone(),
+            RtpRewriteBridgeParams {
+                ssrc_offset: 0,
+                fixed_out_ssrc: None,
+                payload_type: None,
+                dtmf_payload_type: None,
+                initial_sequence_number: None,
+                initial_timestamp_offset: None,
+                strip_extensions: false,
+            },
+        );
+        assert!(src_transport.has_bridge.load(Ordering::SeqCst));
+
+        // Observe INGRESS on the source transport.
+        let tap = Arc::new(CountingObserver {
+            ingress: std::sync::atomic::AtomicU32::new(0),
+            egress: std::sync::atomic::AtomicU32::new(0),
+            last_pt: std::sync::atomic::AtomicU8::new(0),
+        });
+        src_transport.add_observer(tap.clone());
+
+        let mut marshal_buf = Vec::with_capacity(1500);
+        let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        for seq in 1..=3u16 {
+            let header = crate::rtp::RtpHeader::new(8, seq, 160, 4242);
+            let packet = crate::rtp::RtpPacket::new(header, vec![1u8; 160]);
+            src_transport
+                .receive(
+                    Bytes::from(packet.marshal().unwrap()),
+                    addr,
+                    &mut marshal_buf,
+                )
+                .await;
+        }
+
+        assert_eq!(
+            tap.ingress.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "ingress observer must fire on the relay fast-path"
+        );
+        assert_eq!(
+            tap.last_pt.load(std::sync::atomic::Ordering::Relaxed),
+            8,
+            "ingress observer observed the packet's payload type"
+        );
+    }
+
+    /// The egress observer must fire on the DESTINATION transport for packets
+    /// pushed by the relay — symmetric plaintext observation of the outbound
+    /// direction even in relay mode (record a single leg's bidirectional
+    /// traffic in plaintext, including when the egress is relay-generated).
+    #[tokio::test]
+    async fn test_observer_egress_fires_on_relay() {
+        use crate::transports::ice::IceSocketWrapper;
+        use tokio::net::UdpSocket;
+        use tokio::sync::watch;
+
+        let src_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_src_tx, src_rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(src_socket))));
+        let src_conn = IceConn::new(src_rx, "127.0.0.1:9".parse().unwrap(), None);
+        let src_transport = Arc::new(RtpTransport::new(src_conn, false));
+
+        let dst_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_dst_tx, dst_rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(dst_socket))));
+        let dst_conn = IceConn::new(dst_rx, "127.0.0.1:9".parse().unwrap(), None);
+        let dst_transport = Arc::new(RtpTransport::new(dst_conn, false));
+
+        src_transport.bridge_rewrite_to(
+            dst_transport.clone(),
+            RtpRewriteBridgeParams {
+                ssrc_offset: 0,
+                fixed_out_ssrc: None,
+                payload_type: Some(96),
+                dtmf_payload_type: None,
+                initial_sequence_number: None,
+                initial_timestamp_offset: None,
+                strip_extensions: false,
+            },
+        );
+
+        // Observe EGRESS on the DESTINATION (relay pushes to dst's IceConn,
+        // firing dst's egress observer on the plaintext rewritten packet).
+        let tap = Arc::new(CountingObserver {
+            ingress: std::sync::atomic::AtomicU32::new(0),
+            egress: std::sync::atomic::AtomicU32::new(0),
+            last_pt: std::sync::atomic::AtomicU8::new(0),
+        });
+        dst_transport.add_observer(tap.clone());
+
+        let mut marshal_buf = Vec::with_capacity(1500);
+        let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        for seq in 1..=3u16 {
+            let header = crate::rtp::RtpHeader::new(0, seq, 160, 4242);
+            let packet = crate::rtp::RtpPacket::new(header, vec![1u8; 160]);
+            src_transport
+                .receive(
+                    Bytes::from(packet.marshal().unwrap()),
+                    addr,
+                    &mut marshal_buf,
+                )
+                .await;
+        }
+
+        assert_eq!(
+            tap.egress.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "egress observer on destination must fire for relayed packets"
+        );
+        assert_eq!(
+            tap.last_pt.load(std::sync::atomic::Ordering::Relaxed),
+            96,
+            "egress observer saw the rewritten payload type"
+        );
+        assert_eq!(
+            tap.ingress.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "ingress on destination must NOT fire (relay bypasses dst receive)"
+        );
+    }
+
+    /// The egress observer fires in the normal send path (send_rtp), pre
+    /// SRTP-protect — covers non-relay egress (IVR / file playback / slow-path).
+    #[tokio::test]
+    async fn test_observer_egress_fires_on_normal_send() {
+        use crate::transports::ice::IceSocketWrapper;
+        use tokio::net::UdpSocket;
+        use tokio::sync::watch;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_tx, rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(socket))));
+        let conn = IceConn::new(rx, "127.0.0.1:9".parse().unwrap(), None);
+        let transport = Arc::new(RtpTransport::new(conn, false));
+
+        let tap = Arc::new(CountingObserver {
+            ingress: std::sync::atomic::AtomicU32::new(0),
+            egress: std::sync::atomic::AtomicU32::new(0),
+            last_pt: std::sync::atomic::AtomicU8::new(0),
+        });
+        transport.add_observer(tap.clone());
+
+        for seq in 1..=2u16 {
+            let header = crate::rtp::RtpHeader::new(0, seq, 160, 7777);
+            let packet = crate::rtp::RtpPacket::new(header, vec![1u8; 160]);
+            transport.send_rtp(packet).await.unwrap();
+        }
+
+        assert_eq!(
+            tap.egress.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "egress observer must fire on normal send_rtp"
+        );
+        assert_eq!(
+            tap.last_pt.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "egress observer saw the sent payload type"
+        );
+    }
+
+    /// When no observer is registered, the hot path is a single atomic load —
+    /// verified here by confirming the flag stays false and the relay fast-path
+    /// still works untouched.
+    #[tokio::test]
+    async fn test_no_observer_zero_cost_on_relay() {
+        use crate::transports::ice::IceSocketWrapper;
+        use tokio::net::UdpSocket;
+        use tokio::sync::watch;
+
+        let src_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_src_tx, src_rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(src_socket))));
+        let src_conn = IceConn::new(src_rx, "127.0.0.1:9".parse().unwrap(), None);
+        let src_transport = Arc::new(RtpTransport::new(src_conn, false));
+
+        let dst_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_dst_tx, dst_rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(dst_socket))));
+        let dst_conn = IceConn::new(dst_rx, "127.0.0.1:9".parse().unwrap(), None);
+        let dst_transport = Arc::new(RtpTransport::new(dst_conn, false));
+
+        src_transport.bridge_rewrite_to(
+            dst_transport,
+            RtpRewriteBridgeParams {
+                ssrc_offset: 0,
+                fixed_out_ssrc: None,
+                payload_type: None,
+                dtmf_payload_type: None,
+                initial_sequence_number: None,
+                initial_timestamp_offset: None,
+                strip_extensions: false,
+            },
+        );
+
+        assert!(
+            !src_transport
+                .has_observers
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "flag must be false when no observer registered"
+        );
+
+        let mut marshal_buf = Vec::with_capacity(1500);
+        let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let header = crate::rtp::RtpHeader::new(0, 1, 160, 99);
+        let packet = crate::rtp::RtpPacket::new(header, vec![1u8; 160]);
+        // Must not panic / must complete (relay fast-path untouched).
+        src_transport
+            .receive(
+                Bytes::from(packet.marshal().unwrap()),
+                addr,
+                &mut marshal_buf,
+            )
+            .await;
+        assert_eq!(src_transport.received_rtp_packets(), 1);
     }
 }
