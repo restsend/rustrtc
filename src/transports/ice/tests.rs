@@ -1861,7 +1861,7 @@ async fn test_turn_destroy_releases_allocation() -> Result<()> {
     );
 
     // Build and send the destroy request (Refresh LIFETIME=0).
-    let (bytes, tx_id) = client.create_destroy_packet().await?;
+    let (bytes, tx_id) = client.create_destroy_packet_sync()?;
     client.send(&bytes).await?;
     let mut buf = [0u8; MAX_STUN_MESSAGE];
     let len = client.recv(&mut buf).await?;

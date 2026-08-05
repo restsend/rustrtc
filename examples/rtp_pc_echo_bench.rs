@@ -257,9 +257,12 @@ async fn process_offer(
             .await?;
         pc.bridge_rtp_with_rewrite_to_self(RtpRewriteBridgeParams {
             ssrc_offset: 10_000,
+            fixed_out_ssrc: None,
             payload_type: Some(0),
+            dtmf_payload_type: None,
             initial_sequence_number: None,
             initial_timestamp_offset: None,
+            strip_extensions: false,
         })?;
     }
 

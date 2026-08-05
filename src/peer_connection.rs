@@ -135,6 +135,13 @@ impl Drop for LoopsGuard {
     }
 }
 
+/// NACK / retransmission / RTCP-feedback hook for the SENDER side.
+///
+/// **Not for general packet observation.** This fires per-sender on the
+/// depacketize/repacketize path and can return RTCP to drive retransmission.
+/// For plaintext, bidirectional, all-mode observation (stats / DTMF /
+/// recording / sipflow) use [`RtpObserver`] instead — it covers the relay
+/// fast-path too, which this interceptor does not.
 #[async_trait]
 pub trait RtpSenderInterceptor: Send + Sync {
     /// Fires on every outgoing RTP packet, post seq/timestamp rewrite,
@@ -160,9 +167,18 @@ pub trait RtpSenderInterceptor: Send + Sync {
     }
 }
 
+/// NACK / retransmission / RTCP-feedback hook for the RECEIVER side.
+///
+/// **Not for general packet observation** — despite the method name,
+/// `on_packet_received` fires on the depacketize/track path ONLY and does
+/// NOT fire for packets handled by the relay fast-path (they early-return
+/// before reaching here). For plaintext, bidirectional, all-mode observation
+/// (stats / DTMF / recording / sipflow, including relay packets) use
+/// [`RtpObserver`] instead.
 #[async_trait]
 pub trait RtpReceiverInterceptor: Send + Sync {
-    /// Fires on every incoming RTP packet, pre-depacketize.
+    /// Fires on incoming RTP packets that reach the depacketize path,
+    /// pre-depacketize. Does NOT fire for relay fast-path packets.
     /// `src_addr` is the remote peer address, `local_addr` is the local
     /// socket address on which the packet was received.
     async fn on_packet_received(
@@ -177,6 +193,31 @@ pub trait RtpReceiverInterceptor: Send + Sync {
     fn as_nack_stats(self: Arc<Self>) -> Option<Arc<dyn NackStats>> {
         None
     }
+}
+
+/// Transport-level plaintext observer — fires on the clear (post-SRTP-unprotect
+/// on ingress, pre-SRTP-protect on egress) RTP stream of an [`RtpTransport`],
+/// covering BOTH directions and ALL forwarding modes (including the relay
+/// fast-path).
+///
+/// This is distinct from [`RtpReceiverInterceptor`] / [`RtpSenderInterceptor`],
+/// which serve the NACK / retransmission / RTCP-feedback subsystem (they fire
+/// per-receiver, post-demux, and can return RTCP). `RtpObserver` is for pure
+/// observation (stats / DTMF / recording / sipflow capture): read-only, sync,
+/// no return value.
+///
+/// Register via [`PeerConnection::add_observer`] /
+/// [`RtpTransport::add_observer`]. When no observer is registered the hot path
+/// is a single atomic load (zero cost).
+pub trait RtpObserver: Send + Sync {
+    /// Inbound packet, AFTER SRTP unprotect, BEFORE relay/demux. Fires for
+    /// every accepted inbound RTP packet (relay and depacketize paths alike).
+    fn on_ingress(&self, _packet: &RtpPacket, _src_addr: std::net::SocketAddr) {}
+
+    /// Outbound packet, BEFORE SRTP protect (normal send) or BEFORE the relay
+    /// push. Plaintext in both cases. Fires for every packet this transport
+    /// emits on the wire.
+    fn on_egress(&self, _packet: &RtpPacket, _dst_addr: std::net::SocketAddr) {}
 }
 
 const RTP_RECEIVER_SAMPLE_CAPACITY: usize = 64;
@@ -677,6 +718,9 @@ pub(crate) fn map_crypto_suite(suite: &str) -> RtcResult<crate::srtp::SrtpProfil
 impl PeerConnection {
     pub fn new(config: RtcConfiguration) -> Self {
         let is_rtp_mode = config.transport_mode == TransportMode::Rtp;
+        // SDES-SRTP uses a direct transport like RTP (c-line address + a=crypto),
+        // NOT full ICE — so it uses the same direct loop as RTP mode.
+        let is_direct_mode = is_rtp_mode || config.transport_mode == TransportMode::Srtp;
         let (ice_transport, ice_runner) = IceTransport::new(config.clone());
         // Only WebRtc/Srtp modes use DTLS. Skip the expensive EC keypair
         // generation + PEM round-trip for plain RTP mode.
@@ -740,10 +784,10 @@ impl PeerConnection {
             inner: Arc::new(inner),
         };
 
-        if is_rtp_mode {
-            // RTP mode: skip ICE gathering/connectivity/DTLS loops entirely.
+        if is_direct_mode {
+            // RTP / SDES-SRTP: skip ICE gathering/connectivity/DTLS loops.
             // Only run the ice_runner for socket read loops (needed to receive packets).
-            // The ICE state machine and DTLS loop are handled directly via
+            // The ICE state machine and DTLS/SRTP setup are handled directly via
             // setup_direct_rtp / complete_direct_rtp.
             let inner_weak = Arc::downgrade(&pc.inner);
             let ice_transport = pc.inner.ice_transport.clone();
@@ -820,6 +864,67 @@ impl PeerConnection {
         for transport in self.inner.rtp_media_transports.lock().values() {
             transport.clear_bridge_rewrite();
         }
+    }
+
+    /// Register a plaintext [`RtpObserver`] on this PeerConnection's
+    /// transports. The observer fires on clear RTP for BOTH directions
+    /// (inbound post-SRTP-unprotect, outbound pre-SRTP-protect / pre-relay-push)
+    /// and ALL forwarding modes, including the relay fast-path.
+    ///
+    /// Use this for stats / DTMF / recording / sipflow capture. For NACK /
+    /// retransmission / RTCP feedback, use the existing
+    /// [`RtpReceiverInterceptor`] / [`RtpSenderInterceptor`] (installed via
+    /// [`RtcConfigurationBuilder`]) instead.
+    ///
+    /// Applied to the primary transport and all muxed media transports.
+    pub fn add_observer(&self, observer: Arc<dyn RtpObserver>) {
+        if let Some(transport) = self.inner.rtp_transport.lock().clone() {
+            transport.add_observer(observer.clone());
+        }
+        for transport in self.inner.rtp_media_transports.lock().values() {
+            transport.add_observer(observer.clone());
+        }
+    }
+
+    /// Remove all observers from the primary and muxed media transports.
+    pub fn clear_observers(&self) {
+        if let Some(transport) = self.inner.rtp_transport.lock().clone() {
+            transport.clear_observers();
+        }
+        for transport in self.inner.rtp_media_transports.lock().values() {
+            transport.clear_observers();
+        }
+    }
+
+    /// Send a raw RTP packet on this connection's RTP transport.
+    ///
+    /// This is the escape hatch for out-of-band packets that do not fit the
+    /// sample-track path — most importantly RFC 4733 telephone-event (DTMF)
+    /// packets, which use a separate payload type from the audio codec (the
+    /// `RtpSender` always stamps the audio codec's PT, so DTMF cannot ride the
+    /// sample track).
+    ///
+    /// The packet is sent on the audio sender's transport when available (so it
+    /// egresses on the same 5-tuple as media), falling back to the primary RTP
+    /// transport. It is SRTP-protected and fire&forget (same as
+    /// [`RtpTransport::send_rtp`]). Callers should gate DTMF on the leg having
+    /// a negotiated profile.
+    pub async fn send_raw_rtp(&self, packet: RtpPacket) -> RtcResult<()> {
+        let transport = self
+            .get_transceivers()
+            .into_iter()
+            .find(|t| t.kind() == MediaKind::Audio)
+            .and_then(|t| t.sender())
+            .and_then(|s| s.transport())
+            .or_else(|| self.inner.rtp_transport.lock().clone())
+            .ok_or_else(|| {
+                RtcError::InvalidState("RTP transport is not ready for send_raw_rtp".into())
+            })?;
+        transport
+            .send_rtp(packet)
+            .await
+            .map_err(|e| RtcError::Transport(e.to_string()))?;
+        Ok(())
     }
 
     /// Cumulative count of inbound RTP packets accepted at the transport
@@ -2751,7 +2856,7 @@ impl PeerConnection {
         }
 
         let mut addr = remote_rtp_addr;
-        addr.set_port(addr.port() + 1);
+        addr.set_port(addr.port().checked_add(1)?);
         Some(addr)
     }
 
@@ -3137,8 +3242,10 @@ impl PeerConnection {
     }
 
     pub async fn wait_for_gathering_complete(&self) {
-        if self.config().transport_mode == TransportMode::Rtp {
-            // RTP mode: no ICE gathering needed. Gathering completes
+        if self.config().transport_mode == TransportMode::Rtp
+            || self.config().transport_mode == TransportMode::Srtp
+        {
+            // RTP / SDES-SRTP: no ICE gathering needed. Gathering completes
             // synchronously when setup_direct_rtp_offer is called.
             return;
         }
@@ -3219,7 +3326,29 @@ impl PeerConnection {
                         trace!("Validating PT {}: clock_rate={}", pt, params.clock_rate);
                         // TODO: Add full codec capability check against local capabilities
                     }
-                    t.update_payload_map(payload_map)?;
+                    t.update_payload_map(payload_map.clone())?;
+
+                    // Sync the sender's params to the new negotiated PT.
+                    // Without this the sender keeps stamping the stale PT
+                    // after a codec-changing re-INVITE — only the receiver
+                    // side was updated by `update_payload_map` above.
+                    if let Some(sender) = t.sender() {
+                        let cur = sender.params();
+                        let new_params = payload_map
+                            .values()
+                            .find(|p| p.clock_rate == cur.clock_rate)
+                            .cloned()
+                            .or_else(|| payload_map.values().next().cloned());
+                        if let Some(np) = new_params
+                            && np.payload_type != cur.payload_type
+                        {
+                            debug!(
+                                "Syncing sender PT for mid={}: {} -> {} (clock_rate={})",
+                                section.mid, cur.payload_type, np.payload_type, np.clock_rate
+                            );
+                            sender.set_params(np);
+                        }
+                    }
                 }
 
                 // Extract and update extension mapping
@@ -4485,8 +4614,11 @@ impl PeerConnectionInner {
                 }
             } else {
                 // For RTP/SRTP, use the first candidate's address for c= and m= port
-                // Prefer non-loopback candidates
-                let section_ice_transport = if mode == TransportMode::Rtp {
+                // Prefer non-loopback candidates. SDES-SRTP (TransportMode::Srtp)
+                // also uses a direct transport like RTP — it does NOT run ICE.
+                let section_ice_transport = if mode == TransportMode::Rtp
+                    || mode == TransportMode::Srtp
+                {
                     let ice_transport = if !will_bundle && media_index > 0 {
                         self.direct_rtp_ice_transport(transceiver.id(), false)
                     } else {
@@ -5192,7 +5324,9 @@ impl PeerConnectionInner {
                 tracing::debug!("PeerConnection.close: cleared {} listeners", count);
             }
 
-            // Send RTCP BYE
+            // Send RTCP BYE — synchronous, best-effort (no spawn/await: the
+            // close path may run during runtime teardown where tokio::spawn
+            // would panic). The remote times out RTP if BYE is dropped.
             let transceivers = self.transceivers.lock();
             let mut ssrcs = Vec::new();
             for t in transceivers.iter() {
@@ -5205,10 +5339,7 @@ impl PeerConnectionInner {
                     sources: ssrcs,
                     reason: Some("PeerConnection closed".to_string()),
                 });
-                let transport_clone = transport.clone();
-                tokio::spawn(async move {
-                    let _ = transport_clone.send_rtcp(&[bye]).await;
-                });
+                transport.send_rtcp_sync(&[bye]);
             }
         }
 
@@ -5856,6 +5987,12 @@ impl RtpSender {
 
     pub fn cname(&self) -> &str {
         &self.cname
+    }
+
+    /// The RTP transport this sender writes to (the per-media transport, set
+    /// on negotiation). `None` until the transport is wired.
+    pub fn transport(&self) -> Option<Arc<RtpTransport>> {
+        self.transport.lock().clone()
     }
 
     pub fn track_id(&self) -> &str {

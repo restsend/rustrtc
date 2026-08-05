@@ -1372,72 +1372,18 @@ impl IceTransport {
     /// is informational. Runs on a detached task so it never blocks `stop()` /
     /// `PeerConnection::close()`.
     fn destroy_turn_allocations_best_effort(&self) {
+        // Synchronous, no spawn/await: build a Refresh(LIFETIME=0) packet and
+        // fire it off via non-blocking UDP. We do NOT wait for a response or
+        // retry on stale-nonce — the server destroys the allocation on receipt
+        // (RFC 5766 §7.4) and eventually times it out if the packet is lost.
         let clients: Vec<Arc<TurnClient>> = {
             let map = self.inner.gatherer.turn_clients.lock();
             map.values().cloned().collect()
         };
-        if clients.is_empty() {
-            return;
-        }
-        let inner = self.inner.clone();
-        tokio::spawn(async move {
-            for client in clients {
-                Self::destroy_one_turn_allocation(&inner, &client).await;
-            }
-        });
-    }
-
-    /// Send Refresh(LIFETIME=0) to a single TURN server, retrying once on a
-    /// stale-nonce (401/438). Best-effort: a missing/erroneous response is
-    /// logged but never propagates — the allocation is destroyed server-side
-    /// as soon as the request is received.
-    async fn destroy_one_turn_allocation(inner: &Arc<IceTransportInner>, client: &Arc<TurnClient>) {
-        for attempt in 0..2u8 {
-            let (bytes, tx_id) = match client.create_destroy_packet().await {
-                Ok(p) => p,
-                Err(e) => {
-                    debug!("TURN destroy packet creation failed: {}", e);
-                    return;
-                }
-            };
-            let (tx, rx) = oneshot::channel();
-            inner.pending_transactions.lock().insert(tx_id, tx);
-            if let Err(e) = client.send(&bytes).await {
-                debug!("TURN destroy send failed: {}", e);
-                inner.pending_transactions.lock().remove(&tx_id);
-                return;
-            }
-            match timeout(Duration::from_millis(250), rx).await {
-                Ok(Ok(msg)) if msg.class == StunClass::SuccessResponse => {
-                    debug!("TURN allocation destroyed (Refresh LIFETIME=0)");
-                    return;
-                }
-                Ok(Ok(msg)) if matches!(msg.error_code, Some(401) | Some(438)) && attempt == 0 => {
-                    if let (Some(realm), Some(nonce)) = (msg.realm, msg.nonce) {
-                        debug!(
-                            "TURN destroy got {}: updating nonce, retrying",
-                            msg.error_code.unwrap_or(0)
-                        );
-                        client.update_nonce(realm, nonce).await;
-                        continue;
-                    }
-                    return;
-                }
-                Ok(Ok(msg)) => {
-                    debug!("TURN destroy failed: error={:?}", msg.error_code);
-                    return;
-                }
-                _ => {
-                    // Timeout (250ms) or read-loop already shut down (state ->
-                    // Closed). The server still destroys the allocation on
-                    // request receipt, so this is best-effort — don't block the
-                    // close path for a full response.
-                    inner.pending_transactions.lock().remove(&tx_id);
-                    trace!(
-                        "TURN destroy: no response within 250ms (best-effort; \
-                         allocation is released server-side on receipt)"
-                    );
-                    return;
+        for client in &clients {
+            if let Ok((bytes, _tx_id)) = client.create_destroy_packet_sync() {
+                if client.try_send_sync(&bytes) {
+                    trace!("TURN allocation destroy Refresh(LIFETIME=0) sent (best-effort)");
                 }
             }
         }
@@ -1452,12 +1398,15 @@ impl IceTransport {
         // detached task races the read-loop shutdown.
         self.destroy_turn_allocations_best_effort();
 
-        // Best-effort UPnP port mapping cleanup. Fire-and-forget so it does
-        // not block the close path on a slow/unreachable router.
-        let upnp_clone = self.inner.gatherer.clone();
-        tokio::spawn(async move {
-            upnp_clone.cleanup_upnp_mappings().await;
-        });
+        // Best-effort UPnP port mapping cleanup. Guarded: only spawn when a
+        // tokio runtime is alive (normal close). During runtime teardown
+        // (Drop) this is skipped — port mapping leases expire on the router.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let upnp_clone = self.inner.gatherer.clone();
+            let _ = handle.spawn(async move {
+                upnp_clone.cleanup_upnp_mappings().await;
+            });
+        }
 
         let _ = self.inner.state.send(IceTransportState::Closed);
         let _ = self.inner.selected_socket.send(None);

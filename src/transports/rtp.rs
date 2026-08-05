@@ -297,6 +297,9 @@ pub struct RtpTransport {
     /// fast-path, listener/track chain) share, so it can be polled to detect
     /// RTP inactivity regardless of the active forwarding mode.
     received_rtp_packets: AtomicU64,
+    /// Cumulative count of failed relay fast-path pushes (diagnostic for
+    /// "call connected but no audio").
+    relay_send_failures: AtomicU64,
     /// Plaintext transport observers — fire on clear RTP for BOTH directions
     /// and ALL forwarding modes (including the relay fast-path). Inbound fires
     /// post-SRTP-unprotect / pre-relay; outbound fires pre-SRTP-protect
@@ -329,6 +332,7 @@ impl RtpTransport {
             srtp_required,
             has_sent_first_packet: AtomicBool::new(false),
             received_rtp_packets: AtomicU64::new(0),
+            relay_send_failures: AtomicU64::new(0),
             observers: Mutex::new(Vec::new()),
             has_observers: AtomicBool::new(false),
         }
@@ -645,7 +649,20 @@ impl RtpTransport {
 
         // Marshal (buffer reuse) + non-blocking UDP send.
         packet.marshal_into(marshal_buf);
-        let _ = target.ice_conn().try_send(marshal_buf);
+        if let Err(e) = target.ice_conn().try_send(marshal_buf) {
+            // A failed relay push is the #1 cause of "call connected but no
+            // audio" — surface it instead of dropping silently.
+            let relay_failures = self.relay_send_failures.fetch_add(1, Ordering::Relaxed) + 1;
+            if relay_failures <= 5 || relay_failures % 100 == 0 {
+                tracing::warn!(
+                    relay_failures,
+                    error = %e,
+                    ssrc = packet.header.ssrc,
+                    pt = packet.header.payload_type,
+                    "RTP rewrite bridge: relay push to destination failed"
+                );
+            }
+        }
         None
     }
 
@@ -1203,12 +1220,14 @@ mod tests {
         let bridge = guard.as_mut().expect("rewrite bridge should be configured");
 
         // Audio packet (PT 100) → rewritten to audio dst PT 96.
-        let mut audio = RtpPacket::new(crate::rtp::RtpHeader::new(0, 7, 1111, 100), vec![1u8; 32]);
+        let mut audio =
+            RtpPacket::new(crate::rtp::RtpHeader::new(100, 7, 1111, 1111), vec![1u8; 32]);
         bridge.rewrite_packet(&mut audio);
         assert_eq!(audio.header.payload_type, 96);
 
         // DTMF packet (PT 101) → rewritten to DTMF dst PT 110.
-        let mut dtmf = RtpPacket::new(crate::rtp::RtpHeader::new(0, 7, 1111, 101), vec![1u8; 32]);
+        let mut dtmf =
+            RtpPacket::new(crate::rtp::RtpHeader::new(101, 7, 1111, 1111), vec![1u8; 32]);
         bridge.rewrite_packet(&mut dtmf);
         assert_eq!(dtmf.header.payload_type, 110);
         drop(guard);

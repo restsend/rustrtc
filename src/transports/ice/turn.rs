@@ -7,6 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
+use parking_lot::Mutex as SyncMutex;
 use tokio::time::timeout;
 
 use super::stun::{StunAttribute, StunClass, StunMessage, StunMethod, random_bytes};
@@ -42,7 +43,7 @@ impl TurnCredentials {
 #[derive(Debug)]
 pub struct TurnClient {
     transport: TurnTransport,
-    auth: Mutex<Option<TurnAuthState>>,
+    auth: SyncMutex<Option<TurnAuthState>>,
     channels: Mutex<HashMap<SocketAddr, u16>>,
     channel_map: Mutex<HashMap<u16, SocketAddr>>,
     next_channel: Mutex<u16>,
@@ -106,7 +107,7 @@ impl TurnClient {
         };
         Ok(Self {
             transport,
-            auth: Mutex::new(None),
+            auth: SyncMutex::new(None),
             channels: Mutex::new(HashMap::new()),
             channel_map: Mutex::new(HashMap::new()),
             next_channel: Mutex::new(0x4000),
@@ -114,7 +115,7 @@ impl TurnClient {
     }
 
     pub(crate) async fn allocate(&self, creds: TurnCredentials) -> Result<TurnAllocation> {
-        *self.auth.lock().await = None;
+        *self.auth.lock() = None;
         let mut nonce_info: Option<TurnNonce> = None;
         let mut attempt = 0;
         loop {
@@ -154,7 +155,7 @@ impl TurnClient {
                 StunClass::SuccessResponse => {
                     if let Some(relayed) = parsed.xor_relayed_address {
                         if let (Some(info), Some(key)) = (nonce_info.clone(), used_key) {
-                            *self.auth.lock().await = Some(TurnAuthState::with_key(
+                            *self.auth.lock() = Some(TurnAuthState::with_key(
                                 creds.username.clone(),
                                 creds.password.clone(),
                                 info.realm,
@@ -200,7 +201,7 @@ impl TurnClient {
         for _ in 0..MAX_ATTEMPTS {
             let tx_id = random_bytes::<12>();
             let bytes = {
-                let auth_guard = self.auth.lock().await;
+                let auth_guard = self.auth.lock();
                 let auth = auth_guard
                     .as_ref()
                     .ok_or_else(|| anyhow!("TURN allocation missing auth context"))?;
@@ -238,7 +239,7 @@ impl TurnClient {
                             .nonce
                             .clone()
                             .ok_or_else(|| anyhow!("TURN error missing nonce"))?;
-                        if let Some(state) = self.auth.lock().await.as_mut() {
+                        if let Some(state) = self.auth.lock().as_mut() {
                             state.update_nonce(realm, nonce);
                         }
                         continue;
@@ -256,7 +257,7 @@ impl TurnClient {
 
     pub(crate) async fn create_refresh_packet(&self) -> Result<(Vec<u8>, [u8; 12])> {
         let tx_id = random_bytes::<12>();
-        let auth_guard = self.auth.lock().await;
+        let auth_guard = self.auth.lock();
         let auth = auth_guard
             .as_ref()
             .ok_or_else(|| anyhow!("TURN refresh: no auth context"))?;
@@ -282,10 +283,13 @@ impl TurnClient {
     /// allocation (RFC 5766 §7.4 "Destroying an Allocation"). The server
     /// releases the allocation upon receipt of the request; the success
     /// response (which carries LIFETIME=0) is purely informational.
-    pub(crate) async fn create_destroy_packet(&self) -> Result<(Vec<u8>, [u8; 12])> {
+    pub(crate) fn create_destroy_packet_sync(&self) -> Result<(Vec<u8>, [u8; 12])> {
         let tx_id = random_bytes::<12>();
-        let auth_guard = self.auth.lock().await;
-        let auth = auth_guard
+        let guard = self
+            .auth
+            .try_lock()
+            .ok_or_else(|| anyhow!("TURN destroy: auth mutex busy"))?;
+        let auth = guard
             .as_ref()
             .ok_or_else(|| anyhow!("TURN destroy: no auth context"))?;
 
@@ -309,7 +313,7 @@ impl TurnClient {
     /// Update the stored nonce (and realm) after receiving a 401/438 from the TURN server.
     /// Must be called before retrying the request that triggered the stale-nonce error.
     pub(crate) async fn update_nonce(&self, realm: String, nonce: String) {
-        if let Some(state) = self.auth.lock().await.as_mut() {
+        if let Some(state) = self.auth.lock().as_mut() {
             state.update_nonce(realm, nonce);
         }
     }
@@ -331,6 +335,19 @@ impl TurnClient {
             }
         }
         Ok(())
+    }
+
+    /// Synchronous best-effort send for the close path. UDP uses
+    /// `try_send_to` (non-blocking); TCP is skipped (needs async write).
+    /// Returns true if a best-effort attempt was made.
+    pub(crate) fn try_send_sync(&self, data: &[u8]) -> bool {
+        match &self.transport {
+            TurnTransport::Udp { socket, server } => {
+                let _ = socket.try_send_to(data, *server);
+                true
+            }
+            TurnTransport::Tcp { .. } => false,
+        }
     }
 
     pub(crate) async fn recv(&self, buf: &mut [u8]) -> Result<usize> {
@@ -370,7 +387,7 @@ impl TurnClient {
         };
 
         let bytes = {
-            let auth_guard = self.auth.lock().await;
+            let auth_guard = self.auth.lock();
             if let Some(auth) = auth_guard.as_ref() {
                 let mut authenticated_msg = msg.clone();
                 authenticated_msg
@@ -396,7 +413,7 @@ impl TurnClient {
         peer: SocketAddr,
     ) -> Result<(Vec<u8>, [u8; 12])> {
         let tx_id = random_bytes::<12>();
-        let auth_guard = self.auth.lock().await;
+        let auth_guard = self.auth.lock();
         let auth = auth_guard.as_ref().ok_or_else(|| anyhow!("no auth"))?;
 
         let mut attributes = vec![StunAttribute::Username(auth.username.clone())];
@@ -431,7 +448,7 @@ impl TurnClient {
         };
 
         let tx_id = random_bytes::<12>();
-        let auth_guard = self.auth.lock().await;
+        let auth_guard = self.auth.lock();
         let auth = auth_guard.as_ref().ok_or_else(|| anyhow!("no auth"))?;
 
         let attributes = vec![
@@ -458,7 +475,7 @@ impl TurnClient {
         channel_number: u16,
     ) -> Result<(Vec<u8>, [u8; 12])> {
         let tx_id = random_bytes::<12>();
-        let auth_guard = self.auth.lock().await;
+        let auth_guard = self.auth.lock();
         let auth = auth_guard.as_ref().ok_or_else(|| anyhow!("no auth"))?;
 
         let attributes = vec![
