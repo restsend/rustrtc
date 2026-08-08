@@ -3,23 +3,18 @@
 [![Crates.io](https://img.shields.io/crates/v/rustrtc.svg)](https://crates.io/crates/rustrtc)
 [![Documentation](https://docs.rs/rustrtc/badge.svg)](https://docs.rs/rustrtc)
 
-A high-performance, full-featured real-time communication library — **WebRTC, RTP/SRTP, T.38 Fax**, and **RTP Latching** — all through a **unified `PeerConnection` API**.
+A high-performance, full-stack real-time communication library — **WebRTC, RTP/SRTP, T.38 Fax, and UPnP NAT traversal** — all through a **unified `PeerConnection` API**.
 
 ## Features
 
-- ** Unified API** — A single `PeerConnection` interface for all transport modes: WebRTC (ICE/DTLS/SRTP), raw RTP, SRTP-only, and T.38 fax. No fragmented APIs.
-- ** High performance** — ~2.7x faster than `webrtc-rs` and ~2.4x faster than `pion` (Go) in throughput benchmarks. ~30% less memory than `webrtc-rs`.
-- ** WebRTC Compliant** — Full compliance with Chrome/WebRTC. Supports offer/answer, renegotiation, and all standard SDP attributes.
-- ** Media Support** — RTP/SRTP handling for audio and video with packetizer, depacketizer, jitter buffer, NACK/FIR/PLI, TWCC, and REMB.
-- ** ICE/STUN/TURN** — Full ICE implementation with STUN, TURN (UDP + TCP), ICE Lite, ICE TCP (RFC 6544), and nominated pair management.
-- ** ICE UDP Mux** — Single-port multiplexing: many `PeerConnection`s share one UDP socket, demuxed by the server ufrag in the STUN Binding Request. Ideal for SFU/WHEP deployments that must advertise a single public UDP port.
-- ** T.38 Fax** — Fax over IP via T.38 (UDPTL, IFP ASN.1 PER encoding, T.30 state machine). Gated behind `features = ["t38"]`.
-- ** RTP Latching** — Dynamic remote address detection for RTP-only NAT traversal. Probation-based candidate selection with configurable observation window.
-- ** Transport Modes** — `TransportMode::WebRtc` (full ICE/DTLS), `TransportMode::Srtp` (SRTP without ICE), `TransportMode::Rtp` (raw RTP without encryption).
-- ** UPnP IGD** — Automatic port mapping via UPnP for NAT traversal without STUN/TURN.
-- ** Port Range Control** — Restrict RTP/ICE ports to a specific range (`rtp_start_port`/`rtp_end_port`) for firewall-friendly deployment.
-- ** RTP Rewrite Bridge** — Transparent RTP proxy/rewrite between `PeerConnection` instances (SSRC offset, PT remap, sequence rewriting).
-- ** Built-in Stats** — WebRTC-compatible stats model: inbound/outbound RTP, transport, candidate pair, and data channel stats.
+- **High performance** — ~2.7× faster than `webrtc-rs` and ~2.4× faster than `pion` (Go) in throughput, with ~30% less memory than `webrtc-rs` (see the benchmark below).
+- **Full protocol stack** — WebRTC, RTP, SRTP, and **T.38 fax** in a single library, plus **UPnP IGD** NAT traversal. Few moving parts, no missing pieces.
+- **Unified `PeerConnection` API** — one interface for every transport mode (`WebRtc` ICE/DTLS/SRTP, `Srtp`, `Rtp`, and T.38). No fragmented APIs.
+- **WebRTC compliant** — interoperable with Chrome/WebRTC and pion; offer/answer, renegotiation, and standard SDP attributes.
+- **Complete media pipeline** — packetizer/depacketizer, jitter buffer, NACK/FIR/PLI, TWCC, and REMB for audio and video.
+- **Full ICE** — STUN, TURN (UDP + TCP), ICE Lite, ICE TCP (RFC 6544), and single-port UDP mux for SFU/WHEP deployments.
+- **NAT traversal & deployment** — RTP latching, UPnP IGD port mapping, and firewall-friendly port ranges (`rtp_start_port`/`rtp_end_port`).
+- **Production extras** — RTP rewrite bridge (SSRC/PT/sequence remapping) and a WebRTC-compatible stats model.
 
 ## Benchmark game (rustrtc vs webrtc-rs & pion) in 0.3.113
 
