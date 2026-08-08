@@ -7,14 +7,14 @@ use crate::transports::ice::stun::random_u32;
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use tokio::sync::mpsc;
-use tracing::{info, trace, warn};
+use tracing::{debug, trace};
 
 const EXT_ID_NONE: u8 = 0;
 
@@ -67,6 +67,75 @@ pub struct RtpRewriteBridgeParams {
     pub strip_extensions: bool,
 }
 
+/// A single payload-type-scoped rewrite rule for the RTP rewrite bridge.
+///
+/// The bridge rewrites every forwarded packet using the most specific match:
+/// a rule whose `match_payload_type` equals the packet's payload type wins;
+/// otherwise the single rule with `match_payload_type: None` acts as the
+/// catch-all. Audio-only relays install one catch-all rule; video relays add
+/// one rule per m-line payload type so audio, video and DTMF each get their own
+/// destination SSRC / payload type (the legacy single-param bridge rewrote
+/// every packet — audio AND video — to one SSRC/PT, which corrupted video).
+#[derive(Debug, Clone, Copy)]
+pub struct RtpRewriteRule {
+    /// When `Some(pt)`, only packets carrying this payload type are rewritten.
+    /// When `None`, this is the catch-all rule applied to any other packet.
+    pub match_payload_type: Option<u8>,
+    /// Fixed SSRC written on rewritten packets. Defaults to
+    /// `src_ssrc + ssrc_offset` when `None`.
+    pub fixed_out_ssrc: Option<u32>,
+    /// SSRC offset applied when `fixed_out_ssrc` is `None`.
+    pub ssrc_offset: u32,
+    /// Replacement payload type, or `None` to keep the original.
+    pub out_payload_type: Option<u8>,
+}
+
+/// Direction-level rewrite bridge options (not payload-type-scoped).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RtpRewriteBridgeOptions {
+    /// Strip RTP extension headers before forwarding (WebRTC → RTP).
+    pub strip_extensions: bool,
+    /// Seed the first forwarded sequence number of each new source stream.
+    pub initial_sequence_number: Option<u16>,
+    /// Seed the first forwarded timestamp offset of each new source stream.
+    pub initial_timestamp_offset: Option<u32>,
+}
+
+impl RtpRewriteRule {
+    /// The catch-all rule mirroring the legacy single-params behavior.
+    pub fn catch_all(params: RtpRewriteBridgeParams) -> Self {
+        Self {
+            match_payload_type: None,
+            fixed_out_ssrc: params.fixed_out_ssrc,
+            ssrc_offset: params.ssrc_offset,
+            out_payload_type: params.payload_type,
+        }
+    }
+
+    /// DTMF remap: rewrite a specific source PT to a destination PT while
+    /// inheriting the same SSRC rewrite as the catch-all rule.
+    pub fn dtmf(src_pt: u8, dst_pt: u8, params: RtpRewriteBridgeParams) -> Self {
+        Self {
+            match_payload_type: Some(src_pt),
+            fixed_out_ssrc: params.fixed_out_ssrc,
+            ssrc_offset: params.ssrc_offset,
+            out_payload_type: Some(dst_pt),
+        }
+    }
+
+    /// Convert the legacy params into the rule list they map to: a catch-all
+    /// rule plus, when DTMF remapping is configured, a DTMF rule. This is the
+    /// single place that interprets the legacy struct, keeping the rewrite
+    /// path itself rule-table-only.
+    pub fn from_params(params: RtpRewriteBridgeParams) -> Vec<Self> {
+        let mut rules = vec![Self::catch_all(params)];
+        if let Some((src_pt, dst_pt)) = params.dtmf_payload_type {
+            rules.push(Self::dtmf(src_pt, dst_pt, params));
+        }
+        rules
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct StreamRewriteState {
     out_ssrc: u32,
@@ -77,55 +146,75 @@ struct StreamRewriteState {
 
 struct RewriteBridge {
     target: Arc<RtpTransport>,
-    params: RtpRewriteBridgeParams,
+    options: RtpRewriteBridgeOptions,
+    rules: Vec<RtpRewriteRule>,
     streams: RefCell<HashMap<u32, StreamRewriteState>>,
 }
 
 impl RewriteBridge {
-    fn new(target: Arc<RtpTransport>, params: RtpRewriteBridgeParams) -> Self {
+    fn new(
+        target: Arc<RtpTransport>,
+        options: RtpRewriteBridgeOptions,
+        rules: Vec<RtpRewriteRule>,
+    ) -> Self {
         Self {
             target,
-            params,
+            options,
+            rules,
             streams: RefCell::new(HashMap::new()),
         }
     }
 
+    /// Pick the most specific rule for a payload type: an exact-PT match wins,
+    /// otherwise the catch-all (match_payload_type: None), otherwise none.
+    fn rule_for(&self, raw_pt: u8) -> Option<RtpRewriteRule> {
+        self.rules
+            .iter()
+            .copied()
+            .find(|r| r.match_payload_type == Some(raw_pt))
+            .or_else(|| self.rules.iter().copied().find(|r| r.match_payload_type.is_none()))
+    }
+
     fn rewrite_packet(&self, packet: &mut RtpPacket) {
-        let params = self.params;
         let src_ssrc = packet.header.ssrc;
         let src_timestamp = packet.header.timestamp;
 
         // Strip extension headers (WebRTC → RTP) before any marshaling so the
         // RTP peer doesn't see WebRTC-specific extensions it can't parse.
-        if params.strip_extensions {
+        if self.options.strip_extensions {
             packet.header.extension = None;
         }
 
-        let out_ssrc = params
-            .fixed_out_ssrc
-            .unwrap_or_else(|| src_ssrc.wrapping_add(params.ssrc_offset));
+        let raw_pt = packet.header.payload_type;
+        let rule = self.rule_for(raw_pt);
+        let out_ssrc = match rule {
+            Some(r) => r
+                .fixed_out_ssrc
+                .unwrap_or_else(|| src_ssrc.wrapping_add(r.ssrc_offset)),
+            // No matching rule: pass the SSRC through untouched.
+            None => src_ssrc,
+        };
 
         let mut streams = self.streams.borrow_mut();
         let state = streams
             .entry(src_ssrc)
             .or_insert_with(|| StreamRewriteState {
                 out_ssrc,
-                next_sequence_number: params
+                next_sequence_number: self
+                    .options
                     .initial_sequence_number
                     .unwrap_or(random_u32() as u16),
                 last_source_timestamp: None,
-                timestamp_offset: params.initial_timestamp_offset.unwrap_or_else(random_u32),
+                timestamp_offset: self
+                    .options
+                    .initial_timestamp_offset
+                    .unwrap_or_else(random_u32),
             });
 
-        let raw_pt = packet.header.payload_type;
-        if let Some((src_pt, dst_pt)) = params.dtmf_payload_type {
-            if raw_pt == src_pt {
-                packet.header.payload_type = dst_pt;
-            } else if let Some(payload_type) = params.payload_type {
+        if let Some(r) = rule {
+            if let Some(payload_type) = r.out_payload_type {
                 packet.header.payload_type = payload_type;
             }
-        } else if let Some(payload_type) = params.payload_type {
-            packet.header.payload_type = payload_type;
         }
         packet.header.ssrc = state.out_ssrc;
 
@@ -305,7 +394,7 @@ pub struct RtpTransport {
     /// post-SRTP-unprotect / pre-relay; outbound fires pre-SRTP-protect
     /// (normal send) or pre-push (relay). Empty by default; `has_observers`
     /// makes the hot-path check a single atomic load (zero cost when unused).
-    observers: Mutex<Vec<Arc<dyn RtpObserver>>>,
+    observers: RwLock<Vec<Arc<dyn RtpObserver>>>,
     has_observers: AtomicBool,
 }
 
@@ -333,7 +422,7 @@ impl RtpTransport {
             has_sent_first_packet: AtomicBool::new(false),
             received_rtp_packets: AtomicU64::new(0),
             relay_send_failures: AtomicU64::new(0),
-            observers: Mutex::new(Vec::new()),
+            observers: RwLock::new(Vec::new()),
             has_observers: AtomicBool::new(false),
         }
     }
@@ -426,7 +515,24 @@ impl RtpTransport {
     }
 
     pub fn bridge_rewrite_to(&self, dst: Arc<RtpTransport>, params: RtpRewriteBridgeParams) {
-        *self.rewrite_bridge.lock() = Some(Box::new(RewriteBridge::new(dst, params)));
+        let options = RtpRewriteBridgeOptions {
+            strip_extensions: params.strip_extensions,
+            initial_sequence_number: params.initial_sequence_number,
+            initial_timestamp_offset: params.initial_timestamp_offset,
+        };
+        self.bridge_rewrite_rules_to(dst, options, RtpRewriteRule::from_params(params));
+    }
+
+    /// Install a payload-type-aware rewrite bridge. Rules are matched per
+    /// packet (exact-PT first, then catch-all); packets matching no rule pass
+    /// through with their SSRC/PT untouched.
+    pub fn bridge_rewrite_rules_to(
+        &self,
+        dst: Arc<RtpTransport>,
+        options: RtpRewriteBridgeOptions,
+        rules: Vec<RtpRewriteRule>,
+    ) {
+        *self.rewrite_bridge.lock() = Some(Box::new(RewriteBridge::new(dst, options, rules)));
         self.has_bridge.store(true, Ordering::Release);
     }
 
@@ -448,69 +554,77 @@ impl RtpTransport {
     /// When no observer is registered the hot path is a single atomic load
     /// (zero cost).
     pub fn add_observer(&self, observer: Arc<dyn RtpObserver>) {
-        self.observers.lock().push(observer);
+        self.observers.write().push(observer);
         self.has_observers.store(true, Ordering::Release);
     }
 
     /// Remove all observers and disable the hot-path checks.
     pub fn clear_observers(&self) {
-        self.observers.lock().clear();
+        self.observers.write().clear();
         self.has_observers.store(false, Ordering::Release);
     }
 
-    /// Fire ingress observers on a plaintext inbound packet. The Vec is cloned
-    /// out so the lock is NOT held across any observer work. Zero cost (single
-    /// atomic load) when no observer is registered.
+    /// Fire ingress observers on a plaintext inbound packet. Uses a read guard
+    /// (no Vec clone/allocation) and is NOT held across any blocking work.
+    /// Zero cost (single atomic load) when no observer is registered.
     #[inline]
     fn fire_ingress(&self, packet: &RtpPacket, src_addr: SocketAddr) {
         if !self.has_observers.load(Ordering::Acquire) {
             return;
         }
-        let observers = self.observers.lock().clone();
-        for o in &observers {
+        let observers = self.observers.read();
+        for o in observers.iter() {
             o.on_ingress(packet, src_addr);
         }
     }
 
     /// Fire egress observers on a plaintext outbound packet. `dst_addr` is the
     /// configured remote peer address (from the underlying ICE connection).
-    /// Same lock-clone pattern as [`Self::fire_ingress`].
+    /// Same read-guard pattern as [`Self::fire_ingress`].
     #[inline]
     fn fire_egress(&self, packet: &RtpPacket) {
         if !self.has_observers.load(Ordering::Acquire) {
             return;
         }
         let dst_addr = *self.transport.remote_addr.read();
-        let observers = self.observers.lock().clone();
-        for o in &observers {
+        let observers = self.observers.read();
+        for o in observers.iter() {
             o.on_egress(packet, dst_addr);
         }
     }
 
     pub async fn send(&self, buf: &[u8]) -> Result<usize> {
         let protected = {
-            let session_guard = self.srtp_session.lock();
-            if let Some(session) = &*session_guard {
-                let mut srtp = session.lock();
-                let mut packet = RtpPacket::parse(buf)?;
+            // Clone the session Arc out and release the outer guard immediately
+            // so the inner SRTP lock is held only around `protect_rtp`, not the
+            // (allocation-heavy) parse/set-extension/marshal that follows.
+            let session = self.srtp_session.lock().as_ref().map(|s| s.clone());
+            match session {
+                Some(session) => {
+                    let mut packet = RtpPacket::parse(buf)?;
 
-                // Inject abs-send-time if enabled
-                if let Some(id) =
-                    decode_ext_id(self.abs_send_time_extension_id.load(Ordering::Relaxed))
-                {
-                    let abs_send_time =
-                        crate::rtp::calculate_abs_send_time(std::time::SystemTime::now());
-                    let data = abs_send_time.to_be_bytes();
-                    packet.header.set_extension(id, &data[1..4])?;
-                }
+                    // Inject abs-send-time if enabled
+                    if let Some(id) =
+                        decode_ext_id(self.abs_send_time_extension_id.load(Ordering::Relaxed))
+                    {
+                        let abs_send_time =
+                            crate::rtp::calculate_abs_send_time(std::time::SystemTime::now());
+                        let data = abs_send_time.to_be_bytes();
+                        packet.header.set_extension(id, &data[1..4])?;
+                    }
 
-                srtp.protect_rtp(&mut packet)?;
-                packet.marshal()?
-            } else {
-                if self.srtp_required {
-                    return Err(anyhow::anyhow!("SRTP required but session not ready"));
+                    {
+                        let mut srtp = session.lock();
+                        srtp.protect_rtp(&mut packet)?;
+                    }
+                    packet.marshal()?
                 }
-                buf.to_vec()
+                None => {
+                    if self.srtp_required {
+                        return Err(anyhow::anyhow!("SRTP required but session not ready"));
+                    }
+                    buf.to_vec()
+                }
             }
         };
         self.transport.send(&protected).await
@@ -538,23 +652,31 @@ impl RtpTransport {
         }
 
         let protected = {
-            let session_guard = self.srtp_session.lock();
-            if let Some(session) = &*session_guard {
-                let mut srtp = session.lock();
-                srtp.protect_rtp(&mut packet)?;
-                packet.marshal()?
-            } else {
-                if self.srtp_required {
-                    warn!("RtpTransport: SRTP required but session not ready, dropping RTP send");
-                    return Err(anyhow::anyhow!("SRTP required but session not ready"));
+            // Release the outer guard at once; hold the inner SRTP lock only
+            // around `protect_rtp`, then marshal outside the lock.
+            let session = self.srtp_session.lock().as_ref().map(|s| s.clone());
+            match session {
+                Some(session) => {
+                    {
+                        let mut srtp = session.lock();
+                        srtp.protect_rtp(&mut packet)?;
+                    }
+                    packet.marshal()?
                 }
-                packet.marshal()?
+                None => {
+                    if self.srtp_required {
+                        debug!("RtpTransport: SRTP required but session not ready, dropping RTP send");
+                        return Err(anyhow::anyhow!("SRTP required but session not ready"));
+                    }
+                    packet.marshal()?
+                }
             }
         };
         match self.transport.send(&protected).await {
             Ok(n) => {
                 if is_first {
-                    info!(
+                    self.transport.mark_first_outbound();
+                    trace!(
                         "RtpTransport: first SRTP packet sent ({} bytes)",
                         protected.len()
                     );
@@ -562,7 +684,7 @@ impl RtpTransport {
                 Ok(n)
             }
             Err(e) => {
-                warn!(
+                debug!(
                     "RtpTransport: failed to send SRTP packet ({} bytes): {}",
                     protected.len(),
                     e
@@ -582,7 +704,7 @@ impl RtpTransport {
                 raw
             } else {
                 if self.srtp_required {
-                    tracing::warn!("Failed to send PLI: SRTP required but session not ready");
+                    debug!("Failed to send PLI: SRTP required but session not ready");
                     return Err(anyhow::anyhow!("SRTP required but session not ready"));
                 }
                 raw
@@ -701,24 +823,30 @@ impl PacketReceiver for RtpTransport {
         let is_rtcp_packet = is_rtcp(&packet);
 
         if is_rtcp_packet {
-            let unprotected = {
-                let session_guard = self.srtp_session.lock();
-                if let Some(session) = &*session_guard {
-                    let mut srtp = session.lock();
-                    let mut buf = packet.to_vec();
-                    match srtp.unprotect_rtcp(&mut buf) {
-                        Ok(_) => buf,
-                        Err(e) => {
-                            tracing::warn!("SRTP unprotect RTCP failed: {}", e);
-                            return;
+            let unprotected: Bytes = {
+                // Release the outer guard at once; hold the inner SRTP lock only
+                // around the unprotect. The plain (no-SRTP) branch keeps the
+                // received `Bytes` directly (no copy) since parsing takes &[u8].
+                let session = self.srtp_session.lock().as_ref().map(|s| s.clone());
+                match session {
+                    Some(session) => {
+                        let mut buf = packet.to_vec();
+                        let mut srtp = session.lock();
+                        match srtp.unprotect_rtcp(&mut buf) {
+                            Ok(()) => Bytes::from(buf),
+                            Err(e) => {
+                                debug!("SRTP unprotect RTCP failed: {}", e);
+                                return;
+                            }
                         }
                     }
-                } else {
-                    if self.srtp_required {
-                        trace!("Dropping packet because SRTP is required but session is not ready");
-                        return;
+                    None => {
+                        if self.srtp_required {
+                            trace!("Dropping packet because SRTP is required but session is not ready");
+                            return;
+                        }
+                        packet
                     }
-                    packet.to_vec()
                 }
             };
 
@@ -747,34 +875,39 @@ impl PacketReceiver for RtpTransport {
             }
         } else {
             let rtp_packet = {
-                let session_guard = self.srtp_session.lock();
-                if let Some(session) = &*session_guard {
-                    let mut srtp = session.lock();
-                    // SRTP path: keep a borrowed parse (crypto materializes a
-                    // mutable copy itself, so no benefit from zero-copy here).
-                    match RtpPacket::parse(&packet) {
-                        Ok(mut rtp_packet) => match srtp.unprotect_rtp(&mut rtp_packet) {
-                            Ok(_) => rtp_packet,
-                            Err(_) => return,
-                        },
-                        Err(e) => {
-                            trace!("RTP parse failed: {}", e);
-                            return;
+                // Release the outer guard at once; hold the inner SRTP lock only
+                // around parse + unprotect.
+                let session = self.srtp_session.lock().as_ref().map(|s| s.clone());
+                match session {
+                    Some(session) => {
+                        let mut srtp = session.lock();
+                        // SRTP path: keep a borrowed parse (crypto materializes a
+                        // mutable copy itself, so no benefit from zero-copy here).
+                        match RtpPacket::parse(&packet) {
+                            Ok(mut rtp_packet) => match srtp.unprotect_rtp(&mut rtp_packet) {
+                                Ok(_) => rtp_packet,
+                                Err(_) => return,
+                            },
+                            Err(e) => {
+                                trace!("RTP parse failed: {}", e);
+                                return;
+                            }
                         }
                     }
-                } else {
-                    if self.srtp_required {
-                        trace!("Dropping packet because SRTP is required but session is not ready");
-                        return;
-                    }
-                    // Plain-RTP fast path: zero-copy parse — the packet's
-                    // payload/extension are cheap `Bytes` slices of the
-                    // already-owned receive buffer instead of fresh Vec copies.
-                    match RtpPacket::parse_bytes(packet.clone()) {
-                        Ok(rtp_packet) => rtp_packet,
-                        Err(e) => {
-                            trace!("RTP parse failed: {}", e);
+                    None => {
+                        if self.srtp_required {
+                            trace!("Dropping packet because SRTP is required but session is not ready");
                             return;
+                        }
+                        // Plain-RTP fast path: zero-copy parse — the packet's
+                        // payload/extension are cheap `Bytes` slices of the
+                        // already-owned receive buffer instead of fresh Vec copies.
+                        match RtpPacket::parse_bytes(packet.clone()) {
+                            Ok(rtp_packet) => rtp_packet,
+                            Err(e) => {
+                                trace!("RTP parse failed: {}", e);
+                                return;
+                            }
                         }
                     }
                 }
@@ -798,25 +931,29 @@ impl PacketReceiver for RtpTransport {
             let ssrc = rtp_packet.header.ssrc;
             let pt = rtp_packet.header.payload_type;
 
+            // Extract the RID/MID extension slices BEFORE taking the listeners
+            // lock — the byte-scan depends only on the packet, not the registry,
+            // so it should not run inside the demux critical section.
+            let rid_id = decode_ext_id(self.rid_extension_id.load(Ordering::Relaxed));
+            let mid_id = decode_ext_id(self.sdes_mid_extension_id.load(Ordering::Relaxed));
+            let rid_bytes = rid_id.and_then(|id| rtp_packet.header.get_extension(id));
+            let mid_bytes = mid_id.and_then(|id| rtp_packet.header.get_extension(id));
+
             let listener = {
-                let rid_id = decode_ext_id(self.rid_extension_id.load(Ordering::Relaxed));
-                let mid_id = decode_ext_id(self.sdes_mid_extension_id.load(Ordering::Relaxed));
                 let mut listeners = self.listeners.lock();
                 let mut selected = None;
                 let mut bind_ssrc = false;
 
-                if let Some(id) = rid_id
-                    && let Some(rid) = rtp_packet.header.get_extension(id)
-                    && let Ok(rid_str) = std::str::from_utf8(&rid)
+                if let Some(rid) = &rid_bytes
+                    && let Ok(rid_str) = std::str::from_utf8(rid)
                 {
                     selected = listeners.by_rid.get(rid_str).cloned();
                     bind_ssrc = selected.is_some();
                 }
 
                 if selected.is_none()
-                    && let Some(id) = mid_id
-                    && let Some(mid) = rtp_packet.header.get_extension(id)
-                    && let Ok(mid_str) = std::str::from_utf8(&mid)
+                    && let Some(mid) = &mid_bytes
+                    && let Ok(mid_str) = std::str::from_utf8(mid)
                 {
                     selected = listeners.by_mid(mid_str);
                     bind_ssrc = selected.is_some();
@@ -1229,6 +1366,188 @@ mod tests {
         let mut dtmf =
             RtpPacket::new(crate::rtp::RtpHeader::new(101, 7, 1111, 1111), vec![1u8; 32]);
         bridge.rewrite_packet(&mut dtmf);
+        assert_eq!(dtmf.header.payload_type, 110);
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_rules_route_audio_video_dtmf_to_distinct_ssrc_pt() {
+        use crate::transports::ice::IceSocketWrapper;
+        use tokio::net::UdpSocket;
+        use tokio::sync::watch;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_tx, rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(socket))));
+        let src_conn = IceConn::new(rx, "127.0.0.1:9".parse().unwrap(), None);
+        let src_transport = Arc::new(RtpTransport::new(src_conn, false));
+
+        let dst_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_dst_tx, dst_rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(dst_socket))));
+        let dst_conn = IceConn::new(dst_rx, "127.0.0.1:9".parse().unwrap(), None);
+        let dst_transport = Arc::new(RtpTransport::new(dst_conn, false));
+
+        // Audio catch-all + DTMF remap + two video PTs (H264 + its RTX PT).
+        let audio_ssrc = 111u32;
+        let video_ssrc = 222u32;
+        let rules = vec![
+            RtpRewriteRule {
+                match_payload_type: None,
+                fixed_out_ssrc: Some(audio_ssrc),
+                ssrc_offset: 0,
+                out_payload_type: Some(96),
+            },
+            // DTMF PT 101 → 110, still on the audio SSRC.
+            RtpRewriteRule {
+                match_payload_type: Some(101),
+                fixed_out_ssrc: Some(audio_ssrc),
+                ssrc_offset: 0,
+                out_payload_type: Some(110),
+            },
+            // Video PT 98 → 102, video SSRC.
+            RtpRewriteRule {
+                match_payload_type: Some(98),
+                fixed_out_ssrc: Some(video_ssrc),
+                ssrc_offset: 0,
+                out_payload_type: Some(102),
+            },
+            // Video RTX PT 99 → 103, same video SSRC (distinct source stream).
+            RtpRewriteRule {
+                match_payload_type: Some(99),
+                fixed_out_ssrc: Some(video_ssrc),
+                ssrc_offset: 0,
+                out_payload_type: Some(103),
+            },
+        ];
+        src_transport.bridge_rewrite_rules_to(dst_transport.clone(), Default::default(), rules);
+
+        let mut guard = src_transport.rewrite_bridge.lock();
+        let bridge = guard.as_mut().expect("rewrite bridge should be configured");
+
+        // Audio packet (PT 97) → audio SSRC + PT 96.
+        let mut audio =
+            RtpPacket::new(crate::rtp::RtpHeader::new(97, 7, 1111, 1111), vec![1u8; 32]);
+        bridge.rewrite_packet(&mut audio);
+        assert_eq!(audio.header.ssrc, audio_ssrc);
+        assert_eq!(audio.header.payload_type, 96);
+
+        // DTMF packet (PT 101) → audio SSRC + PT 110.
+        let mut dtmf =
+            RtpPacket::new(crate::rtp::RtpHeader::new(101, 7, 1111, 1111), vec![1u8; 32]);
+        bridge.rewrite_packet(&mut dtmf);
+        assert_eq!(dtmf.header.ssrc, audio_ssrc);
+        assert_eq!(dtmf.header.payload_type, 110);
+
+        // Video packet (PT 98) → video SSRC + PT 102.
+        let mut video =
+            RtpPacket::new(crate::rtp::RtpHeader::new(98, 7, 2222, 2222), vec![1u8; 32]);
+        bridge.rewrite_packet(&mut video);
+        assert_eq!(video.header.ssrc, video_ssrc);
+        assert_eq!(video.header.payload_type, 102);
+
+        // RTX packet (PT 99, distinct source SSRC) → video SSRC + PT 103.
+        let mut rtx =
+            RtpPacket::new(crate::rtp::RtpHeader::new(99, 7, 3333, 3333), vec![1u8; 32]);
+        bridge.rewrite_packet(&mut rtx);
+        assert_eq!(rtx.header.ssrc, video_ssrc);
+        assert_eq!(rtx.header.payload_type, 103);
+
+        // Each source stream keeps independent sequence/timestamp continuity.
+        let mut video2 =
+            RtpPacket::new(crate::rtp::RtpHeader::new(98, 8, 2382, 2222), vec![1u8; 32]);
+        bridge.rewrite_packet(&mut video2);
+        assert_eq!(video2.header.sequence_number, video.header.sequence_number + 1);
+        assert_eq!(video2.header.timestamp, video.header.timestamp.wrapping_add(160));
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_rules_unmatched_packet_passes_ssrc_through() {
+        use crate::transports::ice::IceSocketWrapper;
+        use tokio::net::UdpSocket;
+        use tokio::sync::watch;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_tx, rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(socket))));
+        let src_conn = IceConn::new(rx, "127.0.0.1:9".parse().unwrap(), None);
+        let src_transport = Arc::new(RtpTransport::new(src_conn, false));
+
+        let dst_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_dst_tx, dst_rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(dst_socket))));
+        let dst_conn = IceConn::new(dst_rx, "127.0.0.1:9".parse().unwrap(), None);
+        let dst_transport = Arc::new(RtpTransport::new(dst_conn, false));
+
+        // Only a video rule: no catch-all. Audio-ish PT 97 must pass through.
+        let rules = vec![RtpRewriteRule {
+            match_payload_type: Some(98),
+            fixed_out_ssrc: Some(222),
+            ssrc_offset: 0,
+            out_payload_type: Some(102),
+        }];
+        src_transport.bridge_rewrite_rules_to(dst_transport.clone(), Default::default(), rules);
+
+        let mut guard = src_transport.rewrite_bridge.lock();
+        let bridge = guard.as_mut().expect("rewrite bridge should be configured");
+
+        let mut video =
+            RtpPacket::new(crate::rtp::RtpHeader::new(98, 7, 2222, 2222), vec![1u8; 32]);
+        bridge.rewrite_packet(&mut video);
+        assert_eq!(video.header.ssrc, 222);
+        assert_eq!(video.header.payload_type, 102);
+
+        let mut unmatched =
+            RtpPacket::new(crate::rtp::RtpHeader::new(97, 7, 1111, 1111), vec![1u8; 32]);
+        bridge.rewrite_packet(&mut unmatched);
+        assert_eq!(unmatched.header.ssrc, 1111);
+        assert_eq!(unmatched.header.payload_type, 97);
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_rules_legacy_params_equivalent_to_single_rule() {
+        use crate::transports::ice::IceSocketWrapper;
+        use tokio::net::UdpSocket;
+        use tokio::sync::watch;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_tx, rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(socket))));
+        let src_conn = IceConn::new(rx, "127.0.0.1:9".parse().unwrap(), None);
+        let src_transport = Arc::new(RtpTransport::new(src_conn, false));
+
+        let dst_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_dst_tx, dst_rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(dst_socket))));
+        let dst_conn = IceConn::new(dst_rx, "127.0.0.1:9".parse().unwrap(), None);
+        let dst_transport = Arc::new(RtpTransport::new(dst_conn, false));
+
+        // Legacy path: bridge_rewrite_to(dst, params) builds catch-all + dtmf
+        // rules internally and must behave exactly as before.
+        src_transport.bridge_rewrite_to(
+            dst_transport.clone(),
+            RtpRewriteBridgeParams {
+                ssrc_offset: 900,
+                fixed_out_ssrc: None,
+                payload_type: Some(96),
+                dtmf_payload_type: Some((101, 110)),
+                initial_sequence_number: Some(32000),
+                initial_timestamp_offset: Some(12345),
+                strip_extensions: false,
+            },
+        );
+
+        let mut guard = src_transport.rewrite_bridge.lock();
+        let bridge = guard.as_mut().expect("rewrite bridge should be configured");
+
+        let mut audio =
+            RtpPacket::new(crate::rtp::RtpHeader::new(100, 7, 1111, 1111), vec![1u8; 32]);
+        bridge.rewrite_packet(&mut audio);
+        assert_eq!(audio.header.ssrc, 1111 + 900);
+        assert_eq!(audio.header.payload_type, 96);
+        assert_eq!(audio.header.sequence_number, 32000);
+        assert_eq!(audio.header.timestamp, 1111 + 12345);
+
+        let mut dtmf =
+            RtpPacket::new(crate::rtp::RtpHeader::new(101, 7, 1111, 1111), vec![1u8; 32]);
+        bridge.rewrite_packet(&mut dtmf);
+        assert_eq!(dtmf.header.ssrc, 1111 + 900);
         assert_eq!(dtmf.header.payload_type, 110);
         drop(guard);
     }

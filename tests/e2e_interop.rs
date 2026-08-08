@@ -42,7 +42,7 @@ fn test_rust_server_go_client() {
 
     // 2. Start Rust Server
     let mut server = Command::new("./target/e2e/debug/examples/interop_pion")
-        .args(["server", "127.0.0.1:3000"])
+        .args(["server", "127.0.0.1:39081"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -53,7 +53,7 @@ fn test_rust_server_go_client() {
 
     // 3. Start Go Client
     let client = Command::new("./examples/interop_pion_go/interop_pion_go")
-        .args(["-mode", "client", "-addr", "127.0.0.1:3000"])
+        .args(["-mode", "client", "-addr", "127.0.0.1:39081"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -77,12 +77,10 @@ fn test_rust_server_go_client() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    if output.status.success() {
-        println!(
-            "Go Client stdout: {}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-    }
+    assert!(
+        output.status.success(),
+        "Go (pion) client failed against Rust server — interop broken"
+    );
 }
 
 #[test]

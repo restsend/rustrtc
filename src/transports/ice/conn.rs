@@ -74,6 +74,16 @@ pub struct IceConn {
     pub expected_ssrc: AtomicU32,
     pub rtp_rx_count: AtomicU64,
     pub label: Option<String>,
+    /// First inbound RTP logged (INFO, once) — proves the remote is sending
+    /// media to us.
+    first_rtp_rx_logged: AtomicBool,
+    /// First inbound RTCP logged (INFO, once) — proves the remote's stack is
+    /// alive / acking.
+    first_rtcp_rx_logged: AtomicBool,
+    /// Set once the first outbound RTP has been written to the wire.
+    first_out_seen: AtomicBool,
+    /// Set once the "media flowing both directions" INFO has been emitted.
+    both_ways_logged: AtomicBool,
     pub rx_packets: AtomicU64,
     pub rx_bytes: AtomicU64,
     pub tx_packets: AtomicU64,
@@ -116,6 +126,10 @@ impl IceConn {
             expected_ssrc: AtomicU32::new(0),
             rtp_rx_count: AtomicU64::new(0),
             label,
+            first_rtp_rx_logged: AtomicBool::new(false),
+            first_rtcp_rx_logged: AtomicBool::new(false),
+            first_out_seen: AtomicBool::new(false),
+            both_ways_logged: AtomicBool::new(false),
             rx_packets: AtomicU64::new(0),
             rx_bytes: AtomicU64::new(0),
             tx_packets: AtomicU64::new(0),
@@ -128,6 +142,38 @@ impl IceConn {
     pub fn set_probation_max_packets(&self, max: Option<u8>) {
         self.probation_max_packets
             .store(max.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    /// Record that the first outbound RTP was written to the wire. Called by
+    /// `RtpTransport` after its first successful send.
+    pub fn mark_first_outbound(&self) {
+        if self.first_out_seen.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let label_str = self.label.as_deref().unwrap_or("unknown");
+        tracing::trace!("IceConn: first outbound RTP sent label={}", label_str);
+        self.maybe_log_both_ways(label_str);
+    }
+
+    /// Single TRACE "media confirmed both directions" emitted once outbound and
+    /// inbound (RTP or RTCP) traffic have both been observed on this connection.
+    fn maybe_log_both_ways(&self, label_str: &str) {
+        if self.both_ways_logged.load(Ordering::Relaxed) {
+            return;
+        }
+        let inbound_seen = self.first_rtp_rx_logged.load(Ordering::Relaxed)
+            || self.first_rtcp_rx_logged.load(Ordering::Relaxed);
+        if self.first_out_seen.load(Ordering::Relaxed) && inbound_seen
+            && self
+                .both_ways_logged
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            tracing::trace!(
+                "IceConn: media confirmed both directions (outbound + inbound) label={}",
+                label_str
+            );
+        }
     }
 
     pub fn enable_latch_on_rtp(&self) {
@@ -605,18 +651,34 @@ impl PacketReceiver for IceConn {
             };
 
             if let Some(strong_rx) = receiver {
-                // Log once per connection when the first RTP packet arrives.
-                let prev = self.rtp_rx_count.fetch_add(1, Ordering::Relaxed);
-                if prev == 0 {
-                    let label_str = self.label.as_deref().unwrap_or("unknown");
+                self.rtp_rx_count.fetch_add(1, Ordering::Relaxed);
+                let label_str = self.label.as_deref().unwrap_or("unknown");
+                if is_rtcp {
+                    if self
+                        .first_rtcp_rx_logged
+                        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        tracing::debug!(
+                            "IceConn: first inbound RTCP ({} bytes) from {} label={} — remote alive",
+                            packet.len(),
+                            addr,
+                            label_str
+                        );
+                    }
+                } else if self
+                    .first_rtp_rx_logged
+                    .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
                     tracing::debug!(
-                        "IceConn: first {} packet ({} bytes) from {} label={} — forwarding to RTP receiver",
-                        if is_rtcp { "RTCP" } else { "RTP" },
+                        "IceConn: first inbound RTP ({} bytes) from {} label={}",
                         packet.len(),
                         addr,
-                        label_str,
+                        label_str
                     );
                 }
+                self.maybe_log_both_ways(label_str);
                 strong_rx.receive(packet, addr, marshal_buf).await;
             } else {
                 trace!(

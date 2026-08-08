@@ -1,6 +1,6 @@
 [package]
 name = "rustrtc"
-version = "0.3.112"
+version = "0.3.113"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 repository = "https://github.com/restsend/rustrtc"
@@ -98,3 +98,15 @@ split-debuginfo = "unpacked"
 
 [profile.test]
 split-debuginfo = "unpacked"
+
+# Optimized release profile for the high-throughput media/crypto hot paths.
+# `fat` LTO + single codegen unit enable cross-crate inlining across the many
+# small RustCrypto crates and the RTP/SRTP/SCTP hot paths.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
+[profile.bench]
+lto = "fat"
+codegen-units = 1

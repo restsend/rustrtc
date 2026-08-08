@@ -31,7 +31,10 @@ struct InternalMessage {
 async fn main() {
     rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
     tracing_subscriber::fmt()
-        .with_env_filter("debug,rustrtc=debug")
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
 
     let (tx, _rx) = broadcast::channel(100);

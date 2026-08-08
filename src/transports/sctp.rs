@@ -16,6 +16,74 @@ use tracing::{debug, trace};
 
 type HmacSha1 = Hmac<Sha1>;
 
+// ---------------------------------------------------------------------------
+// CRC-32C (Castagnoli) — the SCTP checksum, computed for every packet on the
+// DataChannel path. Hardware-accelerated on x86-64 (SSE4.2 `crc32`) and
+// aarch64 (CRC extension), with a software fallback (the `crc32c` crate).
+// ---------------------------------------------------------------------------
+
+/// Compute CRC-32C over `data` (init/xorout 0xFFFFFFFF). Equivalent to
+/// `crc32c::crc32c`.
+#[inline]
+pub(crate) fn sctp_crc32c(data: &[u8]) -> u32 {
+    sctp_crc32c_append(0, data)
+}
+
+/// Append `data` to a running CRC-32C `crc`. Equivalent to
+/// `crc32c::crc32c_append` (i.e. `sctp_crc32c_append(sctp_crc32c(a), b) ==
+/// sctp_crc32c(a || b)`).
+#[inline]
+pub(crate) fn sctp_crc32c_append(crc: u32, data: &[u8]) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("sse4.2") {
+            // SAFETY: feature detected above; the target_feature fn only uses
+            // SSE4.2 crc32 instructions.
+            return unsafe { crc32c_append_x86(crc, data) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("crc") {
+            // SAFETY: feature detected above; the target_feature fn only uses
+            // aarch64 CRC instructions.
+            return unsafe { crc32c_append_aarch64(crc, data) };
+        }
+    }
+    crc32c::crc32c_append(crc, data)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.2")]
+unsafe fn crc32c_append_x86(crc: u32, data: &[u8]) -> u32 {
+    use std::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8};
+    let mut c = (crc ^ 0xFFFF_FFFF) as u64;
+    let mut chunks = data.chunks_exact(8);
+    for chunk in chunks.by_ref() {
+        c = _mm_crc32_u64(c, u64::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    let mut c32 = c as u32;
+    for &b in chunks.remainder() {
+        c32 = _mm_crc32_u8(c32, b);
+    }
+    c32 ^ 0xFFFF_FFFF
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "crc")]
+unsafe fn crc32c_append_aarch64(crc: u32, data: &[u8]) -> u32 {
+    use std::arch::aarch64::{__crc32cb, __crc32cd};
+    let mut c = crc ^ 0xFFFF_FFFF;
+    let mut chunks = data.chunks_exact(8);
+    for chunk in chunks.by_ref() {
+        c = __crc32cd(c, u64::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    for &b in chunks.remainder() {
+        c = __crc32cb(c, b);
+    }
+    c ^ 0xFFFF_FFFF
+}
+
 // RTO Constants (RFC 4960)
 const RTO_ALPHA: f64 = 0.125;
 const RTO_BETA: f64 = 0.25;
@@ -1494,9 +1562,9 @@ impl SctpInner {
             // segments, skipping the 4-byte checksum field at offset 8..12.
             // CRC32c(header[0..8] || 0000 || payload[12..]) must equal received_checksum.
             let zeroed_checksum: [u8; 4] = [0; 4];
-            let crc = crc32c::crc32c(&packet[..8]);
-            let crc = crc32c::crc32c_append(crc, &zeroed_checksum);
-            let calculated = crc32c::crc32c_append(crc, &packet[12..]);
+            let crc = sctp_crc32c(&packet[..8]);
+            let crc = sctp_crc32c_append(crc, &zeroed_checksum);
+            let calculated = sctp_crc32c_append(crc, &packet[12..]);
             if calculated != received_checksum {
                 debug!(
                     "SCTP Checksum mismatch: received {:08x}, calculated {:08x}",
@@ -3007,7 +3075,7 @@ impl SctpInner {
         }
 
         // Calculate Checksum (CRC32c)
-        let checksum = crc32c::crc32c(&buf);
+        let checksum = sctp_crc32c(&buf);
         let checksum_bytes = checksum.to_le_bytes();
         buf[8] = checksum_bytes[0];
         buf[9] = checksum_bytes[1];
@@ -3343,21 +3411,24 @@ impl SctpInner {
     fn update_advanced_peer_ack_point(&self) {
         let mut sent_queue = self.sent_queue.lock();
 
-        // First: check all unacked chunks for abandonment
-        let mut abandon_messages: Vec<(u16, u16)> = Vec::new();
-        for (_tsn, record) in sent_queue.iter_mut() {
+        // First: collect the (stream, ssn) pairs of messages whose chunks should
+        // be abandoned. Using a set lets the marking pass below run in a single
+        // O(n) sweep instead of re-scanning the whole queue per abandoned message.
+        let mut abandon_set: std::collections::HashSet<(u16, u16)> =
+            std::collections::HashSet::new();
+        for record in sent_queue.values_mut() {
             if record.acked || record.abandoned {
                 continue;
             }
             if Self::should_abandon(record) {
-                abandon_messages.push((record.stream_id, record.ssn));
+                abandon_set.insert((record.stream_id, record.ssn));
             }
         }
 
-        // Mark all chunks of abandoned messages
-        for (sid, ssn) in &abandon_messages {
-            for (_, record) in sent_queue.iter_mut() {
-                if record.stream_id == *sid && record.ssn == *ssn {
+        // Mark all chunks of abandoned messages in one pass.
+        if !abandon_set.is_empty() {
+            for record in sent_queue.values_mut() {
+                if abandon_set.contains(&(record.stream_id, record.ssn)) {
                     record.abandoned = true;
                     record.needs_retransmit = false;
                     if record.in_flight {
@@ -3509,18 +3580,18 @@ impl SctpInner {
 
     fn create_sack_chunk(&self) -> Bytes {
         let cumulative_tsn_ack = self.cumulative_tsn_ack.load(Ordering::SeqCst);
-        let mut sack = BytesMut::new();
-        sack.put_u32(cumulative_tsn_ack); // Cumulative TSN Ack
         let adv_rwnd = self.advertised_rwnd();
-        sack.put_u32(adv_rwnd); // a_rwnd reflects buffered state
-
         let gap_blocks = self.build_gap_ack_blocks(cumulative_tsn_ack);
         let dups = {
             let mut d = self.dups_buffer.lock();
             let take = d.len().min(32);
-            let out: Vec<u32> = d.drain(..take).collect();
-            out
+            d.drain(..take).collect::<Vec<u32>>()
         };
+
+        // 12-byte fixed fields + 4 bytes per gap block + 4 bytes per dup TSN.
+        let mut sack = BytesMut::with_capacity(12 + gap_blocks.len() * 4 + dups.len() * 4);
+        sack.put_u32(cumulative_tsn_ack); // Cumulative TSN Ack
+        sack.put_u32(adv_rwnd); // a_rwnd reflects buffered state
         sack.put_u16(gap_blocks.len() as u16); // Number of Gap Ack Blocks
         sack.put_u16(dups.len() as u16); // Number of Duplicate TSNs
 
@@ -3686,6 +3757,52 @@ mod tests {
         buf.put_u32(51); // PPID (binary)
         buf.put_slice(b"test data");
         buf.freeze()
+    }
+
+    /// The hardware-accelerated CRC-32C must match the software reference and
+    /// the canonical test vector, across sizes that exercise both the wide
+    /// (8-byte) loop and the byte remainder.
+    #[test]
+    fn test_sctp_crc32c_matches_reference() {
+        // Canonical CRC-32C (Castagnoli) check value.
+        assert_eq!(sctp_crc32c(b"123456789"), 0xE306_9283);
+        assert_eq!(sctp_crc32c(b""), 0);
+
+        // Match the software crate across a range of lengths (0..=40) to cover
+        // the 8-byte loop and every remainder alignment.
+        let data: Vec<u8> = (0..40u8).map(|i| i.wrapping_mul(31)).collect();
+        for len in 0..=data.len() {
+            let slice = &data[..len];
+            assert_eq!(
+                sctp_crc32c(slice),
+                crc32c::crc32c(slice),
+                "crc mismatch at len={len}"
+            );
+        }
+
+        // A realistic ~1200-byte SCTP packet size.
+        let big: Vec<u8> = (0..1200).map(|i| (i % 251) as u8).collect();
+        assert_eq!(sctp_crc32c(&big), crc32c::crc32c(&big));
+    }
+
+    /// The incremental append must compose exactly like the reference crate.
+    #[test]
+    fn test_sctp_crc32c_append_composes() {
+        let data: Vec<u8> = (0..100u8).map(|i| i.wrapping_mul(7)).collect();
+        for split in 0..=data.len() {
+            let (a, b) = data.split_at(split);
+            let combined = sctp_crc32c_append(sctp_crc32c(a), b);
+            assert_eq!(
+                combined,
+                crc32c::crc32c(&data),
+                "append composition mismatch at split={split}"
+            );
+            assert_eq!(
+                combined,
+                crc32c::crc32c_append(crc32c::crc32c(a), b),
+                "append mismatch vs reference at split={split}"
+            );
+        }
     }
 
     #[test]
@@ -3900,7 +4017,7 @@ mod tests {
         buf.put_u32(0x12345678); // tag
         buf.put_u32(0); // checksum placeholder
 
-        let calculated = crc32c::crc32c(&buf);
+        let calculated = sctp_crc32c(&buf);
         let checksum_bytes = calculated.to_le_bytes();
         buf[8] = checksum_bytes[0];
         buf[9] = checksum_bytes[1];
@@ -3921,7 +4038,7 @@ mod tests {
         packet_copy[9] = 0;
         packet_copy[10] = 0;
         packet_copy[11] = 0;
-        let calculated_again = crc32c::crc32c(&packet_copy);
+        let calculated_again = sctp_crc32c(&packet_copy);
         assert_eq!(received_checksum, calculated_again);
     }
 

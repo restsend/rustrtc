@@ -132,19 +132,22 @@ impl RtpHeader {
 
         let mut ext = self
             .extension
-            .clone()
+            .take()
             .unwrap_or_else(|| RtpHeaderExtension::new(0xBEDE, Vec::new()));
 
         if ext.profile != 0xBEDE {
             // For now, we only support modifying 0xBEDE
+            self.extension = Some(ext);
             return Err(RtpError::InvalidHeader(
                 "unsupported extension profile for modification",
             ));
         }
 
-        let mut new_data = Vec::new();
+        // Upper bound on the rebuilt block: existing bytes + one new entry + padding.
+        let mut new_data = Vec::with_capacity(ext.data.len() + data.len() + 1 + 4);
         let mut found = false;
         let mut offset = 0;
+        let id_header = (id << 4) | ((data.len() - 1) as u8);
 
         while offset < ext.data.len() {
             let b = ext.data[offset];
@@ -162,7 +165,7 @@ impl RtpHeader {
 
             if ext_id == id {
                 found = true;
-                new_data.push((id << 4) | ((data.len() - 1) as u8));
+                new_data.push(id_header);
                 new_data.extend_from_slice(data);
             } else {
                 new_data.push(b);
@@ -172,14 +175,13 @@ impl RtpHeader {
         }
 
         if !found {
-            new_data.push((id << 4) | ((data.len() - 1) as u8));
+            new_data.push(id_header);
             new_data.extend_from_slice(data);
         }
 
-        // Align to 32-bit boundary
-        while new_data.len() % 4 != 0 {
-            new_data.push(0);
-        }
+        // Align to 32-bit boundary in a single resize (no per-byte push loop).
+        let aligned = (new_data.len() + 3) & !3;
+        new_data.resize(aligned, 0);
 
         ext.data = Bytes::from(new_data);
         self.extension = Some(ext);
@@ -323,8 +325,29 @@ impl RtpPacket {
         Self::marshal_impl(self, buf);
     }
 
+    /// Marshal only the header (fixed fields + CSRC list + extension) into
+    /// `buf`, excluding payload and padding. Used by SRTP to feed the HMAC
+    /// authentication tag incrementally (header bytes, then ciphertext, then
+    /// ROC) without allocating the full marshaled packet on every protect.
+    pub(crate) fn marshal_header_into(&self, buf: &mut Vec<u8>) {
+        buf.clear();
+        Self::write_header(self, buf);
+    }
+
     fn marshal_impl(packet: &RtpPacket, buffer: &mut Vec<u8>) {
-        buffer.reserve(12 + packet.header.csrcs.len() * 4 + packet.payload.len() as usize);
+        buffer.reserve(12 + packet.header.csrcs.len() * 4 + packet.payload.len());
+        Self::write_header(packet, buffer);
+        buffer.extend_from_slice(&packet.payload);
+        if packet.padding_len > 0 {
+            buffer.extend(std::iter::repeat_n(
+                packet.padding_len,
+                packet.padding_len as usize,
+            ));
+        }
+    }
+
+    /// Write the fixed header + CSRC list + extension block (no payload/padding).
+    fn write_header(packet: &RtpPacket, buffer: &mut Vec<u8>) {
         let mut b0 = RTP_VERSION << 6;
         if packet.padding_len > 0 {
             b0 |= 0x20;
@@ -350,13 +373,6 @@ impl RtpPacket {
             buffer.extend_from_slice(&extension.profile.to_be_bytes());
             buffer.extend_from_slice(&length_words.to_be_bytes());
             buffer.extend_from_slice(&extension.data);
-        }
-        buffer.extend_from_slice(&packet.payload);
-        if packet.padding_len > 0 {
-            buffer.extend(std::iter::repeat_n(
-                packet.padding_len,
-                packet.padding_len as usize,
-            ));
         }
     }
 }
@@ -482,7 +498,9 @@ pub enum RtcpPacket {
 }
 
 pub fn parse_rtcp_packets(raw: &[u8], addr: Option<SocketAddr>) -> RtpResult<Vec<RtcpPacket>> {
-    let mut packets = Vec::new();
+    // RTCP compound packets typically contain 1-3 sub-packets; preallocate to
+    // avoid the grow-from-zero reallocation on the (occasional) receive path.
+    let mut packets = Vec::with_capacity(4);
     let mut offset = 0usize;
     while offset + 4 <= raw.len() {
         let vrc = raw[offset];
@@ -1023,7 +1041,8 @@ fn pack_nack_pairs(packets: &[u16]) -> Vec<(u16, u16)> {
     let mut seqs = packets.to_vec();
     seqs.sort_unstable();
     seqs.dedup();
-    let mut pairs = Vec::new();
+    // At most one (pid, blp) pair per input seq — preallocate accordingly.
+    let mut pairs = Vec::with_capacity(seqs.len());
     let mut idx = 0;
     while idx < seqs.len() {
         let pid = seqs[idx];

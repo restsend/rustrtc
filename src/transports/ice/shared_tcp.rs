@@ -5,7 +5,6 @@
 //! server ufrag in the first STUN Binding request USERNAME attribute.
 
 use super::{IceTransportInner, MAX_STUN_MESSAGE, attach_demuxed_tcp_stream};
-use crate::transports::ice::stun::{StunClass, StunMessage, StunMethod};
 use anyhow::{Context, Result, anyhow, bail};
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -183,8 +182,15 @@ async fn read_tcp_framed_packet(stream: &mut TcpStream) -> Result<Vec<u8>> {
 /// USERNAME on an inbound Binding request is `peer-ufrag:own-ufrag` from the sender.
 /// For a browser connecting to our passive listener, peer-ufrag is our local ufrag.
 pub(crate) fn peer_ufrag_from_binding_request(data: &[u8]) -> Option<String> {
-    let decoded = StunMessage::decode(data).ok()?;
-    if decoded.class != StunClass::Request || decoded.method != StunMethod::Binding {
+    // Cheap header classification (Binding method + Request class) instead of a
+    // full attribute decode — this runs on every STUN packet in the mux path.
+    if data.len() < 20 {
+        return None;
+    }
+    let msg_type = u16::from_be_bytes([data[0], data[1]]);
+    let is_binding = (msg_type & 0x3EEF) == 0x0001;
+    let is_request = (msg_type & 0x0110) == 0x0000;
+    if !is_binding || !is_request {
         return None;
     }
     let username = username_from_stun_bytes(data)?;
@@ -221,7 +227,7 @@ pub(crate) fn username_from_stun_bytes(bytes: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transports::ice::stun::{StunAttribute, random_bytes};
+    use crate::transports::ice::stun::{StunAttribute, StunMessage, random_bytes};
 
     #[test]
     fn extracts_peer_ufrag_from_binding_username() {

@@ -8,7 +8,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
 };
 use bytes::Bytes;
-use ctr::cipher::{KeyIvInit, StreamCipher};
+use ctr::cipher::{InnerIvInit, StreamCipher};
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use std::collections::HashMap;
@@ -17,6 +17,9 @@ use std::fmt;
 
 type Aes128Ctr = ctr::Ctr128BE<Aes128>;
 type HmacSha1 = Hmac<Sha1>;
+
+/// Maximum HMAC-SHA1 digest length (used for fixed-size auth-tag buffers).
+const SHA1_LEN: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SrtpProfile {
@@ -221,13 +224,24 @@ pub struct SrtpContext {
     _profile: SrtpProfile,
     rtp_keys: SessionKeys,
     rtcp_keys: SessionKeys,
+    /// Pre-expanded AES-128 round keys for the RTP session cipher key. Building
+    /// this once avoids re-running the AES key schedule on every packet (the
+    /// `ctr` cipher is reconstructed per packet from this cached key + a
+    /// per-packet IV, which is a cheap clone of the round keys, not a re-key).
+    rtp_aes_key: Aes128,
+    rtcp_aes_key: Aes128,
     rtp_gcm_cipher: Option<Aes128Gcm>,
     rtcp_gcm_cipher: Option<Aes128Gcm>,
     rtp_auth_prototype: Option<HmacSha1>,
+    rtcp_auth_prototype: Option<HmacSha1>,
     direction: SrtpDirection,
     rollover_counter: u32,
     last_sequence: Option<u16>,
     rtcp_index: u32,
+    /// Reusable scratch buffer holding the marshaled RTP header (fixed fields +
+    /// CSRC list + extension) for incremental HMAC computation. Avoids a
+    /// per-packet allocation of the full marshaled packet on the auth path.
+    auth_scratch: Vec<u8>,
     /// Wall-clock time of the most recent protect/unprotect call, used to evict
     /// contexts for SSRCs that have gone away (prevents unbounded growth as
     /// SSRCs churn across a long call / relay).
@@ -260,6 +274,14 @@ impl SrtpContext {
 
         let (rtp_keys, rtcp_keys) = Self::derive_keys(profile, &keying)?;
 
+        // Pre-expand the AES-128 key schedules once (instead of per packet).
+        let mut rtp_key_bytes = [0u8; 16];
+        rtp_key_bytes.copy_from_slice(&rtp_keys.cipher_key[..16]);
+        let mut rtcp_key_bytes = [0u8; 16];
+        rtcp_key_bytes.copy_from_slice(&rtcp_keys.cipher_key[..16]);
+        let rtp_aes_key = <Aes128 as ctr::cipher::KeyInit>::new(&rtp_key_bytes.into());
+        let rtcp_aes_key = <Aes128 as ctr::cipher::KeyInit>::new(&rtcp_key_bytes.into());
+
         let rtp_gcm_cipher = if let SrtpProfile::AeadAes128Gcm = profile {
             Some(
                 Aes128Gcm::new_from_slice(&rtp_keys.cipher_key)
@@ -287,18 +309,31 @@ impl SrtpContext {
             None
         };
 
+        let rtcp_auth_prototype = if !rtcp_keys.auth_key.is_empty() {
+            Some(
+                <HmacSha1 as hmac::digest::KeyInit>::new_from_slice(&rtcp_keys.auth_key)
+                    .map_err(|_| SrtpError::UnsupportedProfile)?,
+            )
+        } else {
+            None
+        };
+
         Ok(Self {
             ssrc,
             _profile: profile,
             rtp_keys,
             rtcp_keys,
+            rtp_aes_key,
+            rtcp_aes_key,
             rtp_gcm_cipher,
             rtcp_gcm_cipher,
             rtp_auth_prototype,
+            rtcp_auth_prototype,
             direction,
             rollover_counter: 0,
             last_sequence: None,
             rtcp_index: 0,
+            auth_scratch: Vec::new(),
             last_used: std::time::Instant::now(),
         })
     }
@@ -361,7 +396,7 @@ impl SrtpContext {
 
         // Run AES-CM
         let mut out = vec![0u8; len];
-        let mut cipher = Aes128Ctr::new_from_slices(&master_key[..16], &iv)
+        let mut cipher = <Aes128Ctr as ctr::cipher::KeyIvInit>::new_from_slices(&master_key[..16], &iv)
             .map_err(|_| SrtpError::UnsupportedProfile)?;
         cipher.apply_keystream(&mut out);
 
@@ -409,15 +444,16 @@ impl SrtpContext {
         // Encrypt payload (everything after first 8 bytes of header)
         // RFC 3711: The first 8 octets of the RTCP header are not encrypted.
         if packet.len() > 8 {
-            self.cipher_rtcp(packet, index)?;
+            self.cipher_rtcp(packet, index);
         }
 
         // Append SRTCP Index
         packet.extend_from_slice(&index_with_e.to_be_bytes());
 
         // Authenticate
-        let tag = self.auth_tag_rtcp(packet)?;
-        packet.extend_from_slice(&tag);
+        let mut tag = [0u8; SHA1_LEN];
+        self.auth_tag_rtcp_into(packet, &mut tag)?;
+        packet.extend_from_slice(&tag[..self._profile.tag_len()]);
 
         Ok(())
     }
@@ -478,12 +514,14 @@ impl SrtpContext {
 
         // Split tag
         let split = packet.len() - tag_len;
-        let tag = packet[split..].to_vec();
+        let mut tag = [0u8; SHA1_LEN];
+        tag[..tag_len].copy_from_slice(&packet[split..split + tag_len]);
         packet.truncate(split);
 
         // Verify tag
-        let expected = self.auth_tag_rtcp(packet)?;
-        if !constant_time_eq(&tag, &expected) {
+        let mut expected = [0u8; SHA1_LEN];
+        self.auth_tag_rtcp_into(packet, &mut expected)?;
+        if !constant_time_eq(&tag[..tag_len], &expected[..tag_len]) {
             return Err(SrtpError::AuthenticationFailed);
         }
 
@@ -507,47 +545,55 @@ impl SrtpContext {
         }
 
         if e_bit && packet.len() > 8 {
-            self.cipher_rtcp(packet, index)?;
+            self.cipher_rtcp(packet, index);
         }
 
         Ok(())
     }
 
-    fn cipher_rtcp(&self, packet: &mut [u8], index: u32) -> SrtpResult<()> {
-        // IV = (salt << 16) XOR (SSRC << 64) XOR (SRTCP_INDEX << 16)
-        // Actually:
-        // IV = (k_s * 2^16) XOR (SSRC * 2^64) XOR (SRTCP_INDEX * 2^16)
+    /// Build an AES-128-CTR cipher from a pre-expanded key schedule and a
+    /// per-packet IV. This reuses the cached round keys (a cheap clone) instead
+    /// of re-running the AES key expansion on every packet.
+    #[inline]
+    fn ctr_from_key(key: &Aes128, iv: [u8; 16]) -> Aes128Ctr {
+        let core = <ctr::CtrCore<Aes128, ctr::flavors::Ctr128BE> as InnerIvInit>::inner_iv_init(
+            key.clone(),
+            &iv.into(),
+        );
+        Aes128Ctr::from_core(core)
+    }
 
+    fn cipher_rtcp(&self, packet: &mut [u8], index: u32) {
+        // IV = (salt * 2^16) XOR (SSRC * 2^64) XOR (SRTCP_INDEX * 2^16)
         let mut iv = [0u8; 16];
-        for (i, &b) in self.rtcp_keys.salt.iter().take(14).enumerate() {
-            iv[i] = b;
-        }
+        iv[..14].copy_from_slice(&self.rtcp_keys.salt[..14]);
 
         let mut block = [0u8; 16];
         block[4..8].copy_from_slice(&self.ssrc.to_be_bytes());
         block[10..14].copy_from_slice(&index.to_be_bytes());
 
-        for i in 0..16 {
-            iv[i] ^= block[i];
+        for (a, &b) in iv.iter_mut().zip(block.iter()) {
+            *a ^= b;
         }
 
-        // Keystream
-        let mut cipher = Aes128Ctr::new_from_slices(&self.rtcp_keys.cipher_key[..16], &iv)
-            .map_err(|_| SrtpError::UnsupportedProfile)?;
-
-        // Encrypt/Decrypt payload (offset 8)
+        // Reuse the cached AES key schedule (a clone of the expanded round
+        // keys) instead of re-running AES key expansion on every RTCP packet.
+        let mut cipher = Self::ctr_from_key(&self.rtcp_aes_key, iv);
         cipher.apply_keystream(&mut packet[8..]);
-
-        Ok(())
     }
 
-    fn auth_tag_rtcp(&self, data: &[u8]) -> SrtpResult<Vec<u8>> {
-        let mut mac = <HmacSha1 as hmac::digest::KeyInit>::new_from_slice(&self.rtcp_keys.auth_key)
-            .map_err(|_| SrtpError::UnsupportedProfile)?;
+    /// Compute the RTCP auth tag (HMAC-SHA1, truncated) into `out`, reusing the
+    /// cached HMAC prototype to avoid re-padding the key (and a `Vec` alloc) on
+    /// every RTCP packet.
+    fn auth_tag_rtcp_into(&self, data: &[u8], out: &mut [u8; SHA1_LEN]) -> SrtpResult<()> {
+        let mut mac = self
+            .rtcp_auth_prototype
+            .as_ref()
+            .ok_or(SrtpError::UnsupportedProfile)?
+            .clone();
         mac.update(data);
-        let result = mac.finalize().into_bytes();
-        let tag_len = self._profile.tag_len();
-        Ok(result[..tag_len].to_vec())
+        out.copy_from_slice(&mac.finalize().into_bytes());
+        Ok(())
     }
 
     pub fn protect(&mut self, packet: &mut RtpPacket) -> SrtpResult<()> {
@@ -579,12 +625,35 @@ impl SrtpContext {
             return Ok(());
         }
 
-        self.cipher_payload(packet, roc)?;
-        let auth_input = packet.marshal()?;
-        let tag = self.auth_tag(&auth_input, roc)?;
-        let mut with_tag = packet.payload.to_vec();
-        with_tag.extend_from_slice(&tag);
-        packet.payload = Bytes::from(with_tag);
+        let tag_len = self._profile.tag_len();
+        // AES-CM / Null path. Encrypt into a single owned buffer that becomes
+        // the final SRTP payload (ciphertext + auth tag), avoiding the previous
+        // double copy (one buffer for the keystream, another to append the tag).
+        let mut buf = packet.payload.to_vec();
+        let encrypts = !matches!(self._profile, SrtpProfile::NullCipherHmac);
+        if !buf.is_empty() && encrypts {
+            let iv = self.build_iv(packet.header.sequence_number, roc);
+            // Reuse the cached AES key schedule; only the per-packet IV differs.
+            let mut cipher = Self::ctr_from_key(&self.rtp_aes_key, iv);
+            cipher.apply_keystream(&mut buf);
+        }
+
+        // Auth tag over (header || ciphertext || padding || ROC), computed
+        // incrementally so no full marshaled packet is allocated per call.
+        if let Some(proto) = self.rtp_auth_prototype.as_ref() {
+            let mut mac = proto.clone();
+            packet.marshal_header_into(&mut self.auth_scratch);
+            mac.update(&self.auth_scratch);
+            mac.update(&buf);
+            if packet.padding_len > 0 {
+                let pad = [packet.padding_len; 255];
+                mac.update(&pad[..packet.padding_len as usize]);
+            }
+            mac.update(&roc.to_be_bytes());
+            let result = mac.finalize().into_bytes();
+            buf.extend_from_slice(&result[..tag_len]);
+        }
+        packet.payload = Bytes::from(buf);
         self.update(packet.header.sequence_number, roc);
         Ok(())
     }
@@ -624,52 +693,40 @@ impl SrtpContext {
         }
 
         let split = packet.payload.len() - tag_len;
-        let tag = packet.payload[split..].to_vec();
-        // Truncate the auth tag via a zero-copy slice (Bytes is immutable).
+        // Copy the trailing auth tag into a fixed-size buffer (no allocation),
+        // then zero-copy truncate the payload down to the ciphertext.
+        let mut tag = [0u8; SHA1_LEN];
+        tag[..tag_len].copy_from_slice(&packet.payload[split..split + tag_len]);
         packet.payload = packet.payload.slice(..split);
-        let auth_input = packet.marshal()?;
-        let expected = self.auth_tag(&auth_input, roc)?;
-        if !constant_time_eq(&tag, &expected) {
-            return Err(SrtpError::AuthenticationFailed);
+
+        // Verify the auth tag incrementally over header || ciphertext || ROC.
+        if let Some(proto) = self.rtp_auth_prototype.as_ref() {
+            let mut mac = proto.clone();
+            packet.marshal_header_into(&mut self.auth_scratch);
+            mac.update(&self.auth_scratch);
+            mac.update(&packet.payload);
+            if packet.padding_len > 0 {
+                let pad = [packet.padding_len; 255];
+                mac.update(&pad[..packet.padding_len as usize]);
+            }
+            mac.update(&roc.to_be_bytes());
+            let result = mac.finalize().into_bytes();
+            if !constant_time_eq(&tag[..tag_len], &result[..tag_len]) {
+                return Err(SrtpError::AuthenticationFailed);
+            }
         }
-        self.cipher_payload(packet, roc)?;
+
+        // Decrypt the ciphertext in place.
+        let decrypts = !matches!(self._profile, SrtpProfile::NullCipherHmac);
+        if !packet.payload.is_empty() && decrypts {
+            let iv = self.build_iv(packet.header.sequence_number, roc);
+            let mut cipher = Self::ctr_from_key(&self.rtp_aes_key, iv);
+            let mut buf = packet.payload.to_vec();
+            cipher.apply_keystream(&mut buf);
+            packet.payload = Bytes::from(buf);
+        }
         self.update(packet.header.sequence_number, roc);
         Ok(())
-    }
-
-    fn cipher_payload(&self, packet: &mut RtpPacket, roc: u32) -> SrtpResult<()> {
-        if packet.payload.is_empty() {
-            return Ok(());
-        }
-        match self._profile {
-            SrtpProfile::NullCipherHmac => Ok(()),
-            SrtpProfile::Aes128Sha1_80 | SrtpProfile::Aes128Sha1_32 => {
-                let iv = self.build_iv(packet.header.sequence_number, roc);
-                let mut cipher = Aes128Ctr::new_from_slices(&self.rtp_keys.cipher_key[..16], &iv)
-                    .map_err(|_| SrtpError::UnsupportedProfile)?;
-                // `Bytes` is immutable; copy into a mutable buffer, apply the
-                // keystream, then write back. SRTP is the WebRTC-only path so
-                // this copy does not affect the plain-RTP forwarding hot path.
-                let mut buf = packet.payload.to_vec();
-                cipher.apply_keystream(&mut buf);
-                packet.payload = Bytes::from(buf);
-                Ok(())
-            }
-            _ => Err(SrtpError::UnsupportedProfile),
-        }
-    }
-
-    fn auth_tag(&self, data: &[u8], roc: u32) -> SrtpResult<Vec<u8>> {
-        let mut mac = self
-            .rtp_auth_prototype
-            .as_ref()
-            .ok_or(SrtpError::UnsupportedProfile)?
-            .clone();
-        mac.update(data);
-        mac.update(&roc.to_be_bytes());
-        let result = mac.finalize().into_bytes();
-        let tag_len = self._profile.tag_len();
-        Ok(result[..tag_len].to_vec())
     }
 
     fn build_gcm_rtcp_nonce(&self, index: u32) -> [u8; 12] {
@@ -704,19 +761,17 @@ impl SrtpContext {
     fn build_iv(&self, sequence: u16, roc: u32) -> [u8; 16] {
         let index = ((roc as u64) << 16) | sequence as u64;
         let mut iv = [0u8; 16];
-        for (i, byte) in self.rtp_keys.salt.iter().enumerate().take(14) {
-            iv[i] = *byte;
-        }
+        iv[..14].copy_from_slice(&self.rtp_keys.salt[..14]);
+
         let mut block = [0u8; 16];
         block[4..8].copy_from_slice(&self.ssrc.to_be_bytes());
 
         // IV = (salt * 2^16) XOR (SSRC * 2^64) XOR (Index * 2^16)
-        // We need to shift index left by 16 bits.
         let iv_part = index << 16;
         block[8..16].copy_from_slice(&iv_part.to_be_bytes());
 
-        for i in 0..16 {
-            iv[i] ^= block[i];
+        for (a, &b) in iv.iter_mut().zip(block.iter()) {
+            *a ^= b;
         }
         iv
     }

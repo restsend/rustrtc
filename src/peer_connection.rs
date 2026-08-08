@@ -14,7 +14,9 @@ use crate::transports::dtls::{self, DtlsTransport};
 use crate::transports::get_local_ip;
 use crate::transports::ice::stun::random_u32;
 use crate::transports::ice::{IceCandidate, IceGathererState, IceTransport, conn::IceConn};
-use crate::transports::rtp::{RtpRewriteBridgeParams, RtpTransport};
+use crate::transports::rtp::{
+    RtpRewriteBridgeOptions, RtpRewriteBridgeParams, RtpRewriteRule, RtpTransport,
+};
 use crate::transports::sctp::{SctpLinkStats, SctpTransport};
 use crate::transports::udptl::UdtlTransport;
 use crate::{
@@ -33,7 +35,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Notify, broadcast, mpsc, watch};
-use tracing::{debug, info, trace, warn};
+use tracing::{Instrument, debug, debug_span, trace, warn};
 
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -675,6 +677,11 @@ struct PeerConnectionInner {
     /// shutdown so they cannot outlive the connection and leak the Arcs they
     /// captured (tracks, transports, etc.).
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Root span for this PeerConnection. Carries the configured `label` (set
+    /// by the application, e.g. rustpbx's `{session_id}-{leg}`) and is
+    /// instrumented onto every internal runner task so all ICE/DTLS/RTP logs
+    /// for one connection stay correlated.
+    pc_span: tracing::Span,
 }
 
 pub(crate) fn generate_sdes_key_params() -> String {
@@ -746,6 +753,15 @@ impl PeerConnection {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (disconnect_reason_tx, disconnect_reason_rx) = watch::channel(None);
 
+        // Root correlation span for all internal tasks of this connection.
+        // The label (when the application sets it, e.g. rustpbx's
+        // `{session_id}-{leg}`) is recorded on the span so every log emitted
+        // inside the instrumented runner tasks carries it.
+        let pc_span = match config.label.clone() {
+            Some(l) => debug_span!("pc", label = %l),
+            None => debug_span!("pc"),
+        };
+
         let inner = PeerConnectionInner {
             config,
             signaling_state: signaling_state_tx,
@@ -779,6 +795,7 @@ impl PeerConnection {
             disconnect_reason: disconnect_reason_tx,
             _disconnect_reason_rx: disconnect_reason_rx,
             tasks: Mutex::new(Vec::new()),
+            pc_span,
         };
         let pc = Self {
             inner: Arc::new(inner),
@@ -792,11 +809,15 @@ impl PeerConnection {
             let inner_weak = Arc::downgrade(&pc.inner);
             let ice_transport = pc.inner.ice_transport.clone();
             let ice_connection_state_tx = pc.inner.ice_connection_state.clone();
-            let h = tokio::spawn(async move {
-                let rtp_ice_loop =
-                    run_rtp_direct_loop(ice_transport, ice_connection_state_tx, inner_weak);
-                tokio::join!(rtp_ice_loop, ice_runner);
-            });
+            let h = crate::spawn_rtc(
+                pc.inner.config.runtime_handle.as_ref(),
+                pc.inner.pc_span.clone(),
+                async move {
+                    let rtp_ice_loop =
+                        run_rtp_direct_loop(ice_transport, ice_connection_state_tx, inner_weak);
+                    tokio::join!(rtp_ice_loop, ice_runner);
+                },
+            );
             pc.inner.track_task(h);
         } else {
             let inner_weak = Arc::downgrade(&pc.inner);
@@ -807,22 +828,26 @@ impl PeerConnection {
             let ice_transport_gathering = ice_transport.clone();
             let ice_gathering_state_tx = pc.inner.ice_gathering_state.clone();
             let inner_weak_gathering = inner_weak.clone();
-            let h = tokio::spawn(async move {
-                let gathering_loop = run_gathering_loop(
-                    ice_transport_gathering,
-                    ice_gathering_state_tx,
-                    inner_weak_gathering,
-                );
+            let h = crate::spawn_rtc(
+                pc.inner.config.runtime_handle.as_ref(),
+                pc.inner.pc_span.clone(),
+                async move {
+                    let gathering_loop = run_gathering_loop(
+                        ice_transport_gathering,
+                        ice_gathering_state_tx,
+                        inner_weak_gathering,
+                    );
 
-                let dtls_loop = run_ice_dtls_loop(
-                    ice_transport,
-                    ice_connection_state_tx,
-                    dtls_role_rx,
-                    inner_weak,
-                );
+                    let dtls_loop = run_ice_dtls_loop(
+                        ice_transport,
+                        ice_connection_state_tx,
+                        dtls_role_rx,
+                        inner_weak,
+                    );
 
-                tokio::join!(gathering_loop, dtls_loop, ice_runner);
-            });
+                    tokio::join!(gathering_loop, dtls_loop, ice_runner);
+                },
+            );
             pc.inner.track_task(h);
         }
         pc
@@ -854,6 +879,27 @@ impl PeerConnection {
             RtcError::InvalidState("RTP transport is not ready for PeerConnection".into())
         })?;
         transport.bridge_rewrite_to(transport.clone(), params);
+        Ok(())
+    }
+
+    /// Install a payload-type-aware rewrite bridge between two PeerConnections.
+    /// Rules are matched per packet (exact-PT first, then catch-all); packets
+    /// matching no rule pass through with their SSRC/PT untouched.
+    pub fn bridge_rtp_with_rewrite_rules(
+        &self,
+        dst: &PeerConnection,
+        options: RtpRewriteBridgeOptions,
+        rules: &[RtpRewriteRule],
+    ) -> RtcResult<()> {
+        let src = self.inner.rtp_transport.lock().clone().ok_or_else(|| {
+            RtcError::InvalidState("RTP transport is not ready for source PeerConnection".into())
+        })?;
+        let dst = dst.inner.rtp_transport.lock().clone().ok_or_else(|| {
+            RtcError::InvalidState(
+                "RTP transport is not ready for destination PeerConnection".into(),
+            )
+        })?;
+        src.bridge_rewrite_rules_to(dst, options, rules.to_vec());
         Ok(())
     }
 
@@ -1013,6 +1059,8 @@ impl PeerConnection {
         let transceiver = Arc::new(RtpTransceiver::new(kind, direction));
         let mut builder = RtpReceiverBuilder::new(kind, 0)
             .payload_map(transceiver.payload_map.clone())
+            .pc_span(self.inner.pc_span.clone())
+            .runtime_handle(self.inner.config.runtime_handle.clone())
             .interceptor(self.inner.stats_collector.clone())
             .depacketizer_factory(self.inner.config.depacketizer_strategy.factory.clone());
         for i in &self.inner.config.recorder_interceptors.receivers {
@@ -1094,7 +1142,7 @@ impl PeerConnection {
                 .iter()
                 .find(|t| t.kind() == kind && t.mid().is_some() && t.sender.lock().is_none())
             {
-                info!(
+                debug!(
                     "add_track: reusing offer transceiver kind={:?} mid={:?}",
                     kind,
                     existing.mid()
@@ -1111,6 +1159,8 @@ impl PeerConnection {
         let mut builder = RtpSenderBuilder::new(track, ssrc)
             .stream_id(stream_id)
             .params(params)
+            .pc_span(self.inner.pc_span.clone())
+            .runtime_handle(self.inner.config.runtime_handle.clone())
             .interceptor(self.inner.stats_collector.clone());
         for i in &self.inner.config.recorder_interceptors.senders {
             builder = builder.interceptor(i.clone());
@@ -1751,6 +1801,8 @@ impl PeerConnection {
 
                     let mut builder = RtpReceiverBuilder::new(kind, receiver_ssrc)
                         .payload_map(t.payload_map.clone())
+                        .pc_span(self.inner.pc_span.clone())
+                        .runtime_handle(self.inner.config.runtime_handle.clone())
                         .interceptor(self.inner.stats_collector.clone());
 
                     let nack_enabled = if let Some(caps) = &self.inner.config.media_capabilities {
@@ -1936,10 +1988,14 @@ impl PeerConnection {
 
         for fut in loops {
             let done = done.clone();
-            let handle = tokio::spawn(async move {
-                let _done = TransportLoopDone(done);
-                fut.await;
-            });
+            let handle = crate::spawn_rtc(
+                self.inner.config.runtime_handle.as_ref(),
+                self.inner.pc_span.clone(),
+                async move {
+                    let _done = TransportLoopDone(done);
+                    fut.await;
+                },
+            );
             handles.push(handle);
         }
 
@@ -1953,7 +2009,9 @@ impl PeerConnection {
         &self,
         is_client: bool,
     ) -> RtcResult<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> {
-        debug!("start_dtls: starting with is_client={}", is_client);
+        self.inner
+            .pc_span
+            .in_scope(|| debug!("start_dtls: starting with is_client={}", is_client));
         let pair = self
             .inner
             .ice_transport
@@ -2087,7 +2145,11 @@ impl PeerConnection {
 
         // Start the handshake loop before flushing buffered packets so inbound
         // DTLS records are not dropped on the try_send race.
-        let mut dtls_runner_task = tokio::spawn(dtls_runner);
+        let mut dtls_runner_task = crate::spawn_rtc(
+            self.inner.config.runtime_handle.as_ref(),
+            self.inner.pc_span.clone(),
+            dtls_runner,
+        );
         // Once the runner task completes we must not poll its JoinHandle again
         // (tokio panics with "JoinHandle polled after completion"). This flag
         // guards the select! branch below so the handle is only ever polled once.
@@ -2381,10 +2443,12 @@ impl PeerConnection {
             match crate::srtp::SrtpSession::new(profile, tx_keying, rx_keying) {
                 Ok(session) => {
                     rtp_transport.start_srtp(session);
-                    info!(
-                        "setup_srtp: SRTP session ready (is_client={}, profile={:?})",
-                        is_client, profile
-                    );
+                    self.inner.pc_span.in_scope(|| {
+                        debug!(
+                            "setup_srtp: SRTP session ready (is_client={}, profile={:?})",
+                            is_client, profile
+                        )
+                    });
 
                     let transceivers = self.inner.transceivers.lock();
                     for t in transceivers.iter() {
@@ -2758,12 +2822,16 @@ impl PeerConnection {
         );
         let pair_monitor =
             Self::create_pair_monitor(ice_transport.subscribe_selected_pair(), ice_conn);
-        let h = tokio::spawn(async move {
-            tokio::select! {
-                _ = rtcp_loop => {},
-                _ = pair_monitor => {},
-            }
-        });
+        let h = crate::spawn_rtc(
+            self.inner.config.runtime_handle.as_ref(),
+            self.inner.pc_span.clone(),
+            async move {
+                tokio::select! {
+                    _ = rtcp_loop => {},
+                    _ = pair_monitor => {},
+                }
+            },
+        );
         self.inner.track_task(h);
 
         rtp_transport
@@ -3153,11 +3221,15 @@ impl PeerConnection {
             let transport = self.inner.sctp_transport.lock().clone();
             if let Some(transport) = transport {
                 let dc_clone = dc.clone();
-                let h = tokio::spawn(async move {
-                    if let Err(e) = transport.send_dcep_open(&dc_clone).await {
-                        debug!("Failed to send DCEP OPEN: {}", e);
-                    }
-                });
+                let h = crate::spawn_rtc(
+                    self.inner.config.runtime_handle.as_ref(),
+                    self.inner.pc_span.clone(),
+                    async move {
+                        if let Err(e) = transport.send_dcep_open(&dc_clone).await {
+                            debug!("Failed to send DCEP OPEN: {}", e);
+                        }
+                    },
+                );
                 self.inner.track_task(h);
             }
         }
@@ -4032,10 +4104,13 @@ async fn handle_connected_state_no_dtls(
                                     }
                                     let epoch = disconnect_epoch;
                                     let tx = grace_tx.clone();
-                                    tokio::spawn(async move {
-                                        tokio::time::sleep(grace).await;
-                                        let _ = tx.send(epoch);
-                                    });
+                                    tokio::spawn(
+                                        async move {
+                                            tokio::time::sleep(grace).await;
+                                            let _ = tx.send(epoch);
+                                        }
+                                        .instrument(tracing::Span::current()),
+                                    );
                                     debug!("ICE Disconnected, grace timer started ({:.1}s, epoch {})", grace.as_secs_f64(), epoch);
                                 }
                                 crate::transports::ice::IceTransportState::Connected
@@ -4136,10 +4211,13 @@ async fn handle_connected_state(
                                                 let _ = ice_connection_state_tx.send(IceConnectionState::Disconnected);
                                                 let epoch = disconnect_epoch;
                                                 let tx = grace_tx.clone();
-                                                tokio::spawn(async move {
-                                                    tokio::time::sleep(grace).await;
-                                                    let _ = tx.send(epoch);
-                                                });
+                                                tokio::spawn(
+                                                    async move {
+                                                        tokio::time::sleep(grace).await;
+                                                        let _ = tx.send(epoch);
+                                                    }
+                                                    .instrument(tracing::Span::current()),
+                                                );
                                                 debug!("ICE Disconnected, grace timer started ({:.1}s, epoch {})", grace.as_secs_f64(), epoch);
                                             }
                                             crate::transports::ice::IceTransportState::Connected
@@ -4216,10 +4294,13 @@ async fn handle_connected_state(
                                                 let _ = ice_connection_state_tx.send(IceConnectionState::Disconnected);
                                                 let epoch = disconnect_epoch;
                                                 let tx = grace_tx.clone();
-                                                tokio::spawn(async move {
-                                                    tokio::time::sleep(grace).await;
-                                                    let _ = tx.send(epoch);
-                                                });
+                                                tokio::spawn(
+                                                    async move {
+                                                        tokio::time::sleep(grace).await;
+                                                        let _ = tx.send(epoch);
+                                                    }
+                                                    .instrument(tracing::Span::current()),
+                                                );
                                                 debug!("ICE Disconnected, grace timer started ({:.1}s, epoch {})", grace.as_secs_f64(), epoch);
                                             }
                                             crate::transports::ice::IceTransportState::Connected
@@ -4328,7 +4409,11 @@ impl PeerConnectionInner {
         }
 
         let (transport, runner) = IceTransport::new(self.config.clone());
-        let h = tokio::spawn(runner);
+        let h = crate::spawn_rtc(
+            self.config.runtime_handle.as_ref(),
+            self.pc_span.clone(),
+            runner,
+        );
         self.track_task(h);
         transports.insert(transceiver_id, transport.clone());
         transport
@@ -5284,7 +5369,8 @@ impl PeerConnectionInner {
             reason_guard.clone().unwrap()
         };
 
-        tracing::debug!("PeerConnection closing: reason={}", final_reason);
+        self.pc_span
+            .in_scope(|| tracing::debug!("PeerConnection closing: reason={}", final_reason));
 
         // Log SCTP diagnostic info for debugging network issues
         if let Some(sctp) = self.sctp_transport.lock().as_ref() {
@@ -5308,7 +5394,7 @@ impl PeerConnectionInner {
                 if let Some(receiver) = t.receiver() {
                     let track = receiver.track();
                     track.stop();
-                    tracing::debug!(
+                    tracing::trace!(
                         "PeerConnection.close: marked receiver track {} as ended",
                         track.id()
                     );
@@ -5321,7 +5407,7 @@ impl PeerConnectionInner {
         if let Some(transport) = rtp_transport.as_ref() {
             let count = transport.clear_listeners();
             if count > 0 {
-                tracing::debug!("PeerConnection.close: cleared {} listeners", count);
+                tracing::trace!("PeerConnection.close: cleared {} listeners", count);
             }
 
             // Send RTCP BYE — synchronous, best-effort (no spawn/await: the
@@ -5352,7 +5438,7 @@ impl PeerConnectionInner {
         for transport in extra_transports {
             let count = transport.clear_listeners();
             if count > 0 {
-                tracing::debug!(
+                tracing::trace!(
                     "PeerConnection.close: cleared {} extra RTP listeners",
                     count
                 );
@@ -5383,7 +5469,8 @@ impl PeerConnectionInner {
 
 impl Drop for PeerConnectionInner {
     fn drop(&mut self) {
-        debug!("PeerConnectionInner dropped, stopping ICE transport");
+        self.pc_span
+            .in_scope(|| debug!("PeerConnectionInner dropped, stopping ICE transport"));
         self.close_with_reason(DisconnectReason::Dropped);
         // Belt-and-suspenders: abort any tracked task that survived cooperative
         // shutdown so it (and the Arcs it captured) cannot outlive the PC.
@@ -5862,6 +5949,11 @@ pub struct RtpSender {
     sdes_mid: Arc<Mutex<Option<(u8, Arc<str>)>>>,
     transport_generation: Arc<AtomicU64>,
     transport_change_tx: watch::Sender<u64>,
+    /// Correlation span of the owning PeerConnection; instrumented onto the
+    /// send-loop task so its logs stay grouped with the rest of the session.
+    pc_span: tracing::Span,
+    /// Dedicated runtime for the send loop (see `RtcConfiguration.runtime_handle`).
+    runtime_handle: Option<tokio::runtime::Handle>,
 }
 
 pub struct RtpSenderBuilder {
@@ -5871,6 +5963,8 @@ pub struct RtpSenderBuilder {
     params: RtpCodecParameters,
     interceptors: Vec<Arc<dyn RtpSenderInterceptor + Send + Sync>>,
     cname: Option<String>,
+    pc_span: tracing::Span,
+    runtime_handle: Option<tokio::runtime::Handle>,
 }
 
 impl RtpSenderBuilder {
@@ -5882,6 +5976,8 @@ impl RtpSenderBuilder {
             params: RtpCodecParameters::default(),
             interceptors: Vec::new(),
             cname: None,
+            pc_span: debug_span!("pc"),
+            runtime_handle: None,
         }
     }
 
@@ -5917,6 +6013,20 @@ impl RtpSenderBuilder {
         self
     }
 
+    /// Attach the owning PeerConnection's correlation span so the send-loop
+    /// task's logs inherit the session label.
+    pub fn pc_span(mut self, span: tracing::Span) -> Self {
+        self.pc_span = span;
+        self
+    }
+
+    /// Attach the owning PeerConnection's dedicated runtime handle (see
+    /// `RtcConfiguration.runtime_handle`).
+    pub fn runtime_handle(mut self, handle: Option<tokio::runtime::Handle>) -> Self {
+        self.runtime_handle = handle;
+        self
+    }
+
     pub fn build(self) -> Arc<RtpSender> {
         Arc::new(RtpSender::new_internal(
             self.track,
@@ -5925,6 +6035,8 @@ impl RtpSenderBuilder {
             self.params,
             self.interceptors,
             self.cname,
+            self.pc_span,
+            self.runtime_handle,
         ))
     }
 }
@@ -5941,7 +6053,16 @@ impl RtpSender {
         params: RtpCodecParameters,
         interceptors: Vec<Arc<dyn RtpSenderInterceptor + Send + Sync>>,
     ) -> Self {
-        Self::new_internal(track, ssrc, stream_id, params, interceptors, None)
+        Self::new_internal(
+            track,
+            ssrc,
+            stream_id,
+            params,
+            interceptors,
+            None,
+            debug_span!("pc"),
+            None,
+        )
     }
 
     fn new_internal(
@@ -5951,6 +6072,8 @@ impl RtpSender {
         params: RtpCodecParameters,
         interceptors: Vec<Arc<dyn RtpSenderInterceptor + Send + Sync>>,
         cname_override: Option<String>,
+        pc_span: tracing::Span,
+        runtime_handle: Option<tokio::runtime::Handle>,
     ) -> Self {
         let track_label = track.id().to_string();
         let track_id = Arc::<str>::from(track_label.clone());
@@ -5978,6 +6101,8 @@ impl RtpSender {
             sdes_mid: Arc::new(Mutex::new(None)),
             transport_generation: Arc::new(AtomicU64::new(0)),
             transport_change_tx,
+            pc_span,
+            runtime_handle,
         }
     }
 
@@ -6064,7 +6189,7 @@ impl RtpSender {
             if let Some(existing) = current_transport.as_ref()
                 && Arc::ptr_eq(existing, &transport)
             {
-                info!(
+                debug!(
                     "ignored same transport track_id={}, ssrc={}, transport_ptr={:p}",
                     track_id,
                     ssrc,
@@ -6089,10 +6214,12 @@ impl RtpSender {
         let track_id = self.track_id.clone();
         let track = self.track.clone();
         let ssrc = self.ssrc;
-        info!(
-            "RtpSender: spawning send loop track_id={} ssrc={}",
-            track_id, ssrc
-        );
+        self.pc_span.in_scope(|| {
+            debug!(
+                "RtpSender: spawning send loop track_id={} ssrc={}",
+                track_id, ssrc
+            )
+        });
         let params_lock = self.params.clone();
         let stop_rx = self.stop_tx.clone();
         let mut transport_change_rx = self.transport_change_tx.subscribe();
@@ -6105,9 +6232,14 @@ impl RtpSender {
         let sdes_mid = self.sdes_mid.clone();
         let mut rtcp_rx = self.rtcp_tx.subscribe();
 
-        tokio::spawn(async move {
-            let mut sequence_number = next_seq.load(Ordering::SeqCst);
-            let mut logged_first_sample = false;
+        let pc_span = self.pc_span.clone();
+        let rt_handle = self.runtime_handle.clone();
+        crate::spawn_rtc(
+            rt_handle.as_ref(),
+            pc_span,
+            async move {
+                let mut sequence_number = next_seq.load(Ordering::SeqCst);
+                let mut logged_first_sample = false;
             let mut last_source_ts: Option<u32> = None;
             let mut timestamp_offset = random_u32(); // Start with random offset
             // Delay the first SR so the initial RTP burst is not immediately followed by RTCP
@@ -6182,7 +6314,7 @@ impl RtpSender {
                             Ok(mut sample) => {
                                 if !logged_first_sample {
                                     logged_first_sample = true;
-                                    info!(
+                                    trace!(
                                         "RtpSender: first sample dequeued ssrc={} track_id={}",
                                         ssrc, track_id
                                     );
@@ -6279,7 +6411,7 @@ impl RtpSender {
                                 } else {
                                     let n = packets_sent.fetch_add(1, Ordering::Relaxed) + 1;
                                     if n == 1 {
-                                        info!(
+                                        trace!(
                                             "RtpSender: first RTP packet sent on wire ssrc={} track_id={}",
                                             ssrc, track_id
                                         );
@@ -6297,7 +6429,8 @@ impl RtpSender {
                     }
                 }
             }
-        });
+        }
+    );
     }
 
     fn build_sender_report(
@@ -6376,6 +6509,11 @@ pub struct RtpReceiver {
     clock_rate_cache_pt: AtomicU8,
     clock_rate_cache: AtomicU32,
     pub depacketizer_factory: Arc<dyn DepacketizerFactory>,
+    /// Correlation span of the owning PeerConnection; instrumented onto the
+    /// receive-loop task so its logs stay grouped with the rest of the session.
+    pc_span: tracing::Span,
+    /// Dedicated runtime for the receive loop (see `RtcConfiguration.runtime_handle`).
+    runtime_handle: Option<tokio::runtime::Handle>,
 }
 
 pub struct RtpReceiverBuilder {
@@ -6384,6 +6522,8 @@ pub struct RtpReceiverBuilder {
     interceptors: Vec<Arc<dyn RtpReceiverInterceptor>>,
     depacketizer_factory: Option<Arc<dyn DepacketizerFactory>>,
     payload_map: Arc<RwLock<HashMap<u8, RtpCodecParameters>>>,
+    pc_span: tracing::Span,
+    runtime_handle: Option<tokio::runtime::Handle>,
 }
 
 impl RtpReceiverBuilder {
@@ -6394,6 +6534,8 @@ impl RtpReceiverBuilder {
             interceptors: Vec::new(),
             depacketizer_factory: None,
             payload_map: Arc::new(RwLock::new(HashMap::new())),
+            pc_span: debug_span!("pc"),
+            runtime_handle: None,
         }
     }
 
@@ -6418,6 +6560,20 @@ impl RtpReceiverBuilder {
 
     pub fn interceptor(mut self, interceptor: Arc<dyn RtpReceiverInterceptor>) -> Self {
         self.interceptors.push(interceptor);
+        self
+    }
+
+    /// Attach the owning PeerConnection's correlation span so the receive-loop
+    /// task's logs inherit the session label.
+    pub fn pc_span(mut self, span: tracing::Span) -> Self {
+        self.pc_span = span;
+        self
+    }
+
+    /// Attach the owning PeerConnection's dedicated runtime handle (see
+    /// `RtcConfiguration.runtime_handle`).
+    pub fn runtime_handle(mut self, handle: Option<tokio::runtime::Handle>) -> Self {
+        self.runtime_handle = handle;
         self
     }
 
@@ -6467,6 +6623,8 @@ impl RtpReceiverBuilder {
             depacketizer_factory: self.depacketizer_factory.unwrap_or_else(|| {
                 Arc::new(crate::media::depacketizer::DefaultDepacketizerFactory)
             }),
+            pc_span: self.pc_span,
+            runtime_handle: self.runtime_handle,
         })
     }
 }
@@ -6520,6 +6678,8 @@ impl RtpReceiver {
             clock_rate_cache_pt: AtomicU8::new(u8::MAX),
             clock_rate_cache: AtomicU32::new(0),
             depacketizer_factory: Arc::new(crate::media::depacketizer::DefaultDepacketizerFactory),
+            pc_span: debug_span!("pc"),
+            runtime_handle: None,
         }
     }
 
@@ -6827,17 +6987,19 @@ impl RtpReceiver {
         if let Some(rtx_ssrc) = *self.rtx_ssrc.lock() {
             transport.register_listener_sync(rtx_ssrc, tx.clone());
         }
-        debug!(
-            transport_id = format_args!("{:p}", Arc::as_ptr(&transport)),
-            transceiver_id = route_transceiver.as_ref().map(|t| t.id()),
-            transceiver_kind = ?route_transceiver.as_ref().map(|t| t.kind()),
-            transceiver_mid = ?route_transceiver.as_ref().and_then(|t| t.mid()),
-            receiver_kind = ?self.track.kind(),
-            receiver_ssrc = ssrc,
-            default_pt,
-            payload_types = ?payload_types,
-            "RTP receiver registered on transport"
-        );
+        self.pc_span.in_scope(|| {
+            debug!(
+                transport_id = format_args!("{:p}", Arc::as_ptr(&transport)),
+                transceiver_id = route_transceiver.as_ref().map(|t| t.id()),
+                transceiver_kind = ?route_transceiver.as_ref().map(|t| t.kind()),
+                transceiver_mid = ?route_transceiver.as_ref().and_then(|t| t.mid()),
+                receiver_kind = ?self.track.kind(),
+                receiver_ssrc = ssrc,
+                default_pt,
+                payload_types = ?payload_types,
+                "RTP receiver registered on transport"
+            )
+        });
 
         *self.packet_tx.lock() = Some(tx);
 
@@ -6865,9 +7027,15 @@ impl RtpReceiver {
         drop(tracks_guard);
 
         let weak_self = Arc::downgrade(self);
-        tokio::spawn(async move {
-            Self::run_loop(weak_self, cmd_rx, initial_tracks).await;
-        });
+        let pc_span = self.pc_span.clone();
+        let rt_handle = self.runtime_handle.clone();
+        crate::spawn_rtc(
+            rt_handle.as_ref(),
+            pc_span,
+            async move {
+                Self::run_loop(weak_self, cmd_rx, initial_tracks).await;
+            },
+        );
     }
 
     async fn run_loop(
@@ -6983,7 +7151,7 @@ impl RtpReceiver {
 
                                             // Send Track event after learning the first real SSRC.
                                             if old_ssrc == 0 {
-                                                tracing::info!(
+                                                tracing::debug!(
                                                     ssrc = packet.header.ssrc,
                                                     pt = packet.header.payload_type,
                                                     src = %addr,
@@ -7052,7 +7220,7 @@ impl RtpReceiver {
                                             source.increment_drop_count();
                                         }
                                         if let Err(e) = source.send_many(samples) {
-                                            tracing::warn!("Failed to send media sample batch: {}", e);
+                                            debug!("Failed to send media sample batch: {}", e);
                                         }
                                     }
 

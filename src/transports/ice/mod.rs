@@ -31,7 +31,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use tokio::net::{TcpListener, TcpStream, UdpSocket, lookup_host};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio::time::timeout;
-use tracing::{debug, info, instrument, trace};
+use tracing::{debug, instrument, trace};
 
 #[cfg(any(test, feature = "simulator"))]
 use self::stun::random_u32;
@@ -131,7 +131,12 @@ pub(crate) struct IceTransportInner {
     _rtcp_socket_rx_keeper: watch::Receiver<Option<IceSocketWrapper>>,
     selected_pair_notifier: watch::Sender<Option<IceCandidatePair>>,
     _selected_pair_rx_keeper: watch::Receiver<Option<IceCandidatePair>>,
-    last_received: parking_lot::Mutex<Instant>,
+    /// Reference epoch used to interpret `last_received_nanos`.
+    created_at: Instant,
+    /// Nanoseconds since `created_at` when the most recent packet arrived.
+    /// Stored atomically so the per-packet receive path records the timestamp
+    /// without taking a mutex.
+    last_received_nanos: AtomicU64,
     candidate_tx: broadcast::Sender<IceCandidate>,
     cmd_tx: mpsc::UnboundedSender<IceCommand>,
     checking_pairs: Mutex<std::collections::HashSet<(SocketAddr, SocketAddr)>>,
@@ -272,9 +277,14 @@ impl IceTransportRunner {
                             // candidates: the check may block on TcpStream::connect while
                             // the runner still needs to process pending socket_rx messages
                             // (e.g. TcpListener accept loops) to complete the connection.
-                            tokio::spawn(async move {
-                                perform_connectivity_checks_async(inner).await;
-                            });
+                            let rt_handle = inner.config.runtime_handle.clone();
+                            crate::spawn_rtc(
+                                rt_handle.as_ref(),
+                                tracing::Span::current(),
+                                async move {
+                                    perform_connectivity_checks_async(inner).await;
+                                },
+                            );
                         }
                     }
                 }
@@ -533,7 +543,9 @@ impl IceTransportRunner {
         let state = *inner.state.borrow();
         if state == IceTransportState::Connected || state == IceTransportState::Disconnected {
             if inner.config.transport_mode == crate::TransportMode::WebRtc {
-                let elapsed = inner.last_received.lock().elapsed();
+                let last_nanos = inner.last_received_nanos.load(Ordering::Relaxed);
+                let now_nanos = inner.created_at.elapsed().as_nanos() as u64;
+                let elapsed = Duration::from_nanos(now_nanos.saturating_sub(last_nanos));
                 let ice_conn_timeout = inner.config.ice_connection_timeout;
                 let tcp_selected = inner
                     .selected_pair
@@ -876,7 +888,8 @@ impl IceTransport {
             _rtcp_socket_rx_keeper: selected_rtcp_socket_rx,
             selected_pair_notifier: selected_pair_tx,
             _selected_pair_rx_keeper: selected_pair_rx,
-            last_received: parking_lot::Mutex::new(Instant::now()),
+            created_at: Instant::now(),
+            last_received_nanos: AtomicU64::new(0),
             candidate_tx: candidate_tx.clone(),
             cmd_tx,
             checking_pairs: Mutex::new(std::collections::HashSet::new()),
@@ -946,22 +959,27 @@ impl IceTransport {
             return;
         }
         let inner = self.inner.clone();
-        info!("ICE: nudging passive TCP nomination (controlled, awaiting inbound TCP)");
-        tokio::spawn(async move {
-            let streams: Vec<_> = inner
-                .gatherer
-                .tcp_streams
-                .lock()
-                .values()
-                .cloned()
-                .collect();
-            for wrapper in streams {
-                if let IceSocketWrapper::TcpStream(_, _, peer) = wrapper {
-                    complete_controlled_inbound_tcp_nomination(&wrapper, peer, inner).await;
-                    return;
+        debug!("ICE: nudging passive TCP nomination (controlled, awaiting inbound TCP)");
+        let rt_handle = inner.config.runtime_handle.clone();
+        crate::spawn_rtc(
+            rt_handle.as_ref(),
+            tracing::Span::current(),
+            async move {
+                let streams: Vec<_> = inner
+                    .gatherer
+                    .tcp_streams
+                    .lock()
+                    .values()
+                    .cloned()
+                    .collect();
+                for wrapper in streams {
+                    if let IceSocketWrapper::TcpStream(_, _, peer) = wrapper {
+                        complete_controlled_inbound_tcp_nomination(&wrapper, peer, inner).await;
+                        return;
+                    }
                 }
-            }
-        });
+            },
+        );
     }
 
     pub fn gather_state(&self) -> IceGathererState {
@@ -2090,9 +2108,10 @@ async fn handle_packet(
     if should_drop_packet() {
         return;
     }
-    {
-        *inner.last_received.lock() = Instant::now();
-    }
+    inner.last_received_nanos.store(
+        inner.created_at.elapsed().as_nanos() as u64,
+        Ordering::Relaxed,
+    );
     let b = packet[0];
     if b < 2 {
         // STUN
@@ -2169,7 +2188,13 @@ async fn handle_packet(
                         buffer.push_back((packet.to_vec(), addr));
                     }
                     BufferDropStrategy::DropNew => {
-                        tracing::warn!(src = %addr, capacity, "RTP buffer full — dropping inbound packet (DropNew strategy)");
+                        // Rate-limit: warn on the first drop and every 1000th
+                        // thereafter, so a persistently-full buffer does not
+                        // spam per packet (drops are also counted in buffer_stats).
+                        let dropped = stats.packets_dropped.load(Ordering::Relaxed);
+                        if dropped == 0 || dropped.is_multiple_of(1000) {
+                            tracing::warn!(src = %addr, capacity, "RTP buffer full — dropping inbound packet (DropNew strategy)");
+                        }
                     }
                 }
                 stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
@@ -2201,7 +2226,7 @@ async fn handle_packet(
                 let received = stats.packets_received.load(Ordering::Relaxed);
                 let dropped = stats.packets_dropped.load(Ordering::Relaxed);
                 let peak_size = stats.peak_size.load(Ordering::Relaxed);
-                debug!(
+                trace!(
                     "Buffer stats: received={}, dropped={}, current={}, peak={}, capacity={}",
                     received, dropped, current_size, peak_size, capacity
                 );

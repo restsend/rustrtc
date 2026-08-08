@@ -6,32 +6,89 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde_json::json;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Default)]
+/// Entries in `sent_sr_times` older than this are stale for RTT computation and
+/// eligible for eviction (prevents unbounded growth over long calls).
+const SENT_SR_TIME_MAX_AGE: Duration = Duration::from_secs(60);
+/// High-water mark for `sent_sr_times`; eviction runs once it is reached.
+const SENT_SR_TIME_HIGH_WATERMARK: usize = 64;
+/// High-water mark for the per-SSRC stats maps. Beyond this, stale SSRCs from
+/// long-gone streams (SSRC churn / re-INVITE) are dropped to bound memory.
+const SSRC_STATS_HIGH_WATERMARK: usize = 64;
+
+#[derive(Debug, Clone)]
 struct RemoteInboundStats {
     packets_lost: i32,
     fraction_lost: u8,
     jitter: u32,
     round_trip_time: Option<f64>,
+    last_seen: Instant,
 }
 
-#[derive(Debug, Clone, Default)]
+impl Default for RemoteInboundStats {
+    fn default() -> Self {
+        Self {
+            packets_lost: 0,
+            fraction_lost: 0,
+            jitter: 0,
+            round_trip_time: None,
+            last_seen: Instant::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct RemoteOutboundStats {
     packets_sent: u32,
     bytes_sent: u32,
     remote_timestamp: u32,
+    last_seen: Instant,
 }
 
-#[derive(Debug, Clone, Default)]
+impl Default for RemoteOutboundStats {
+    fn default() -> Self {
+        Self {
+            packets_sent: 0,
+            bytes_sent: 0,
+            remote_timestamp: 0,
+            last_seen: Instant::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct LocalInboundStats {
     packets_received: u64,
     bytes_received: u64,
+    last_seen: Instant,
 }
 
-#[derive(Debug, Clone, Default)]
+impl Default for LocalInboundStats {
+    fn default() -> Self {
+        Self {
+            packets_received: 0,
+            bytes_received: 0,
+            last_seen: Instant::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct LocalOutboundStats {
     packets_sent: u64,
     bytes_sent: u64,
+    last_seen: Instant,
+}
+
+impl Default for LocalOutboundStats {
+    fn default() -> Self {
+        Self {
+            packets_sent: 0,
+            bytes_sent: 0,
+            last_seen: Instant::now(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -43,6 +100,27 @@ pub struct StatsCollector {
     /// Maps ntp_least → Instant for outgoing Sender Reports, used to compute
     /// round-trip time from the LSR/DLSR fields of incoming Receiver Reports.
     sent_sr_times: Mutex<HashMap<u32, std::time::Instant>>,
+}
+
+/// Bound a per-SSRC stats map so long-lived SSRC churn (re-INVITE, simulcast
+/// layer switches, relay rewrite) cannot grow it without bound. First drops
+/// entries not seen within `SENT_SR_TIME_MAX_AGE`; if the map is still over the
+/// high-water mark (all entries fresh), trims the least-recently-seen half.
+fn evict_stale_ssrcs<V>(map: &mut HashMap<u32, V>, last_seen: impl Fn(&V) -> Instant) {
+    if map.len() < SSRC_STATS_HIGH_WATERMARK {
+        return;
+    }
+    let now = Instant::now();
+    map.retain(|_, v| now.duration_since(last_seen(v)) < SENT_SR_TIME_MAX_AGE);
+    if map.len() >= SSRC_STATS_HIGH_WATERMARK {
+        let mut by_age: Vec<(u32, Instant)> =
+            map.iter().map(|(k, v)| (*k, last_seen(v))).collect();
+        by_age.sort_by_key(|(_, t)| *t);
+        let excess = map.len() - SSRC_STATS_HIGH_WATERMARK / 2;
+        for (k, _) in by_age.into_iter().take(excess) {
+            map.remove(&k);
+        }
+    }
 }
 
 impl StatsCollector {
@@ -64,37 +142,49 @@ impl StatsCollector {
     }
 
     pub fn record_sr_sent(&self, _ssrc: u32, ntp_least: u32) {
-        self.sent_sr_times
-            .lock()
-            .insert(ntp_least, std::time::Instant::now());
+        let mut times = self.sent_sr_times.lock();
+        // Evict stale entries once the high-water mark is reached so the map
+        // does not grow without bound over a long-lived call. RTT samples older
+        // than `SENT_SR_TIME_MAX_AGE` are no longer useful anyway.
+        if times.len() >= SENT_SR_TIME_HIGH_WATERMARK {
+            let now = Instant::now();
+            times.retain(|_, t| now.duration_since(*t) < SENT_SR_TIME_MAX_AGE);
+        }
+        times.insert(ntp_least, Instant::now());
     }
 
     fn handle_sr(&self, sr: &SenderReport) {
         {
             let mut outbound = self.remote_outbound.lock();
+            evict_stale_ssrcs(&mut outbound, |v| v.last_seen);
             let stats = outbound.entry(sr.sender_ssrc).or_default();
             stats.packets_sent = sr.packet_count;
             stats.bytes_sent = sr.octet_count;
             stats.remote_timestamp = sr.ntp_least; // simplified
+            stats.last_seen = Instant::now();
         }
 
         // SR also contains report blocks for our streams
         for block in &sr.report_blocks {
             let mut inbound = self.remote_inbound.lock();
+            evict_stale_ssrcs(&mut inbound, |v| v.last_seen);
             let stats = inbound.entry(block.ssrc).or_default();
             stats.packets_lost = block.packets_lost;
             stats.fraction_lost = block.fraction_lost;
             stats.jitter = block.jitter;
+            stats.last_seen = Instant::now();
         }
     }
 
     fn handle_rr(&self, rr: &ReceiverReport) {
         for block in &rr.report_blocks {
             let mut inbound = self.remote_inbound.lock();
+            evict_stale_ssrcs(&mut inbound, |v| v.last_seen);
             let stats = inbound.entry(block.ssrc).or_default();
             stats.packets_lost = block.packets_lost;
             stats.fraction_lost = block.fraction_lost;
             stats.jitter = block.jitter;
+            stats.last_seen = Instant::now();
 
             // Compute RTT from LSR / DLSR (RFC 3550 §6.4.1):
             //   RTT = now - when_we_sent_sr_with_this_ntp - DLSR
@@ -133,9 +223,11 @@ impl RtpSenderInterceptor for StatsCollector {
     ) {
         let size = Self::packet_size(packet);
         let mut outbound = self.local_outbound.lock();
+        evict_stale_ssrcs(&mut outbound, |v| v.last_seen);
         let stats = outbound.entry(packet.header.ssrc).or_default();
         stats.packets_sent += 1;
         stats.bytes_sent += size;
+        stats.last_seen = Instant::now();
     }
 
     fn on_sr_sent(&self, ssrc: u32, ntp_least: u32) {
@@ -153,9 +245,11 @@ impl RtpReceiverInterceptor for StatsCollector {
     ) -> Option<RtcpPacket> {
         let size = Self::packet_size(packet);
         let mut inbound = self.local_inbound.lock();
+        evict_stale_ssrcs(&mut inbound, |v| v.last_seen);
         let stats = inbound.entry(packet.header.ssrc).or_default();
         stats.packets_received += 1;
         stats.bytes_received += size;
+        stats.last_seen = Instant::now();
         None
     }
 }

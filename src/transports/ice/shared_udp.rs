@@ -33,8 +33,10 @@ pub(crate) type SharedUdpPacket = (Vec<u8>, SocketAddr);
 /// Per-session demux channel depth. Bounded so that a slow or stalled session
 /// cannot grow memory without bound under packet pressure (mirrors the OS
 /// socket-buffer backpressure of a non-mux UDP socket). When full, new packets
-/// are dropped (UDP semantics).
-const SHARED_UDP_CHANNEL_CAPACITY: usize = 2048;
+/// are dropped (UDP semantics). Kept modest because one channel exists per
+/// registered session on a shared mux port, so this is the dominant per-session
+/// memory cost in single-port SFU deployments.
+const SHARED_UDP_CHANNEL_CAPACITY: usize = 512;
 
 /// Shared `peer_addr -> ufrag` routing table (cloned into every handle).
 type PeerMap = Arc<Mutex<HashMap<SocketAddr, String>>>;

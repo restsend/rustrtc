@@ -52,6 +52,29 @@ pub use transports::ice::{
     IceCandidateType, IceGathererState, IceRole, IceTransport, IceTransportState,
     MAX_LEASE_DURATION, MIN_LEASE_DURATION, TcpType, UpnpPortMapper,
 };
-pub use transports::rtp::RtpRewriteBridgeParams;
+pub use transports::rtp::{RtpRewriteBridgeOptions, RtpRewriteBridgeParams, RtpRewriteRule};
 pub use transports::sctp::{DataChannelEvent, DataChannelState, SctpLinkStats};
 pub use transports::udptl::{UdtlConfig, UdtlReceiveBuffer, UdtlTransport};
+
+use std::future::Future;
+use tracing::Instrument;
+
+/// Spawn a task on the configured runtime handle when one is set, else on the
+/// ambient (current) runtime. The future is instrumented with `span` so logs
+/// emitted inside inherit the correlation context (pass `tracing::Span::current()`
+/// for nested spawns that already run inside an instrumented task).
+#[inline]
+pub(crate) fn spawn_rtc<F>(
+    handle: Option<&tokio::runtime::Handle>,
+    span: tracing::Span,
+    fut: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let fut = fut.instrument(span);
+    match handle {
+        Some(h) => h.spawn(fut),
+        None => tokio::spawn(fut),
+    }
+}

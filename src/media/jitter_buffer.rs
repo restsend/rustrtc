@@ -47,6 +47,10 @@ impl JitterBuffer {
             return;
         };
 
+        // Capture the arrival instant once; reused for any buffered sample
+        // (avoids repeated clock reads per push).
+        let now = Instant::now();
+
         // If we already delivered this or a newer sequence (with wrap-around check), ignore it
         if let Some(last) = self.last_delivered_seq
             && !is_newer(seq, last)
@@ -71,7 +75,7 @@ impl JitterBuffer {
             // Using wrapping math: if ts_diff > half of u32::MAX, it's a backward jump
             if ts_diff > max_reasonable_jump && ts_diff < (u32::MAX / 2) {
                 // Massive forward jump - likely SSRC change or stream switch
-                tracing::info!(
+                tracing::debug!(
                     "JitterBuffer: Detected stream switch (timestamp jump {}s), resetting buffer",
                     ts_diff / 8000
                 );
@@ -81,7 +85,7 @@ impl JitterBuffer {
                     seq,
                     BufferedSample {
                         sample,
-                        arrival: Instant::now(),
+                        arrival: now,
                     },
                 );
                 return;
@@ -89,7 +93,7 @@ impl JitterBuffer {
                 // Backward jump (wrapped subtraction)
                 let backward_diff = last_ts.wrapping_sub(timestamp);
                 if backward_diff > max_reasonable_jump {
-                    tracing::info!(
+                    tracing::debug!(
                         "JitterBuffer: Detected backward stream switch (timestamp jump -{}s), resetting buffer",
                         backward_diff / 8000
                     );
@@ -99,7 +103,7 @@ impl JitterBuffer {
                         seq,
                         BufferedSample {
                             sample,
-                            arrival: Instant::now(),
+                            arrival: now,
                         },
                     );
                     return;
@@ -116,7 +120,7 @@ impl JitterBuffer {
             seq,
             BufferedSample {
                 sample,
-                arrival: Instant::now(),
+                arrival: now,
             },
         );
     }
@@ -189,19 +193,14 @@ impl JitterBuffer {
         let last = match self.last_delivered_seq {
             Some(l) => l,
             None => {
-                // Find the oldest packet in the buffer
-                let mut oldest: Option<u16> = None;
-                for &seq in self.samples.keys() {
-                    match oldest {
-                        None => oldest = Some(seq),
-                        Some(o) => {
-                            if is_newer(o, seq) {
-                                oldest = Some(seq);
-                            }
-                        }
-                    }
-                }
-                return oldest;
+                // Warmup (nothing delivered yet): pick the RTP-oldest buffered
+                // seq. BTreeMap keys are sorted ascending, so the oldest is
+                // either the numeric-min or numeric-max key, depending on
+                // whether the window wraps the u16 boundary. O(log n) instead of
+                // re-scanning every key on each pop during warmup.
+                let k0 = *self.samples.keys().next()?;
+                let kn = *self.samples.keys().next_back()?;
+                return if is_newer(k0, kn) { Some(kn) } else { Some(k0) };
             }
         };
 
