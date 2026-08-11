@@ -2050,12 +2050,15 @@ impl SctpInner {
                     let done_bytes = outcome.bytes_acked_by_cum_tsn + outcome.bytes_acked_by_gap;
                     // Was the pipe full during this RTT? A sender is window-
                     // limited when the last transmit() left data queued because
-                    // the window budget ran out. Using flight_size >= cwnd here
+                    // the window budget ran out. Using flight_size >= cwnd alone
                     // is wrong on fast lossless links (loopback): a single SACK
                     // acks the entire window, flight_size drops below cwnd, and
-                    // cwnd would stall at its initial value forever.
-                    let cwnd_fully_utilized =
-                        self.window_limited.load(Ordering::Relaxed);
+                    // cwnd would stall at its initial value forever. We OR the
+                    // two so growth also happens when the window is still
+                    // provably saturated at SACK time (e.g. unit tests that
+                    // sustain flight_size >= cwnd directly).
+                    let cwnd_fully_utilized = self.window_limited.load(Ordering::Relaxed)
+                        || self.flight_size.load(Ordering::SeqCst) >= cwnd;
 
                     if done_bytes > 0 && cwnd_fully_utilized && cwnd < self.max_cwnd {
                         if cwnd <= ssthresh {
