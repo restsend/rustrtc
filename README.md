@@ -16,7 +16,7 @@ A high-performance, full-stack real-time communication library — **WebRTC, RTP
 - **NAT traversal & deployment** — RTP latching, UPnP IGD port mapping, and firewall-friendly port ranges (`rtp_start_port`/`rtp_end_port`).
 - **Production extras** — RTP rewrite bridge (SSRC/PT/sequence remapping) and a WebRTC-compatible stats model.
 
-## Benchmark game (rustrtc vs webrtc-rs & pion) in 0.3.113
+## Benchmark game (rustrtc vs webrtc-rs & pion) in 0.3.114
 
 **CPU:**  `AMD Ryzen 7 5700X 8-Core Processor`
 **OS** `5.15.0-118-generic #128-Ubuntu`  
