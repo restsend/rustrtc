@@ -91,7 +91,7 @@ pub struct RtpRewriteRule {
 }
 
 /// Direction-level rewrite bridge options (not payload-type-scoped).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct RtpRewriteBridgeOptions {
     /// Strip RTP extension headers before forwarding (WebRTC → RTP).
     pub strip_extensions: bool,
@@ -99,6 +99,16 @@ pub struct RtpRewriteBridgeOptions {
     pub initial_sequence_number: Option<u16>,
     /// Seed the first forwarded timestamp offset of each new source stream.
     pub initial_timestamp_offset: Option<u32>,
+    /// SDES-MID RTP header extension id (the extmap id negotiated for
+    /// `urn:ietf:params:rtp-hdrext:sdes:mid`). When set together with
+    /// [`Self::sdes_mid`], every forwarded packet gets the MID extension
+    /// stamped so a WebRTC receiver (Chrome) can attribute the packet to
+    /// the negotiated track via MID demux, regardless of SSRC.
+    pub sdes_mid_extension_id: Option<u8>,
+    /// The destination leg's audio MID value (e.g. "0"), stamped as the
+    /// SDES-MID extension. Only written when [`Self::strip_extensions`] is
+    /// false (i.e. the destination is WebRTC).
+    pub sdes_mid: Option<String>,
 }
 
 impl RtpRewriteRule {
@@ -236,6 +246,14 @@ impl RewriteBridge {
         packet.header.timestamp = src_timestamp.wrapping_add(state.timestamp_offset);
         packet.header.sequence_number = state.next_sequence_number;
         state.next_sequence_number = state.next_sequence_number.wrapping_add(1);
+
+        if !self.options.strip_extensions {
+            if let (Some(ext_id), Some(mid)) =
+                (self.options.sdes_mid_extension_id, &self.options.sdes_mid)
+            {
+                let _ = packet.header.set_extension(ext_id, mid.as_bytes());
+            }
+        }
     }
 }
 
@@ -519,6 +537,7 @@ impl RtpTransport {
             strip_extensions: params.strip_extensions,
             initial_sequence_number: params.initial_sequence_number,
             initial_timestamp_offset: params.initial_timestamp_offset,
+            ..Default::default()
         };
         self.bridge_rewrite_rules_to(dst, options, RtpRewriteRule::from_params(params));
     }

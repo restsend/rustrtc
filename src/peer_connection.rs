@@ -6132,6 +6132,10 @@ impl RtpSender {
         *self.sdes_mid.lock() = Some((ext_id, mid));
     }
 
+    pub fn sdes_mid(&self) -> Option<(u8, Arc<str>)> {
+        self.sdes_mid.lock().clone()
+    }
+
     pub fn subscribe_rtcp(&self) -> broadcast::Receiver<RtcpPacket> {
         self.rtcp_tx.subscribe()
     }
