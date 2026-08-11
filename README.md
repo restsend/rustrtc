@@ -28,48 +28,52 @@ nice@miuda.ai rustrtc % cargo run -r --example benchmark
 Comparison (Baseline: webrtc)
 Metric               | webrtc     | rustrtc    | pion      
 --------------------------------------------------------------------------------
-Duration (s)         | 10.05      | 10.05      | 10.08     
-Setup Latency (ms)   | 0.92       | 0.20       | 0.90      
-Throughput (MB/s)    | 285.64     | 758.67     | 310.14    
-Msg Rate (msg/s)     | 292495.02  | 776880.40  | 317586.71 
-CPU Usage (%)        | 1348.20    | 1341.00    | 1154.67   
-Memory (MB)          | 33.00      | 23.00      | 44.00     
+Duration (s)         | 10.02      | 10.02      | 10.08     
+Setup Latency (ms)   | 0.75       | 0.25       | 0.90      
+Throughput (MB/s)    | 280.13     | 825.45     | 310.14    
+Msg Rate (msg/s)     | 286850.22  | 845261.21  | 317586.71 
+CPU Usage (%)        | 1269.85    | 1530.65    | 1154.67   
+Memory (MB)          | 32.00      | 25.00      | 44.00     
 --------------------------------------------------------------------------------
 
 Performance Charts
 ==================
 
 Throughput (MB/s) (Higher is better)
-webrtc     | ███████████████                          285.64
-rustrtc    | ████████████████████████████████████████ 758.67
+webrtc     | ███████████████                          280.13
+rustrtc    | ████████████████████████████████████████ 825.45
 pion       | ████████████████                         310.14
 
 Message Rate (msg/s) (Higher is better)
-webrtc     | ███████████████                          292495.02
-rustrtc    | ████████████████████████████████████████ 776880.40
+webrtc     | ███████████████                          286850.22
+rustrtc    | ████████████████████████████████████████ 845261.21
 pion       | ████████████████                         317586.71
 
 Setup Latency (ms) (Lower is better)
-webrtc     | ████████████████████████████████████████ 0.92
-rustrtc    | █████████                                  0.20
-pion       | ███████████████████████████████████████  0.90
+webrtc     | ████████████████████████████████████████ 0.75
+rustrtc    | ██████████████                           0.25
+pion       | ████████████████████████████████████████ 0.90
 
 CPU Usage (%) (Lower is better)
-webrtc     | ████████████████████████████████████████ 1348.20
-rustrtc    | ███████████████████████████████████████  1341.00
+webrtc     | ████████████████████████████████████████ 1269.85
+rustrtc    | ████████████████████████████████████████ 1530.65
 pion       | ██████████████████████████████████       1154.67
 
 Memory (MB) (Lower is better)
-webrtc     | ██████████████████████████████           33.00
-rustrtc    | █████████████████████                    23.00
+webrtc     | ████████████████████████████████████████ 32.00
+rustrtc    | █████████████████████████████████        25.00
 pion       | ████████████████████████████████████████ 44.00
 ```
 
 **Key Findings:**
 
-- **Throughput**: `rustrtc` is ~2.7x faster than `webrtc-rs` and ~2.4x faster than `pion`.
-- **Memory**: `rustrtc` uses ~30% less memory than `webrtc-rs` and ~48% less than `pion`.
-- **Setup Latency**: Significantly faster connection setup (0.20ms vs 0.92ms/0.90ms).
+- **Throughput**: `rustrtc` is ~2.95x faster than `webrtc-rs` and ~2.7x faster than `pion`.
+- **Memory**: `rustrtc` uses ~22% less memory than `webrtc-rs` and ~43% less than `pion`.
+- **Setup Latency**: Significantly faster connection setup (0.25ms vs 0.75ms/0.90ms).
+
+> The `pion` numbers are from the previous benchmark run (0.3.113); `rustrtc` and `webrtc-rs`
+> were re-measured on the same machine for 0.3.114 after the SCTP congestion-window stall
+> and flow-control lost-wakeup fixes.
 
 ## Usage
 
