@@ -100,7 +100,6 @@ const DUP_THRESH: u8 = 3;
 const CWND_INITIAL: usize = MAX_SCTP_PACKET_SIZE * 10; // 10 * 1200 = 12000 bytes
 const SSTHRESH_MIN: usize = MAX_SCTP_PACKET_SIZE * 4; // 4 * 1200 = 4800 bytes
 const CWND_MIN_AFTER_RTO: usize = MAX_SCTP_PACKET_SIZE * 4; // 4 * 1200 = 4800 bytes (faster recovery after RTO)
-const MAX_BUFFERED_AMOUNT: usize = 256 * 1024; // 256KB - reduced for lower memory footprint
 
 // Memory limits for inbound queues - balanced for memory efficiency and loss tolerance
 // These values provide good memory efficiency while maintaining tolerance for packet loss
@@ -367,6 +366,7 @@ struct SctpInner {
     max_tsn_retransmits: u32,
     max_burst_packets: usize, // 0 = use default heuristic
     max_cwnd: usize,
+    max_buffered_amount: usize, // 0 = unbounded (compat with pre-restriction behavior)
 
     // Association Error Counter
     association_error_count: AtomicU32,
@@ -388,6 +388,13 @@ struct SctpInner {
     // Outqueue for non-blocking sends
     outbound_queue: Mutex<VecDeque<OutboundChunk>>,
     queued_bytes: AtomicUsize,
+    // Set by transmit() when it leaves data in outbound_queue because the
+    // window (cwnd / peer rwnd / burst budget) is exhausted. Consumed by
+    // handle_sack to decide whether to grow cwnd: a sender that was window-
+    // limited had a full pipe during the RTT, so it is eligible for growth
+    // even if this SACK happened to drain flight_size back below cwnd (the
+    // common loopback case, where one SACK can ack an entire window).
+    window_limited: AtomicBool,
 
     // Outgoing Packet Queue to prevent deadlocks
     outgoing_packet_tx: mpsc::UnboundedSender<Bytes>,
@@ -822,6 +829,7 @@ impl SctpTransport {
             max_tsn_retransmits: config.sctp_max_tsn_retransmits,
             max_burst_packets: config.sctp_max_burst,
             max_cwnd: config.sctp_max_cwnd,
+            max_buffered_amount: config.sctp_max_buffered_amount,
             association_error_count: AtomicU32::new(0),
             heartbeat_sent_time: Mutex::new(None),
             consecutive_heartbeat_failures: AtomicU32::new(0),
@@ -831,6 +839,7 @@ impl SctpTransport {
             last_suspicious_rto_log: Mutex::new(None),
             outbound_queue: Mutex::new(VecDeque::new()),
             queued_bytes: AtomicUsize::new(0),
+            window_limited: AtomicBool::new(false),
             last_sack_time: Mutex::new(None),
             t1_chunk: Mutex::new(None),
             t1_failures: AtomicU32::new(0),
@@ -1836,6 +1845,7 @@ impl SctpInner {
                 );
             }
 
+            self.flow_control_notify.notify_one();
             self.flow_control_notify.notify_waiters();
 
             let mut gap_blocks = Vec::new();
@@ -2038,7 +2048,14 @@ impl SctpInner {
                     }
                 } else {
                     let done_bytes = outcome.bytes_acked_by_cum_tsn + outcome.bytes_acked_by_gap;
-                    let cwnd_fully_utilized = self.flight_size.load(Ordering::SeqCst) >= cwnd;
+                    // Was the pipe full during this RTT? A sender is window-
+                    // limited when the last transmit() left data queued because
+                    // the window budget ran out. Using flight_size >= cwnd here
+                    // is wrong on fast lossless links (loopback): a single SACK
+                    // acks the entire window, flight_size drops below cwnd, and
+                    // cwnd would stall at its initial value forever.
+                    let cwnd_fully_utilized =
+                        self.window_limited.load(Ordering::Relaxed);
 
                     if done_bytes > 0 && cwnd_fully_utilized && cwnd < self.max_cwnd {
                         if cwnd <= ssthresh {
@@ -2077,7 +2094,8 @@ impl SctpInner {
                     }
                 }
 
-                self.flow_control_notify.notify_waiters();
+                self.flow_control_notify.notify_one();
+            self.flow_control_notify.notify_waiters();
             }
 
             if outcome.head_moved || outcome.flight_reduction > 0 {
@@ -3179,7 +3197,7 @@ impl SctpInner {
             }
             let flight = self.flight_size.load(Ordering::Relaxed);
             let queued = self.queued_bytes.load(Ordering::Relaxed);
-            if flight + queued <= MAX_BUFFERED_AMOUNT {
+            if self.max_buffered_amount == 0 || flight + queued <= self.max_buffered_amount {
                 break;
             }
             self.flow_control_notify.notified().await;
@@ -3310,6 +3328,7 @@ impl SctpInner {
             let mut budget = available;
             let mut batch: Vec<OutboundChunk> = Vec::new();
             let mut dequeued_bytes = 0usize;
+            let window_limited;
             {
                 let mut outbound = self.outbound_queue.lock();
                 while budget > 0 && batch.len() < 1000 {
@@ -3323,7 +3342,12 @@ impl SctpInner {
                         break;
                     }
                 }
+                // We were window-limited if the budget or the per-batch cap ran
+                // out while data still remained queued (i.e. the pipe was full
+                // and the window, not the application, throttled this drain).
+                window_limited = !outbound.is_empty() || batch.len() >= 1000;
             }
+            self.window_limited.store(window_limited, Ordering::Relaxed);
             if dequeued_bytes > 0 {
                 self.queued_bytes
                     .fetch_sub(dequeued_bytes, Ordering::Relaxed);

@@ -486,6 +486,11 @@ pub struct RtcConfiguration {
     pub sctp_max_tsn_retransmits: u32,
     pub sctp_max_burst: usize,
     pub sctp_max_cwnd: usize,
+    /// Per-data-channel send-side buffered-amount limit in bytes (sum of
+    /// in-flight + queued payload bytes). The sender blocks when the total
+    /// exceeds this threshold, bounding per-channel peak RSS regardless of
+    /// peer speed. Default 256 KB;  0 disables the gate (unbounded).
+    pub sctp_max_buffered_amount: usize,
     pub dtls_buffer_size: usize,
     pub rtp_start_port: Option<u16>,
     pub rtp_end_port: Option<u16>,
@@ -591,6 +596,7 @@ impl PartialEq for RtcConfiguration {
             && self.sctp_max_tsn_retransmits == other.sctp_max_tsn_retransmits
             && self.sctp_max_burst == other.sctp_max_burst
             && self.sctp_max_cwnd == other.sctp_max_cwnd
+            && self.sctp_max_buffered_amount == other.sctp_max_buffered_amount
             && self.dtls_buffer_size == other.dtls_buffer_size
             && self.rtp_start_port == other.rtp_start_port
             && self.rtp_end_port == other.rtp_end_port
@@ -651,6 +657,7 @@ impl Default for RtcConfiguration {
             sctp_max_tsn_retransmits: 8,
             sctp_max_burst: 0,         // 0 = use default heuristic
             sctp_max_cwnd: 256 * 1024, // 256 KB
+            sctp_max_buffered_amount: 256 * 1024, // 256 KB
             dtls_buffer_size: 2048,
             rtp_start_port: None,
             rtp_end_port: None,
@@ -899,6 +906,16 @@ impl RtcConfigurationBuilder {
     /// Default is 256 KB. For high-latency TURN relays, consider 512KB-1MB.
     pub fn sctp_max_cwnd(mut self, size: usize) -> Self {
         self.inner.sctp_max_cwnd = size;
+        self
+    }
+
+    /// Per-data-channel send-side buffered-amount limit in bytes.
+    /// Default is 256 KB. Set to 0 for unbounded (compatibility with pre-0.3.114
+    /// behavior that had no gate). A non-zero limit bounds the sum of in-flight
+    /// and queued payload bytes per data channel, blocking `send()`/`send_text()`
+    /// until the buffer drains below the threshold.
+    pub fn sctp_max_buffered_amount(mut self, bytes: usize) -> Self {
+        self.inner.sctp_max_buffered_amount = bytes;
         self
     }
 

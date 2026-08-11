@@ -326,7 +326,7 @@ impl IceTransportRunner {
 
     async fn run_udp_read_loop(socket: Arc<UdpSocket>, inner: Arc<IceTransportInner>) {
         let mut buf = [0u8; 1500];
-        let mut marshal_buf = Vec::with_capacity(200);
+        let mut marshal_buf = Vec::with_capacity(1500);
         let mut state_rx = inner.state.subscribe();
         let sender = IceSocketWrapper::Udp(socket.clone());
         trace!("Read loop started for {:?}", socket.local_addr());
@@ -382,7 +382,7 @@ impl IceTransportRunner {
         inner: Arc<IceTransportInner>,
     ) {
         let mut state_rx = inner.state.subscribe();
-        let mut marshal_buf = Vec::with_capacity(200);
+        let mut marshal_buf = Vec::with_capacity(1500);
         let sender = IceSocketWrapper::SharedUdp(handle.clone());
         trace!("Shared UDP read loop started");
         loop {
@@ -424,7 +424,7 @@ impl IceTransportRunner {
         inner: Arc<IceTransportInner>,
     ) {
         let mut buf = [0u8; 1500];
-        let mut marshal_buf = Vec::with_capacity(200);
+        let mut marshal_buf = Vec::with_capacity(1500);
         let mut state_rx = inner.state.subscribe();
         trace!("Read loop started for TURN client {}", relayed_addr);
         loop {
@@ -500,7 +500,7 @@ impl IceTransportRunner {
         inner: Arc<IceTransportInner>,
     ) {
         let mut buf = [0u8; 65_535];
-        let mut marshal_buf = Vec::with_capacity(200);
+        let mut marshal_buf = Vec::with_capacity(1500);
         let mut state_rx = inner.state.subscribe();
         let sender = IceSocketWrapper::TcpStream(read, write, peer_addr);
         trace!("TCP read loop started for peer {}", peer_addr);
