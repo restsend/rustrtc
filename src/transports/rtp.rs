@@ -76,7 +76,7 @@ pub struct RtpRewriteBridgeParams {
 /// one rule per m-line payload type so audio, video and DTMF each get their own
 /// destination SSRC / payload type (the legacy single-param bridge rewrote
 /// every packet — audio AND video — to one SSRC/PT, which corrupted video).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RtpRewriteRule {
     /// When `Some(pt)`, only packets carrying this payload type are rewritten.
     /// When `None`, this is the catch-all rule applied to any other packet.
@@ -88,10 +88,22 @@ pub struct RtpRewriteRule {
     pub ssrc_offset: u32,
     /// Replacement payload type, or `None` to keep the original.
     pub out_payload_type: Option<u8>,
+    /// SDES-MID RTP header extension id (the extmap id negotiated for
+    /// `urn:ietf:params:rtp-hdrext:sdes:mid`). When set together with
+    /// [`Self::sdes_mid`], packets rewritten by this rule get the MID
+    /// extension stamped so a WebRTC receiver (Chrome) can attribute them
+    /// to the negotiated track regardless of SSRC. Payload-type-scoped:
+    /// audio/DTMF rules carry the audio m-line's mid, video rules the
+    /// video m-line's mid. Only written when the bridge's
+    /// [`RtpRewriteBridgeOptions::strip_extensions`] is false.
+    pub sdes_mid_extension_id: Option<u8>,
+    /// The destination leg's MID value for this m-line (e.g. "0" for the
+    /// audio m-line, "1" for video).
+    pub sdes_mid: Option<String>,
 }
 
 /// Direction-level rewrite bridge options (not payload-type-scoped).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct RtpRewriteBridgeOptions {
     /// Strip RTP extension headers before forwarding (WebRTC → RTP).
     pub strip_extensions: bool,
@@ -99,16 +111,6 @@ pub struct RtpRewriteBridgeOptions {
     pub initial_sequence_number: Option<u16>,
     /// Seed the first forwarded timestamp offset of each new source stream.
     pub initial_timestamp_offset: Option<u32>,
-    /// SDES-MID RTP header extension id (the extmap id negotiated for
-    /// `urn:ietf:params:rtp-hdrext:sdes:mid`). When set together with
-    /// [`Self::sdes_mid`], every forwarded packet gets the MID extension
-    /// stamped so a WebRTC receiver (Chrome) can attribute the packet to
-    /// the negotiated track via MID demux, regardless of SSRC.
-    pub sdes_mid_extension_id: Option<u8>,
-    /// The destination leg's audio MID value (e.g. "0"), stamped as the
-    /// SDES-MID extension. Only written when [`Self::strip_extensions`] is
-    /// false (i.e. the destination is WebRTC).
-    pub sdes_mid: Option<String>,
 }
 
 impl RtpRewriteRule {
@@ -119,6 +121,8 @@ impl RtpRewriteRule {
             fixed_out_ssrc: params.fixed_out_ssrc,
             ssrc_offset: params.ssrc_offset,
             out_payload_type: params.payload_type,
+            sdes_mid_extension_id: None,
+            sdes_mid: None,
         }
     }
 
@@ -130,6 +134,8 @@ impl RtpRewriteRule {
             fixed_out_ssrc: params.fixed_out_ssrc,
             ssrc_offset: params.ssrc_offset,
             out_payload_type: Some(dst_pt),
+            sdes_mid_extension_id: None,
+            sdes_mid: None,
         }
     }
 
@@ -180,9 +186,9 @@ impl RewriteBridge {
     fn rule_for(&self, raw_pt: u8) -> Option<RtpRewriteRule> {
         self.rules
             .iter()
-            .copied()
+            .cloned()
             .find(|r| r.match_payload_type == Some(raw_pt))
-            .or_else(|| self.rules.iter().copied().find(|r| r.match_payload_type.is_none()))
+            .or_else(|| self.rules.iter().cloned().find(|r| r.match_payload_type.is_none()))
     }
 
     fn rewrite_packet(&self, packet: &mut RtpPacket) {
@@ -197,7 +203,7 @@ impl RewriteBridge {
 
         let raw_pt = packet.header.payload_type;
         let rule = self.rule_for(raw_pt);
-        let out_ssrc = match rule {
+        let out_ssrc = match &rule {
             Some(r) => r
                 .fixed_out_ssrc
                 .unwrap_or_else(|| src_ssrc.wrapping_add(r.ssrc_offset)),
@@ -221,7 +227,7 @@ impl RewriteBridge {
                     .unwrap_or_else(random_u32),
             });
 
-        if let Some(r) = rule {
+        if let Some(r) = &rule {
             if let Some(payload_type) = r.out_payload_type {
                 packet.header.payload_type = payload_type;
             }
@@ -248,8 +254,12 @@ impl RewriteBridge {
         state.next_sequence_number = state.next_sequence_number.wrapping_add(1);
 
         if !self.options.strip_extensions {
-            if let (Some(ext_id), Some(mid)) =
-                (self.options.sdes_mid_extension_id, &self.options.sdes_mid)
+            // Stamp the matched rule's SDES-MID (payload-type-scoped: audio
+            // rules carry the audio mid, video rules the video mid) so a
+            // WebRTC receiver attributes the packet to the right track.
+            if let Some(r) = &rule
+                && let (Some(ext_id), Some(mid)) =
+                    (r.sdes_mid_extension_id, &r.sdes_mid)
             {
                 let _ = packet.header.set_extension(ext_id, mid.as_bytes());
             }
@@ -1414,6 +1424,8 @@ mod tests {
                 fixed_out_ssrc: Some(audio_ssrc),
                 ssrc_offset: 0,
                 out_payload_type: Some(96),
+                sdes_mid_extension_id: None,
+                sdes_mid: None,
             },
             // DTMF PT 101 → 110, still on the audio SSRC.
             RtpRewriteRule {
@@ -1421,6 +1433,8 @@ mod tests {
                 fixed_out_ssrc: Some(audio_ssrc),
                 ssrc_offset: 0,
                 out_payload_type: Some(110),
+                sdes_mid_extension_id: None,
+                sdes_mid: None,
             },
             // Video PT 98 → 102, video SSRC.
             RtpRewriteRule {
@@ -1428,6 +1442,8 @@ mod tests {
                 fixed_out_ssrc: Some(video_ssrc),
                 ssrc_offset: 0,
                 out_payload_type: Some(102),
+                sdes_mid_extension_id: None,
+                sdes_mid: None,
             },
             // Video RTX PT 99 → 103, same video SSRC (distinct source stream).
             RtpRewriteRule {
@@ -1435,6 +1451,8 @@ mod tests {
                 fixed_out_ssrc: Some(video_ssrc),
                 ssrc_offset: 0,
                 out_payload_type: Some(103),
+                sdes_mid_extension_id: None,
+                sdes_mid: None,
             },
         ];
         src_transport.bridge_rewrite_rules_to(dst_transport.clone(), Default::default(), rules);
@@ -1501,6 +1519,8 @@ mod tests {
             fixed_out_ssrc: Some(222),
             ssrc_offset: 0,
             out_payload_type: Some(102),
+            sdes_mid_extension_id: None,
+            sdes_mid: None,
         }];
         src_transport.bridge_rewrite_rules_to(dst_transport.clone(), Default::default(), rules);
 
