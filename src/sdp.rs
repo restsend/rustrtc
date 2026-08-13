@@ -1335,12 +1335,30 @@ impl MediaSection {
         if let Some(connection) = &self.connection {
             write!(out, "c={}\r\n", connection)?;
         }
+        // Chrome's WebRTC SDP parser requires DTLS/ICE transport attributes
+        // (ice-ufrag / ice-pwd / fingerprint / setup) to appear BEFORE a=mid
+        // within each media section. rustrtc previously emitted them after
+        // mid, which Chrome rejects with "Invalid SDP line" when parsing a
+        // rustrtc-generated SDP as an offer (re-INVITE). Split attributes
+        // into transport-level (emitted first) and media-level (after mid).
+        let (transport, media): (Vec<_>, Vec<_>) = self
+            .attributes
+            .iter()
+            .partition(|a| {
+                matches!(
+                    a.key.as_str(),
+                    "ice-ufrag" | "ice-pwd" | "fingerprint" | "setup" | "candidate"
+                )
+            });
+        for attr in &transport {
+            attr.write_line(out)?;
+        }
         // Always write a=mid if it is present, as it is required for BUNDLE
         if !self.mid.is_empty() {
             write!(out, "a=mid:{}\r\n", self.mid)?;
         }
         write!(out, "a={}\r\n", self.direction.as_str())?;
-        for attr in &self.attributes {
+        for attr in &media {
             attr.write_line(out)?;
         }
         Ok(())

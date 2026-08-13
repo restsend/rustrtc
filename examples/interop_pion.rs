@@ -46,7 +46,18 @@ struct OfferRequest {
 }
 
 async fn run_server(addr_str: &str) {
-    let app = Router::new().route("/offer", post(handle_offer));
+    let app = Router::new().route("/offer", post(handle_offer)).layer(
+        axum::middleware::from_fn(|req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| async move {
+            let mut res = next.run(req).await;
+            res.headers_mut()
+                .insert("Access-Control-Allow-Origin", axum::http::HeaderValue::from_static("*"));
+            res.headers_mut()
+                .insert("Access-Control-Allow-Methods", axum::http::HeaderValue::from_static("POST, OPTIONS"));
+            res.headers_mut()
+                .insert("Access-Control-Allow-Headers", axum::http::HeaderValue::from_static("Content-Type"));
+            res
+        }),
+    );
 
     let addr: SocketAddr = addr_str.parse().expect("Invalid address");
     info!("Listening on http://{}", addr);

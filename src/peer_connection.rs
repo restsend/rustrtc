@@ -1104,8 +1104,8 @@ impl PeerConnection {
                 .ssrc_generator
                 .fetch_add(1 + rand_val, Ordering::Relaxed);
             *transceiver.sender_ssrc.lock() = Some(ssrc);
-            *transceiver.sender_stream_id.lock() = Some("default".to_string());
-            *transceiver.sender_track_id.lock() = Some(format!("track-{}", transceiver.id()));
+            *transceiver.sender_stream_id.lock() = Some(random_rtc_id());
+            *transceiver.sender_track_id.lock() = Some(random_rtc_id());
         }
         transceiver.set_receiver(Some(receiver));
 
@@ -4850,17 +4850,17 @@ impl PeerConnectionInner {
                     .config
                     .cname
                     .clone()
-                    .unwrap_or_else(|| format!("rustrtc-cname-{ssrc}"));
+                    .unwrap_or_else(|| random_rtc_id());
                 let stream_id = transceiver
                     .sender_stream_id
                     .lock()
                     .clone()
-                    .unwrap_or_else(|| "default".to_string());
+                    .unwrap_or_else(|| random_rtc_id());
                 let track_id = transceiver
                     .sender_track_id
                     .lock()
                     .clone()
-                    .unwrap_or_else(|| format!("track-{}", transceiver.id()));
+                    .unwrap_or_else(|| random_rtc_id());
                 Self::attach_sender_attributes(
                     &mut section,
                     ssrc,
@@ -12537,4 +12537,28 @@ a=mid:0
         assert!(extmap_value(crate::sdp::SDES_MID_URI).starts_with("3 "));
         assert!(!extmap_value(crate::sdp::ABS_SEND_TIME_URI).starts_with("3 "));
     }
+}
+
+/// Generate a random RFC-4122 v4-style UUID string.
+///
+/// Used for SDP stream-id / track-id / cname values. Chrome's WebRTC SDP
+/// parser rejects the legacy `track-<u64>` / `rustrtc-cname-<u64>`
+/// identifier formats when it has to parse a rustrtc-generated SDP as an
+/// offer (re-INVITE). A standard UUID format is accepted by both Chrome
+/// and Firefox.
+fn random_rtc_id() -> String {
+    let r1 = crate::transports::ice::stun::random_u32();
+    let r2 = crate::transports::ice::stun::random_u32();
+    let r3 = crate::transports::ice::stun::random_u32();
+    let r4 = crate::transports::ice::stun::random_u32();
+    let b = [
+        (r1 >> 24) as u8, (r1 >> 16) as u8, (r1 >> 8) as u8, r1 as u8,
+        (r2 >> 24) as u8, (r2 >> 16) as u8, (r2 >> 8) as u8, r2 as u8,
+        (r3 >> 24) as u8, (r3 >> 16) as u8, (r3 >> 8) as u8, r3 as u8,
+        (r4 >> 24) as u8, (r4 >> 16) as u8, (r4 >> 8) as u8, r4 as u8,
+    ];
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+    )
 }
