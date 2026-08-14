@@ -387,6 +387,7 @@ async fn setup_new_peer(peer: Arc<Peer>, room: Arc<Room>) {
 
                         let params = RtpCodecParameters {
                             payload_type,
+                            name: String::new(),
                             clock_rate: clock_rate as u32,
                             channels,
                         };

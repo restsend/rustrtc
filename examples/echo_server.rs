@@ -260,6 +260,7 @@ async fn start_echo(pc: PeerConnection, vp8_pt: u8) {
             .stream_id("stream".to_string())
             .params(rustrtc::RtpCodecParameters {
                 payload_type: vp8_pt,
+                name: "VP8".to_string(),
                 clock_rate: 90000,
                 channels: 0,
             })
@@ -439,6 +440,7 @@ async fn start_video_playback(pc: PeerConnection, vp8_pt: u8) {
             .stream_id("stream".to_string())
             .params(rustrtc::RtpCodecParameters {
                 payload_type: vp8_pt,
+                name: "VP8".to_string(),
                 clock_rate: 90000,
                 channels: 0,
             })

@@ -124,7 +124,7 @@ impl Depacketizer for H264Depacketizer {
             // STAP-A (Single-Time Aggregation Packet type A)
             24 => {
                 let mut offset = 1; // Skip STAP-A header
-                let data = Bytes::from(payload);
+                let data = payload;
                 let len = data.len();
                 let packet_marker = raw_packet.header.marker;
 
@@ -220,7 +220,7 @@ impl Depacketizer for H264Depacketizer {
             }
             // Single NAL unit (1-23)
             1..=23 => {
-                let data = Bytes::from(payload);
+                let data = payload;
                 samples.push(create_video_sample(
                     data,
                     raw_packet.header.timestamp,
@@ -230,7 +230,7 @@ impl Depacketizer for H264Depacketizer {
             }
             // Unknown or unsupported type headers (fallback)
             _ => {
-                let data = Bytes::from(payload);
+                let data = payload;
                 samples.push(create_video_sample(
                     data,
                     raw_packet.header.timestamp,

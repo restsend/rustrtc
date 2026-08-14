@@ -92,6 +92,7 @@ async fn test_rtp_mode_callee_no_ssrc_signaled() -> Result<()> {
         rustrtc::media::track::sample_track(rustrtc::media::frame::MediaKind::Video, 100);
     let params = RtpCodecParameters {
         payload_type: 96,
+        name: "VP8".to_string(),
         clock_rate: 90000,
         channels: 0,
     };
@@ -189,6 +190,7 @@ async fn test_rtp_mode_callee_no_ssrc_signaled_stun_first() -> Result<()> {
         rustrtc::media::track::sample_track(rustrtc::media::frame::MediaKind::Video, 100);
     let params = RtpCodecParameters {
         payload_type: 96,
+        name: "VP8".to_string(),
         clock_rate: 90000,
         channels: 0,
     };

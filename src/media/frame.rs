@@ -160,7 +160,7 @@ impl MediaSample {
         addr: SocketAddr,
     ) -> Self {
         let raw_packet = packet.clone();
-        let data = bytes::Bytes::from(packet.payload);
+        let data = packet.payload;
 
         match kind {
             MediaKind::Audio => MediaSample::Audio(AudioFrame {

@@ -186,9 +186,14 @@ impl RewriteBridge {
     fn rule_for(&self, raw_pt: u8) -> Option<RtpRewriteRule> {
         self.rules
             .iter()
-            .cloned()
             .find(|r| r.match_payload_type == Some(raw_pt))
-            .or_else(|| self.rules.iter().cloned().find(|r| r.match_payload_type.is_none()))
+            .cloned()
+            .or_else(|| {
+                self.rules
+                    .iter()
+                    .find(|r| r.match_payload_type.is_none())
+                    .cloned()
+            })
     }
 
     fn rewrite_packet(&self, packet: &mut RtpPacket) {
@@ -227,10 +232,10 @@ impl RewriteBridge {
                     .unwrap_or_else(random_u32),
             });
 
-        if let Some(r) = &rule {
-            if let Some(payload_type) = r.out_payload_type {
-                packet.header.payload_type = payload_type;
-            }
+        if let Some(r) = &rule
+            && let Some(payload_type) = r.out_payload_type
+        {
+            packet.header.payload_type = payload_type;
         }
         packet.header.ssrc = state.out_ssrc;
 
@@ -417,6 +422,10 @@ pub struct RtpTransport {
     /// Cumulative count of failed relay fast-path pushes (diagnostic for
     /// "call connected but no audio").
     relay_send_failures: AtomicU64,
+    srtp_protect_failures: AtomicU64,
+    srtp_dropped_no_session: AtomicU64,
+    bridge_relayed_packets: AtomicU64,
+    srtp_unprotect_failures: AtomicU64,
     /// Plaintext transport observers — fire on clear RTP for BOTH directions
     /// and ALL forwarding modes (including the relay fast-path). Inbound fires
     /// post-SRTP-unprotect / pre-relay; outbound fires pre-SRTP-protect
@@ -450,6 +459,10 @@ impl RtpTransport {
             has_sent_first_packet: AtomicBool::new(false),
             received_rtp_packets: AtomicU64::new(0),
             relay_send_failures: AtomicU64::new(0),
+            srtp_protect_failures: AtomicU64::new(0),
+            srtp_dropped_no_session: AtomicU64::new(0),
+            bridge_relayed_packets: AtomicU64::new(0),
+            srtp_unprotect_failures: AtomicU64::new(0),
             observers: RwLock::new(Vec::new()),
             has_observers: AtomicBool::new(false),
         }
@@ -547,7 +560,6 @@ impl RtpTransport {
             strip_extensions: params.strip_extensions,
             initial_sequence_number: params.initial_sequence_number,
             initial_timestamp_offset: params.initial_timestamp_offset,
-            ..Default::default()
         };
         self.bridge_rewrite_rules_to(dst, options, RtpRewriteRule::from_params(params));
     }
@@ -791,9 +803,17 @@ impl RtpTransport {
             let session_guard = target.srtp_session.lock();
             if let Some(session) = &*session_guard {
                 if session.lock().protect_rtp(&mut packet).is_err() {
+                    let failures = target.srtp_protect_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                    if failures <= 3 || failures.is_multiple_of(100) {
+                        tracing::warn!(failures, ssrc = packet.header.ssrc, "relay: SRTP protect_rtp failed, dropping");
+                    }
                     return None; // drop on protect error
                 }
             } else if target.srtp_required {
+                let failures = target.srtp_dropped_no_session.fetch_add(1, Ordering::Relaxed) + 1;
+                if failures <= 3 || failures.is_multiple_of(100) {
+                    tracing::debug!(failures, ssrc = packet.header.ssrc, "relay: target SRTP required but session not ready, dropping");
+                }
                 return None; // session not ready → drop
             }
         }
@@ -804,13 +824,23 @@ impl RtpTransport {
             // A failed relay push is the #1 cause of "call connected but no
             // audio" — surface it instead of dropping silently.
             let relay_failures = self.relay_send_failures.fetch_add(1, Ordering::Relaxed) + 1;
-            if relay_failures <= 5 || relay_failures % 100 == 0 {
+            if relay_failures <= 5 || relay_failures.is_multiple_of(100) {
                 tracing::warn!(
                     relay_failures,
                     error = %e,
                     ssrc = packet.header.ssrc,
                     pt = packet.header.payload_type,
                     "RTP rewrite bridge: relay push to destination failed"
+                );
+            }
+        } else {
+            let relayed = self.bridge_relayed_packets.fetch_add(1, Ordering::Relaxed) + 1;
+            if relayed <= 5 {
+                tracing::debug!(
+                    relayed,
+                    ssrc = packet.header.ssrc,
+                    pt = packet.header.payload_type,
+                    "RTP rewrite bridge: relayed packet"
                 );
             }
         }
@@ -915,7 +945,19 @@ impl PacketReceiver for RtpTransport {
                         match RtpPacket::parse(&packet) {
                             Ok(mut rtp_packet) => match srtp.unprotect_rtp(&mut rtp_packet) {
                                 Ok(_) => rtp_packet,
-                                Err(_) => return,
+                                Err(_) => {
+                                    let failures =
+                                        self.srtp_unprotect_failures.fetch_add(1, Ordering::Relaxed)
+                                            + 1;
+                                    if failures <= 5 || failures.is_multiple_of(100) {
+                                        tracing::warn!(
+                                            failures,
+                                            from = %addr,
+                                            "SRTP unprotect RTP failed, dropping"
+                                        );
+                                    }
+                                    return;
+                                }
                             },
                             Err(e) => {
                                 trace!("RTP parse failed: {}", e);

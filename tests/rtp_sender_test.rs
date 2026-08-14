@@ -31,6 +31,7 @@ mod tests {
         // 3. Create RtpSender
         let params = RtpCodecParameters {
             payload_type: 111,
+            name: "opus".to_string(),
             clock_rate: 48000,
             channels: 2,
         };
@@ -100,6 +101,7 @@ mod tests {
         // 3. Create RtpSender
         let params = RtpCodecParameters {
             payload_type: 96,
+            name: "VP8".to_string(),
             clock_rate: 90000,
             channels: 0,
         };

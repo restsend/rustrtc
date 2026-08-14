@@ -1321,6 +1321,7 @@ impl DtlsInner {
                         self.write_epoch.store(ctx.epoch, Ordering::SeqCst);
                         self.write_seq.store(ctx.sequence_number, Ordering::SeqCst);
                         let _ = self.state_tx.send(state);
+                        debug!("DTLS handshake complete (client role) (remote={})", self.conn.remote_addr.read());
                         ctx.local_secret = None;
                     }
                 }

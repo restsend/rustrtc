@@ -1889,7 +1889,27 @@ impl PeerConnection {
                 // Update transceiver parameters
                 let payload_map = Self::extract_payload_map(section);
                 if !payload_map.is_empty() {
-                    let _ = t.update_payload_map(payload_map);
+                    let _ = t.update_payload_map(payload_map.clone());
+
+                    // Sync the sender's params to the new negotiated PT.
+                    // The offer path does this, but the answer path did not —
+                    // after a multi-codec offer is answered with a different
+                    // codec than the sender's default, the sender kept
+                    // stamping the stale PT, so no RTP matched the negotiated
+                    // payload type and the call was silent.
+                    if let Some(sender) = t.sender() {
+                        let cur = sender.params();
+                        let new_params = Self::pick_sender_codec_params(section, &payload_map, &cur);
+                        if let Some(np) = new_params
+                            && np.payload_type != cur.payload_type
+                        {
+                            debug!(
+                                "Syncing sender PT for mid={} (answer): {} -> {} (clock_rate={})",
+                                section.mid, cur.payload_type, np.payload_type, np.clock_rate
+                            );
+                            sender.set_params(np);
+                        }
+                    }
                 }
                 let extmap = Self::extract_extmap(section);
                 let _ = t.update_extmap(extmap);
@@ -3406,11 +3426,7 @@ impl PeerConnection {
                     // side was updated by `update_payload_map` above.
                     if let Some(sender) = t.sender() {
                         let cur = sender.params();
-                        let new_params = payload_map
-                            .values()
-                            .find(|p| p.clock_rate == cur.clock_rate)
-                            .cloned()
-                            .or_else(|| payload_map.values().next().cloned());
+                        let new_params = Self::pick_sender_codec_params(section, &payload_map, &cur);
                         if let Some(np) = new_params
                             && np.payload_type != cur.payload_type
                         {
@@ -3493,10 +3509,10 @@ impl PeerConnection {
         let mut orphan_ids = Vec::new();
         let transceivers = self.inner.transceivers.lock();
         for t in transceivers.iter() {
-            if let Some(mid) = t.mid() {
-                if !mids.contains(mid.as_str()) {
-                    orphan_ids.push(t.id());
-                }
+            if let Some(mid) = t.mid()
+                && !mids.contains(mid.as_str())
+            {
+                orphan_ids.push(t.id());
             }
         }
         drop(transceivers);
@@ -3519,10 +3535,78 @@ impl PeerConnection {
         }
     }
 
+    /// Pick the codec params the sender should stamp after negotiation.
+    ///
+    /// Per RFC 3264 the payload-type number is just an arbitrary label; the
+    /// codec identity is the encoding *name* + clock rate. So this does two
+    /// passes over the remote m-line `formats` (in remote-preference order):
+    ///
+    /// 1. **Name match (preferred)** — the first entry whose encoding name
+    ///    equals the sender's current name. This is the case that fixes silent
+    ///    calls: e.g. we offer Opus at PT 111, the browser answers Opus at PT
+    ///    109, and the sender must re-stamp 109.
+    /// 2. **Clock-rate fallback** — if no name matches (or the names are
+    ///    unknown/empty), the first entry with a matching clock rate, else the
+    ///    first usable entry.
+    ///
+    /// Auxiliary payloads — `telephone-event` (RFC 4733 DTMF) and `rtx`
+    /// (RFC 4588 retransmission) — are skipped in every pass; they must never
+    /// become the sender's primary media payload type.
+    fn pick_sender_codec_params(
+        section: &crate::MediaSection,
+        payload_map: &HashMap<u8, RtpCodecParameters>,
+        cur: &RtpCodecParameters,
+    ) -> Option<RtpCodecParameters> {
+        /// True for payloads that can never be a sender's primary media codec.
+        fn is_auxiliary(p: &RtpCodecParameters) -> bool {
+            p.name.eq_ignore_ascii_case("telephone-event") || p.name.eq_ignore_ascii_case("rtx")
+        }
+
+        // Pass 1: exact codec-name match (RFC 3264). Only compare when both
+        // sides carry a non-empty name; an empty name (e.g. defaulted params)
+        // opts out and falls through to the clock-rate pass.
+        if !cur.name.is_empty() {
+            for fmt in &section.formats {
+                let Ok(pt) = fmt.parse::<u8>() else {
+                    continue;
+                };
+                let Some(params) = payload_map.get(&pt) else {
+                    continue;
+                };
+                if params.name.is_empty() || is_auxiliary(params) {
+                    continue;
+                }
+                if params.name.eq_ignore_ascii_case(&cur.name) {
+                    return Some(params.clone());
+                }
+            }
+        }
+
+        // Pass 2: clock-rate match, then fall back to the first usable entry.
+        let mut fallback: Option<RtpCodecParameters> = None;
+        for fmt in &section.formats {
+            let Ok(pt) = fmt.parse::<u8>() else {
+                continue;
+            };
+            let Some(params) = payload_map.get(&pt) else {
+                continue;
+            };
+            if is_auxiliary(params) {
+                continue;
+            }
+            if fallback.is_none() {
+                fallback = Some(params.clone());
+            }
+            if params.clock_rate == cur.clock_rate {
+                return Some(params.clone());
+            }
+        }
+        fallback
+    }
+
     /// Extract payload type to codec parameters mapping from media section
     fn extract_payload_map(section: &crate::MediaSection) -> HashMap<u8, RtpCodecParameters> {
         let mut payload_map = HashMap::new();
-
         // Parse rtpmap attributes: "96 opus/48000/2"
         for attr in &section.attributes {
             if attr.key == "rtpmap"
@@ -3546,6 +3630,7 @@ impl PeerConnection {
                             pt,
                             RtpCodecParameters {
                                 payload_type: pt,
+                                name: codec_parts[0].to_string(),
                                 clock_rate,
                                 channels,
                             },
@@ -3573,21 +3658,25 @@ impl PeerConnection {
         match pt {
             0 => Some(RtpCodecParameters {
                 payload_type: 0,
+                name: "PCMU".to_string(),
                 clock_rate: 8000,
                 channels: 1,
             }), // PCMU
             8 => Some(RtpCodecParameters {
                 payload_type: 8,
+                name: "PCMA".to_string(),
                 clock_rate: 8000,
                 channels: 1,
             }), // PCMA
             9 => Some(RtpCodecParameters {
                 payload_type: 9,
+                name: "G722".to_string(),
                 clock_rate: 8000,
                 channels: 1,
             }), // G.722
             18 => Some(RtpCodecParameters {
                 payload_type: 18,
+                name: "G729".to_string(),
                 clock_rate: 8000,
                 channels: 1,
             }), // G.729
@@ -4850,17 +4939,17 @@ impl PeerConnectionInner {
                     .config
                     .cname
                     .clone()
-                    .unwrap_or_else(|| random_rtc_id());
+                    .unwrap_or_else(random_rtc_id);
                 let stream_id = transceiver
                     .sender_stream_id
                     .lock()
                     .clone()
-                    .unwrap_or_else(|| random_rtc_id());
+                    .unwrap_or_else(random_rtc_id);
                 let track_id = transceiver
                     .sender_track_id
                     .lock()
                     .clone()
-                    .unwrap_or_else(|| random_rtc_id());
+                    .unwrap_or_else(random_rtc_id);
                 Self::attach_sender_attributes(
                     &mut section,
                     ssrc,
@@ -5638,6 +5727,10 @@ static TRANSCEIVER_COUNTER: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Clone, PartialEq)]
 pub struct RtpCodecParameters {
     pub payload_type: u8,
+    /// RTP encoding name (RFC 3551), e.g. "opus", "VP8", "PCMU".
+    /// The payload-type number is just an arbitrary label; the codec identity
+    /// is the name + clock rate (RFC 3264).
+    pub name: String,
     pub clock_rate: u32,
     pub channels: u8,
 }
@@ -5646,6 +5739,9 @@ impl Default for RtpCodecParameters {
     fn default() -> Self {
         Self {
             payload_type: 96,
+            // Empty so a defaulted param never name-matches and instead falls
+            // back to clock-rate matching, preserving historic behaviour.
+            name: String::new(),
             clock_rate: 90000,
             channels: 0,
         }
@@ -6592,11 +6688,13 @@ impl RtpReceiverBuilder {
         let params = match self.kind {
             MediaKind::Audio => RtpCodecParameters {
                 payload_type: 111,
+                name: "opus".to_string(),
                 clock_rate: 48000,
                 channels: 2,
             },
             MediaKind::Video => RtpCodecParameters {
                 payload_type: 96,
+                name: "VP8".to_string(),
                 clock_rate: 90000,
                 channels: 0,
             },
@@ -6649,11 +6747,13 @@ impl RtpReceiver {
         let params = match kind {
             MediaKind::Audio => RtpCodecParameters {
                 payload_type: 111,
+                name: "opus".to_string(),
                 clock_rate: 48000,
                 channels: 2,
             },
             MediaKind::Video => RtpCodecParameters {
                 payload_type: 96,
+                name: "VP8".to_string(),
                 clock_rate: 90000,
                 channels: 0,
             },
@@ -7345,6 +7445,30 @@ impl RtpReceiver {
     }
 }
 
+/// Generate a random RFC-4122 v4-style UUID string.
+///
+/// Used for SDP stream-id / track-id / cname values. Chrome's WebRTC SDP
+/// parser rejects the legacy `track-<u64>` / `rustrtc-cname-<u64>`
+/// identifier formats when it has to parse a rustrtc-generated SDP as an
+/// offer (re-INVITE). A standard UUID format is accepted by both Chrome
+/// and Firefox.
+fn random_rtc_id() -> String {
+    let r1 = crate::transports::ice::stun::random_u32();
+    let r2 = crate::transports::ice::stun::random_u32();
+    let r3 = crate::transports::ice::stun::random_u32();
+    let r4 = crate::transports::ice::stun::random_u32();
+    let b = [
+        (r1 >> 24) as u8, (r1 >> 16) as u8, (r1 >> 8) as u8, r1 as u8,
+        (r2 >> 24) as u8, (r2 >> 16) as u8, (r2 >> 8) as u8, r2 as u8,
+        (r3 >> 24) as u8, (r3 >> 16) as u8, (r3 >> 8) as u8, r3 as u8,
+        (r4 >> 24) as u8, (r4 >> 16) as u8, (r4 >> 8) as u8, r4 as u8,
+    ];
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+    )
+}
+
 #[cfg(test)]
 impl PeerConnection {
     /// Expose the ICE transport for state manipulation in unit tests.
@@ -7421,6 +7545,7 @@ mod tests {
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 111,
+            name: "opus".to_string(),
             clock_rate: 48000,
             channels: 2,
         };
@@ -7887,6 +8012,7 @@ mod tests {
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 111,
+            name: "opus".to_string(),
             clock_rate: 48000,
             channels: 2,
         };
@@ -8076,6 +8202,7 @@ a=ssrc-group:FID 12345 67890\r\n";
         let _ = source;
         let params = RtpCodecParameters {
             payload_type: 96,
+            name: "VP8".to_string(),
             clock_rate: 90000,
             channels: 0,
         };
@@ -8217,6 +8344,7 @@ a=ice-pwd:testpassword12345678901\r\n";
         let _ = source;
         let params = RtpCodecParameters {
             payload_type: 96,
+            name: "VP8".to_string(),
             clock_rate: 90000,
             channels: 0,
         };
@@ -8361,6 +8489,7 @@ a=ssrc:67890 cname:foo\r\n";
             crate::media::track::sample_track(crate::media::frame::MediaKind::Video, 8);
         let params = RtpCodecParameters {
             payload_type: 96,
+            name: "VP8".to_string(),
             clock_rate: 90000,
             channels: 0,
         };
@@ -8891,6 +9020,7 @@ a=mid:0
             8,
             RtpCodecParameters {
                 payload_type: 8,
+                name: "PCMA".to_string(),
                 clock_rate: 8000,
                 channels: 1,
             },
@@ -9028,6 +9158,7 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 8,
+            name: "PCMA".to_string(),
             clock_rate: 8000,
             channels: 1,
         };
@@ -9068,6 +9199,7 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 8,
+            name: "PCMA".to_string(),
             clock_rate: 8000,
             channels: 1,
         };
@@ -9133,6 +9265,7 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 8,
+            name: "PCMA".to_string(),
             clock_rate: 8000,
             channels: 1,
         };
@@ -9171,6 +9304,7 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 8,
+            name: "PCMA".to_string(),
             clock_rate: 8000,
             channels: 1,
         };
@@ -9232,6 +9366,7 @@ a=mid:0
             sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 111,
+            name: "opus".to_string(),
             clock_rate: 48000,
             channels: 2,
         };
@@ -9448,6 +9583,7 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 8,
+            name: "PCMA".to_string(),
             clock_rate: 8000,
             channels: 1,
         };
@@ -9551,6 +9687,7 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 0,
+            name: "PCMU".to_string(),
             clock_rate: 8000,
             channels: 1,
         };
@@ -9803,6 +9940,7 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 8,
+            name: "PCMA".to_string(),
             clock_rate: 8000,
             channels: 1,
         };
@@ -9834,6 +9972,7 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 8,
+            name: "PCMA".to_string(),
             clock_rate: 8000,
             channels: 1,
         };
@@ -9866,6 +10005,7 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 0,
+            name: "PCMU".to_string(),
             clock_rate: 8000,
             channels: 1,
         };
@@ -10396,6 +10536,7 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 8,
+            name: "PCMA".to_string(),
             clock_rate: 8000,
             channels: 1,
         };
@@ -10456,6 +10597,7 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 8,
+            name: "PCMA".to_string(),
             clock_rate: 8000,
             channels: 1,
         };
@@ -11300,6 +11442,7 @@ a=rtpmap:8 PCMA/8000\r\n";
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 8000);
         let pcma_params = RtpCodecParameters {
             payload_type: 8,
+            name: "PCMA".to_string(),
             clock_rate: 8000,
             channels: 1,
         };
@@ -11390,6 +11533,7 @@ a=rtpmap:8 PCMA/8000\r\n";
                 track,
                 RtpCodecParameters {
                     payload_type: 8,
+                    name: "PCMA".to_string(),
                     clock_rate: 8000,
                     channels: 1,
                 },
@@ -11462,6 +11606,7 @@ a=rtpmap:8 PCMA/8000\r\n";
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 8000);
         let pcma_params = RtpCodecParameters {
             payload_type: 8,
+            name: "PCMA".to_string(),
             clock_rate: 8000,
             channels: 1,
         };
@@ -11548,6 +11693,7 @@ a=rtpmap:8 PCMA/8000\r\n";
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 8000);
         let pcma_params = RtpCodecParameters {
             payload_type: 8,
+            name: "PCMA".to_string(),
             clock_rate: 8000,
             channels: 1,
         };
@@ -11737,6 +11883,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             8u8,
             RtpCodecParameters {
                 payload_type: 8,
+                name: "PCMA".to_string(),
                 clock_rate: 8000,
                 channels: 1,
             },
@@ -11882,6 +12029,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             8u8,
             RtpCodecParameters {
                 payload_type: 8,
+                name: "PCMA".to_string(),
                 clock_rate: 8000,
                 channels: 1,
             },
@@ -11973,6 +12121,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             8u8,
             RtpCodecParameters {
                 payload_type: 8,
+                name: "PCMA".to_string(),
                 clock_rate: 8000,
                 channels: 1,
             },
@@ -12057,6 +12206,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             8u8,
             RtpCodecParameters {
                 payload_type: 8,
+                name: "PCMA".to_string(),
                 clock_rate: 8000,
                 channels: 1,
             },
@@ -12241,6 +12391,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             8u8,
             RtpCodecParameters {
                 payload_type: 8,
+                name: "PCMA".to_string(),
                 clock_rate: 8000,
                 channels: 1,
             },
@@ -12381,6 +12532,7 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 111,
+            name: "opus".to_string(),
             clock_rate: 48000,
             channels: 2,
         };
@@ -12440,6 +12592,7 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Video, 90000);
         let params = RtpCodecParameters {
             payload_type: 96,
+            name: "VP8".to_string(),
             clock_rate: 90000,
             channels: 0,
         };
@@ -12462,6 +12615,7 @@ a=mid:0
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
             payload_type: 111,
+            name: "opus".to_string(),
             clock_rate: 48000,
             channels: 2,
         };
@@ -12539,26 +12693,3 @@ a=mid:0
     }
 }
 
-/// Generate a random RFC-4122 v4-style UUID string.
-///
-/// Used for SDP stream-id / track-id / cname values. Chrome's WebRTC SDP
-/// parser rejects the legacy `track-<u64>` / `rustrtc-cname-<u64>`
-/// identifier formats when it has to parse a rustrtc-generated SDP as an
-/// offer (re-INVITE). A standard UUID format is accepted by both Chrome
-/// and Firefox.
-fn random_rtc_id() -> String {
-    let r1 = crate::transports::ice::stun::random_u32();
-    let r2 = crate::transports::ice::stun::random_u32();
-    let r3 = crate::transports::ice::stun::random_u32();
-    let r4 = crate::transports::ice::stun::random_u32();
-    let b = [
-        (r1 >> 24) as u8, (r1 >> 16) as u8, (r1 >> 8) as u8, r1 as u8,
-        (r2 >> 24) as u8, (r2 >> 16) as u8, (r2 >> 8) as u8, r2 as u8,
-        (r3 >> 24) as u8, (r3 >> 16) as u8, (r3 >> 8) as u8, r3 as u8,
-        (r4 >> 24) as u8, (r4 >> 16) as u8, (r4 >> 8) as u8, r4 as u8,
-    ];
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
-    )
-}

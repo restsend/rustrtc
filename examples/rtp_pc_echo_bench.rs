@@ -205,6 +205,7 @@ async fn start_echo_tracks(pc: PeerConnection, counters: Arc<ServerCounters>) {
         let sender = RtpSender::builder(outgoing_track, 5000 + transceiver.id() as u32)
             .params(rustrtc::RtpCodecParameters {
                 payload_type: 0,
+                name: "PCMU".to_string(),
                 clock_rate: 8000,
                 channels: 1,
             })

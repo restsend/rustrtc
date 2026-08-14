@@ -25,6 +25,7 @@ async fn test_media_flow_and_pli() -> Result<()> {
     let source = Arc::new(source);
     let params = RtpCodecParameters {
         payload_type: 96,
+        name: "VP8".to_string(),
         clock_rate: 90000,
         channels: 0,
     };

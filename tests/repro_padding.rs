@@ -42,6 +42,7 @@ async fn test_padding_packet_drop() -> Result<()> {
         .stream_id("stream".to_string())
         .params(rustrtc::RtpCodecParameters {
             payload_type: 96,
+            name: "VP8".to_string(),
             clock_rate: 90000,
             channels: 0,
         })
@@ -73,6 +74,7 @@ async fn test_padding_packet_drop() -> Result<()> {
         .stream_id("stream".to_string())
         .params(rustrtc::RtpCodecParameters {
             payload_type: 96,
+            name: "VP8".to_string(),
             clock_rate: 90000,
             channels: 0,
         })

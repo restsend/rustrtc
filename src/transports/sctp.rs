@@ -1375,7 +1375,7 @@ impl SctpInner {
         let mut t3_expired = false;
         {
             let sent_queue = self.sent_queue.lock();
-            for (_, record) in sent_queue.iter() {
+            for record in sent_queue.values() {
                 if !record.acked && !record.abandoned && now >= record.sent_time + rto_dur {
                     t3_expired = true;
                     break;
@@ -2897,7 +2897,7 @@ impl SctpInner {
     /// before the timer fires flushes the SACK immediately (every-other rule).
     fn schedule_sack_delayed(&self) {
         let mut deadline = self.sack_delayed_until.lock();
-        if let Some(_) = *deadline {
+        if deadline.is_some() {
             // Already waiting on a delayed SACK → 2nd in-order chunk: flush now.
             *deadline = None;
             self.sack_needed.store(true, Ordering::Relaxed);
@@ -3301,7 +3301,7 @@ impl SctpInner {
             let mut sent = self.sent_queue.lock();
             let mut recovery_tx = self.fast_recovery_transmit.load(Ordering::Relaxed);
 
-            for (_, record) in sent.iter_mut() {
+            for record in sent.values_mut() {
                 if record.needs_retransmit {
                     if recovery_tx {
                         self.fast_recovery_transmit.store(false, Ordering::Relaxed);

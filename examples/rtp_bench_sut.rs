@@ -61,6 +61,7 @@ async fn start_forwarding(pc: PeerConnection, pt: u8, echo_addr: SocketAddr) {
         let sender = rustrtc::peer_connection::RtpSender::builder(outgoing_track, ssrc)
             .params(rustrtc::RtpCodecParameters {
                 payload_type: pt,
+                name: String::new(),
                 clock_rate,
                 channels: if pt == 0 { 1 } else { 0 },
             })

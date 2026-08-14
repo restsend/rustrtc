@@ -128,6 +128,7 @@ async fn interop_vp8_echo() -> Result<()> {
     let (source, track, _) = rustrtc::media::sample_track(rustrtc::media::MediaKind::Video, 10);
     let params = rustrtc::RtpCodecParameters {
         payload_type: 96,
+        name: "VP8".to_string(),
         clock_rate: 90000,
         channels: 0,
     };
@@ -312,6 +313,7 @@ async fn interop_vp8_echo_with_pli() -> Result<()> {
     let (source, track, _) = rustrtc::media::sample_track(rustrtc::media::MediaKind::Video, 10);
     let params = rustrtc::RtpCodecParameters {
         payload_type: 96,
+        name: "VP8".to_string(),
         clock_rate: 90000,
         channels: 0,
     };

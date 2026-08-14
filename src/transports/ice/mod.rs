@@ -1399,10 +1399,10 @@ impl IceTransport {
             map.values().cloned().collect()
         };
         for client in &clients {
-            if let Ok((bytes, _tx_id)) = client.create_destroy_packet_sync() {
-                if client.try_send_sync(&bytes) {
-                    trace!("TURN allocation destroy Refresh(LIFETIME=0) sent (best-effort)");
-                }
+            if let Ok((bytes, _tx_id)) = client.create_destroy_packet_sync()
+                && client.try_send_sync(&bytes)
+            {
+                trace!("TURN allocation destroy Refresh(LIFETIME=0) sent (best-effort)");
             }
         }
     }
@@ -1421,7 +1421,7 @@ impl IceTransport {
         // (Drop) this is skipped — port mapping leases expire on the router.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let upnp_clone = self.inner.gatherer.clone();
-            let _ = handle.spawn(async move {
+            handle.spawn(async move {
                 upnp_clone.cleanup_upnp_mappings().await;
             });
         }

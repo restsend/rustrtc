@@ -34,6 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         111,
         peer_connection::RtpCodecParameters {
             payload_type: 111,
+            name: "opus".to_string(),
             clock_rate: 48000,
             channels: 2,
         },
@@ -70,6 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         120, // Changed from 111
         peer_connection::RtpCodecParameters {
             payload_type: 120,
+            name: "opus".to_string(),
             clock_rate: 48000,
             channels: 2,
         },

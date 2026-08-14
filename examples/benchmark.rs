@@ -495,6 +495,7 @@ async fn run_rustrtc(count: usize) -> (f64, u64, u64) {
             let (_source, track, _) = sample_track(MediaKind::Audio, 100);
             let params = rustrtc::RtpCodecParameters {
                 payload_type: 111,
+                name: "opus".to_string(),
                 clock_rate: 48000,
                 channels: 2,
             };

@@ -16,6 +16,7 @@ async fn test_payload_type_update() {
         111,
         peer_connection::RtpCodecParameters {
             payload_type: 111,
+            name: "opus".to_string(),
             clock_rate: 48000,
             channels: 2,
         },
@@ -34,6 +35,7 @@ async fn test_payload_type_update() {
         111,
         peer_connection::RtpCodecParameters {
             payload_type: 111,
+            name: "opus".to_string(),
             clock_rate: 16000,
             channels: 1,
         },
@@ -51,6 +53,7 @@ async fn test_payload_type_update() {
         120,
         peer_connection::RtpCodecParameters {
             payload_type: 120,
+            name: "VP8".to_string(),
             clock_rate: 90000,
             channels: 0,
         },
@@ -119,6 +122,7 @@ async fn test_concurrent_payload_map_access() {
         96,
         peer_connection::RtpCodecParameters {
             payload_type: 96,
+            name: "VP8".to_string(),
             clock_rate: 90000,
             channels: 0,
         },
@@ -152,6 +156,7 @@ async fn test_concurrent_payload_map_access() {
         97,
         peer_connection::RtpCodecParameters {
             payload_type: 97,
+            name: "VP8".to_string(),
             clock_rate: 90000,
             channels: 0,
         },
@@ -275,6 +280,7 @@ async fn test_reinvite_payload_change() {
         111,
         peer_connection::RtpCodecParameters {
             payload_type: 111,
+            name: "opus".to_string(),
             clock_rate: 48000,
             channels: 2,
         },
@@ -293,6 +299,7 @@ async fn test_reinvite_payload_change() {
         120,
         peer_connection::RtpCodecParameters {
             payload_type: 120,
+            name: "opus".to_string(),
             clock_rate: 48000,
             channels: 2,
         },
@@ -320,6 +327,7 @@ async fn test_reinvite_comprehensive() {
         96,
         peer_connection::RtpCodecParameters {
             payload_type: 96,
+            name: "VP8".to_string(),
             clock_rate: 90000,
             channels: 0,
         },
@@ -328,6 +336,7 @@ async fn test_reinvite_comprehensive() {
         97,
         peer_connection::RtpCodecParameters {
             payload_type: 97,
+            name: "VP8".to_string(),
             clock_rate: 90000,
             channels: 0,
         },
@@ -359,6 +368,7 @@ async fn test_reinvite_comprehensive() {
         98, // Changed from 96
         peer_connection::RtpCodecParameters {
             payload_type: 98,
+            name: "VP8".to_string(),
             clock_rate: 90000,
             channels: 0,
         },
@@ -367,6 +377,7 @@ async fn test_reinvite_comprehensive() {
         97, // Kept
         peer_connection::RtpCodecParameters {
             payload_type: 97,
+            name: "VP8".to_string(),
             clock_rate: 90000,
             channels: 0,
         },
@@ -406,6 +417,7 @@ async fn test_reinvite_comprehensive() {
         100,
         peer_connection::RtpCodecParameters {
             payload_type: 100,
+            name: "VP8".to_string(),
             clock_rate: 90000,
             channels: 0,
         },
@@ -447,6 +459,7 @@ fn extract_payload_map_helper(
                         pt,
                         peer_connection::RtpCodecParameters {
                             payload_type: pt,
+                            name: codec_parts[0].to_string(),
                             clock_rate,
                             channels,
                         },

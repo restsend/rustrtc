@@ -100,6 +100,9 @@ fn sample_queue_channel(capacity: usize) -> (SampleQueueSender, SampleQueueRecei
 }
 
 impl SampleQueueSender {
+    /// Enqueue a sample. The unit error signals "dropped" (queue full / closed);
+    /// it is mapped to a typed error by the single real caller.
+    #[allow(clippy::result_unit_err)]
     pub fn send(&self, sample: MediaSample) -> Result<(), ()> {
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(());

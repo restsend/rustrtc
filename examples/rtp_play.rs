@@ -45,6 +45,7 @@ async fn main() {
     let (sample_source, track, _) = rustrtc::media::sample_track(MediaKind::Video, 100);
     let params = rustrtc::RtpCodecParameters {
         payload_type: 96,
+        name: "VP8".to_string(),
         clock_rate: 90000,
         channels: 0,
     };
