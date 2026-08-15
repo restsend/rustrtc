@@ -31,7 +31,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use tokio::net::{TcpListener, TcpStream, UdpSocket, lookup_host};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio::time::timeout;
-use tracing::{debug, instrument, trace};
+use tracing::{debug, instrument, trace, warn};
 
 #[cfg(any(test, feature = "simulator"))]
 use self::stun::random_u32;
@@ -149,6 +149,9 @@ pub(crate) struct IceTransportInner {
     /// timer tick skips when a previous refresh is still in flight instead of
     /// cancelling it (which used to orphan pending transactions).
     turn_refresh_in_progress: std::sync::atomic::AtomicBool,
+    /// Guards against overlapping UPnP mapping refreshes (same skip-on-in-flight
+    /// pattern as `turn_refresh_in_progress`).
+    upnp_refresh_in_progress: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for IceTransportInner {
@@ -203,9 +206,17 @@ impl IceTransportRunner {
             tokio::time::Instant::now() + Duration::from_secs(25),
             Duration::from_secs(25),
         );
+        // UPnP mapping refresh interval. Long-lived sessions (> 1 hour) outlive
+        // the default router lease (3600s); re-issuing AddPortMapping keeps the
+        // mapping alive so inbound P2P traffic isn't lost mid-call.
+        let mut upnp_refresh_interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + self.inner.config.upnp_refresh_interval,
+            self.inner.config.upnp_refresh_interval,
+        );
         let mut read_futures: FuturesUnordered<BoxFuture<'static, ()>> = FuturesUnordered::new();
         let mut gathering_future: BoxFuture<'static, ()> = Box::pin(futures::future::pending());
         let mut turn_refresh_future: BoxFuture<'static, ()> = Box::pin(futures::future::pending());
+        let mut upnp_refresh_future: BoxFuture<'static, ()> = Box::pin(futures::future::pending());
 
         loop {
             tokio::select! {
@@ -313,6 +324,28 @@ impl IceTransportRunner {
                 }
                 _ = &mut turn_refresh_future => {
                     turn_refresh_future = Box::pin(futures::future::pending());
+                }
+                _ = upnp_refresh_interval.tick() => {
+                    // UPnP SOAP calls can be slow (hundreds of ms). Run them in
+                    // a detached future so the runner's 1s keepalive tick is
+                    // never blocked. Guard with an in-progress flag so slow
+                    // routers don't pile up overlapping refreshes.
+                    if !self
+                        .inner
+                        .upnp_refresh_in_progress
+                        .swap(true, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        let inner = self.inner.clone();
+                        upnp_refresh_future = Box::pin(async move {
+                            inner.gatherer.renew_upnp_mappings().await;
+                            inner
+                                .upnp_refresh_in_progress
+                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                        });
+                    }
+                }
+                _ = &mut upnp_refresh_future => {
+                    upnp_refresh_future = Box::pin(futures::future::pending());
                 }
                 Some(_) = read_futures.next() => {
                     // Read loop finished
@@ -896,6 +929,7 @@ impl IceTransport {
             nomination_complete: nomination_complete_tx,
             _nomination_complete_rx: nomination_complete_rx,
             turn_refresh_in_progress: std::sync::atomic::AtomicBool::new(false),
+            upnp_refresh_in_progress: std::sync::atomic::AtomicBool::new(false),
             buffer_stats: Arc::new(BufferStats::default()),
         };
         let inner = Arc::new(inner);
@@ -3368,6 +3402,20 @@ impl IceGatherer {
             }
         }
         self.upnp_mappers.lock().clear();
+    }
+
+    /// Refresh all stale UPnP port mappings (best-effort).
+    ///
+    /// Called periodically by the ICE runner so long-lived sessions keep their
+    /// router leases alive. Each mapper renews its own stale mappings and a
+    /// single failure does not abort the rest.
+    pub async fn renew_upnp_mappings(&self) {
+        let mappers = self.upnp_mappers.lock().clone();
+        for mapper in mappers {
+            if let Err(e) = mapper.renew_all_stale().await {
+                warn!("Failed to refresh UPnP mappings: {}", e);
+            }
+        }
     }
 
     fn state(&self) -> IceGathererState {

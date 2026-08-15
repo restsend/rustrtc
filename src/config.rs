@@ -415,6 +415,10 @@ fn default_upnp_discovery_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(1)
 }
 
+fn default_upnp_refresh_interval() -> std::time::Duration {
+    std::time::Duration::from_secs(30)
+}
+
 /// Primary configuration for a `PeerConnection`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RtcConfiguration {
@@ -460,7 +464,7 @@ pub struct RtcConfiguration {
     /// resume. Keep this comfortably below `ice_connection_timeout`, which is
     /// the hard, non-recoverable failure threshold.
     ///
-    /// Default: 5s (standard heuristic). Raise it (e.g. 120s) for long-lived
+    /// Default: 30s. Raise it further (e.g. 120s) for long-lived
     /// tunnels (SSH/port-forwarding) over lossy links where brief blackouts are
     /// expected and must not even flap the SCTP association.
     pub ice_disconnect_threshold: std::time::Duration,
@@ -474,7 +478,7 @@ pub struct RtcConfiguration {
     /// bounding how long a dead connection lingers.
     ///
     /// Set to 0 to tear down immediately on ICE Disconnected.
-    /// Default: 15s
+    /// Default: 60s
     pub ice_disconnect_grace: std::time::Duration,
     pub sctp_rto_initial: std::time::Duration,
     pub sctp_rto_min: std::time::Duration,
@@ -517,6 +521,12 @@ pub struct RtcConfiguration {
     /// UPnP gateway discovery timeout
     #[serde(default = "default_upnp_discovery_timeout")]
     pub upnp_discovery_timeout: std::time::Duration,
+    /// How often to refresh UPnP port mappings before the router lease expires.
+    /// Re-issuing AddPortMapping with the same external port renews the lease on
+    /// most IGDs without deleting the mapping, so long-lived sessions survive
+    /// the default lease (3600s) without inbound path loss.
+    #[serde(default = "default_upnp_refresh_interval")]
+    pub upnp_refresh_interval: std::time::Duration,
     #[serde(skip, default)]
     pub depacketizer_strategy: DepacketizerStrategy,
     #[serde(default = "default_rtp_buffer_capacity")]
@@ -610,6 +620,7 @@ impl PartialEq for RtcConfiguration {
             && self.enable_upnp == other.enable_upnp
             && self.upnp_lease_duration == other.upnp_lease_duration
             && self.upnp_discovery_timeout == other.upnp_discovery_timeout
+            && self.upnp_refresh_interval == other.upnp_refresh_interval
             && self.depacketizer_strategy == other.depacketizer_strategy
             && self.rtp_buffer_capacity == other.rtp_buffer_capacity
             && self.buffer_drop_strategy == other.buffer_drop_strategy
@@ -644,9 +655,9 @@ impl Default for RtcConfiguration {
             ssrc_start: 10000,
             stun_timeout: std::time::Duration::from_secs(5),
             nomination_timeout: std::time::Duration::from_secs(10),
-            ice_connection_timeout: std::time::Duration::from_secs(30),
-            ice_disconnect_threshold: std::time::Duration::from_secs(5),
-            ice_disconnect_grace: std::time::Duration::from_secs(15),
+            ice_connection_timeout: std::time::Duration::from_secs(120),
+            ice_disconnect_threshold: std::time::Duration::from_secs(30),
+            ice_disconnect_grace: std::time::Duration::from_secs(60),
             sctp_rto_initial: std::time::Duration::from_secs(3),
             sctp_rto_min: std::time::Duration::from_millis(200),
             sctp_rto_max: std::time::Duration::from_secs(60),
@@ -671,6 +682,7 @@ impl Default for RtcConfiguration {
             enable_upnp: default_enable_upnp(),
             upnp_lease_duration: default_upnp_lease_duration(),
             upnp_discovery_timeout: default_upnp_discovery_timeout(),
+            upnp_refresh_interval: default_upnp_refresh_interval(),
             depacketizer_strategy: DepacketizerStrategy::default(),
             rtp_buffer_capacity: default_rtp_buffer_capacity(),
             buffer_drop_strategy: BufferDropStrategy::default(),
@@ -763,6 +775,12 @@ impl RtcConfigurationBuilder {
 
     pub fn upnp_discovery_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.inner.upnp_discovery_timeout = timeout;
+        self
+    }
+
+    /// Set how often UPnP port mappings are refreshed to keep the router lease alive.
+    pub fn upnp_refresh_interval(mut self, interval: std::time::Duration) -> Self {
+        self.inner.upnp_refresh_interval = interval;
         self
     }
 
@@ -1024,9 +1042,9 @@ mod tests {
     #[test]
     fn test_rtc_configuration_defaults() {
         let config = RtcConfiguration::default();
-        assert_eq!(config.ice_connection_timeout, Duration::from_secs(30));
-        assert_eq!(config.ice_disconnect_threshold, Duration::from_secs(5));
-        assert_eq!(config.ice_disconnect_grace, Duration::from_secs(15));
+        assert_eq!(config.ice_connection_timeout, Duration::from_secs(120));
+        assert_eq!(config.ice_disconnect_threshold, Duration::from_secs(30));
+        assert_eq!(config.ice_disconnect_grace, Duration::from_secs(60));
         assert_eq!(config.sctp_rto_initial, Duration::from_secs(3));
         assert_eq!(config.sctp_rto_min, Duration::from_millis(200));
         assert_eq!(config.sctp_rto_max, Duration::from_secs(60));
@@ -1047,7 +1065,7 @@ mod tests {
             .build();
         assert_eq!(config.stun_timeout, Duration::from_secs(10));
         // Verify other defaults are still there
-        assert_eq!(config.ice_connection_timeout, Duration::from_secs(30));
+        assert_eq!(config.ice_connection_timeout, Duration::from_secs(120));
     }
 
     #[test]
@@ -1142,6 +1160,7 @@ mod tests {
         let config = RtcConfiguration::default();
         assert!(!config.enable_upnp, "UPnP should be disabled by default");
         assert_eq!(config.upnp_lease_duration, 3600);
+        assert_eq!(config.upnp_refresh_interval, Duration::from_secs(30));
     }
 
     #[test]
@@ -1152,6 +1171,24 @@ mod tests {
             .build();
         assert!(!config.enable_upnp);
         assert_eq!(config.upnp_lease_duration, 7200);
+    }
+
+    #[test]
+    fn test_upnp_refresh_interval_builder() {
+        let config = RtcConfigurationBuilder::new()
+            .upnp_refresh_interval(Duration::from_secs(60))
+            .build();
+        assert_eq!(config.upnp_refresh_interval, Duration::from_secs(60));
+
+        // Refresh interval participates in PartialEq
+        let a = RtcConfigurationBuilder::new()
+            .upnp_refresh_interval(Duration::from_secs(60))
+            .build();
+        let b = RtcConfigurationBuilder::new()
+            .upnp_refresh_interval(Duration::from_secs(120))
+            .build();
+        assert_ne!(a, b);
+        assert_eq!(a, a.clone());
     }
 
     #[test]

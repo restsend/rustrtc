@@ -4299,3 +4299,43 @@ async fn test_shared_udp_socket_cleared_on_stop() {
     );
     assert_eq!(transport.state(), IceTransportState::Closed);
 }
+
+/// The runner's periodic UPnP refresh tick must invoke
+/// `renew_upnp_mappings()` on the gatherer. We inject a mapper whose local
+/// mapping is stale and a mock IGD, then verify the runner's tick fires an
+/// AddPortMapping against it — proving long-lived mappings get renewed
+/// automatically (no inbound-path gap after the router lease expires).
+#[tokio::test]
+async fn test_runner_upnp_refresh_tick_renews_mappings() {
+    use crate::transports::ice::upnp::test_mock_igd::{MockIgd, STALE_AGE};
+
+    let mut config = RtcConfiguration::default();
+    config.enable_upnp = true;
+    config.upnp_refresh_interval = Duration::from_millis(200);
+
+    let (transport, runner) = IceTransportBuilder::new(config).build();
+    tokio::spawn(runner);
+
+    // Inject a mapper with a stale local mapping pointing at a mock IGD.
+    let mock = MockIgd::start().await;
+    let mut mapper = UpnpPortMapper::new("192.168.1.100:5000".parse().unwrap());
+    mapper.set_gateway_for_test(mock.gateway());
+    mapper.insert_mapping_for_test(20001, STALE_AGE).await;
+    transport.inner.gatherer.upnp_mappers.lock().push(mapper);
+
+    // The runner runs the upnp refresh tick every 200ms regardless of ICE
+    // state; wait for a couple of ticks.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let add_calls = mock.add_calls.load(Ordering::SeqCst);
+    assert!(
+        add_calls >= 1,
+        "runner upnp refresh tick must issue AddPortMapping (got {})",
+        add_calls
+    );
+
+    transport.stop();
+    // Stop spawns the async cleanup; give it a moment so it doesn't race the
+    // test harness teardown.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+}

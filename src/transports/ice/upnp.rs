@@ -6,6 +6,7 @@
 
 use crate::transports::ice::IceCandidate;
 use anyhow::{Result, anyhow};
+use igd::AddPortError;
 use igd::PortMappingProtocol;
 use igd::aio::Gateway;
 use std::collections::HashMap;
@@ -105,6 +106,30 @@ impl UpnpPortMapper {
     /// Enable UPnP functionality
     pub fn enable(&mut self) {
         self.enabled = true;
+    }
+
+    /// Inject a gateway directly (test-only). The `Gateway` fields are all
+    /// `pub`, so tests can point one at a local mock SOAP IGD server.
+    #[cfg(test)]
+    pub fn set_gateway_for_test(&mut self, gateway: Gateway) {
+        self.gateway = Some(gateway);
+    }
+
+    /// Insert a mapping directly with the given age (test-only), bypassing the
+    /// router. Used to drive `is_expired_or_stale` in renewal tests.
+    #[cfg(test)]
+    pub async fn insert_mapping_for_test(&self, external_port: u16, age: Duration) {
+        let mut mappings = self.mappings.lock().await;
+        mappings.insert(
+            external_port,
+            PortMapping {
+                external_port,
+                internal_addr: self.local_addr,
+                lease_duration: self.default_lease_duration,
+                description: format!("rustrtc-{}", self.local_addr.port()),
+                created_at: std::time::Instant::now().checked_sub(age).unwrap(),
+            },
+        );
     }
 
     /// Check if UPnP is enabled
@@ -378,6 +403,91 @@ impl UpnpPortMapper {
         self.mappings.lock().await.clone()
     }
 
+    /// Refresh a mapping's lease by re-issuing AddPortMapping with the same
+    /// external port, WITHOUT deleting the mapping first.
+    ///
+    /// Re-issuing AddPortMapping for an existing external port renews the lease
+    /// on most IGDs with no inbound-path gap. This is the safe way to keep a
+    /// long-lived mapping alive past the router's lease duration.
+    ///
+    /// Returns:
+    ///   - `Ok(true)` if the mapping was refreshed or re-added
+    ///   - `Ok(false)` if the mapping doesn't exist locally (nothing to refresh)
+    pub async fn refresh_mapping(&self, external_port: u16) -> Result<bool> {
+        let gateway = match &self.gateway {
+            Some(g) => g,
+            None => return Ok(false), // No gateway, nothing to refresh
+        };
+
+        let mapping = {
+            let mappings = self.mappings.lock().await;
+            match mappings.get(&external_port) {
+                Some(m) => m.clone(),
+                None => return Ok(false),
+            }
+        };
+
+        let local_ip = match mapping.internal_addr.ip() {
+            IpAddr::V4(ip) => ip,
+            IpAddr::V6(_) => return Err(anyhow!("IPv6 not supported for UPnP IGD")),
+        };
+        let internal_sock_addr = SocketAddrV4::new(local_ip, mapping.internal_addr.port());
+
+        // Try a plain re-issue first (idempotent lease refresh on most routers).
+        // Only fall back to delete-then-add if the router reports PortInUse.
+        let refreshed = match gateway
+            .add_port(
+                PortMappingProtocol::UDP,
+                external_port,
+                internal_sock_addr,
+                self.default_lease_duration,
+                &mapping.description,
+            )
+            .await
+        {
+            Ok(()) => true,
+            Err(AddPortError::PortInUse) => {
+                // Router thinks the port belongs to someone else (e.g. a stale
+                // entry). Remove then re-add — but NEVER switch to a random port:
+                // changing the external port would break the negotiated ICE
+                // candidate.
+                let _ = self.remove_mapping(external_port).await;
+                gateway
+                    .add_port(
+                        PortMappingProtocol::UDP,
+                        external_port,
+                        internal_sock_addr,
+                        self.default_lease_duration,
+                        &mapping.description,
+                    )
+                    .await
+                    .map_err(|e| anyhow!("Failed to re-add UPnP mapping after conflict: {}", e))?;
+                true
+            }
+            Err(AddPortError::OnlyPermanentLeasesSupported) => {
+                // Router only supports permanent (lease 0) mappings; refresh is
+                // effectively a no-op since the mapping never expires. Reset the
+                // local staleness clock so we stop hammering the router.
+                true
+            }
+            Err(e) => {
+                return Err(anyhow!("Failed to refresh UPnP mapping: {}", e));
+            }
+        };
+
+        if refreshed {
+            {
+                let mut mappings = self.mappings.lock().await;
+                if let Some(m) = mappings.get_mut(&external_port) {
+                    m.created_at = std::time::Instant::now();
+                }
+            }
+            debug!("Refreshed UPnP mapping for port {}", external_port);
+        }
+
+        Ok(refreshed)
+    }
+
     /// Renew a mapping if it's about to expire
     ///
     /// Returns true if the mapping was renewed, false if it doesn't exist
@@ -396,17 +506,14 @@ impl UpnpPortMapper {
             return Ok(false);
         }
 
-        // Remove old mapping and add new one
-        let _ = self.remove_mapping(external_port).await;
-        self.add_mapping(external_port).await?;
-
-        debug!("Renewed UPnP mapping for port {}", external_port);
-        Ok(true)
+        self.refresh_mapping(external_port).await
     }
 
     /// Renew all stale mappings
     ///
-    /// Returns the number of mappings that were renewed.
+    /// Best-effort: a failure on one mapping is logged and renewal continues
+    /// with the rest, so a single transient router error never blocks the
+    /// refresh cycle. Returns the number of mappings that were renewed.
     pub async fn renew_all_stale(&self) -> Result<usize> {
         let ports_to_renew: Vec<u16> = {
             let mappings = self.mappings.lock().await;
@@ -419,8 +526,12 @@ impl UpnpPortMapper {
 
         let mut renewed = 0;
         for port in ports_to_renew {
-            if self.renew_mapping(port).await? {
-                renewed += 1;
+            match self.renew_mapping(port).await {
+                Ok(true) => renewed += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    warn!("Failed to renew UPnP mapping for port {}: {}", port, e);
+                }
             }
         }
 
@@ -496,9 +607,196 @@ pub async fn try_create_upnp_candidate(local_addr: SocketAddr) -> Option<IceCand
     Some(candidate)
 }
 
+/// Shared in-process mock UPnP IGD used by upnp unit tests and the ICE
+/// runner integration tests (`ice::tests`). Serves SOAP responses over a
+/// loopback TCP listener so the real `igd` client code path is exercised.
+#[cfg(test)]
+pub(crate) mod test_mock_igd {
+    use super::*;
+    use igd::aio::Gateway;
+    use std::collections::VecDeque;
+    use std::net::SocketAddrV4;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex as TokioMutex;
+
+    #[derive(Debug, Clone)]
+    pub enum MockAddResponse {
+        Ok,
+        PortInUse,
+        PermanentOnly,
+        Unauthorized,
+    }
+
+    /// Minimal in-process UPnP IGD. Ignores the SOAP body; decides the reply
+    /// from the `SOAPAction` header, with a programmable queue of responses for
+    /// AddPortMapping. Tracks how many AddPortMapping / DeletePortMapping
+    /// requests it received so tests can assert the exact sequence.
+    #[derive(Debug, Clone)]
+    pub struct MockIgd {
+        addr: SocketAddrV4,
+        pub add_calls: Arc<AtomicUsize>,
+        pub delete_calls: Arc<AtomicUsize>,
+        add_queue: Arc<TokioMutex<VecDeque<MockAddResponse>>>,
+    }
+
+    impl MockIgd {
+        pub async fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let addr_v4 = match addr {
+                SocketAddr::V4(v4) => v4,
+                _ => unreachable!("bound to IPv4 loopback"),
+            };
+            let this = Self {
+                addr: addr_v4,
+                add_calls: Arc::new(AtomicUsize::new(0)),
+                delete_calls: Arc::new(AtomicUsize::new(0)),
+                add_queue: Arc::new(TokioMutex::new(VecDeque::new())),
+            };
+            let server = this.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut sock, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let server = server.clone();
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 8192];
+                        let n = match sock.read(&mut buf).await {
+                            Ok(n) => n,
+                            Err(_) => return,
+                        };
+                        let req = String::from_utf8_lossy(&buf[..n]);
+                        let soap_action = req
+                            .lines()
+                            .find_map(|l| {
+                                let lower = l.to_ascii_lowercase();
+                                lower
+                                    .starts_with("soapaction:")
+                                    .then(|| l["soapaction:".len()..].trim().to_string())
+                            })
+                            .unwrap_or_default();
+                        // "urn:...:WANIPConnection:1#Action"
+                        let action = soap_action
+                            .rsplit('#')
+                            .next()
+                            .unwrap_or("")
+                            .trim_matches('"')
+                            .to_string();
+
+                        let body = server.handle_action(&action).await;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = sock.write_all(response.as_bytes()).await;
+                    });
+                }
+            });
+            this
+        }
+
+        pub async fn handle_action(&self, action: &str) -> String {
+            if action.contains("GetExternalIPAddress") {
+                return ok_response(
+                    "GetExternalIPAddressResponse",
+                    "<NewExternalIPAddress>203.0.113.1</NewExternalIPAddress>",
+                );
+            }
+            if action.contains("AddPortMapping") {
+                let _ = self.add_calls.fetch_add(1, Ordering::SeqCst);
+                let resp = {
+                    let mut q = self.add_queue.lock().await;
+                    q.pop_front().unwrap_or(MockAddResponse::Ok)
+                };
+                return match resp {
+                    MockAddResponse::Ok => ok_response("AddPortMappingResponse", ""),
+                    MockAddResponse::PortInUse => error_response(718, "ConflictInMappingEntry"),
+                    MockAddResponse::PermanentOnly => {
+                        error_response(725, "OnlyPermanentLeasesSupported")
+                    }
+                    MockAddResponse::Unauthorized => error_response(606, "ActionNotAuthorized"),
+                };
+            }
+            if action.contains("DeletePortMapping") {
+                let _ = self.delete_calls.fetch_add(1, Ordering::SeqCst);
+                return ok_response("DeletePortMappingResponse", "");
+            }
+            error_response(401, "InvalidAction")
+        }
+
+        pub fn gateway(&self) -> Gateway {
+            let mut schema = HashMap::new();
+            schema.insert(
+                "AddPortMapping".to_string(),
+                vec![
+                    "NewEnabled".to_string(),
+                    "NewExternalPort".to_string(),
+                    "NewInternalClient".to_string(),
+                    "NewInternalPort".to_string(),
+                    "NewLeaseDuration".to_string(),
+                    "NewPortMappingDescription".to_string(),
+                    "NewProtocol".to_string(),
+                    "NewRemoteHost".to_string(),
+                ],
+            );
+            schema.insert(
+                "DeletePortMapping".to_string(),
+                vec![
+                    "NewExternalPort".to_string(),
+                    "NewProtocol".to_string(),
+                    "NewRemoteHost".to_string(),
+                ],
+            );
+            Gateway {
+                addr: self.addr,
+                root_url: format!("http://{}/", self.addr),
+                control_url: "/upnp/control".to_string(),
+                control_schema_url: "/upnp/control/scpd.xml".to_string(),
+                control_schema: schema,
+            }
+        }
+
+        pub async fn enqueue_add(&self, resp: MockAddResponse) {
+            self.add_queue.lock().await.push_back(resp);
+        }
+    }
+
+    pub fn ok_response(name: &str, inner: &str) -> String {
+        soap_envelope(&format!(
+            r#"<u:{name} xmlns:u="urn:schemas-upnp-org:service:WANIPConnection:1">{inner}</u:{name}>"#
+        ))
+    }
+
+    pub fn error_response(code: u16, desc: &str) -> String {
+        soap_envelope(&format!(
+            r#"<s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring><detail>
+<UPnPError><errorCode>{code}</errorCode><errorDescription>{desc}</errorDescription></UPnPError>
+</detail></s:Fault>"#
+        ))
+    }
+
+    pub fn soap_envelope(body: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+<s:Body>{body}</s:Body>
+</s:Envelope>"#
+        )
+    }
+
+    pub const STALE_AGE: Duration = Duration::from_secs(3540); // lease 3600, stale at >= 3540
+    pub const FRESH_AGE: Duration = Duration::from_secs(60);
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_mock_igd::{FRESH_AGE, MockAddResponse, MockIgd, STALE_AGE};
     use super::*;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn test_port_mapping_expiry() {
@@ -649,5 +947,165 @@ mod tests {
         assert!(MAX_LEASE_DURATION > MIN_LEASE_DURATION);
         assert!(DEFAULT_LEASE_DURATION >= MIN_LEASE_DURATION);
         assert!(DEFAULT_LEASE_DURATION <= MAX_LEASE_DURATION);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_mapping_reissues_add_without_delete() {
+        let mock = MockIgd::start().await;
+        let mut mapper = UpnpPortMapper::new("192.168.1.100:5000".parse().unwrap());
+        mapper.set_gateway_for_test(mock.gateway());
+        mapper.insert_mapping_for_test(10001, STALE_AGE).await;
+
+        let renewed = mapper.renew_mapping(10001).await.unwrap();
+        assert!(renewed, "stale mapping must be renewed");
+        assert_eq!(mock.add_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.delete_calls.load(Ordering::SeqCst), 0);
+        // Local staleness clock reset: mapping no longer stale.
+        assert!(
+            !mapper.mappings.lock().await[&10001].is_expired_or_stale(),
+            "created_at must be reset after refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_mapping_router_lost_mapping_readds() {
+        // If the router dropped the mapping (lease expired on the router), a
+        // plain AddPortMapping simply re-creates it — same happy path as
+        // refresh. Verify the mapping is restored and the clock reset.
+        let mock = MockIgd::start().await;
+        let mut mapper = UpnpPortMapper::new("192.168.1.100:5000".parse().unwrap());
+        mapper.set_gateway_for_test(mock.gateway());
+        mapper.insert_mapping_for_test(10002, STALE_AGE).await;
+
+        let renewed = mapper.renew_mapping(10002).await.unwrap();
+        assert!(renewed);
+        assert_eq!(mock.add_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.delete_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_mapping_port_in_use_falls_back_to_delete_then_add() {
+        let mock = MockIgd::start().await;
+        mock.enqueue_add(MockAddResponse::PortInUse).await; // first add -> 718
+        let mut mapper = UpnpPortMapper::new("192.168.1.100:5000".parse().unwrap());
+        mapper.set_gateway_for_test(mock.gateway());
+        mapper.insert_mapping_for_test(10003, STALE_AGE).await;
+
+        let renewed = mapper.renew_mapping(10003).await.unwrap();
+        assert!(renewed, "PortInUse fallback should still renew");
+        assert_eq!(
+            mock.add_calls.load(Ordering::SeqCst),
+            2,
+            "expect delete-then-add: two AddPortMapping calls"
+        );
+        assert_eq!(
+            mock.delete_calls.load(Ordering::SeqCst),
+            1,
+            "expect one DeletePortMapping before re-add"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_mapping_never_switches_port_on_conflict() {
+        // The critical invariant: on PortInUse we must NOT fall back to a
+        // random port (that would break the negotiated ICE candidate). The
+        // mock can't observe the port directly from SOAP body (ignored), but
+        // verifying the exact add/delete call sequence (2 adds, 1 delete, no
+        // random-port scan) is the observable contract.
+        let mock = MockIgd::start().await;
+        mock.enqueue_add(MockAddResponse::PortInUse).await;
+        let mut mapper = UpnpPortMapper::new("192.168.1.100:5000".parse().unwrap());
+        mapper.set_gateway_for_test(mock.gateway());
+        mapper.insert_mapping_for_test(10004, STALE_AGE).await;
+
+        let renewed = mapper.renew_mapping(10004).await.unwrap();
+        assert!(renewed);
+        assert_eq!(mock.add_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(mock.delete_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_mapping_only_permanent_lease_supported() {
+        // Router only supports permanent leases: refresh is a no-op but we must
+        // not error out or loop — reset the clock so we stop re-hitting it.
+        let mock = MockIgd::start().await;
+        mock.enqueue_add(MockAddResponse::PermanentOnly).await;
+        let mut mapper = UpnpPortMapper::new("192.168.1.100:5000".parse().unwrap());
+        mapper.set_gateway_for_test(mock.gateway());
+        mapper.insert_mapping_for_test(10005, STALE_AGE).await;
+
+        let renewed = mapper.renew_mapping(10005).await.unwrap();
+        assert!(renewed);
+        assert_eq!(mock.add_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.delete_calls.load(Ordering::SeqCst), 0);
+        assert!(!mapper.mappings.lock().await[&10005].is_expired_or_stale());
+    }
+
+    #[tokio::test]
+    async fn test_refresh_mapping_unauthorized_returns_error() {
+        let mock = MockIgd::start().await;
+        mock.enqueue_add(MockAddResponse::Unauthorized).await;
+        let mut mapper = UpnpPortMapper::new("192.168.1.100:5000".parse().unwrap());
+        mapper.set_gateway_for_test(mock.gateway());
+        mapper.insert_mapping_for_test(10006, STALE_AGE).await;
+
+        let result = mapper.renew_mapping(10006).await;
+        assert!(result.is_err(), "non-recoverable router error must surface");
+    }
+
+    #[tokio::test]
+    async fn test_renew_mapping_missing_locally_returns_false() {
+        let mock = MockIgd::start().await;
+        let mut mapper = UpnpPortMapper::new("192.168.1.100:5000".parse().unwrap());
+        mapper.set_gateway_for_test(mock.gateway());
+        // No mapping inserted.
+        let renewed = mapper.renew_mapping(10007).await.unwrap();
+        assert!(!renewed);
+        assert_eq!(mock.add_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(mock.delete_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_renew_mapping_no_gateway_returns_false() {
+        let mapper = UpnpPortMapper::new("192.168.1.100:5000".parse().unwrap());
+        mapper.insert_mapping_for_test(10008, STALE_AGE).await;
+        let renewed = mapper.renew_mapping(10008).await.unwrap();
+        assert!(!renewed, "no gateway -> nothing to refresh, must not error");
+    }
+
+    #[tokio::test]
+    async fn test_renew_all_stale_skips_fresh_mappings() {
+        let mock = MockIgd::start().await;
+        let mut mapper = UpnpPortMapper::new("192.168.1.100:5000".parse().unwrap());
+        mapper.set_gateway_for_test(mock.gateway());
+        mapper.insert_mapping_for_test(10009, FRESH_AGE).await;
+
+        let renewed = mapper.renew_all_stale().await.unwrap();
+        assert_eq!(renewed, 0);
+        assert_eq!(mock.add_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_renew_all_stale_continues_on_error() {
+        // First mapping fails (unauthorized), second succeeds — best-effort
+        // renewal must not abort on the first failure.
+        let mock = MockIgd::start().await;
+        mock.enqueue_add(MockAddResponse::Unauthorized).await;
+        let mut mapper = UpnpPortMapper::new("192.168.1.100:5000".parse().unwrap());
+        mapper.set_gateway_for_test(mock.gateway());
+        mapper.insert_mapping_for_test(10010, STALE_AGE).await;
+        mapper.insert_mapping_for_test(10011, STALE_AGE).await;
+
+        let renewed = mapper.renew_all_stale().await.unwrap();
+        assert_eq!(renewed, 1, "second mapping must still be renewed");
+        assert_eq!(mock.add_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_renew_all_stale_no_gateway_is_noop() {
+        let mapper = UpnpPortMapper::new("192.168.1.100:5000".parse().unwrap());
+        mapper.insert_mapping_for_test(10012, STALE_AGE).await;
+        let renewed = mapper.renew_all_stale().await.unwrap();
+        assert_eq!(renewed, 0, "no gateway -> no mappings renewed, no error");
     }
 }
