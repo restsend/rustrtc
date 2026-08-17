@@ -29,6 +29,12 @@ pub const MAX_LEASE_DURATION: u32 = 86400;
 /// Default timeout for UPnP discovery (2 seconds to avoid blocking RTP setup)
 pub const DEFAULT_UPNP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Default timeout for a single SOAP request to the IGD (AddPortMapping,
+/// GetExternalIPAddress, ...). The `igd` crate's aio client has no built-in
+/// timeout and can hang forever on a slow/unresponsive router, which would
+/// block ICE gathering completion indefinitely.
+pub const DEFAULT_UPNP_SOAP_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// UPnP IGD port mapping entry
 #[derive(Debug, Clone)]
 pub struct PortMapping {
@@ -198,9 +204,14 @@ impl UpnpPortMapper {
             .as_ref()
             .ok_or_else(|| anyhow!("No UPnP gateway available"))?;
 
-        let ip = gateway
-            .get_external_ip()
+        let ip = timeout(DEFAULT_UPNP_SOAP_TIMEOUT, gateway.get_external_ip())
             .await
+            .map_err(|_| {
+                anyhow!(
+                    "UPnP GetExternalIP timed out after {:?}",
+                    DEFAULT_UPNP_SOAP_TIMEOUT
+                )
+            })?
             .map_err(|e| anyhow!("Failed to get external IP: {}", e))?;
 
         Ok(ip)
@@ -251,17 +262,16 @@ impl UpnpPortMapper {
 
         let internal_sock_addr = SocketAddrV4::new(local_ip, self.local_addr.port());
 
-        match gateway
-            .add_port(
-                PortMappingProtocol::UDP,
-                requested_port,
-                internal_sock_addr,
-                self.default_lease_duration,
-                &description,
-            )
-            .await
+        match timeout(DEFAULT_UPNP_SOAP_TIMEOUT, gateway.add_port(
+            PortMappingProtocol::UDP,
+            requested_port,
+            internal_sock_addr,
+            self.default_lease_duration,
+            &description,
+        ))
+        .await
         {
-            Ok(()) => {
+            Ok(Ok(())) => {
                 let external_addr = SocketAddr::new(IpAddr::V4(external_ip), requested_port);
 
                 let mapping = PortMapping {
@@ -281,7 +291,7 @@ impl UpnpPortMapper {
 
                 Ok(external_addr)
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 // If the requested port is taken, try with port 0 (random)
                 if external_port != 0 && requested_port != 0 {
                     warn!(
@@ -294,6 +304,16 @@ impl UpnpPortMapper {
                 } else {
                     Err(anyhow!("Failed to add UPnP port mapping: {}", e))
                 }
+            }
+            Err(_) => {
+                warn!(
+                    "UPnP AddPortMapping timed out after {:?}, trying random port: {}",
+                    DEFAULT_UPNP_SOAP_TIMEOUT,
+                    requested_port
+                );
+                // Avoid recursion by manually trying a random port
+                self.add_mapping_random_port(gateway, external_ip, local_ip)
+                    .await
             }
         }
     }
@@ -310,17 +330,19 @@ impl UpnpPortMapper {
             let description = format!("rustrtc-{}", self.local_addr.port());
             let internal_sock_addr = SocketAddrV4::new(local_ip, self.local_addr.port());
 
-            match gateway
-                .add_port(
+            match timeout(
+                DEFAULT_UPNP_SOAP_TIMEOUT,
+                gateway.add_port(
                     PortMappingProtocol::UDP,
                     port,
                     internal_sock_addr,
                     self.default_lease_duration,
                     &description,
-                )
-                .await
+                ),
+            )
+            .await
             {
-                Ok(()) => {
+                Ok(Ok(())) => {
                     let external_addr = SocketAddr::new(IpAddr::V4(external_ip), port);
 
                     let mapping = PortMapping {
@@ -340,7 +362,14 @@ impl UpnpPortMapper {
 
                     return Ok(external_addr);
                 }
-                Err(_) => continue,
+                Ok(Err(_)) => continue,
+                Err(_) => {
+                    warn!(
+                        "UPnP AddPortMapping timed out after {:?} for port {}, skipping",
+                        DEFAULT_UPNP_SOAP_TIMEOUT, port
+                    );
+                    continue;
+                }
             }
         }
         Err(anyhow!("Failed to find available port for UPnP mapping"))
@@ -359,10 +388,18 @@ impl UpnpPortMapper {
             }
         };
 
-        gateway
-            .remove_port(PortMappingProtocol::UDP, external_port)
-            .await
-            .map_err(|e| anyhow!("Failed to remove UPnP mapping: {}", e))?;
+        timeout(
+            DEFAULT_UPNP_SOAP_TIMEOUT,
+            gateway.remove_port(PortMappingProtocol::UDP, external_port),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "UPnP RemovePortMapping timed out after {:?}",
+                DEFAULT_UPNP_SOAP_TIMEOUT
+            )
+        })?
+        .map_err(|e| anyhow!("Failed to remove UPnP mapping: {}", e))?;
 
         self.mappings.lock().await.remove(&external_port);
 
@@ -435,42 +472,61 @@ impl UpnpPortMapper {
 
         // Try a plain re-issue first (idempotent lease refresh on most routers).
         // Only fall back to delete-then-add if the router reports PortInUse.
-        let refreshed = match gateway
-            .add_port(
+        let refreshed = match timeout(
+            DEFAULT_UPNP_SOAP_TIMEOUT,
+            gateway.add_port(
                 PortMappingProtocol::UDP,
                 external_port,
                 internal_sock_addr,
                 self.default_lease_duration,
                 &mapping.description,
-            )
-            .await
+            ),
+        )
+        .await
         {
-            Ok(()) => true,
-            Err(AddPortError::PortInUse) => {
+            Ok(Ok(())) => true,
+            Err(_) => {
+                warn!(
+                    "UPnP refresh AddPortMapping timed out after {:?} for port {}",
+                    DEFAULT_UPNP_SOAP_TIMEOUT, external_port
+                );
+                false
+            }
+            Ok(Err(AddPortError::PortInUse)) => {
                 // Router thinks the port belongs to someone else (e.g. a stale
                 // entry). Remove then re-add — but NEVER switch to a random port:
                 // changing the external port would break the negotiated ICE
                 // candidate.
                 let _ = self.remove_mapping(external_port).await;
-                gateway
-                    .add_port(
+                timeout(
+                    DEFAULT_UPNP_SOAP_TIMEOUT,
+                    gateway.add_port(
                         PortMappingProtocol::UDP,
                         external_port,
                         internal_sock_addr,
                         self.default_lease_duration,
                         &mapping.description,
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "UPnP re-add timed out after {:?}",
+                        DEFAULT_UPNP_SOAP_TIMEOUT
                     )
-                    .await
-                    .map_err(|e| anyhow!("Failed to re-add UPnP mapping after conflict: {}", e))?;
+                })?
+                .map_err(|e| {
+                    anyhow!("Failed to re-add UPnP mapping after conflict: {}", e)
+                })?;
                 true
             }
-            Err(AddPortError::OnlyPermanentLeasesSupported) => {
+            Ok(Err(AddPortError::OnlyPermanentLeasesSupported)) => {
                 // Router only supports permanent (lease 0) mappings; refresh is
                 // effectively a no-op since the mapping never expires. Reset the
                 // local staleness clock so we stop hammering the router.
                 true
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 return Err(anyhow!("Failed to refresh UPnP mapping: {}", e));
             }
         };

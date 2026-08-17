@@ -109,6 +109,13 @@ pub(crate) struct IceTransportInner {
     state: watch::Sender<IceTransportState>,
     _state_rx_keeper: watch::Receiver<IceTransportState>,
     gathering_state: watch::Sender<IceGathererState>,
+    /// Keeper receiver for the gathering_state watch channel. Without a live
+    /// receiver, `watch::Sender::send()` with zero receivers returns Err and
+    /// never stores the value — a late subscriber would miss the `Complete`
+    /// update and `wait_for_gathering_complete()` would hang forever. Every
+    /// other watch channel in this struct holds a keeper receiver for exactly
+    /// this reason.
+    _gathering_state_rx_keeper: watch::Receiver<IceGathererState>,
     role: parking_lot::Mutex<IceRole>,
     selected_pair: parking_lot::Mutex<Option<IceCandidatePair>>,
     local_candidates: Mutex<Vec<IceCandidate>>,
@@ -892,7 +899,7 @@ impl IceTransport {
         let gatherer = IceGatherer::new(config.clone(), candidate_tx.clone(), socket_tx);
         let (state_tx, state_rx) = watch::channel(IceTransportState::New);
         let runner_state_rx = state_tx.subscribe();
-        let (gathering_state_tx, _) = watch::channel(IceGathererState::New);
+        let (gathering_state_tx, gathering_state_rx) = watch::channel(IceGathererState::New);
         let (selected_socket_tx, selected_socket_rx) = watch::channel(None);
         let (selected_rtcp_socket_tx, selected_rtcp_socket_rx) = watch::channel(None);
         let (selected_pair_tx, selected_pair_rx) = watch::channel(None);
@@ -903,6 +910,7 @@ impl IceTransport {
             state: state_tx,
             _state_rx_keeper: state_rx,
             gathering_state: gathering_state_tx,
+            _gathering_state_rx_keeper: gathering_state_rx,
             role: parking_lot::Mutex::new(IceRole::Controlled),
             selected_pair: parking_lot::Mutex::new(None),
             local_candidates: Mutex::new(Vec::new()),
@@ -3568,9 +3576,17 @@ impl IceGatherer {
         }
 
         // STUN must complete before UPnP so we can detect double-NAT
-        // and use STUN's public IP for UPnP candidates
+        // and use STUN's public IP for UPnP candidates. Bounded so a
+        // hung STUN/TURN server (no DNS timeout, no TCP connect timeout)
+        // can never stall the whole gather — UPnP still runs and the
+        // gather completes with whatever candidates arrived in time.
         let stun_public_ip = if self.config.enable_upnp {
-            self.gather_servers_and_get_public_ip().await
+            timeout(Duration::from_secs(5), self.gather_servers_and_get_public_ip())
+                .await
+                .unwrap_or_else(|_| {
+                    debug!("STUN/TURN gathering timed out after 5s, skipping UPnP double-NAT detection");
+                    None
+                })
         } else {
             if let Err(e) = self.gather_servers().await {
                 debug!("Server gathering failed: {}", e);
@@ -4260,7 +4276,9 @@ impl IceServerUri {
 
     async fn resolve(&self, disable_ipv6: bool) -> Result<SocketAddr> {
         let target = format!("{}:{}", self.host, self.port);
-        let addrs = lookup_host(target).await?;
+        let addrs = timeout(Duration::from_secs(5), lookup_host(&target))
+            .await
+            .map_err(|_| anyhow!("DNS lookup timed out for {}", target))??;
 
         for addr in addrs {
             if disable_ipv6 && addr.is_ipv6() {

@@ -87,7 +87,9 @@ impl TurnAuthState {
 
 impl TurnClient {
     pub(crate) async fn connect(uri: &IceServerUri, disable_ipv6: bool) -> Result<Self> {
-        let addr = uri.resolve(disable_ipv6).await?;
+        let addr = timeout(DEFAULT_STUN_TIMEOUT, uri.resolve(disable_ipv6))
+            .await
+            .map_err(|_| anyhow::anyhow!("TURN server DNS resolution timed out"))??;
         let transport = match uri.transport {
             IceTransportProtocol::Udp => {
                 let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
@@ -97,7 +99,11 @@ impl TurnClient {
                 }
             }
             IceTransportProtocol::Tcp => {
-                let stream = TcpStream::connect(addr).await?;
+                let stream = timeout(DEFAULT_STUN_TIMEOUT, TcpStream::connect(addr))
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("TURN TCP connect to {} timed out", addr)
+                    })??;
                 let (read, write) = stream.into_split();
                 TurnTransport::Tcp {
                     read: Arc::new(Mutex::new(read)),
