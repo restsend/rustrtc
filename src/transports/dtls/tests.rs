@@ -626,3 +626,142 @@ async fn test_dtls_close_during_handshake_exits_task() -> Result<()> {
 
     Ok(())
 }
+
+//=== Application-data fragmentation (large messages must not be IP-fragmented) ===
+
+/// Spin up a connected client/server DTLS pair over loopback.
+async fn spawn_connected_dtls_pair(
+) -> Result<(Arc<DtlsTransport>, Arc<DtlsTransport>, mpsc::UnboundedReceiver<Bytes>)> {
+    let client_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let server_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+
+    let client_addr = client_socket.local_addr()?;
+    let server_addr = server_socket.local_addr()?;
+
+    let (client_socket_tx, _) = watch::channel(Some(IceSocketWrapper::Udp(client_socket.clone())));
+    let client_conn = IceConn::new(client_socket_tx.subscribe(), server_addr, None);
+
+    let (server_socket_tx, _) = watch::channel(Some(IceSocketWrapper::Udp(server_socket.clone())));
+    let server_conn = IceConn::new(server_socket_tx.subscribe(), client_addr, None);
+
+    let client_cert = generate_certificate()?;
+    let server_cert = generate_certificate()?;
+
+    let (client_dtls, _client_rx, client_runner) = DtlsTransport::new(
+        client_conn.clone(),
+        client_cert,
+        true,
+        1500,
+        Some(fingerprint(&server_cert)),
+    )
+    .await?;
+    tokio::spawn(client_runner);
+    let (server_dtls, server_rx, server_runner) =
+        DtlsTransport::new(server_conn.clone(), server_cert, false, 1500, None).await?;
+    tokio::spawn(server_runner);
+
+    spawn_socket_pump(client_socket, client_conn);
+    spawn_socket_pump(server_socket, server_conn);
+
+    assert!(matches!(
+        wait_for_terminal_state(&client_dtls).await?,
+        DtlsState::Connected(..)
+    ));
+    assert!(matches!(
+        wait_for_terminal_state(&server_dtls).await?,
+        DtlsState::Connected(..)
+    ));
+
+    Ok((client_dtls, server_dtls, server_rx))
+}
+
+/// Send `payload` from client to server and return `(record_count, reassembled)`.
+/// Each received `Bytes` is one DTLS ApplicationData record; a record larger
+/// than `MAX_APP_DATA_RECORD_SIZE` would prove an MTU violation.
+async fn send_and_collect_records(
+    client_dtls: &Arc<DtlsTransport>,
+    server_rx: &mut mpsc::UnboundedReceiver<Bytes>,
+    payload: &[u8],
+) -> Result<(usize, Vec<u8>)> {
+    client_dtls.send(Bytes::copy_from_slice(payload)).await?;
+
+    let mut received = Vec::new();
+    let mut record_count = 0usize;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while received.len() < payload.len() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out reassembling fragmented payload (got {} of {} bytes)",
+            received.len(),
+            payload.len()
+        );
+        let record = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server_rx.recv(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("record recv timeout"))?
+        .ok_or_else(|| anyhow::anyhow!("DTLS channel closed"))?;
+        record_count += 1;
+        assert!(
+            record.len() <= MAX_APP_DATA_RECORD_SIZE,
+            "record {} exceeds the MTU-safe ceiling: {} bytes",
+            record_count,
+            record.len()
+        );
+        received.extend_from_slice(&record);
+    }
+    Ok((record_count, received))
+}
+
+#[tokio::test]
+async fn test_dtls_application_data_fragmentation_roundtrip() -> Result<()> {
+    let (client_dtls, _server_dtls, mut server_rx) = spawn_connected_dtls_pair().await?;
+
+    // Deterministic 5000-byte payload — far larger than one MTU-sized record.
+    let payload: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
+
+    let (record_count, received) =
+        send_and_collect_records(&client_dtls, &mut server_rx, &payload).await?;
+
+    assert!(
+        record_count > 1,
+        "payload was not fragmented: expected >1 records, got {}",
+        record_count
+    );
+    assert_eq!(
+        received, payload,
+        "reassembled payload must match the original"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_dtls_application_data_fragmentation_boundary() -> Result<()> {
+    // Exactly one record at the ceiling; two records just past it.
+    let (client_dtls, _server_dtls, mut server_rx) = spawn_connected_dtls_pair().await?;
+
+    let (count, received) = send_and_collect_records(
+        &client_dtls,
+        &mut server_rx,
+        &vec![7u8; MAX_APP_DATA_RECORD_SIZE],
+    )
+    .await?;
+    assert_eq!(count, 1, "payload == record ceiling must be a single record");
+    assert_eq!(received.len(), MAX_APP_DATA_RECORD_SIZE);
+
+    let (count2, received2) = send_and_collect_records(
+        &client_dtls,
+        &mut server_rx,
+        &vec![9u8; MAX_APP_DATA_RECORD_SIZE + 1],
+    )
+    .await?;
+    assert_eq!(
+        count2, 2,
+        "payload == ceiling+1 must span exactly two records"
+    );
+    assert_eq!(received2.len(), MAX_APP_DATA_RECORD_SIZE + 1);
+
+    Ok(())
+}

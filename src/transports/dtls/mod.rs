@@ -193,6 +193,22 @@ const DTLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 #[cfg(test)]
 const DTLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Maximum plaintext payload carried in a single DTLS ApplicationData record.
+///
+/// Each DTLS record is sent as one UDP datagram. A record larger than the path
+/// MTU must be IP-fragmented, and NATs routinely drop IP fragments — silently
+/// losing the whole message. Sending one record per UDP datagram sized to fit
+/// common MTUs avoids this. The value matches the SCTP packet cap
+/// (`MAX_SCTP_PACKET_SIZE` = 1200 in `transports/sctp.rs`), so data-channel
+/// traffic is never split; only oversized signaling messages are fragmented,
+/// and the peer reassembles them from the ordered record stream using the
+/// upper-layer message framing (the 4-byte length prefix in rport).
+///
+/// 1200 + 13 (header) + 8 (explicit nonce) + 16 (tag) = 1237 bytes per
+/// datagram, well under the 1472-byte payload limit of 1500-byte Ethernet,
+/// 1464 under PPPoE (1492), and 1252 under the IPv6 minimum MTU (1280).
+pub const MAX_APP_DATA_RECORD_SIZE: usize = 1200;
+
 pub struct DtlsTransport {
     inner: Arc<DtlsInner>,
     close_tx: Arc<tokio::sync::Notify>,
@@ -315,6 +331,24 @@ impl DtlsTransport {
             }
         };
 
+        // DTLS application data is delivered one record per UDP datagram with
+        // no retransmission. If the whole payload were put in a single record
+        // larger than the path MTU, it would be IP-fragmented and commonly
+        // dropped by NATs, losing the message silently. Split oversized
+        // payloads into MTU-safe records instead; the peer concatenates the
+        // ordered record stream and recovers the message using the upper-layer
+        // framing (SCTP packets are capped at 1200 bytes, so they are never
+        // split and remain byte-identical to the unfragmented path).
+        for chunk in data.chunks(MAX_APP_DATA_RECORD_SIZE) {
+            self.send_record(&crypto, chunk).await?;
+        }
+        Ok(())
+    }
+
+    /// Build, encrypt and transmit one DTLS ApplicationData record for `data`.
+    /// Each record gets its own DTLS sequence number / nonce / AAD and is sent
+    /// as a single UDP datagram.
+    async fn send_record(&self, crypto: &SessionCrypto, data: &[u8]) -> Result<()> {
         let (cipher, iv) = if self.inner.is_client {
             (&crypto.client_write_cipher, &crypto.keys.client_write_iv)
         } else {
@@ -346,7 +380,7 @@ impl DtlsTransport {
         buf.put_u64(full_seq);
 
         // 3. Payload
-        buf.put_slice(&data);
+        buf.put_slice(data);
 
         // 4. Encrypt in place
         let payload_offset = header_len + explicit_nonce_len;
