@@ -72,6 +72,37 @@ pub(crate) fn should_drop_packet() -> bool {
     }
 }
 
+/// Simulator hook: delay STUN Binding responses so a nominally fast path can
+/// be made slower than a lower-priority one, reproducing the ICE nomination
+/// race seen across cascaded NAT (the controlling side picked a fast
+/// srflx/relay pair while the controlled side selected the host path).
+///
+/// `RUSTRTC_STUN_RESPOND_DELAY_MS=<ms>` delays every response sent from a
+/// direct (non-TURN) socket. Only used by tests.
+#[cfg(any(test, feature = "simulator"))]
+async fn simulate_stun_respond_delay(sender: &IceSocketWrapper) {
+    let spec = match std::env::var("RUSTRTC_STUN_RESPOND_DELAY_MS").ok() {
+        Some(s) => s,
+        None => return,
+    };
+    let Ok(ms) = spec.trim().parse::<u64>() else {
+        return;
+    };
+    if ms == 0 {
+        return;
+    }
+    if matches!(
+        sender,
+        IceSocketWrapper::Turn(_, _)
+            | IceSocketWrapper::TcpListener(_)
+            | IceSocketWrapper::TcpStream(_, _, _)
+    ) {
+        return;
+    }
+    trace!("SIMULATOR: delaying STUN response by {}ms", ms);
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+}
+
 /// Statistics for monitoring buffer behavior
 #[derive(Debug)]
 struct BufferStats {
@@ -1753,7 +1784,13 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
 
             match res {
                 Ok(_) => Some(IceCandidatePair::new(local, remote)),
-                Err(_) => None,
+                Err(e) => {
+                    debug!(
+                        "ICE connectivity check failed: {} -> {}: {}",
+                        local.address, remote.address, e
+                    );
+                    None
+                }
             }
         });
     }
@@ -1811,14 +1848,40 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     // Sort by priority: host > srflx > relay.  P2P first, relay last.
     successful_pairs.sort_by_key(|p| std::cmp::Reverse(p.priority(role)));
 
+    for p in &successful_pairs {
+        debug!(
+            "ICE successful pair ({}): local {} {:?} -> remote {} {:?}",
+            if role == IceRole::Controlling {
+                "controlling"
+            } else {
+                "controlled"
+            },
+            p.local.address, p.local.typ, p.remote.address, p.remote.typ
+        );
+    }
+
     if role == IceRole::Controlling {
         // Signal Connected so the PeerConnection starts waiting for nomination_complete.
         let _ = inner.state.send(IceTransportState::Connected);
 
-        // Launch ALL nomination checks in parallel — first success wins.
-        // This avoids the N × nomination_timeout latency of sequential
-        // nomination when the highest-priority pairs are unreachable
-        // (e.g. host/srflx → relay pairs behind NAT).
+        // Launch ALL nomination checks in parallel, but select the
+        // highest-priority pair that succeeds — not merely the first one to
+        // complete. A fast lower-priority path (e.g. a TURN relay whose
+        // socket was pre-allocated during gathering) can otherwise win the
+        // race against a higher-priority host path that the peer actually
+        // selected, leaving the two ends with incompatible pairs and a
+        // broken DTLS media path (seen across cascaded NAT: the controlling
+        // side chose a srflx/relay pair while the controlled side selected a
+        // host <-> peer-reflexive pair, so neither direction carried DTLS).
+        //
+        // To avoid paying the N × nomination_timeout latency of sequential
+        // nomination when the highest-priority pairs are unreachable, all
+        // nominations still run concurrently; we only apply a short grace
+        // window after the first success so a slower-but-higher-priority pair
+        // still gets a chance to win. The window is skipped entirely when the
+        // globally highest-priority pair already succeeded or nothing else is
+        // still in flight (the common single-pair LAN case).
+        const NOMINATION_GRACE: Duration = Duration::from_millis(200);
         let mut nom_checks = futures::stream::FuturesUnordered::new();
         for pair in &successful_pairs {
             let inner_c = inner.clone();
@@ -1834,18 +1897,41 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
             });
         }
 
-        // Wait for the first successful nomination.
-        // Remaining futures are dropped (TransactionGuard cleans up).
-        let mut nominated_pair: Option<IceCandidatePair> = None;
-        while let Some((pair, result)) = nom_checks.next().await {
+        let highest_priority = successful_pairs[0].clone();
+        let mut successful_nominations: Vec<IceCandidatePair> = Vec::new();
+        let mut in_flight = nom_checks.len();
+        loop {
+            let next = if successful_nominations.is_empty() {
+                nom_checks.next().await
+            } else {
+                tokio::select! {
+                    biased;
+                    res = nom_checks.next() => res,
+                    _ = tokio::time::sleep(NOMINATION_GRACE) => None,
+                }
+            };
+            let Some((pair, result)) = next else { break };
+            in_flight -= 1;
             match result {
                 Ok(_) => {
                     debug!(
                         "Nomination succeeded: {} -> {}",
                         pair.local.address, pair.remote.address
                     );
-                    nominated_pair = Some(pair);
-                    break;
+                    let key = (pair.local.address, pair.remote.address);
+                    if !successful_nominations
+                        .iter()
+                        .any(|p| (p.local.address, p.remote.address) == key)
+                    {
+                        successful_nominations.push(pair.clone());
+                    }
+                    // The globally highest-priority pair succeeded — nothing
+                    // better to wait for.
+                    if pair.local.address == highest_priority.local.address
+                        && pair.remote.address == highest_priority.remote.address
+                    {
+                        break;
+                    }
                 }
                 Err(e) => {
                     debug!(
@@ -1854,13 +1940,19 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
                     );
                 }
             }
+            if in_flight == 0 {
+                break;
+            }
         }
 
-        // Set selected_pair: use the winning pair on success, or the
-        // highest-priority pair on all-fail (for best-effort data flow).
-        let final_pair = nominated_pair
-            .clone()
+        // Set selected_pair: use the highest-priority successful nomination,
+        // or the highest-priority pair on all-fail (for best-effort data flow).
+        successful_nominations.sort_by_key(|p| std::cmp::Reverse(p.priority(role)));
+        let final_pair = successful_nominations
+            .first()
+            .cloned()
             .unwrap_or_else(|| successful_pairs[0].clone());
+        let nominated = !successful_nominations.is_empty();
         *inner.selected_pair.lock() = Some(final_pair.clone());
         let _ = inner.selected_pair_notifier.send(Some(final_pair.clone()));
         if let Some(socket) = resolve_socket(&inner, &final_pair) {
@@ -1872,7 +1964,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
             final_pair.local.address, final_pair.remote.address
         );
 
-        if nominated_pair.is_some() {
+        if nominated {
             let _ = inner.nomination_complete.send(Some(true));
         } else {
             debug!(
@@ -2286,6 +2378,9 @@ async fn handle_stun_request(
 ) {
     let response = StunMessage::binding_success_response(msg.transaction_id, addr);
 
+    #[cfg(any(test, feature = "simulator"))]
+    simulate_stun_respond_delay(sender).await;
+
     let password = inner.local_parameters.lock().password.clone();
     if let Ok(bytes) = response.encode(Some(password.as_bytes()), true) {
         match sender.send_to(&bytes, addr).await {
@@ -2385,82 +2480,94 @@ async fn handle_stun_request(
             }
             // RFC 8445 §7.3.1.5: once a pair has been nominated, subsequent
             // USE-CANDIDATE (e.g. keepalives from other candidates) must not
-            // trigger re-nomination.  Guard here to prevent pair_monitor churn.
-            if inner.nomination_complete.borrow().is_some() {
-                trace!(
-                    "Controlled agent ignoring UseCandidate from {} – pair already nominated",
-                    addr
-                );
-            } else {
-                // The controlling agent's nomination is authoritative. A pair
-                // selected earlier by our own check completion is only
-                // provisional: on a multihomed host it can differ from the
-                // pair the peer actually validated - it may even be a path
-                // that only works in one direction (e.g. a source address the
-                // peer's network drops on the return leg) - so it must be
-                // replaced by the pair this request arrived on.
-                let local_addr: SocketAddr = match sender {
-                    IceSocketWrapper::Udp(s) => s
-                        .local_addr()
-                        .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
-                    IceSocketWrapper::SharedUdp(h) => h
-                        .local_addr()
-                        .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
-                    IceSocketWrapper::TcpListener(l) => l
-                        .local_addr()
-                        .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
-                    IceSocketWrapper::TcpStream(read, _, _) => {
-                        let s = read.lock().await;
-                        s.local_addr()
-                            .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
-                    }
-                    IceSocketWrapper::Turn(_, addr) => *addr,
-                };
-
-                let locals = inner.gatherer.local_candidates();
-                let local_cand = locals.iter().find(|c| c.base_address() == local_addr);
-
-                let pair = {
-                    let remotes = inner.remote_candidates.lock();
-                    let remote_cand = remotes.iter().find(|c| c.address == addr);
-                    if let (Some(l), Some(r)) = (local_cand, remote_cand) {
-                        Some(IceCandidatePair::new(l.clone(), r.clone()))
-                    } else {
-                        None
-                    }
-                };
-
-                if let Some(pair) = pair {
-                    let already_selected = {
-                        let selected = inner.selected_pair.lock();
-                        selected.as_ref().is_some_and(|s| {
-                            s.local.address == pair.local.address
-                                && s.remote.address == pair.remote.address
-                        })
-                    };
-                    if already_selected {
-                        trace!(
-                            "Controlled agent: UseCandidate confirms already-selected pair {} -> {}",
-                            pair.local.address, pair.remote.address
-                        );
-                    } else {
-                        debug!(
-                            "Controlled agent selected pair via UseCandidate: {} -> {}",
-                            pair.local.address, pair.remote.address
-                        );
-                        *inner.selected_pair.lock() = Some(pair.clone());
-                        let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
-                        publish_selected_socket(&inner, &pair, Some(sender));
-                    }
-                    let _ = inner.state.send(IceTransportState::Connected);
-                    let _ = inner.nomination_complete.send(Some(true));
-                } else {
-                    debug!(
-                        "Received UseCandidate but could not find UDP pair for {} -> {}",
-                        local_addr, addr
-                    );
-                    let _ = inner.nomination_complete.send(Some(true));
+            // trigger re-nomination.  We still process them here, but only to
+            // upgrade to a strictly higher-priority pair: the controlling side
+            // nominates every successful pair in parallel, so a fast
+            // lower-priority path (e.g. TURN relay) routinely arrives BEFORE a
+            // slower host path the peer actually prefers. Latching the first
+            // arrival would leave the two ends on incompatible pairs (see
+            // cascaded-NAT reports). Mirror the controlling side's priority
+            // check so both sides converge on the best nominated pair.
+            let already_nominated = inner.nomination_complete.borrow().is_some();
+            // The controlling agent's nomination is authoritative. A pair
+            // selected earlier by our own check completion is only
+            // provisional: on a multihomed host it can differ from the
+            // pair the peer actually validated - it may even be a path
+            // that only works in one direction (e.g. a source address the
+            // peer's network drops on the return leg) - so it must be
+            // replaced by the pair this request arrived on.
+            let local_addr: SocketAddr = match sender {
+                IceSocketWrapper::Udp(s) => s
+                    .local_addr()
+                    .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
+                IceSocketWrapper::SharedUdp(h) => h
+                    .local_addr()
+                    .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
+                IceSocketWrapper::TcpListener(l) => l
+                    .local_addr()
+                    .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
+                IceSocketWrapper::TcpStream(read, _, _) => {
+                    let s = read.lock().await;
+                    s.local_addr()
+                        .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
                 }
+                IceSocketWrapper::Turn(_, addr) => *addr,
+            };
+
+            let locals = inner.gatherer.local_candidates();
+            let local_cand = locals.iter().find(|c| c.base_address() == local_addr);
+
+            let pair = {
+                let remotes = inner.remote_candidates.lock();
+                let remote_cand = remotes.iter().find(|c| c.address == addr);
+                if let (Some(l), Some(r)) = (local_cand, remote_cand) {
+                    Some(IceCandidatePair::new(l.clone(), r.clone()))
+                } else {
+                    None
+                }
+            };
+
+            if let Some(pair) = pair {
+                let should_select = {
+                    let selected = inner.selected_pair.lock();
+                    match selected.as_ref() {
+                        Some(cur) => {
+                            let same = cur.local.address == pair.local.address
+                                && cur.remote.address == pair.remote.address;
+                            if same {
+                                false
+                            } else if already_nominated {
+                                // Only upgrade to a strictly higher-priority pair.
+                                pair.priority(role) > cur.priority(role)
+                            } else {
+                                true
+                            }
+                        }
+                        None => true,
+                    }
+                };
+                if should_select {
+                    debug!(
+                        "Controlled agent selected pair via UseCandidate: {} -> {}",
+                        pair.local.address, pair.remote.address
+                    );
+                    *inner.selected_pair.lock() = Some(pair.clone());
+                    let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
+                    publish_selected_socket(&inner, &pair, Some(sender));
+                } else {
+                    trace!(
+                        "Controlled agent keeping current pair (UseCandidate {} -> {})",
+                        pair.local.address, pair.remote.address
+                    );
+                }
+                let _ = inner.state.send(IceTransportState::Connected);
+                let _ = inner.nomination_complete.send(Some(true));
+            } else {
+                debug!(
+                    "Received UseCandidate but could not find UDP pair for {} -> {}",
+                    local_addr, addr
+                );
+                let _ = inner.nomination_complete.send(Some(true));
             }
         }
     }
