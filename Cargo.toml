@@ -9,6 +9,7 @@ readme = "README.md"
 keywords = ["rtp", "srtp", "webrtc", "fax", "turn"]
 categories = ["network-programming"]
 license = "MIT"
+exelcude = ["flamegraph.svg","examples", "tests", "rustrtc_sfu.png", "output.ulaw"]
 
 [dependencies]
 anyhow = "1"
