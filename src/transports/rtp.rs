@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -162,6 +162,8 @@ struct StreamRewriteState {
 
 struct RewriteBridge {
     target: Arc<RtpTransport>,
+    video_target: Option<Arc<RtpTransport>>,
+    video_payload_types: HashSet<u8>,
     options: RtpRewriteBridgeOptions,
     rules: Vec<RtpRewriteRule>,
     streams: RefCell<HashMap<u32, StreamRewriteState>>,
@@ -170,11 +172,15 @@ struct RewriteBridge {
 impl RewriteBridge {
     fn new(
         target: Arc<RtpTransport>,
+        video_target: Option<Arc<RtpTransport>>,
+        video_payload_types: HashSet<u8>,
         options: RtpRewriteBridgeOptions,
         rules: Vec<RtpRewriteRule>,
     ) -> Self {
         Self {
             target,
+            video_target,
+            video_payload_types,
             options,
             rules,
             streams: RefCell::new(HashMap::new()),
@@ -194,6 +200,17 @@ impl RewriteBridge {
                     .find(|r| r.match_payload_type.is_none())
                     .cloned()
             })
+    }
+
+    /// Select the destination from the packet's original negotiated payload
+    /// type. This runs before any payload-type rewrite.
+    fn target_for(&self, raw_pt: u8) -> Arc<RtpTransport> {
+        if self.video_payload_types.contains(&raw_pt)
+            && let Some(video_target) = &self.video_target
+        {
+            return video_target.clone();
+        }
+        self.target.clone()
     }
 
     fn rewrite_packet(&self, packet: &mut RtpPacket) {
@@ -564,16 +581,43 @@ impl RtpTransport {
         self.bridge_rewrite_rules_to(dst, options, RtpRewriteRule::from_params(params));
     }
 
-    /// Install a payload-type-aware rewrite bridge. Rules are matched per
-    /// packet (exact-PT first, then catch-all); packets matching no rule pass
-    /// through with their SSRC/PT untouched.
+    /// Install a payload-type-aware rewrite bridge with one destination.
     pub fn bridge_rewrite_rules_to(
         &self,
         dst: Arc<RtpTransport>,
         options: RtpRewriteBridgeOptions,
         rules: Vec<RtpRewriteRule>,
     ) {
-        *self.rewrite_bridge.lock() = Some(Box::new(RewriteBridge::new(dst, options, rules)));
+        self.bridge_rewrite_rules_to_with_video(
+            dst,
+            None,
+            HashSet::new(),
+            options,
+            rules,
+        );
+    }
+
+    /// Install a payload-type-aware rewrite bridge with an optional video
+    /// destination. `video_payload_types` are the source transport's original
+    /// negotiated video PTs; target selection happens before PT rewriting.
+    ///
+    /// This is only needed when a bundled source carries audio and video on
+    /// one transport while the destination uses separate transports.
+    pub fn bridge_rewrite_rules_to_with_video(
+        &self,
+        dst: Arc<RtpTransport>,
+        video_dst: Option<Arc<RtpTransport>>,
+        video_payload_types: HashSet<u8>,
+        options: RtpRewriteBridgeOptions,
+        rules: Vec<RtpRewriteRule>,
+    ) {
+        *self.rewrite_bridge.lock() = Some(Box::new(RewriteBridge::new(
+            dst,
+            video_dst,
+            video_payload_types,
+            options,
+            rules,
+        )));
         self.has_bridge.store(true, Ordering::Release);
     }
 
@@ -783,14 +827,16 @@ impl RtpTransport {
         if !self.has_bridge.load(Ordering::Acquire) {
             return Some(packet);
         }
-        // Rewrite under the bridge lock, then release it.
+        // Select the destination from the original PT and rewrite under the
+        // bridge lock, then release it before SRTP protection and sending.
         let target = {
             let mut guard = self.rewrite_bridge.lock();
             let Some(bridge) = guard.as_mut() else {
                 return Some(packet);
             };
+            let target = bridge.target_for(packet.header.payload_type);
             bridge.rewrite_packet(&mut packet);
-            bridge.target.clone()
+            target
         };
 
         // Fire the destination's egress observer on the plaintext packet
@@ -1442,7 +1488,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rewrite_rules_route_audio_video_dtmf_to_distinct_ssrc_pt() {
+    async fn test_rewrite_bridge_selects_optional_video_target_before_rewrite() {
         use crate::transports::ice::IceSocketWrapper;
         use tokio::net::UdpSocket;
         use tokio::sync::watch;
@@ -1457,7 +1503,13 @@ mod tests {
         let dst_conn = IceConn::new(dst_rx, "127.0.0.1:9".parse().unwrap(), None);
         let dst_transport = Arc::new(RtpTransport::new(dst_conn, false));
 
-        // Audio catch-all + DTMF remap + two video PTs (H264 + its RTX PT).
+        let video_dst_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_video_dst_tx, video_dst_rx) =
+            watch::channel(Some(IceSocketWrapper::Udp(Arc::new(video_dst_socket))));
+        let video_dst_conn = IceConn::new(video_dst_rx, "127.0.0.1:9".parse().unwrap(), None);
+        let video_dst_transport = Arc::new(RtpTransport::new(video_dst_conn, false));
+
+        // Audio/DTMF share one target; H264/RTX use a different target.
         let audio_ssrc = 111u32;
         let video_ssrc = 222u32;
         let rules = vec![
@@ -1497,7 +1549,13 @@ mod tests {
                 sdes_mid: None,
             },
         ];
-        src_transport.bridge_rewrite_rules_to(dst_transport.clone(), Default::default(), rules);
+        src_transport.bridge_rewrite_rules_to_with_video(
+            dst_transport.clone(),
+            Some(video_dst_transport.clone()),
+            HashSet::from([98, 99]),
+            Default::default(),
+            rules,
+        );
 
         let mut guard = src_transport.rewrite_bridge.lock();
         let bridge = guard.as_mut().expect("rewrite bridge should be configured");
@@ -1505,35 +1563,45 @@ mod tests {
         // Audio packet (PT 97) → audio SSRC + PT 96.
         let mut audio =
             RtpPacket::new(crate::rtp::RtpHeader::new(97, 7, 1111, 1111), vec![1u8; 32]);
+        let audio_target = bridge.target_for(audio.header.payload_type);
         bridge.rewrite_packet(&mut audio);
+        assert!(Arc::ptr_eq(&audio_target, &dst_transport));
         assert_eq!(audio.header.ssrc, audio_ssrc);
         assert_eq!(audio.header.payload_type, 96);
 
         // DTMF packet (PT 101) → audio SSRC + PT 110.
         let mut dtmf =
             RtpPacket::new(crate::rtp::RtpHeader::new(101, 7, 1111, 1111), vec![1u8; 32]);
+        let dtmf_target = bridge.target_for(dtmf.header.payload_type);
         bridge.rewrite_packet(&mut dtmf);
+        assert!(Arc::ptr_eq(&dtmf_target, &dst_transport));
         assert_eq!(dtmf.header.ssrc, audio_ssrc);
         assert_eq!(dtmf.header.payload_type, 110);
 
         // Video packet (PT 98) → video SSRC + PT 102.
         let mut video =
             RtpPacket::new(crate::rtp::RtpHeader::new(98, 7, 2222, 2222), vec![1u8; 32]);
+        let video_target = bridge.target_for(video.header.payload_type);
         bridge.rewrite_packet(&mut video);
+        assert!(Arc::ptr_eq(&video_target, &video_dst_transport));
         assert_eq!(video.header.ssrc, video_ssrc);
         assert_eq!(video.header.payload_type, 102);
 
         // RTX packet (PT 99, distinct source SSRC) → video SSRC + PT 103.
         let mut rtx =
             RtpPacket::new(crate::rtp::RtpHeader::new(99, 7, 3333, 3333), vec![1u8; 32]);
+        let rtx_target = bridge.target_for(rtx.header.payload_type);
         bridge.rewrite_packet(&mut rtx);
+        assert!(Arc::ptr_eq(&rtx_target, &video_dst_transport));
         assert_eq!(rtx.header.ssrc, video_ssrc);
         assert_eq!(rtx.header.payload_type, 103);
 
         // Each source stream keeps independent sequence/timestamp continuity.
         let mut video2 =
             RtpPacket::new(crate::rtp::RtpHeader::new(98, 8, 2382, 2222), vec![1u8; 32]);
+        let video2_target = bridge.target_for(video2.header.payload_type);
         bridge.rewrite_packet(&mut video2);
+        assert!(Arc::ptr_eq(&video2_target, &video_dst_transport));
         assert_eq!(video2.header.sequence_number, video.header.sequence_number + 1);
         assert_eq!(video2.header.timestamp, video.header.timestamp.wrapping_add(160));
         drop(guard);

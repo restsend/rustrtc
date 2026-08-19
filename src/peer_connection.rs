@@ -5223,16 +5223,17 @@ impl PeerConnectionInner {
 
         let remote = self.remote_description.lock();
         let remote_desc = remote.as_ref()?;
-        let remote_section = remote_desc
-            .media_sections
-            .iter()
-            .find(|section| section.mid == mid)
-            .or_else(|| {
-                remote_desc
-                    .media_sections
-                    .iter()
-                    .find(|section| section.kind == kind)
-            })?;
+        let remote_section = if mid.is_empty() {
+            remote_desc
+                .media_sections
+                .iter()
+                .find(|section| section.kind == kind)
+        } else {
+            remote_desc
+                .media_sections
+                .iter()
+                .find(|section| section.kind == kind && section.mid == mid)
+        }?;
 
         let local_caps = Self::configured_audio_capabilities(&self.config);
         let caps = Self::derive_answer_audio_capabilities(remote_section, &local_caps);
@@ -12692,4 +12693,3 @@ a=mid:0
         assert!(!extmap_value(crate::sdp::ABS_SEND_TIME_URI).starts_with("3 "));
     }
 }
-
