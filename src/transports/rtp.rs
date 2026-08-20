@@ -639,7 +639,14 @@ impl RtpTransport {
     /// When no observer is registered the hot path is a single atomic load
     /// (zero cost).
     pub fn add_observer(&self, observer: Arc<dyn RtpObserver>) {
-        self.observers.write().push(observer);
+        let mut observers = self.observers.write();
+        if observers
+            .iter()
+            .any(|existing| Arc::ptr_eq(existing, &observer))
+        {
+            return;
+        }
+        observers.push(observer);
         self.has_observers.store(true, Ordering::Release);
     }
 
@@ -1932,6 +1939,29 @@ mod tests {
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
+    }
+
+    #[tokio::test]
+    async fn adding_same_observer_twice_is_idempotent() {
+        use crate::transports::ice::IceSocketWrapper;
+        use tokio::net::UdpSocket;
+        use tokio::sync::watch;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_socket_tx, socket_rx) =
+            watch::channel(Some(IceSocketWrapper::Udp(Arc::new(socket))));
+        let connection = IceConn::new(socket_rx, "127.0.0.1:9".parse().unwrap(), None);
+        let transport = RtpTransport::new(connection, false);
+        let observer: Arc<dyn crate::peer_connection::RtpObserver> = Arc::new(CountingObserver {
+            ingress: std::sync::atomic::AtomicU32::new(0),
+            egress: std::sync::atomic::AtomicU32::new(0),
+            last_pt: std::sync::atomic::AtomicU8::new(0),
+        });
+
+        transport.add_observer(observer.clone());
+        transport.add_observer(observer);
+
+        assert_eq!(transport.observers.read().len(), 1);
     }
 
     /// The ingress observer must fire on EVERY inbound packet even when the

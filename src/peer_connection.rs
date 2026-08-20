@@ -1633,26 +1633,39 @@ impl PeerConnection {
         // Create transceivers for new media sections in Offer
         if desc.sdp_type == SdpType::Offer {
             let mut transceivers = self.inner.transceivers.lock();
+            let mut used_indices = std::collections::HashSet::new();
             for section in &desc.media_sections {
                 let mid = &section.mid;
-                let mut found_transceiver = None;
+                let mut found_transceiver: Option<(usize, Arc<RtpTransceiver>)> = None;
                 let mut newly_matched = false;
 
-                for t in transceivers.iter() {
-                    if let Some(t_mid) = t.mid()
-                        && t_mid == *mid
-                    {
-                        found_transceiver = Some(t.clone());
-                        break;
+                // An empty MID is not an identity. Linphone omits a=mid from
+                // every m-line, so matching "" twice would apply both audio
+                // and video to the first transceiver.
+                if !mid.is_empty() {
+                    for (idx, t) in transceivers.iter().enumerate() {
+                        if used_indices.contains(&idx) {
+                            continue;
+                        }
+                        if t.kind() == section.kind
+                            && let Some(t_mid) = t.mid()
+                            && t_mid == *mid
+                        {
+                            found_transceiver = Some((idx, t.clone()));
+                            break;
+                        }
                     }
                 }
 
                 if found_transceiver.is_none() {
                     // Try to find a transceiver with no MID and same kind
-                    for t in transceivers.iter() {
-                        if t.mid().is_none() && t.kind() == section.kind {
+                    for (idx, t) in transceivers.iter().enumerate() {
+                        if !used_indices.contains(&idx)
+                            && t.mid().is_none()
+                            && t.kind() == section.kind
+                        {
                             t.set_mid(mid.clone());
-                            found_transceiver = Some(t.clone());
+                            found_transceiver = Some((idx, t.clone()));
                             newly_matched = true;
                             break;
                         }
@@ -1660,10 +1673,19 @@ impl PeerConnection {
 
                     if found_transceiver.is_none()
                         && mid.is_empty()
-                        && let Some(t) = transceivers.iter().find(|t| t.kind() == section.kind)
+                        && let Some((idx, t)) = transceivers
+                            .iter()
+                            .enumerate()
+                            .find(|(idx, t)| {
+                                !used_indices.contains(idx) && t.kind() == section.kind
+                            })
                     {
-                        found_transceiver = Some(t.clone());
+                        found_transceiver = Some((idx, t.clone()));
                     }
+                }
+
+                if let Some((idx, _)) = &found_transceiver {
+                    used_indices.insert(*idx);
                 }
 
                 let mut ssrc = None;
@@ -1750,7 +1772,7 @@ impl PeerConnection {
                     transport.set_abs_send_time_extension_id(Some(id));
                 }
 
-                if let Some(t) = found_transceiver {
+                if let Some((_, t)) = found_transceiver {
                     // Update transceiver parameters
                     let payload_map = Self::extract_payload_map(section);
                     if !payload_map.is_empty() {
@@ -1789,11 +1811,7 @@ impl PeerConnection {
                     }
                 } else {
                     let kind = section.kind;
-                    let direction = if kind == MediaKind::Application {
-                        TransceiverDirection::SendRecv
-                    } else {
-                        TransceiverDirection::RecvOnly
-                    };
+                    let direction: TransceiverDirection = section.direction.into();
                     let t = Arc::new(RtpTransceiver::new(kind, direction));
                     t.set_mid(mid.clone());
 
@@ -1871,6 +1889,7 @@ impl PeerConnection {
 
                     t.set_receiver(Some(receiver));
 
+                    used_indices.insert(transceivers.len());
                     transceivers.push(t.clone());
 
                     if ssrc.is_some() {
@@ -2973,6 +2992,9 @@ impl PeerConnection {
                     // Log every RTCP packet to debug
                     match &packet {
                         RtcpPacket::PictureLossIndication(_) => {}
+                        RtcpPacket::FullIntraRequest(fir) => {
+                            trace!("RTCP Loop: Got FIR with {} request(s)", fir.requests.len())
+                        }
                         RtcpPacket::GenericNack(n) => {
                             trace!("RTCP Loop: Got NACK for SSRC {}", n.media_ssrc)
                         }
@@ -2995,15 +3017,16 @@ impl PeerConnection {
                         for t in transceivers.iter() {
                             if let Some(sender) = &*t.sender.lock() {
                                 let is_for_sender = match &packet {
-                                    RtcpPacket::PictureLossIndication(p) => {
-                                        if p.media_ssrc == sender.ssrc() {
-                                            trace!("Received PLI for SSRC: {}", p.media_ssrc);
-                                            true
-                                        } else {
-                                            false
-                                        }
+                                    RtcpPacket::PictureLossIndication(pli) => {
+                                        pli.media_ssrc == sender.ssrc()
                                     }
-                                    RtcpPacket::GenericNack(n) => n.media_ssrc == sender.ssrc(),
+                                    RtcpPacket::FullIntraRequest(fir) => fir
+                                        .requests
+                                        .iter()
+                                        .any(|request| request.ssrc == sender.ssrc()),
+                                    RtcpPacket::GenericNack(nack) => {
+                                        nack.media_ssrc == sender.ssrc()
+                                    }
                                     _ => false,
                                 };
 
@@ -3366,94 +3389,78 @@ impl PeerConnection {
     async fn handle_reinvite(&self, new_desc: &SessionDescription) -> RtcResult<()> {
         debug!("Handling reinvite: updating RTP parameters");
 
-        let transceivers = self.inner.transceivers.lock().clone();
-
         // Extract RTP parameter changes for each media section
-        for section in &new_desc.media_sections {
-            // Find matching transceiver by mid
-            let transceiver = transceivers
-                .iter()
-                .find(|t| t.mid().as_ref() == Some(&section.mid))
-                .or_else(|| {
-                    if section.mid.is_empty() {
-                        // MID-less re-INVITE fallback: match by kind.
-                        transceivers.iter().find(|t| t.kind() == section.kind)
-                    } else {
-                        None
-                    }
-                });
-
-            if let Some(t) = transceiver {
-                // Check SSRC change (indicates new track, not reinvite)
-                if let Some(receiver) = t.receiver() {
-                    let new_ssrc = Self::extract_ssrc_from_section(section);
-                    if let Some(new_ssrc) = new_ssrc {
-                        let old_ssrc = receiver.ssrc();
-                        if old_ssrc != new_ssrc {
-                            if old_ssrc != 0 {
-                                debug!(
-                                    "SSRC changed for mid={} ({} -> {}), updating listener",
-                                    section.mid, old_ssrc, new_ssrc
-                                );
-                            } else {
-                                debug!(
-                                    "SSRC learned for mid={} (-> {}), updating listener",
-                                    section.mid, new_ssrc
-                                );
-                            }
-                            receiver.set_ssrc(new_ssrc);
-                        }
-                    } else {
-                        // If no SSRC in SDP, re-enable provisional listener
-                        // to handle potential SSRC changes during reinvite
-                        receiver.ensure_provisional_listener();
-                    }
-                }
-
-                // Extract and validate payload type mapping
-                let payload_map = Self::extract_payload_map(section);
-                if !payload_map.is_empty() {
-                    // Basic validation: check if we support these codecs
-                    for (pt, params) in &payload_map {
-                        trace!("Validating PT {}: clock_rate={}", pt, params.clock_rate);
-                        // TODO: Add full codec capability check against local capabilities
-                    }
-                    t.update_payload_map(payload_map.clone())?;
-
-                    // Sync the sender's params to the new negotiated PT.
-                    // Without this the sender keeps stamping the stale PT
-                    // after a codec-changing re-INVITE — only the receiver
-                    // side was updated by `update_payload_map` above.
-                    if let Some(sender) = t.sender() {
-                        let cur = sender.params();
-                        let new_params = Self::pick_sender_codec_params(section, &payload_map, &cur);
-                        if let Some(np) = new_params
-                            && np.payload_type != cur.payload_type
-                        {
+        for (t, section_idx) in self.matched_rtp_media_sections(new_desc) {
+            let section = &new_desc.media_sections[section_idx];
+            // Check SSRC change (indicates new track, not reinvite)
+            if let Some(receiver) = t.receiver() {
+                let new_ssrc = Self::extract_ssrc_from_section(section);
+                if let Some(new_ssrc) = new_ssrc {
+                    let old_ssrc = receiver.ssrc();
+                    if old_ssrc != new_ssrc {
+                        if old_ssrc != 0 {
                             debug!(
-                                "Syncing sender PT for mid={}: {} -> {} (clock_rate={})",
-                                section.mid, cur.payload_type, np.payload_type, np.clock_rate
+                                "SSRC changed for mid={} ({} -> {}), updating listener",
+                                section.mid, old_ssrc, new_ssrc
                             );
-                            sender.set_params(np);
+                        } else {
+                            debug!(
+                                "SSRC learned for mid={} (-> {}), updating listener",
+                                section.mid, new_ssrc
+                            );
                         }
+                        receiver.set_ssrc(new_ssrc);
+                    }
+                } else {
+                    // If no SSRC in SDP, re-enable provisional listener
+                    // to handle potential SSRC changes during reinvite
+                    receiver.ensure_provisional_listener();
+                }
+            }
+
+            // Extract and validate payload type mapping
+            let payload_map = Self::extract_payload_map(section);
+            if !payload_map.is_empty() {
+                // Basic validation: check if we support these codecs
+                for (pt, params) in &payload_map {
+                    trace!("Validating PT {}: clock_rate={}", pt, params.clock_rate);
+                    // TODO: Add full codec capability check against local capabilities
+                }
+                t.update_payload_map(payload_map.clone())?;
+
+                // Sync the sender's params to the new negotiated PT.
+                // Without this the sender keeps stamping the stale PT
+                // after a codec-changing re-INVITE — only the receiver
+                // side was updated by `update_payload_map` above.
+                if let Some(sender) = t.sender() {
+                    let cur = sender.params();
+                    let new_params = Self::pick_sender_codec_params(section, &payload_map, &cur);
+                    if let Some(np) = new_params
+                        && np.payload_type != cur.payload_type
+                    {
+                        debug!(
+                            "Syncing sender PT for mid={}: {} -> {} (clock_rate={})",
+                            section.mid, cur.payload_type, np.payload_type, np.clock_rate
+                        );
+                        sender.set_params(np);
                     }
                 }
+            }
 
-                // Extract and update extension mapping
-                let extmap = Self::extract_extmap(section);
-                t.update_extmap(extmap)?;
+            // Extract and update extension mapping
+            let extmap = Self::extract_extmap(section);
+            t.update_extmap(extmap)?;
 
-                // Handle direction changes
-                let new_direction: TransceiverDirection = section.direction.into();
-                let old_direction = t.direction();
-                if new_direction != old_direction {
-                    debug!(
-                        "Direction changed for mid={}: {:?} -> {:?}",
-                        section.mid, old_direction, new_direction
-                    );
-                    t.set_direction(new_direction);
-                    Self::apply_direction_change(t, old_direction, new_direction).await?;
-                }
+            // Handle direction changes
+            let new_direction: TransceiverDirection = section.direction.into();
+            let old_direction = t.direction();
+            if new_direction != old_direction {
+                debug!(
+                    "Direction changed for mid={}: {:?} -> {:?}",
+                    section.mid, old_direction, new_direction
+                );
+                t.set_direction(new_direction);
+                Self::apply_direction_change(&t, old_direction, new_direction).await?;
             }
         }
 
@@ -3502,16 +3509,22 @@ impl PeerConnection {
     /// runner task) survives until the next full close(), leaking resources
     /// across non-BUNDLE renegotiations.
     fn cleanup_orphaned_extra_transports(&self, new_desc: &SessionDescription) {
-        let mids: std::collections::HashSet<&str> =
-            new_desc.media_sections.iter().map(|s| s.mid.as_str()).collect();
+        // Legacy SIP endpoints commonly omit a=mid. The transceivers still
+        // carry rustrtc's internal MIDs, so comparing those strings against an
+        // SDP containing only empty MIDs incorrectly removes every per-media
+        // transport. Reuse the one-to-one MID-or-kind matching used when
+        // configuring RTP transports and retain each matched transceiver.
+        let live_transceiver_ids: std::collections::HashSet<u64> = self
+            .matched_rtp_media_sections(new_desc)
+            .into_iter()
+            .map(|(transceiver, _)| transceiver.id())
+            .collect();
 
         // Collect orphan transceiver IDs (transport key).
         let mut orphan_ids = Vec::new();
         let transceivers = self.inner.transceivers.lock();
         for t in transceivers.iter() {
-            if let Some(mid) = t.mid()
-                && !mids.contains(mid.as_str())
-            {
+            if !live_transceiver_ids.contains(&t.id()) {
                 orphan_ids.push(t.id());
             }
         }
@@ -9489,6 +9502,56 @@ a=mid:0
     }
 
     #[tokio::test]
+    async fn cleanup_orphaned_extra_transports_preserves_midless_video() {
+        let pc = PeerConnection::new(RtcConfiguration::default());
+        let audio = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        let video = pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
+        audio.set_mid("0".into());
+        video.set_mid("1".into());
+
+        let video_id = video.id();
+        pc.inner
+            .rtp_media_ice_transports
+            .lock()
+            .insert(video_id, pc.inner.ice_transport.clone());
+
+        use crate::sdp::{Direction as SdpDir, MediaSection as MediaSec};
+        let mut desc = SessionDescription::new(SdpType::Answer);
+        desc.media_sections = vec![
+            MediaSec {
+                kind: MediaKind::Audio,
+                mid: String::new(),
+                port: 5000,
+                protocol: "RTP/AVP".into(),
+                formats: vec!["0".into()],
+                direction: SdpDir::SendRecv,
+                connection: Some("IN IP4 10.0.0.2".into()),
+                attributes: Vec::new(),
+            },
+            MediaSec {
+                kind: MediaKind::Video,
+                mid: String::new(),
+                port: 6000,
+                protocol: "RTP/AVP".into(),
+                formats: vec!["96".into()],
+                direction: SdpDir::SendRecv,
+                connection: Some("IN IP4 10.0.0.2".into()),
+                attributes: Vec::new(),
+            },
+        ];
+
+        pc.cleanup_orphaned_extra_transports(&desc);
+
+        assert!(
+            pc.inner
+                .rtp_media_ice_transports
+                .lock()
+                .contains_key(&video_id),
+            "MID-less video section must keep its matched non-BUNDLE transport"
+        );
+    }
+
+    #[tokio::test]
     async fn rtp_mode_gathering_completes_immediately() {
         use crate::TransportMode;
         let mut config = RtcConfiguration::default();
@@ -11228,6 +11291,80 @@ a=mid:0
     }
 
     #[tokio::test]
+    async fn rtp_mode_midless_reinvite_reactivates_existing_video_transceiver() {
+        use crate::TransportMode;
+        use crate::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode};
+
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+        config.sdp_compatibility = SdpCompatibilityMode::LegacySip;
+        config.media_capabilities = Some(MediaCapabilities {
+            audio: vec![AudioCapability::pcma()],
+            video: vec![crate::config::VideoCapability::h264()],
+            application: None,
+            image: vec![],
+        });
+        let pc = PeerConnection::new(config);
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
+
+        let local_offer = pc.create_offer().await.unwrap();
+        pc.set_local_description(local_offer).unwrap();
+        let initial_answer = SessionDescription::parse(
+            SdpType::Answer,
+            "v=0\r\n\
+             o=- 1 1 IN IP4 10.0.0.2\r\n\
+             s=-\r\n\
+             t=0 0\r\n\
+             c=IN IP4 10.0.0.2\r\n\
+             m=audio 5000 RTP/AVP 8\r\n\
+             a=rtpmap:8 PCMA/8000\r\n\
+             a=sendrecv\r\n\
+             m=video 0 RTP/AVP 0\r\n\
+             a=inactive\r\n",
+        )
+        .unwrap();
+        pc.set_remote_description(initial_answer).await.unwrap();
+
+        let reinvite = SessionDescription::parse(
+            SdpType::Offer,
+            "v=0\r\n\
+             o=- 1 2 IN IP4 10.0.0.2\r\n\
+             s=-\r\n\
+             t=0 0\r\n\
+             c=IN IP4 10.0.0.2\r\n\
+             m=audio 5000 RTP/AVP 8\r\n\
+             a=rtpmap:8 PCMA/8000\r\n\
+             a=sendrecv\r\n\
+             m=video 6000 RTP/AVP 96\r\n\
+             a=rtpmap:96 H264/90000\r\n\
+             a=sendrecv\r\n",
+        )
+        .unwrap();
+        pc.set_remote_description(reinvite).await.unwrap();
+        let answer = pc.create_answer().await.unwrap();
+
+        let audio = answer
+            .media_sections
+            .iter()
+            .find(|section| section.kind == MediaKind::Audio)
+            .unwrap();
+        let video = answer
+            .media_sections
+            .iter()
+            .find(|section| section.kind == MediaKind::Video)
+            .unwrap();
+        assert_eq!(audio.direction, Direction::SendRecv);
+        assert_eq!(video.direction, Direction::SendRecv);
+        assert_ne!(
+            video.port,
+            0,
+            "video must be reactivated:\n{}",
+            answer.to_sdp_string()
+        );
+    }
+
+    #[tokio::test]
     async fn rtp_mode_midless_non_bundle_answer_maps_each_media_transport() {
         use crate::TransportMode;
         use crate::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode};
@@ -12605,6 +12742,37 @@ a=mid:0
             1,
             "Should reuse the offer transceiver, not create a second one"
         );
+    }
+
+    #[tokio::test]
+    async fn new_offer_transceiver_preserves_remote_direction() {
+        for (attribute, expected) in [
+            ("sendrecv", TransceiverDirection::SendRecv),
+            ("sendonly", TransceiverDirection::SendOnly),
+            ("recvonly", TransceiverDirection::RecvOnly),
+            ("inactive", TransceiverDirection::Inactive),
+        ] {
+            let mut config = RtcConfiguration::default();
+            config.transport_mode = TransportMode::Rtp;
+            let pc = PeerConnection::new(config);
+            let offer_sdp = format!(
+                "v=0\r\n\
+                 o=- 1 1 IN IP4 192.168.1.100\r\n\
+                 s=-\r\n\
+                 c=IN IP4 192.168.1.100\r\n\
+                 t=0 0\r\n\
+                 m=video 4000 RTP/AVP 96\r\n\
+                 a=rtpmap:96 H264/90000\r\n\
+                 a=mid:0\r\n\
+                 a={attribute}\r\n"
+            );
+            let offer = SessionDescription::parse(SdpType::Offer, &offer_sdp).unwrap();
+            pc.set_remote_description(offer).await.unwrap();
+
+            let transceivers = pc.get_transceivers();
+            assert_eq!(transceivers.len(), 1);
+            assert_eq!(transceivers[0].direction(), expected, "a={attribute}");
+        }
     }
 
     // If no offer transceiver exists, add_track_with_stream_id should fall
