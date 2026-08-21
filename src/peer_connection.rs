@@ -6220,6 +6220,34 @@ impl RtpSender {
         self.ssrc
     }
 
+    /// Next sequence number the paced send loop will put on the wire.
+    pub fn next_sequence_number(&self) -> u16 {
+        self.next_sequence_number.load(Ordering::SeqCst)
+    }
+
+    /// RTP timestamp of the last packet this sender (or an external writer
+    /// via [`Self::note_external_packet`]) put on the wire.
+    pub fn last_rtp_timestamp(&self) -> u32 {
+        self.last_rtp_timestamp.load(Ordering::Relaxed)
+    }
+
+    /// Packets counted for RTCP SR (paced send + [`Self::note_external_packet`]).
+    pub fn packets_sent(&self) -> u32 {
+        self.packets_sent.load(Ordering::Relaxed)
+    }
+
+    /// Record a packet that left on this SSRC outside the paced send loop
+    /// (typically the RTP rewrite bridge). Keeps RTCP Sender Reports and the
+    /// next paced sequence/timestamp coherent when IVR and fast-path share
+    /// the SDP/`a=ssrc` stream.
+    pub fn note_external_packet(&self, sequence_number: u16, timestamp: u32, payload_len: u32) {
+        self.next_sequence_number
+            .store(sequence_number.wrapping_add(1), Ordering::SeqCst);
+        self.last_rtp_timestamp.store(timestamp, Ordering::Relaxed);
+        self.packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.octets_sent.fetch_add(payload_len, Ordering::Relaxed);
+    }
+
     pub fn cname(&self) -> &str {
         &self.cname
     }
@@ -6352,7 +6380,8 @@ impl RtpSender {
             rt_handle.as_ref(),
             pc_span,
             async move {
-                let mut sequence_number = next_seq.load(Ordering::SeqCst);
+                #[allow(unused_assignments)]
+                let mut sequence_number = 0u16;
                 let mut logged_first_sample = false;
             let mut last_source_ts: Option<u32> = None;
             let mut timestamp_offset = random_u32(); // Start with random offset
@@ -6426,6 +6455,10 @@ impl RtpSender {
                         }
                         match res {
                             Ok(mut sample) => {
+                                // Reload from the shared counter: rewrite/IVR handoff
+                                // updates it via note_external_packet / adopt while this
+                                // loop may have been blocked on track.recv().
+                                sequence_number = next_seq.load(Ordering::SeqCst);
                                 if !logged_first_sample {
                                     logged_first_sample = true;
                                     trace!(

@@ -110,7 +110,13 @@ pub struct RtpRewriteBridgeOptions {
     /// Seed the first forwarded sequence number of each new source stream.
     pub initial_sequence_number: Option<u16>,
     /// Seed the first forwarded timestamp offset of each new source stream.
+    /// Ignored for the first packet when [`Self::initial_output_timestamp`] is set.
     pub initial_timestamp_offset: Option<u32>,
+    /// Force the first forwarded packet's *output* RTP timestamp to this value
+    /// by choosing `offset = value - src_ts`. Later packets keep source
+    /// deltas. Use this to continue a destination leg's paced-sender timeline
+    /// when IVR and rewrite share the same outbound SSRC (WebRTC).
+    pub initial_output_timestamp: Option<u32>,
 }
 
 impl RtpRewriteRule {
@@ -268,6 +274,15 @@ impl RewriteBridge {
                 state.last_source_timestamp = Some(src_timestamp);
             }
         } else {
+            // First packet of this source stream: optionally pin the output
+            // timestamp so a shared destination SSRC stays continuous with
+            // prior local playback / prior relay.
+            if let Some(desired_out) = self.options.initial_output_timestamp {
+                state.timestamp_offset = desired_out.wrapping_sub(src_timestamp);
+                // Tell the receiver this continues a prior stream on the same
+                // SSRC after a source switch (IVR/CNG → relay).
+                packet.header.marker = true;
+            }
             state.last_source_timestamp = Some(src_timestamp);
         }
 
@@ -577,6 +592,7 @@ impl RtpTransport {
             strip_extensions: params.strip_extensions,
             initial_sequence_number: params.initial_sequence_number,
             initial_timestamp_offset: params.initial_timestamp_offset,
+            initial_output_timestamp: None,
         };
         self.bridge_rewrite_rules_to(dst, options, RtpRewriteRule::from_params(params));
     }
@@ -1445,6 +1461,60 @@ mod tests {
         assert_eq!(packet.header.payload_type, 96);
         assert_eq!(packet.header.sequence_number, 32000);
         assert_eq!(packet.header.timestamp, 1111 + 12345);
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_bridge_pins_first_output_timestamp() {
+        use crate::transports::ice::IceSocketWrapper;
+        use tokio::net::UdpSocket;
+        use tokio::sync::watch;
+
+        let src_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_src_tx, src_rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(src_socket))));
+        let src_conn = IceConn::new(src_rx, "127.0.0.1:9".parse().unwrap(), None);
+        let src_transport = RtpTransport::new(src_conn, false);
+
+        let dst_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_dst_tx, dst_rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(dst_socket))));
+        let dst_conn = IceConn::new(dst_rx, "127.0.0.1:9".parse().unwrap(), None);
+        let dst_transport = Arc::new(RtpTransport::new(dst_conn, false));
+
+        src_transport.bridge_rewrite_rules_to(
+            dst_transport.clone(),
+            RtpRewriteBridgeOptions {
+                strip_extensions: false,
+                initial_sequence_number: Some(100),
+                initial_timestamp_offset: Some(999_999), // ignored on first packet
+                initial_output_timestamp: Some(50_000),
+            },
+            vec![RtpRewriteRule {
+                match_payload_type: None,
+                fixed_out_ssrc: Some(0xABCD),
+                ssrc_offset: 0,
+                out_payload_type: None,
+                sdes_mid_extension_id: None,
+                sdes_mid: None,
+            }],
+        );
+
+        let mut guard = src_transport.rewrite_bridge.lock();
+        let bridge = guard.as_mut().expect("rewrite bridge");
+
+        let mut first = RtpPacket::new(crate::rtp::RtpHeader::new(0, 1, 10_000, 1), vec![1u8; 8]);
+        bridge.rewrite_packet(&mut first);
+        assert_eq!(first.header.ssrc, 0xABCD);
+        assert_eq!(first.header.sequence_number, 100);
+        assert_eq!(first.header.timestamp, 50_000);
+
+        let mut second = RtpPacket::new(crate::rtp::RtpHeader::new(0, 2, 10_160, 1), vec![1u8; 8]);
+        bridge.rewrite_packet(&mut second);
+        assert_eq!(second.header.sequence_number, 101);
+        assert_eq!(
+            second.header.timestamp, 50_160,
+            "source delta must be preserved after the pinned first timestamp"
+        );
+        assert!(first.header.marker, "first pinned packet must be marked");
+        assert!(!second.header.marker, "subsequent packets keep source marker");
     }
 
     #[tokio::test]
