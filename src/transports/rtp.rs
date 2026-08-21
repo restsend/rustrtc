@@ -1,12 +1,12 @@
 use crate::rtp::{RtcpPacket, RtpPacket, is_rtcp, marshal_rtcp_packets, parse_rtcp_packets};
-use crate::srtp::SrtpSession;
+use crate::srtp::{SrtpPacket, SrtpSession};
 use crate::peer_connection::RtpObserver;
 use crate::transports::PacketReceiver;
 use crate::transports::ice::conn::IceConn;
 use crate::transports::ice::stun::random_u32;
 use anyhow::Result;
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use parking_lot::{Mutex, RwLock};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -1003,33 +1003,45 @@ impl PacketReceiver for RtpTransport {
             }
         } else {
             let rtp_packet = {
-                // Release the outer guard at once; hold the inner SRTP lock only
-                // around parse + unprotect.
-                let session = self.srtp_session.lock().as_ref().map(|s| s.clone());
+                // Parse outside both session guards. The inner SRTP lock is
+                // held only while authenticating and decrypting the packet.
+                let session = self.srtp_session.lock().as_ref().cloned();
                 match session {
                     Some(session) => {
-                        let mut srtp = session.lock();
-                        // SRTP path: keep a borrowed parse (crypto materializes a
-                        // mutable copy itself, so no benefit from zero-copy here).
-                        match RtpPacket::parse(&packet) {
-                            Ok(mut rtp_packet) => match srtp.unprotect_rtp(&mut rtp_packet) {
-                                Ok(_) => rtp_packet,
-                                Err(_) => {
-                                    let failures =
-                                        self.srtp_unprotect_failures.fetch_add(1, Ordering::Relaxed)
+                        let packet = match packet.try_into_mut() {
+                            Ok(packet) => packet,
+                            Err(packet) => BytesMut::from(packet.as_ref()),
+                        };
+                        match SrtpPacket::parse(packet) {
+                            Ok(srtp_packet) => {
+                                let ssrc = srtp_packet.header().ssrc;
+                                let payload_type = srtp_packet.header().payload_type;
+                                let sequence = srtp_packet.header().sequence_number;
+                                let mut srtp = session.lock();
+                                match srtp.unprotect_rtp(srtp_packet) {
+                                    Ok(rtp_packet) => rtp_packet,
+                                    Err(error) => {
+                                        let failures = self
+                                            .srtp_unprotect_failures
+                                            .fetch_add(1, Ordering::Relaxed)
                                             + 1;
-                                    if failures <= 5 || failures.is_multiple_of(100) {
-                                        tracing::warn!(
-                                            failures,
-                                            from = %addr,
-                                            "SRTP unprotect RTP failed, dropping"
-                                        );
+                                        if failures <= 5 || failures.is_multiple_of(100) {
+                                            tracing::warn!(
+                                                failures,
+                                                from = %addr,
+                                                ssrc,
+                                                payload_type,
+                                                sequence,
+                                                %error,
+                                                "SRTP unprotect RTP failed, dropping"
+                                            );
+                                        }
+                                        return;
                                     }
-                                    return;
                                 }
-                            },
+                            }
                             Err(e) => {
-                                trace!("RTP parse failed: {}", e);
+                                trace!("SRTP parse failed: {}", e);
                                 return;
                             }
                         }
@@ -1039,10 +1051,7 @@ impl PacketReceiver for RtpTransport {
                             trace!("Dropping packet because SRTP is required but session is not ready");
                             return;
                         }
-                        // Plain-RTP fast path: zero-copy parse — the packet's
-                        // payload/extension are cheap `Bytes` slices of the
-                        // already-owned receive buffer instead of fresh Vec copies.
-                        match RtpPacket::parse_bytes(packet.clone()) {
+                        match RtpPacket::parse_bytes(packet) {
                             Ok(rtp_packet) => rtp_packet,
                             Err(e) => {
                                 trace!("RTP parse failed: {}", e);

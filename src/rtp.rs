@@ -1,5 +1,5 @@
 use crate::errors::{RtpError, RtpResult};
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::time::SystemTime;
@@ -59,6 +59,65 @@ impl RtpHeader {
             csrcs: Vec::new(),
             extension: None,
         }
+    }
+
+    /// Parse and consume an RTP header, leaving `raw` positioned at the packet
+    /// body. The returned boolean is the clear RTP padding bit; interpreting
+    /// the padding length belongs to the plaintext RTP or SRTP body parser.
+    pub fn parse<B: Buf>(raw: &mut B) -> RtpResult<(Self, bool)> {
+        if raw.remaining() < 12 {
+            return Err(RtpError::PacketTooShort);
+        }
+
+        let b0 = raw.get_u8();
+        let b1 = raw.get_u8();
+        let version = b0 >> 6;
+        if version != RTP_VERSION {
+            return Err(RtpError::UnsupportedVersion(version));
+        }
+        let padding = (b0 & 0x20) != 0;
+        let extension = (b0 & 0x10) != 0;
+        let csrc_count = (b0 & 0x0F) as usize;
+        let marker = (b1 & 0x80) != 0;
+        let payload_type = b1 & 0x7F;
+        let sequence_number = raw.get_u16();
+        let timestamp = raw.get_u32();
+        let ssrc = raw.get_u32();
+
+        if raw.remaining() < csrc_count * 4 {
+            return Err(RtpError::PacketTooShort);
+        }
+        let csrcs = (0..csrc_count).map(|_| raw.get_u32()).collect();
+
+        let extension = if extension {
+            if raw.remaining() < 4 {
+                return Err(RtpError::PacketTooShort);
+            }
+            let profile = raw.get_u16();
+            let extension_len = raw.get_u16() as usize * 4;
+            if raw.remaining() < extension_len {
+                return Err(RtpError::PacketTooShort);
+            }
+            Some(RtpHeaderExtension {
+                profile,
+                data: raw.copy_to_bytes(extension_len),
+            })
+        } else {
+            None
+        };
+
+        Ok((
+            Self {
+                marker,
+                payload_type,
+                sequence_number,
+                timestamp,
+                ssrc,
+                csrcs,
+                extension,
+            },
+            padding,
+        ))
     }
 
     pub fn get_extension(&self, id: u8) -> Option<Bytes> {
@@ -188,7 +247,7 @@ impl RtpHeader {
         Ok(())
     }
 
-    fn validate(&self) -> RtpResult<()> {
+    pub(crate) fn validate(&self) -> RtpResult<()> {
         if self.csrcs.len() > 15 {
             return Err(RtpError::InvalidHeader("too many CSRC entries"));
         }
@@ -200,6 +259,36 @@ impl RtpHeader {
             ));
         }
         Ok(())
+    }
+
+    /// Append the fixed header, CSRC list, and extension block to `buffer`.
+    pub(crate) fn write_to(&self, has_padding: bool, buffer: &mut Vec<u8>) {
+        let mut b0 = RTP_VERSION << 6;
+        if has_padding {
+            b0 |= 0x20;
+        }
+        if self.extension.is_some() {
+            b0 |= 0x10;
+        }
+        b0 |= (self.csrcs.len() & 0x0F) as u8;
+        let mut b1 = self.payload_type & 0x7F;
+        if self.marker {
+            b1 |= 0x80;
+        }
+        buffer.push(b0);
+        buffer.push(b1);
+        buffer.extend_from_slice(&self.sequence_number.to_be_bytes());
+        buffer.extend_from_slice(&self.timestamp.to_be_bytes());
+        buffer.extend_from_slice(&self.ssrc.to_be_bytes());
+        for csrc in &self.csrcs {
+            buffer.extend_from_slice(&csrc.to_be_bytes());
+        }
+        if let Some(extension) = &self.extension {
+            let length_words = (extension.data.len() / 4) as u16;
+            buffer.extend_from_slice(&extension.profile.to_be_bytes());
+            buffer.extend_from_slice(&length_words.to_be_bytes());
+            buffer.extend_from_slice(&extension.data);
+        }
     }
 }
 
@@ -223,85 +312,21 @@ impl RtpPacket {
         Self::parse_bytes(Bytes::copy_from_slice(raw))
     }
 
-    /// Zero-copy parse: the returned packet's payload and extension data are
-    /// cheap (`Bytes`) slices of `buf` rather than independent heap allocations.
-    /// Use this on the receive hot path when you already own the packet bytes.
-    pub fn parse_bytes(buf: Bytes) -> RtpResult<Self> {
-        let raw: &[u8] = buf.as_ref();
-        if raw.len() < 12 {
-            return Err(RtpError::PacketTooShort);
-        }
-        let b0 = raw[0];
-        let b1 = raw[1];
-        let version = b0 >> 6;
-        if version != RTP_VERSION {
-            return Err(RtpError::UnsupportedVersion(version));
-        }
-        let padding = (b0 & 0x20) != 0;
-        let extension = (b0 & 0x10) != 0;
-        let csrc_count = (b0 & 0x0F) as usize;
-        let marker = (b1 & 0x80) != 0;
-        let payload_type = b1 & 0x7F;
+    /// Parse an owned buffer without copying its payload. For `Bytes` inputs,
+    /// header-extension data is another slice of the same allocation.
+    pub fn parse_bytes(mut buf: Bytes) -> RtpResult<Self> {
+        let (header, padding) = RtpHeader::parse(&mut buf)?;
 
-        let mut offset = 12usize;
-        if raw.len() < offset + csrc_count * 4 {
-            return Err(RtpError::PacketTooShort);
-        }
-        let sequence_number = u16::from_be_bytes([raw[2], raw[3]]);
-        let timestamp = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]);
-        let ssrc = u32::from_be_bytes([raw[8], raw[9], raw[10], raw[11]]);
-
-        let mut csrcs = Vec::with_capacity(csrc_count);
-        for _ in 0..csrc_count {
-            let value = u32::from_be_bytes([
-                raw[offset],
-                raw[offset + 1],
-                raw[offset + 2],
-                raw[offset + 3],
-            ]);
-            csrcs.push(value);
-            offset += 4;
-        }
-
-        let mut extension_header = None;
-        if extension {
-            if raw.len() < offset + 4 {
-                return Err(RtpError::PacketTooShort);
-            }
-            let profile = u16::from_be_bytes([raw[offset], raw[offset + 1]]);
-            let length_words = u16::from_be_bytes([raw[offset + 2], raw[offset + 3]]) as usize;
-            offset += 4;
-            let extension_len = length_words * 4;
-            if raw.len() < offset + extension_len {
-                return Err(RtpError::PacketTooShort);
-            }
-            extension_header = Some(RtpHeaderExtension {
-                profile,
-                data: buf.slice(offset..offset + extension_len),
-            });
-            offset += extension_len;
-        }
-
-        let mut payload_end = raw.len();
+        let mut payload_end = buf.len();
         let mut padding_len = 0u8;
         if padding {
-            padding_len = *raw.last().ok_or(RtpError::PacketTooShort)?;
-            if padding_len as usize > raw.len().saturating_sub(offset) {
+            padding_len = *buf.last().ok_or(RtpError::PacketTooShort)?;
+            if padding_len as usize > buf.len() {
                 return Err(RtpError::InvalidHeader("padding larger than payload"));
             }
             payload_end -= padding_len as usize;
         }
-        let payload = buf.slice(offset..payload_end);
-
-        let header = RtpHeader {
-            marker,
-            payload_type,
-            sequence_number,
-            timestamp,
-            ssrc,
-            csrcs,
-            extension: extension_header,
-        };
+        let payload = buf.slice(..payload_end);
 
         Ok(Self {
             header,
@@ -325,18 +350,9 @@ impl RtpPacket {
         Self::marshal_impl(self, buf);
     }
 
-    /// Marshal only the header (fixed fields + CSRC list + extension) into
-    /// `buf`, excluding payload and padding. Used by SRTP to feed the HMAC
-    /// authentication tag incrementally (header bytes, then ciphertext, then
-    /// ROC) without allocating the full marshaled packet on every protect.
-    pub(crate) fn marshal_header_into(&self, buf: &mut Vec<u8>) {
-        buf.clear();
-        Self::write_header(self, buf);
-    }
-
     fn marshal_impl(packet: &RtpPacket, buffer: &mut Vec<u8>) {
         buffer.reserve(12 + packet.header.csrcs.len() * 4 + packet.payload.len());
-        Self::write_header(packet, buffer);
+        packet.header.write_to(packet.padding_len != 0, buffer);
         buffer.extend_from_slice(&packet.payload);
         if packet.padding_len > 0 {
             buffer.extend(std::iter::repeat_n(
@@ -346,35 +362,6 @@ impl RtpPacket {
         }
     }
 
-    /// Write the fixed header + CSRC list + extension block (no payload/padding).
-    fn write_header(packet: &RtpPacket, buffer: &mut Vec<u8>) {
-        let mut b0 = RTP_VERSION << 6;
-        if packet.padding_len > 0 {
-            b0 |= 0x20;
-        }
-        if packet.header.extension.is_some() {
-            b0 |= 0x10;
-        }
-        b0 |= (packet.header.csrcs.len() & 0x0F) as u8;
-        let mut b1 = packet.header.payload_type & 0x7F;
-        if packet.header.marker {
-            b1 |= 0x80;
-        }
-        buffer.push(b0);
-        buffer.push(b1);
-        buffer.extend_from_slice(&packet.header.sequence_number.to_be_bytes());
-        buffer.extend_from_slice(&packet.header.timestamp.to_be_bytes());
-        buffer.extend_from_slice(&packet.header.ssrc.to_be_bytes());
-        for csrc in &packet.header.csrcs {
-            buffer.extend_from_slice(&csrc.to_be_bytes());
-        }
-        if let Some(extension) = &packet.header.extension {
-            let length_words = (extension.data.len() / 4) as u16;
-            buffer.extend_from_slice(&extension.profile.to_be_bytes());
-            buffer.extend_from_slice(&length_words.to_be_bytes());
-            buffer.extend_from_slice(&extension.data);
-        }
-    }
 }
 
 pub fn calculate_abs_send_time(time: SystemTime) -> u32 {

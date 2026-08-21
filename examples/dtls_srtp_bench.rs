@@ -59,7 +59,12 @@ fn bench_srtp(profile: SrtpProfile, name: &str) {
         packet.payload.truncate(payload_size);
 
         sender.protect(&mut packet).unwrap();
-        receiver.unprotect(&mut packet).unwrap();
+        let protected = packet.marshal().unwrap();
+        let protected = rustrtc::srtp::SrtpPacket::parse(
+            bytes::BytesMut::from(protected.as_slice()),
+        )
+        .unwrap();
+        packet = receiver.unprotect(protected).unwrap();
     }
     let duration = start.elapsed();
 

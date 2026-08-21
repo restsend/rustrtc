@@ -1,13 +1,13 @@
 use crate::{
     errors::{SrtpError, SrtpResult},
-    rtp::RtpPacket,
+    rtp::{RtpHeader, RtpPacket},
 };
 use aes::Aes128;
 use aes_gcm::{
     Aes128Gcm, Nonce,
-    aead::{Aead, KeyInit, Payload},
+    aead::{Aead, AeadInPlace, KeyInit, Payload},
 };
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use ctr::cipher::{InnerIvInit, StreamCipher};
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
@@ -20,6 +20,35 @@ type HmacSha1 = Hmac<Sha1>;
 
 /// Maximum HMAC-SHA1 digest length (used for fixed-size auth-tag buffers).
 const SHA1_LEN: usize = 20;
+
+/// A received SRTP datagram split into its clear RTP header and protected body.
+/// Unprotection consumes this value and returns a plaintext [`RtpPacket`].
+#[derive(Debug)]
+pub struct SrtpPacket {
+    header: RtpHeader,
+    body: BytesMut,
+    has_padding: bool,
+}
+
+impl SrtpPacket {
+    pub fn parse(mut raw: BytesMut) -> crate::errors::RtpResult<Self> {
+        let (header, has_padding) = RtpHeader::parse(&mut raw)?;
+        Ok(Self {
+            header,
+            body: raw,
+            has_padding,
+        })
+    }
+
+    pub fn header(&self) -> &RtpHeader {
+        &self.header
+    }
+
+    fn marshal_header_into(&self, raw: &mut Vec<u8>) {
+        raw.clear();
+        self.header.write_to(self.has_padding, raw);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SrtpProfile {
@@ -129,7 +158,7 @@ impl SrtpSession {
         ctx.protect(packet)
     }
 
-    pub fn unprotect_rtp(&mut self, packet: &mut RtpPacket) -> SrtpResult<()> {
+    pub fn unprotect_rtp(&mut self, packet: SrtpPacket) -> SrtpResult<RtpPacket> {
         let ssrc = packet.header.ssrc;
         self.evict_stale_rx(ssrc);
         let ctx = match self.rx_contexts.entry(ssrc) {
@@ -642,7 +671,10 @@ impl SrtpContext {
         // incrementally so no full marshaled packet is allocated per call.
         if let Some(proto) = self.rtp_auth_prototype.as_ref() {
             let mut mac = proto.clone();
-            packet.marshal_header_into(&mut self.auth_scratch);
+            self.auth_scratch.clear();
+            packet
+                .header
+                .write_to(packet.padding_len != 0, &mut self.auth_scratch);
             mac.update(&self.auth_scratch);
             mac.update(&buf);
             if packet.padding_len > 0 {
@@ -653,80 +685,80 @@ impl SrtpContext {
             let result = mac.finalize().into_bytes();
             buf.extend_from_slice(&result[..tag_len]);
         }
+
         packet.payload = Bytes::from(buf);
         self.update(packet.header.sequence_number, roc);
         Ok(())
     }
 
-    pub fn unprotect(&mut self, packet: &mut RtpPacket) -> SrtpResult<()> {
+    pub fn unprotect(&mut self, mut packet: SrtpPacket) -> SrtpResult<RtpPacket> {
         let tag_len = self._profile.tag_len();
-        if packet.payload.len() < tag_len {
+        if packet.body.len() < tag_len {
             return Err(SrtpError::PacketTooShort);
         }
 
-        let roc = self.estimate_roc(packet.header.sequence_number);
+        let sequence_number = packet.header.sequence_number;
+        let roc = self.estimate_roc(sequence_number);
+        packet.marshal_header_into(&mut self.auth_scratch);
 
         if let SrtpProfile::AeadAes128Gcm = self._profile {
-            let nonce = self.build_gcm_nonce(packet.header.sequence_number, roc);
+            let nonce = self.build_gcm_nonce(sequence_number, roc);
             let cipher = self
                 .rtp_gcm_cipher
                 .as_ref()
                 .ok_or(SrtpError::UnsupportedProfile)?;
-
-            // Separate payload (ciphertext + tag) from header for AAD
-            let original_payload = std::mem::take(&mut packet.payload);
-            let aad = packet.marshal()?;
-            packet.payload = original_payload;
-
-            let payload = Payload {
-                msg: packet.payload.as_ref(),
-                aad: &aad,
-            };
-
-            let plaintext = cipher
-                .decrypt(Nonce::from_slice(&nonce), payload)
+            let split = packet.body.len() - tag_len;
+            let tag = aes_gcm::Tag::clone_from_slice(&packet.body[split..]);
+            packet.body.truncate(split);
+            cipher
+                .decrypt_in_place_detached(
+                    Nonce::from_slice(&nonce),
+                    &self.auth_scratch,
+                    &mut packet.body,
+                    &tag,
+                )
                 .map_err(|_| SrtpError::AuthenticationFailed)?;
-
-            packet.payload = Bytes::from(plaintext);
-            self.update(packet.header.sequence_number, roc);
-            return Ok(());
-        }
-
-        let split = packet.payload.len() - tag_len;
-        // Copy the trailing auth tag into a fixed-size buffer (no allocation),
-        // then zero-copy truncate the payload down to the ciphertext.
-        let mut tag = [0u8; SHA1_LEN];
-        tag[..tag_len].copy_from_slice(&packet.payload[split..split + tag_len]);
-        packet.payload = packet.payload.slice(..split);
-
-        // Verify the auth tag incrementally over header || ciphertext || ROC.
-        if let Some(proto) = self.rtp_auth_prototype.as_ref() {
-            let mut mac = proto.clone();
-            packet.marshal_header_into(&mut self.auth_scratch);
-            mac.update(&self.auth_scratch);
-            mac.update(&packet.payload);
-            if packet.padding_len > 0 {
-                let pad = [packet.padding_len; 255];
-                mac.update(&pad[..packet.padding_len as usize]);
+        } else {
+            let split = packet.body.len() - tag_len;
+            if let Some(proto) = self.rtp_auth_prototype.as_ref() {
+                let mut mac = proto.clone();
+                mac.update(&self.auth_scratch);
+                mac.update(&packet.body[..split]);
+                mac.update(&roc.to_be_bytes());
+                let result = mac.finalize().into_bytes();
+                if !constant_time_eq(&packet.body[split..], &result[..tag_len]) {
+                    return Err(SrtpError::AuthenticationFailed);
+                }
             }
-            mac.update(&roc.to_be_bytes());
-            let result = mac.finalize().into_bytes();
-            if !constant_time_eq(&tag[..tag_len], &result[..tag_len]) {
-                return Err(SrtpError::AuthenticationFailed);
+            packet.body.truncate(split);
+
+            let decrypts = !matches!(self._profile, SrtpProfile::NullCipherHmac);
+            if !packet.body.is_empty() && decrypts {
+                let iv = self.build_iv(sequence_number, roc);
+                let mut cipher = Self::ctr_from_key(&self.rtp_aes_key, iv);
+                cipher.apply_keystream(&mut packet.body);
             }
         }
 
-        // Decrypt the ciphertext in place.
-        let decrypts = !matches!(self._profile, SrtpProfile::NullCipherHmac);
-        if !packet.payload.is_empty() && decrypts {
-            let iv = self.build_iv(packet.header.sequence_number, roc);
-            let mut cipher = Self::ctr_from_key(&self.rtp_aes_key, iv);
-            let mut buf = packet.payload.to_vec();
-            cipher.apply_keystream(&mut buf);
-            packet.payload = Bytes::from(buf);
-        }
-        self.update(packet.header.sequence_number, roc);
-        Ok(())
+        let padding_len = if packet.has_padding {
+            let padding_len = *packet.body.last().ok_or(SrtpError::PacketTooShort)?;
+            if padding_len == 0 || padding_len as usize > packet.body.len() {
+                return Err(SrtpError::Internal(
+                    "invalid decrypted RTP padding length".to_string(),
+                ));
+            }
+            packet.body.truncate(packet.body.len() - padding_len as usize);
+            padding_len
+        } else {
+            0
+        };
+
+        self.update(sequence_number, roc);
+        Ok(RtpPacket {
+            header: packet.header,
+            payload: packet.body.freeze(),
+            padding_len,
+        })
     }
 
     fn build_gcm_rtcp_nonce(&self, index: u32) -> [u8; 12] {
@@ -822,7 +854,7 @@ impl SrtpContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rtp::{RtpHeader, RtpPacket};
+    use crate::rtp::{RtpHeader, RtpHeaderExtension, RtpPacket};
 
     fn sample_packet(seq: u16) -> RtpPacket {
         let header = RtpHeader::new(96, seq, 1234, 0xdead_beef);
@@ -842,7 +874,9 @@ mod tests {
         session.protect_rtp(&mut packet).unwrap();
         assert_eq!(packet.payload.len(), original.len() + 10);
         assert_ne!(packet.payload[..original.len()], original[..]);
-        session.unprotect_rtp(&mut packet).unwrap();
+        let raw = packet.marshal().unwrap();
+        let packet = SrtpPacket::parse(BytesMut::from(raw.as_slice())).unwrap();
+        let packet = session.unprotect_rtp(packet).unwrap();
         assert_eq!(packet.payload, original);
     }
 
@@ -855,8 +889,90 @@ mod tests {
         session.protect_rtp(&mut packet).unwrap();
         assert_eq!(packet.payload.len(), original.len() + 16);
         assert_ne!(packet.payload[..original.len()], original[..]);
-        session.unprotect_rtp(&mut packet).unwrap();
+        let raw = packet.marshal().unwrap();
+        let packet = SrtpPacket::parse(BytesMut::from(raw.as_slice())).unwrap();
+        let packet = session.unprotect_rtp(packet).unwrap();
         assert_eq!(packet.payload, original);
+    }
+
+    #[test]
+    fn aes_cm_padding_is_encrypted_and_resolved_after_parsing() {
+        let sender = SrtpContext::new(
+            0xdead_beef,
+            SrtpProfile::Aes128Sha1_80,
+            material(),
+            SrtpDirection::Sender,
+        )
+        .unwrap();
+        let mut receiver =
+            SrtpSession::new(SrtpProfile::Aes128Sha1_80, material(), material()).unwrap();
+        let mut packet = sample_packet(7);
+        packet.header.extension = Some(RtpHeaderExtension::new(0xBEDE, vec![1, 2, 3, 4]));
+        packet.padding_len = 4;
+        let original = packet.payload.clone();
+
+        let mut raw = Vec::new();
+        packet.header.write_to(true, &mut raw);
+        let header_len = raw.len();
+        raw.extend_from_slice(&packet.payload);
+        raw.extend_from_slice(&[4, 4, 4, 4]);
+        let iv = sender.build_iv(packet.header.sequence_number, 0);
+        let mut cipher = SrtpContext::ctr_from_key(&sender.rtp_aes_key, iv);
+        cipher.apply_keystream(&mut raw[header_len..]);
+        let mut mac = sender.rtp_auth_prototype.as_ref().unwrap().clone();
+        mac.update(&raw);
+        mac.update(&0u32.to_be_bytes());
+        let tag = mac.finalize().into_bytes();
+        raw.extend_from_slice(&tag[..SrtpProfile::Aes128Sha1_80.tag_len()]);
+        let packet = SrtpPacket::parse(BytesMut::from(raw.as_slice())).unwrap();
+        let body_ptr = packet.body.as_ptr();
+        let packet = receiver.unprotect_rtp(packet).unwrap();
+
+        assert_eq!(packet.payload, original);
+        assert_eq!(packet.padding_len, 4);
+        assert_eq!(packet.payload.as_ptr(), body_ptr);
+    }
+
+    #[test]
+    fn gcm_padding_is_encrypted_and_resolved_after_parsing() {
+        let sender = SrtpContext::new(
+            0xdead_beef,
+            SrtpProfile::AeadAes128Gcm,
+            material(),
+            SrtpDirection::Sender,
+        )
+        .unwrap();
+        let mut receiver =
+            SrtpSession::new(SrtpProfile::AeadAes128Gcm, material(), material()).unwrap();
+        let mut packet = sample_packet(8);
+        packet.padding_len = 4;
+        let original = packet.payload.clone();
+
+        let mut raw = Vec::new();
+        packet.header.write_to(true, &mut raw);
+        let mut body = packet.payload.to_vec();
+        body.extend_from_slice(&[4, 4, 4, 4]);
+        let nonce = sender.build_gcm_nonce(packet.header.sequence_number, 0);
+        let encrypted = sender
+            .rtp_gcm_cipher
+            .as_ref()
+            .unwrap()
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &body,
+                    aad: &raw,
+                },
+            )
+            .unwrap();
+        raw.extend_from_slice(&encrypted);
+        let packet = SrtpPacket::parse(BytesMut::from(raw.as_slice())).unwrap();
+        let body_ptr = packet.body.as_ptr();
+        let packet = receiver.unprotect_rtp(packet).unwrap();
+
+        assert_eq!(packet.payload, original);
+        assert_eq!(packet.padding_len, 4);
+        assert_eq!(packet.payload.as_ptr(), body_ptr);
     }
 
     #[test]
@@ -870,11 +986,10 @@ mod tests {
         .unwrap();
         let mut packet = sample_packet(1);
         ctx.protect(&mut packet).unwrap();
-        // Tamper with the first payload byte (must copy since Bytes is immutable).
-        let mut tampered = packet.payload.to_vec();
-        tampered[0] ^= 0xFF;
-        packet.payload = Bytes::from(tampered);
-        let err = ctx.unprotect(&mut packet).unwrap_err();
+        let raw = packet.marshal().unwrap();
+        let mut packet = SrtpPacket::parse(BytesMut::from(raw.as_slice())).unwrap();
+        packet.body[0] ^= 0xFF;
+        let err = ctx.unprotect(packet).unwrap_err();
         assert!(matches!(err, SrtpError::AuthenticationFailed));
     }
 
@@ -899,17 +1014,19 @@ mod tests {
         let mut receiver =
             SrtpSession::new(SrtpProfile::Aes128Sha1_80, material(), material()).unwrap();
 
-        // Send packet near rollover
-        let mut p1 = sample_packet(65535);
-        sender.protect_rtp(&mut p1).unwrap();
+        let mut packet = sample_packet(65535);
+        sender.protect_rtp(&mut packet).unwrap();
+        let raw = packet.marshal().unwrap();
+        let p1 = SrtpPacket::parse(BytesMut::from(raw.as_slice())).unwrap();
 
-        // Send packet after rollover
-        let mut p2 = sample_packet(0);
-        sender.protect_rtp(&mut p2).unwrap();
+        let mut packet = sample_packet(0);
+        sender.protect_rtp(&mut packet).unwrap();
+        let raw = packet.marshal().unwrap();
+        let p2 = SrtpPacket::parse(BytesMut::from(raw.as_slice())).unwrap();
 
         // Receive in order
-        receiver.unprotect_rtp(&mut p1).unwrap();
-        receiver.unprotect_rtp(&mut p2).unwrap();
+        receiver.unprotect_rtp(p1).unwrap();
+        receiver.unprotect_rtp(p2).unwrap();
     }
 
     #[test]
@@ -919,26 +1036,26 @@ mod tests {
         let mut receiver =
             SrtpSession::new(SrtpProfile::Aes128Sha1_80, material(), material()).unwrap();
 
-        // Send p0 (seq 50000) to sync
-        let mut p0 = sample_packet(50000);
-        sender.protect_rtp(&mut p0).unwrap();
-        receiver.unprotect_rtp(&mut p0).unwrap();
+        let mut packet = sample_packet(50000);
+        sender.protect_rtp(&mut packet).unwrap();
+        let raw = packet.marshal().unwrap();
+        let p0 = SrtpPacket::parse(BytesMut::from(raw.as_slice())).unwrap();
+        receiver.unprotect_rtp(p0).unwrap();
 
-        // Send packet near rollover
-        let mut p1 = sample_packet(65535);
-        sender.protect_rtp(&mut p1).unwrap();
+        let mut packet = sample_packet(65535);
+        sender.protect_rtp(&mut packet).unwrap();
+        let raw = packet.marshal().unwrap();
+        let p1 = SrtpPacket::parse(BytesMut::from(raw.as_slice())).unwrap();
 
-        // Send packet after rollover
-        let mut p2 = sample_packet(0);
-        sender.protect_rtp(&mut p2).unwrap();
+        let mut packet = sample_packet(0);
+        sender.protect_rtp(&mut packet).unwrap();
+        let raw = packet.marshal().unwrap();
+        let p2 = SrtpPacket::parse(BytesMut::from(raw.as_slice())).unwrap();
 
         // Receive out of order: p2 (seq 0) then p1 (seq 65535)
 
-        let mut p1_recv = p1.clone();
-        let mut p2_recv = p2.clone();
-
-        receiver.unprotect_rtp(&mut p2_recv).unwrap();
-        receiver.unprotect_rtp(&mut p1_recv).unwrap();
+        receiver.unprotect_rtp(p2).unwrap();
+        receiver.unprotect_rtp(p1).unwrap();
     }
 }
 
@@ -1020,7 +1137,9 @@ mod security_tests {
             SrtpDirection::Receiver,
         )
         .unwrap();
-        rx_ctx.unprotect(&mut packet).unwrap();
+        let raw = packet.marshal().unwrap();
+        let packet = SrtpPacket::parse(BytesMut::from(raw.as_slice())).unwrap();
+        let packet = rx_ctx.unprotect(packet).unwrap();
         assert_eq!(packet.payload, original_payload);
     }
 }
