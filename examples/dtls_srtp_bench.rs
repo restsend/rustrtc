@@ -58,12 +58,10 @@ fn bench_srtp(profile: SrtpProfile, name: &str) {
         // Reset payload size (protect adds tag)
         packet.payload.truncate(payload_size);
 
-        sender.protect(&mut packet).unwrap();
-        let protected = packet.marshal().unwrap();
-        let protected = rustrtc::srtp::SrtpPacket::parse(
-            bytes::BytesMut::from(protected.as_slice()),
-        )
-        .unwrap();
+        let mut protected = bytes::BytesMut::new();
+        protected.resize(sender.protected_rtp_len(&packet), 0);
+        sender.protect(&packet, &mut protected).unwrap();
+        let protected = rustrtc::srtp::SrtpPacket::parse(protected).unwrap();
         packet = receiver.unprotect(protected).unwrap();
     }
     let duration = start.elapsed();

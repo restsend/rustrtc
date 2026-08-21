@@ -1,5 +1,5 @@
 use crate::errors::{RtpError, RtpResult};
-use bytes::{Buf, Bytes};
+use bytes::{Buf, BufMut, Bytes};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::time::SystemTime;
@@ -261,8 +261,18 @@ impl RtpHeader {
         Ok(())
     }
 
-    /// Append the fixed header, CSRC list, and extension block to `buffer`.
-    pub(crate) fn write_to(&self, has_padding: bool, buffer: &mut Vec<u8>) {
+    pub(crate) fn encoded_len(&self) -> usize {
+        12 + self.csrcs.len() * 4
+            + self
+                .extension
+                .as_ref()
+                .map_or(0, |extension| 4 + extension.data.len())
+    }
+
+    /// Write the fixed header, CSRC list, and extension block into an exact
+    /// caller-owned output slice.
+    pub(crate) fn write_to(&self, has_padding: bool, buffer: &mut [u8]) {
+        let mut buffer = buffer;
         let mut b0 = RTP_VERSION << 6;
         if has_padding {
             b0 |= 0x20;
@@ -275,19 +285,19 @@ impl RtpHeader {
         if self.marker {
             b1 |= 0x80;
         }
-        buffer.push(b0);
-        buffer.push(b1);
-        buffer.extend_from_slice(&self.sequence_number.to_be_bytes());
-        buffer.extend_from_slice(&self.timestamp.to_be_bytes());
-        buffer.extend_from_slice(&self.ssrc.to_be_bytes());
+        buffer.put_u8(b0);
+        buffer.put_u8(b1);
+        buffer.put_u16(self.sequence_number);
+        buffer.put_u32(self.timestamp);
+        buffer.put_u32(self.ssrc);
         for csrc in &self.csrcs {
-            buffer.extend_from_slice(&csrc.to_be_bytes());
+            buffer.put_u32(*csrc);
         }
         if let Some(extension) = &self.extension {
             let length_words = (extension.data.len() / 4) as u16;
-            buffer.extend_from_slice(&extension.profile.to_be_bytes());
-            buffer.extend_from_slice(&length_words.to_be_bytes());
-            buffer.extend_from_slice(&extension.data);
+            buffer.put_u16(extension.profile);
+            buffer.put_u16(length_words);
+            buffer.put_slice(&extension.data);
         }
     }
 }
@@ -336,29 +346,43 @@ impl RtpPacket {
     }
 
     pub fn marshal(&self) -> RtpResult<Vec<u8>> {
-        self.header.validate()?;
-        let mut buf = Vec::new();
-        Self::marshal_impl(self, &mut buf);
+        let packet_len = self.encoded_len();
+        let mut buf = vec![0; packet_len];
+        self.marshal_to(&mut buf)?;
         Ok(buf)
+    }
+
+    pub(crate) fn encoded_len(&self) -> usize {
+        self.header.encoded_len() + self.payload.len() + self.padding_len as usize
+    }
+
+    pub(crate) fn marshal_to(&self, buffer: &mut [u8]) -> RtpResult<()> {
+        self.header.validate()?;
+        if buffer.len() != self.encoded_len() {
+            return Err(RtpError::LengthMismatch);
+        }
+        Self::marshal_impl(self, buffer);
+        Ok(())
     }
 
     /// Serialize into a pre-allocated buffer, reusing its capacity across
     /// calls. Avoids the per-packet `Vec::with_capacity` + grow cycle in
     /// `marshal()` — used by the RTP bridge fast-path.
     pub fn marshal_into(&self, buf: &mut Vec<u8>) {
-        buf.clear();
-        Self::marshal_impl(self, buf);
+        let packet_len = self.encoded_len();
+        buf.resize(packet_len, 0);
+        Self::marshal_impl(self, &mut buf[..]);
     }
 
-    fn marshal_impl(packet: &RtpPacket, buffer: &mut Vec<u8>) {
-        buffer.reserve(12 + packet.header.csrcs.len() * 4 + packet.payload.len());
-        packet.header.write_to(packet.padding_len != 0, buffer);
-        buffer.extend_from_slice(&packet.payload);
-        if packet.padding_len > 0 {
-            buffer.extend(std::iter::repeat_n(
-                packet.padding_len,
-                packet.padding_len as usize,
-            ));
+    fn marshal_impl(packet: &RtpPacket, buffer: &mut [u8]) {
+        let header_len = packet.header.encoded_len();
+        let payload_end = header_len + packet.payload.len();
+        packet
+            .header
+            .write_to(packet.padding_len != 0, &mut buffer[..header_len]);
+        buffer[header_len..payload_end].copy_from_slice(&packet.payload);
+        if packet.padding_len != 0 {
+            buffer[payload_end..].fill(packet.padding_len);
         }
     }
 

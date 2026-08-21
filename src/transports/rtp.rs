@@ -1,6 +1,6 @@
+use crate::peer_connection::RtpObserver;
 use crate::rtp::{RtcpPacket, RtpPacket, is_rtcp, marshal_rtcp_packets, parse_rtcp_packets};
 use crate::srtp::{SrtpPacket, SrtpSession};
-use crate::peer_connection::RtpObserver;
 use crate::transports::PacketReceiver;
 use crate::transports::ice::conn::IceConn;
 use crate::transports::ice::stun::random_u32;
@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use tracing::{debug, trace};
 
@@ -295,8 +295,7 @@ impl RewriteBridge {
             // rules carry the audio mid, video rules the video mid) so a
             // WebRTC receiver attributes the packet to the right track.
             if let Some(r) = &rule
-                && let (Some(ext_id), Some(mid)) =
-                    (r.sdes_mid_extension_id, &r.sdes_mid)
+                && let (Some(ext_id), Some(mid)) = (r.sdes_mid_extension_id, &r.sdes_mid)
             {
                 let _ = packet.header.set_extension(ext_id, mid.as_bytes());
             }
@@ -604,13 +603,7 @@ impl RtpTransport {
         options: RtpRewriteBridgeOptions,
         rules: Vec<RtpRewriteRule>,
     ) {
-        self.bridge_rewrite_rules_to_with_video(
-            dst,
-            None,
-            HashSet::new(),
-            options,
-            rules,
-        );
+        self.bridge_rewrite_rules_to_with_video(dst, None, HashSet::new(), options, rules);
     }
 
     /// Install a payload-type-aware rewrite bridge with an optional video
@@ -702,38 +695,31 @@ impl RtpTransport {
     }
 
     pub async fn send(&self, buf: &[u8]) -> Result<usize> {
-        let protected = {
-            // Clone the session Arc out and release the outer guard immediately
-            // so the inner SRTP lock is held only around `protect_rtp`, not the
-            // (allocation-heavy) parse/set-extension/marshal that follows.
-            let session = self.srtp_session.lock().as_ref().map(|s| s.clone());
-            match session {
-                Some(session) => {
-                    let mut packet = RtpPacket::parse(buf)?;
-
-                    // Inject abs-send-time if enabled
-                    if let Some(id) =
-                        decode_ext_id(self.abs_send_time_extension_id.load(Ordering::Relaxed))
-                    {
-                        let abs_send_time =
-                            crate::rtp::calculate_abs_send_time(std::time::SystemTime::now());
-                        let data = abs_send_time.to_be_bytes();
-                        packet.header.set_extension(id, &data[1..4])?;
-                    }
-
-                    {
-                        let mut srtp = session.lock();
-                        srtp.protect_rtp(&mut packet)?;
-                    }
-                    packet.marshal()?
-                }
-                None => {
-                    if self.srtp_required {
-                        return Err(anyhow::anyhow!("SRTP required but session not ready"));
-                    }
-                    buf.to_vec()
-                }
+        let session = self.srtp_session.lock().as_ref().cloned();
+        let Some(session) = session else {
+            if self.srtp_required {
+                return Err(anyhow::anyhow!("SRTP required but session not ready"));
             }
+            return self.transport.send(buf).await;
+        };
+
+        let protected = {
+            let mut packet = RtpPacket::parse(buf)?;
+
+            // Inject abs-send-time if enabled.
+            if let Some(id) =
+                decode_ext_id(self.abs_send_time_extension_id.load(Ordering::Relaxed))
+            {
+                let abs_send_time =
+                    crate::rtp::calculate_abs_send_time(std::time::SystemTime::now());
+                let data = abs_send_time.to_be_bytes();
+                packet.header.set_extension(id, &data[1..4])?;
+            }
+
+            let mut srtp = session.lock();
+            let mut protected = vec![0; srtp.protected_rtp_len(&packet)];
+            srtp.protect_rtp(&packet, &mut protected)?;
+            protected
         };
         self.transport.send(&protected).await
     }
@@ -760,26 +746,28 @@ impl RtpTransport {
         }
 
         let protected = {
-            // Release the outer guard at once; hold the inner SRTP lock only
-            // around `protect_rtp`, then marshal outside the lock.
-            let session = self.srtp_session.lock().as_ref().map(|s| s.clone());
+            // Release the outer guard immediately; the inner SRTP guard is
+            // dropped after protection and before awaiting the transport send.
+            let session = self.srtp_session.lock().as_ref().cloned();
             match session {
                 Some(session) => {
-                    {
-                        let mut srtp = session.lock();
-                        srtp.protect_rtp(&mut packet)?;
-                    }
-                    packet.marshal()?
+                    let mut srtp = session.lock();
+                    let mut protected = vec![0; srtp.protected_rtp_len(&packet)];
+                    srtp.protect_rtp(&packet, &mut protected)?;
+                    protected
                 }
                 None => {
                     if self.srtp_required {
-                        debug!("RtpTransport: SRTP required but session not ready, dropping RTP send");
+                        debug!(
+                            "RtpTransport: SRTP required but session not ready, dropping RTP send"
+                        );
                         return Err(anyhow::anyhow!("SRTP required but session not ready"));
                     }
                     packet.marshal()?
                 }
             }
         };
+
         match self.transport.send(&protected).await {
             Ok(n) => {
                 if is_first {
@@ -871,24 +859,37 @@ impl RtpTransport {
         {
             let session_guard = target.srtp_session.lock();
             if let Some(session) = &*session_guard {
-                if session.lock().protect_rtp(&mut packet).is_err() {
+                let mut srtp = session.lock();
+                let protected_len = srtp.protected_rtp_len(&packet);
+                marshal_buf.resize(protected_len, 0);
+                if srtp.protect_rtp(&packet, &mut marshal_buf[..]).is_err() {
                     let failures = target.srtp_protect_failures.fetch_add(1, Ordering::Relaxed) + 1;
                     if failures <= 3 || failures.is_multiple_of(100) {
-                        tracing::warn!(failures, ssrc = packet.header.ssrc, "relay: SRTP protect_rtp failed, dropping");
+                        tracing::warn!(
+                            failures,
+                            ssrc = packet.header.ssrc,
+                            "relay: SRTP protect_rtp failed, dropping"
+                        );
                     }
                     return None; // drop on protect error
                 }
             } else if target.srtp_required {
-                let failures = target.srtp_dropped_no_session.fetch_add(1, Ordering::Relaxed) + 1;
+                let failures = target
+                    .srtp_dropped_no_session
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
                 if failures <= 3 || failures.is_multiple_of(100) {
-                    tracing::debug!(failures, ssrc = packet.header.ssrc, "relay: target SRTP required but session not ready, dropping");
+                    tracing::debug!(
+                        failures,
+                        ssrc = packet.header.ssrc,
+                        "relay: target SRTP required but session not ready, dropping"
+                    );
                 }
                 return None; // session not ready → drop
+            } else {
+                packet.marshal_into(marshal_buf);
             }
         }
-
-        // Marshal (buffer reuse) + non-blocking UDP send.
-        packet.marshal_into(marshal_buf);
         if let Err(e) = target.ice_conn().try_send(marshal_buf) {
             // A failed relay push is the #1 cause of "call connected but no
             // audio" — surface it instead of dropping silently.
@@ -970,7 +971,9 @@ impl PacketReceiver for RtpTransport {
                     }
                     None => {
                         if self.srtp_required {
-                            trace!("Dropping packet because SRTP is required but session is not ready");
+                            trace!(
+                                "Dropping packet because SRTP is required but session is not ready"
+                            );
                             return;
                         }
                         packet
@@ -1048,7 +1051,9 @@ impl PacketReceiver for RtpTransport {
                     }
                     None => {
                         if self.srtp_required {
-                            trace!("Dropping packet because SRTP is required but session is not ready");
+                            trace!(
+                                "Dropping packet because SRTP is required but session is not ready"
+                            );
                             return;
                         }
                         match RtpPacket::parse_bytes(packet) {
@@ -1560,14 +1565,18 @@ mod tests {
         let bridge = guard.as_mut().expect("rewrite bridge should be configured");
 
         // Audio packet (PT 100) → rewritten to audio dst PT 96.
-        let mut audio =
-            RtpPacket::new(crate::rtp::RtpHeader::new(100, 7, 1111, 1111), vec![1u8; 32]);
+        let mut audio = RtpPacket::new(
+            crate::rtp::RtpHeader::new(100, 7, 1111, 1111),
+            vec![1u8; 32],
+        );
         bridge.rewrite_packet(&mut audio);
         assert_eq!(audio.header.payload_type, 96);
 
         // DTMF packet (PT 101) → rewritten to DTMF dst PT 110.
-        let mut dtmf =
-            RtpPacket::new(crate::rtp::RtpHeader::new(101, 7, 1111, 1111), vec![1u8; 32]);
+        let mut dtmf = RtpPacket::new(
+            crate::rtp::RtpHeader::new(101, 7, 1111, 1111),
+            vec![1u8; 32],
+        );
         bridge.rewrite_packet(&mut dtmf);
         assert_eq!(dtmf.header.payload_type, 110);
         drop(guard);
@@ -1656,8 +1665,10 @@ mod tests {
         assert_eq!(audio.header.payload_type, 96);
 
         // DTMF packet (PT 101) → audio SSRC + PT 110.
-        let mut dtmf =
-            RtpPacket::new(crate::rtp::RtpHeader::new(101, 7, 1111, 1111), vec![1u8; 32]);
+        let mut dtmf = RtpPacket::new(
+            crate::rtp::RtpHeader::new(101, 7, 1111, 1111),
+            vec![1u8; 32],
+        );
         let dtmf_target = bridge.target_for(dtmf.header.payload_type);
         bridge.rewrite_packet(&mut dtmf);
         assert!(Arc::ptr_eq(&dtmf_target, &dst_transport));
@@ -1674,8 +1685,7 @@ mod tests {
         assert_eq!(video.header.payload_type, 102);
 
         // RTX packet (PT 99, distinct source SSRC) → video SSRC + PT 103.
-        let mut rtx =
-            RtpPacket::new(crate::rtp::RtpHeader::new(99, 7, 3333, 3333), vec![1u8; 32]);
+        let mut rtx = RtpPacket::new(crate::rtp::RtpHeader::new(99, 7, 3333, 3333), vec![1u8; 32]);
         let rtx_target = bridge.target_for(rtx.header.payload_type);
         bridge.rewrite_packet(&mut rtx);
         assert!(Arc::ptr_eq(&rtx_target, &video_dst_transport));
@@ -1688,8 +1698,14 @@ mod tests {
         let video2_target = bridge.target_for(video2.header.payload_type);
         bridge.rewrite_packet(&mut video2);
         assert!(Arc::ptr_eq(&video2_target, &video_dst_transport));
-        assert_eq!(video2.header.sequence_number, video.header.sequence_number + 1);
-        assert_eq!(video2.header.timestamp, video.header.timestamp.wrapping_add(160));
+        assert_eq!(
+            video2.header.sequence_number,
+            video.header.sequence_number + 1
+        );
+        assert_eq!(
+            video2.header.timestamp,
+            video.header.timestamp.wrapping_add(160)
+        );
         drop(guard);
     }
 
@@ -1771,16 +1787,20 @@ mod tests {
         let mut guard = src_transport.rewrite_bridge.lock();
         let bridge = guard.as_mut().expect("rewrite bridge should be configured");
 
-        let mut audio =
-            RtpPacket::new(crate::rtp::RtpHeader::new(100, 7, 1111, 1111), vec![1u8; 32]);
+        let mut audio = RtpPacket::new(
+            crate::rtp::RtpHeader::new(100, 7, 1111, 1111),
+            vec![1u8; 32],
+        );
         bridge.rewrite_packet(&mut audio);
         assert_eq!(audio.header.ssrc, 1111 + 900);
         assert_eq!(audio.header.payload_type, 96);
         assert_eq!(audio.header.sequence_number, 32000);
         assert_eq!(audio.header.timestamp, 1111 + 12345);
 
-        let mut dtmf =
-            RtpPacket::new(crate::rtp::RtpHeader::new(101, 7, 1111, 1111), vec![1u8; 32]);
+        let mut dtmf = RtpPacket::new(
+            crate::rtp::RtpHeader::new(101, 7, 1111, 1111),
+            vec![1u8; 32],
+        );
         bridge.rewrite_packet(&mut dtmf);
         assert_eq!(dtmf.header.ssrc, 1111 + 900);
         assert_eq!(dtmf.header.payload_type, 110);
@@ -1801,13 +1821,21 @@ mod tests {
         let mut marshal_buf = Vec::with_capacity(1500);
         let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
-        assert_eq!(transport.received_rtp_packets(), 0, "counter starts at zero");
+        assert_eq!(
+            transport.received_rtp_packets(),
+            0,
+            "counter starts at zero"
+        );
 
         for seq in 1..=3u16 {
             let header = crate::rtp::RtpHeader::new(0, seq, 160, 1234);
             let packet = crate::rtp::RtpPacket::new(header, vec![1u8; 160]);
             transport
-                .receive(Bytes::from(packet.marshal().unwrap()), addr, &mut marshal_buf)
+                .receive(
+                    Bytes::from(packet.marshal().unwrap()),
+                    addr,
+                    &mut marshal_buf,
+                )
                 .await;
         }
 
@@ -1904,11 +1932,8 @@ mod tests {
         //     exactly why the PeerConnection interceptor chain (which lives on
         //     the listener/track path) cannot observe fast-path packets, and
         //     why the transport counter is required.
-        let attempt = tokio::time::timeout(
-            std::time::Duration::from_millis(150),
-            listener_rx.recv(),
-        )
-        .await;
+        let attempt =
+            tokio::time::timeout(std::time::Duration::from_millis(150), listener_rx.recv()).await;
         assert!(
             attempt.is_err(),
             "listener must NOT receive on the fast-path relay (interceptor path is bypassed)"
@@ -1963,11 +1988,8 @@ mod tests {
         use tokio::sync::watch;
 
         let (_tx, rx) = watch::channel::<Option<IceSocketWrapper>>(None);
-        let conn = crate::transports::ice::conn::IceConn::new(
-            rx,
-            "127.0.0.1:0".parse().unwrap(),
-            None,
-        );
+        let conn =
+            crate::transports::ice::conn::IceConn::new(rx, "127.0.0.1:0".parse().unwrap(), None);
         let transport = Arc::new(super::RtpTransport::new(conn, false));
 
         let ssrc = 1001u32;
@@ -1975,7 +1997,8 @@ mod tests {
             // Each time RegisterListenerSync is called it opens a new tx
             // channel. After the first call, earlier channels are closed
             // (only the latest one is actually connected to a receiver).
-            transport.register_listener_sync(ssrc + i, mpsc::channel::<(RtpPacket, SocketAddr)>(8).0);
+            transport
+                .register_listener_sync(ssrc + i, mpsc::channel::<(RtpPacket, SocketAddr)>(8).0);
         }
 
         let listeners = transport.listeners.lock();
@@ -2027,8 +2050,7 @@ mod tests {
         use tokio::sync::watch;
 
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let (_socket_tx, socket_rx) =
-            watch::channel(Some(IceSocketWrapper::Udp(Arc::new(socket))));
+        let (_socket_tx, socket_rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(socket))));
         let connection = IceConn::new(socket_rx, "127.0.0.1:9".parse().unwrap(), None);
         let transport = RtpTransport::new(connection, false);
         let observer: Arc<dyn crate::peer_connection::RtpObserver> = Arc::new(CountingObserver {
