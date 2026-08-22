@@ -237,7 +237,11 @@ impl VideoCapability {
             codec_name: "H264".to_string(),
             clock_rate: 90000,
             fmtp: Some("packetization-mode=1;profile-level-id=42e01f".to_string()),
-            rtcp_fbs: vec!["nack pli".to_string(), "ccm fir".to_string()],
+            rtcp_fbs: vec![
+                "nack".to_string(),
+                "nack pli".to_string(),
+                "ccm fir".to_string(),
+            ],
             rtx_payload_type: None,
         }
     }

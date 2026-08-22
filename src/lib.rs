@@ -36,7 +36,7 @@ pub use errors::{RtcError, RtcResult, SdpError, SdpResult};
 pub use peer_connection::{
     DisconnectReason, IceConnectionState, IceGatheringState, PeerConnection, PeerConnectionEvent,
     PeerConnectionState, RtpCodecParameters, RtpReceiverInterceptor, RtpSender,
-    RtpSenderInterceptor, RtpTransceiver, SignalingState, TransceiverDirection,
+    RtpSenderInterceptor, RtpTransceiver, SignalingState, TransceiverDirection, rtcp_fb_enables_nack,
 };
 pub use sdp::{
     AddressType, Attribute, Direction, MediaKind, MediaSection, NetworkType, Origin, SDES_MID_URI,

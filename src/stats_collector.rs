@@ -1,11 +1,12 @@
 use crate::errors::RtcResult;
 use crate::peer_connection::{RtpReceiverInterceptor, RtpSenderInterceptor};
-use crate::rtp::{ReceiverReport, RtcpPacket, RtpPacket, SenderReport};
+use crate::rtp::{ReceiverReport, ReportBlock, RtcpPacket, RtpPacket, SenderReport};
 use crate::stats::{StatsEntry, StatsId, StatsKind, StatsProvider};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Entries in `sent_sr_times` older than this are stale for RTT computation and
@@ -16,6 +17,8 @@ const SENT_SR_TIME_HIGH_WATERMARK: usize = 64;
 /// High-water mark for the per-SSRC stats maps. Beyond this, stale SSRCs from
 /// long-gone streams (SSRC churn / re-INVITE) are dropped to bound memory.
 const SSRC_STATS_HIGH_WATERMARK: usize = 64;
+/// Minimum interval between opportunistic Receiver Reports from the receive path.
+const RR_MIN_INTERVAL: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone)]
 struct RemoteInboundStats {
@@ -43,6 +46,10 @@ struct RemoteOutboundStats {
     packets_sent: u32,
     bytes_sent: u32,
     remote_timestamp: u32,
+    /// NTP least-significant 32 bits of the last SR from this SSRC (for LSR).
+    last_sr_ntp_least: u32,
+    /// When we received that SR (for DLSR).
+    last_sr_received_at: Option<Instant>,
     last_seen: Instant,
 }
 
@@ -52,15 +59,32 @@ impl Default for RemoteOutboundStats {
             packets_sent: 0,
             bytes_sent: 0,
             remote_timestamp: 0,
+            last_sr_ntp_least: 0,
+            last_sr_received_at: None,
             last_seen: Instant::now(),
         }
     }
 }
 
+/// Per-SSRC reception tracking used to build RFC 3550 report blocks.
 #[derive(Debug, Clone)]
 struct LocalInboundStats {
     packets_received: u64,
     bytes_received: u64,
+    /// First sequence number seen (unwrapped base).
+    base_seq: u32,
+    /// Highest sequence number seen, including wrap cycles in high 16 bits.
+    max_seq: u32,
+    cycles: u16,
+    initialized: bool,
+    /// Interarrival jitter estimate (RTP timestamp units).
+    jitter: u32,
+    last_rtp_ts: u32,
+    last_arrival_rtp: u32,
+    transit_init: bool,
+    expected_prior: u32,
+    received_prior: u32,
+    clock_rate: u32,
     last_seen: Instant,
 }
 
@@ -69,7 +93,106 @@ impl Default for LocalInboundStats {
         Self {
             packets_received: 0,
             bytes_received: 0,
+            base_seq: 0,
+            max_seq: 0,
+            cycles: 0,
+            initialized: false,
+            jitter: 0,
+            last_rtp_ts: 0,
+            last_arrival_rtp: 0,
+            transit_init: false,
+            expected_prior: 0,
+            received_prior: 0,
+            clock_rate: 90000,
             last_seen: Instant::now(),
+        }
+    }
+}
+
+impl LocalInboundStats {
+    fn update(&mut self, seq: u16, rtp_ts: u32, clock_rate: u32, now: Instant) {
+        self.clock_rate = if clock_rate == 0 { 90000 } else { clock_rate };
+        self.last_seen = now;
+        if !self.initialized {
+            self.initialized = true;
+            self.base_seq = seq as u32;
+            self.max_seq = seq as u32;
+            self.cycles = 0;
+        } else {
+            let udelta = seq.wrapping_sub(self.max_seq as u16);
+            if udelta < 0x8000 {
+                if seq < self.max_seq as u16 {
+                    self.cycles = self.cycles.wrapping_add(1);
+                }
+                self.max_seq = ((self.cycles as u32) << 16) | seq as u32;
+            }
+            // else: out-of-order / duplicate — ignore for max_seq
+        }
+        self.packets_received += 1;
+
+        // RFC 3550 A.8 interarrival jitter (arrival in RTP timestamp units).
+        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        let start = START.get_or_init(Instant::now);
+        let arrival_units =
+            (now.duration_since(*start).as_secs_f64() * self.clock_rate as f64) as u32;
+
+        if self.transit_init {
+            let d = (arrival_units as i64 - self.last_arrival_rtp as i64)
+                - (rtp_ts as i64 - self.last_rtp_ts as i64);
+            let ad = d.unsigned_abs() as i64;
+            self.jitter = ((self.jitter as i64) + ((ad - self.jitter as i64) / 16)) as u32;
+        } else {
+            self.transit_init = true;
+        }
+        self.last_rtp_ts = rtp_ts;
+        self.last_arrival_rtp = arrival_units;
+    }
+
+    fn extended_max(&self) -> u32 {
+        self.max_seq
+    }
+
+    fn expected(&self) -> u32 {
+        if !self.initialized {
+            return 0;
+        }
+        self.extended_max()
+            .wrapping_sub(self.base_seq)
+            .wrapping_add(1)
+    }
+
+    fn packets_lost(&self) -> i32 {
+        let expected = self.expected() as i64;
+        let received = self.packets_received as i64;
+        (expected - received).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+    }
+
+    /// Build a report block and advance the prior counters used for fraction lost.
+    fn take_report_block(
+        &mut self,
+        ssrc: u32,
+        last_sr: u32,
+        delay_since_last_sr: u32,
+    ) -> ReportBlock {
+        let expected = self.expected();
+        let expected_interval = expected.wrapping_sub(self.expected_prior);
+        let received_interval = (self.packets_received as u32).wrapping_sub(self.received_prior);
+        let lost_interval = expected_interval as i32 - received_interval as i32;
+        let fraction = if expected_interval == 0 || lost_interval <= 0 {
+            0u8
+        } else {
+            (((lost_interval as u32) << 8) / expected_interval) as u8
+        };
+        self.expected_prior = expected;
+        self.received_prior = self.packets_received as u32;
+        ReportBlock {
+            ssrc,
+            fraction_lost: fraction,
+            packets_lost: self.packets_lost(),
+            highest_sequence: self.extended_max(),
+            jitter: self.jitter,
+            last_sender_report: last_sr,
+            delay_since_last_sender_report: delay_since_last_sr,
         }
     }
 }
@@ -100,6 +223,9 @@ pub struct StatsCollector {
     /// Maps ntp_least → Instant for outgoing Sender Reports, used to compute
     /// round-trip time from the LSR/DLSR fields of incoming Receiver Reports.
     sent_sr_times: Mutex<HashMap<u32, std::time::Instant>>,
+    last_rr_sent: Mutex<Option<Instant>>,
+    /// Monotonic counter used only to pace RR emission.
+    packets_since_rr: AtomicU64,
 }
 
 /// Bound a per-SSRC stats map so long-lived SSRC churn (re-INVITE, simulcast
@@ -121,6 +247,11 @@ fn evict_stale_ssrcs<V>(map: &mut HashMap<u32, V>, last_seen: impl Fn(&V) -> Ins
             map.remove(&k);
         }
     }
+}
+
+fn delay_since_sr(received_at: Instant) -> u32 {
+    let secs = received_at.elapsed().as_secs_f64();
+    (secs * 65536.0) as u32
 }
 
 impl StatsCollector {
@@ -153,6 +284,31 @@ impl StatsCollector {
         times.insert(ntp_least, Instant::now());
     }
 
+    /// Build RFC 3550 reception report blocks for all locally received SSRCs.
+    pub fn build_report_blocks(&self) -> Vec<ReportBlock> {
+        let remote = self.remote_outbound.lock();
+        let mut inbound = self.local_inbound.lock();
+        let mut blocks = Vec::new();
+        for (ssrc, stats) in inbound.iter_mut() {
+            if !stats.initialized || stats.packets_received == 0 {
+                continue;
+            }
+            let (lsr, dlsr) = remote
+                .get(ssrc)
+                .map(|r| {
+                    let lsr = r.last_sr_ntp_least;
+                    let dlsr = r
+                        .last_sr_received_at
+                        .map(delay_since_sr)
+                        .unwrap_or(0);
+                    (lsr, dlsr)
+                })
+                .unwrap_or((0, 0));
+            blocks.push(stats.take_report_block(*ssrc, lsr, dlsr));
+        }
+        blocks
+    }
+
     fn handle_sr(&self, sr: &SenderReport) {
         {
             let mut outbound = self.remote_outbound.lock();
@@ -160,7 +316,9 @@ impl StatsCollector {
             let stats = outbound.entry(sr.sender_ssrc).or_default();
             stats.packets_sent = sr.packet_count;
             stats.bytes_sent = sr.octet_count;
-            stats.remote_timestamp = sr.ntp_least; // simplified
+            stats.remote_timestamp = sr.ntp_least;
+            stats.last_sr_ntp_least = sr.ntp_least;
+            stats.last_sr_received_at = Some(Instant::now());
             stats.last_seen = Instant::now();
         }
 
@@ -211,6 +369,37 @@ impl StatsCollector {
         size += packet.padding_len as usize;
         size as u64
     }
+
+    fn maybe_receiver_report(&self, _feedback_ssrc: u32) -> Option<RtcpPacket> {
+        let n = self.packets_since_rr.fetch_add(1, Ordering::Relaxed) + 1;
+        let due = {
+            let last = self.last_rr_sent.lock();
+            match *last {
+                None => n >= 50,
+                Some(t) => t.elapsed() >= RR_MIN_INTERVAL && n >= 10,
+            }
+        };
+        if !due {
+            return None;
+        }
+        let blocks = self.build_report_blocks();
+        if blocks.is_empty() {
+            return None;
+        }
+        let sender_ssrc = self
+            .local_outbound
+            .lock()
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or(0);
+        *self.last_rr_sent.lock() = Some(Instant::now());
+        self.packets_since_rr.store(0, Ordering::Relaxed);
+        Some(RtcpPacket::ReceiverReport(ReceiverReport {
+            sender_ssrc,
+            report_blocks: blocks,
+        }))
+    }
 }
 
 #[async_trait]
@@ -233,6 +422,10 @@ impl RtpSenderInterceptor for StatsCollector {
     fn on_sr_sent(&self, ssrc: u32, ntp_least: u32) {
         self.record_sr_sent(ssrc, ntp_least);
     }
+
+    fn reception_report_blocks(&self) -> Vec<ReportBlock> {
+        self.build_report_blocks()
+    }
 }
 
 #[async_trait]
@@ -244,13 +437,23 @@ impl RtpReceiverInterceptor for StatsCollector {
         _local_addr: std::net::SocketAddr,
     ) -> Option<RtcpPacket> {
         let size = Self::packet_size(packet);
-        let mut inbound = self.local_inbound.lock();
-        evict_stale_ssrcs(&mut inbound, |v| v.last_seen);
-        let stats = inbound.entry(packet.header.ssrc).or_default();
-        stats.packets_received += 1;
-        stats.bytes_received += size;
-        stats.last_seen = Instant::now();
-        None
+        let now = Instant::now();
+        {
+            let mut inbound = self.local_inbound.lock();
+            evict_stale_ssrcs(&mut inbound, |v| v.last_seen);
+            let stats = inbound.entry(packet.header.ssrc).or_default();
+            stats.bytes_received += size;
+            // Clock rate unknown here; jitter uses 90k default until known.
+            // Audio (8k/48k) still produces a usable relative estimate.
+            stats.update(
+                packet.header.sequence_number,
+                packet.header.timestamp,
+                stats.clock_rate,
+                now,
+            );
+        }
+        // Opportunistic RR so recv-only / silent-send legs still emit feedback.
+        self.maybe_receiver_report(0)
     }
 }
 
@@ -300,7 +503,9 @@ impl StatsProvider for StatsCollector {
                 entry = entry
                     .with_value("ssrc", json!(ssrc))
                     .with_value("packetsReceived", json!(stats.packets_received))
-                    .with_value("bytesReceived", json!(stats.bytes_received));
+                    .with_value("bytesReceived", json!(stats.bytes_received))
+                    .with_value("jitter", json!(stats.jitter))
+                    .with_value("packetsLost", json!(stats.packets_lost()));
 
                 entries.push(entry);
             }
@@ -422,5 +627,31 @@ mod tests {
         assert_eq!(inbound.values["ssrc"], 67890);
         assert_eq!(inbound.values["packetsReceived"], 1);
         assert_eq!(inbound.values["bytesReceived"], 112);
+    }
+
+    #[tokio::test]
+    async fn test_report_blocks_from_inbound() {
+        let collector = StatsCollector::new();
+        let mut header = crate::rtp::RtpHeader::new(111, 1, 960, 42);
+        for seq in 1u16..=20 {
+            header.sequence_number = seq;
+            header.timestamp = seq as u32 * 960;
+            let packet = RtpPacket::new(header.clone(), vec![0u8; 20]);
+            collector
+                .on_packet_received(&packet, test_addr(), test_addr())
+                .await;
+        }
+        // Simulate a gap (loss)
+        header.sequence_number = 25;
+        header.timestamp = 25 * 960;
+        let packet = RtpPacket::new(header, vec![0u8; 20]);
+        collector
+            .on_packet_received(&packet, test_addr(), test_addr())
+            .await;
+
+        let blocks = collector.build_report_blocks();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].ssrc, 42);
+        assert!(blocks[0].packets_lost >= 4);
     }
 }

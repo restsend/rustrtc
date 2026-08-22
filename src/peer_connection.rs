@@ -47,6 +47,12 @@ fn section_has_rtx(section: &MediaSection) -> bool {
     !crate::rtx::extract_rtx_apt_map_from_attrs(&section.attributes).is_empty()
 }
 
+/// True when `rtcp_fbs` enables generic NACK (`"nack"` or `"nack …"` e.g. `"nack pli"`).
+pub fn rtcp_fb_enables_nack(fbs: &[String]) -> bool {
+    fbs.iter()
+        .any(|fb| fb == "nack" || fb.starts_with("nack "))
+}
+
 /// RTX payload type for the first primary (non-RTX) format that has an `apt=` association.
 /// Prefer format order over `HashMap` iteration so multi-codec sections stay deterministic.
 fn primary_rtx_payload_type(section: &MediaSection) -> Option<u8> {
@@ -161,6 +167,10 @@ pub trait RtpSenderInterceptor: Send + Sync {
     /// can compute RTT from the LSR/DLSR on the return path.
     fn on_sr_sent(&self, _ssrc: u32, _ntp_least: u32) {}
     async fn on_rtcp_received(&self, _packet: &RtcpPacket, _transport: Arc<RtpTransport>) {}
+    /// Reception report blocks to attach to an outgoing Sender Report (RFC 3550).
+    fn reception_report_blocks(&self) -> Vec<crate::rtp::ReportBlock> {
+        Vec::new()
+    }
     fn as_nack_stats(self: Arc<Self>) -> Option<Arc<dyn NackStats>> {
         None
     }
@@ -1072,22 +1082,18 @@ impl PeerConnection {
                 MediaKind::Audio => caps
                     .audio
                     .iter()
-                    .any(|c| c.rtcp_fbs.contains(&"nack".to_string())),
+                    .any(|c| rtcp_fb_enables_nack(&c.rtcp_fbs)),
                 MediaKind::Video => caps
                     .video
                     .iter()
-                    .any(|c| c.rtcp_fbs.contains(&"nack".to_string())),
+                    .any(|c| rtcp_fb_enables_nack(&c.rtcp_fbs)),
                 MediaKind::Application => false,
                 MediaKind::Image => false,
             }
         } else {
             match kind {
-                MediaKind::Audio => AudioCapability::default()
-                    .rtcp_fbs
-                    .contains(&"nack".to_string()),
-                MediaKind::Video => VideoCapability::default()
-                    .rtcp_fbs
-                    .contains(&"nack".to_string()),
+                MediaKind::Audio => rtcp_fb_enables_nack(&AudioCapability::default().rtcp_fbs),
+                MediaKind::Video => rtcp_fb_enables_nack(&VideoCapability::default().rtcp_fbs),
                 MediaKind::Application => false,
                 MediaKind::Image => false,
             }
@@ -1175,22 +1181,18 @@ impl PeerConnection {
                 MediaKind::Audio => caps
                     .audio
                     .iter()
-                    .any(|c| c.rtcp_fbs.contains(&"nack".to_string())),
+                    .any(|c| rtcp_fb_enables_nack(&c.rtcp_fbs)),
                 MediaKind::Video => caps
                     .video
                     .iter()
-                    .any(|c| c.rtcp_fbs.contains(&"nack".to_string())),
+                    .any(|c| rtcp_fb_enables_nack(&c.rtcp_fbs)),
                 MediaKind::Application => false,
                 MediaKind::Image => false,
             }
         } else {
             match kind {
-                MediaKind::Audio => AudioCapability::default()
-                    .rtcp_fbs
-                    .contains(&"nack".to_string()),
-                MediaKind::Video => VideoCapability::default()
-                    .rtcp_fbs
-                    .contains(&"nack".to_string()),
+                MediaKind::Audio => rtcp_fb_enables_nack(&AudioCapability::default().rtcp_fbs),
+                MediaKind::Video => rtcp_fb_enables_nack(&VideoCapability::default().rtcp_fbs),
                 MediaKind::Application => false,
                 MediaKind::Image => false,
             }
@@ -1828,21 +1830,17 @@ impl PeerConnection {
                             MediaKind::Audio => caps
                                 .audio
                                 .iter()
-                                .any(|c| c.rtcp_fbs.contains(&"nack".to_string())),
+                                .any(|c| rtcp_fb_enables_nack(&c.rtcp_fbs)),
                             MediaKind::Video => caps
                                 .video
                                 .iter()
-                                .any(|c| c.rtcp_fbs.contains(&"nack".to_string())),
+                                .any(|c| rtcp_fb_enables_nack(&c.rtcp_fbs)),
                             _ => false,
                         }
                     } else {
                         match kind {
-                            MediaKind::Audio => AudioCapability::default()
-                                .rtcp_fbs
-                                .contains(&"nack".to_string()),
-                            MediaKind::Video => VideoCapability::default()
-                                .rtcp_fbs
-                                .contains(&"nack".to_string()),
+                            MediaKind::Audio => rtcp_fb_enables_nack(&AudioCapability::default().rtcp_fbs),
+                            MediaKind::Video => rtcp_fb_enables_nack(&VideoCapability::default().rtcp_fbs),
                             _ => false,
                         }
                     };
@@ -6420,12 +6418,22 @@ impl RtpSender {
 
                         let octet_count = octets_sent.load(Ordering::Relaxed);
                         let rtp_timestamp = last_rtp_timestamp.load(Ordering::Relaxed);
+                        let mut report_blocks = Vec::new();
+                        for interceptor in &*interceptors {
+                            report_blocks.extend(interceptor.reception_report_blocks());
+                        }
+                        // Deduplicate by media SSRC (multiple interceptors may report).
+                        {
+                            let mut seen = std::collections::HashSet::new();
+                            report_blocks.retain(|b| seen.insert(b.ssrc));
+                        }
                         let report = Self::build_sender_report(
                             ssrc,
                             rtp_timestamp,
                             packet_count,
                             octet_count,
                             SystemTime::now(),
+                            report_blocks,
                         );
 
                         let ntp_least = report.ntp_least;
@@ -6586,6 +6594,7 @@ impl RtpSender {
         packet_count: u32,
         octet_count: u32,
         now: SystemTime,
+        report_blocks: Vec<crate::rtp::ReportBlock>,
     ) -> SenderReport {
         let duration = now.duration_since(UNIX_EPOCH).unwrap_or_default();
         let ntp_seconds = duration.as_secs().saturating_add(2_208_988_800);
@@ -6598,7 +6607,7 @@ impl RtpSender {
             rtp_timestamp,
             packet_count,
             octet_count,
-            report_blocks: Vec::new(),
+            report_blocks,
         }
     }
 }
@@ -10848,7 +10857,7 @@ a=mid:0
 
     #[test]
     fn sender_report_builder_uses_rtp_counters() {
-        let report = RtpSender::build_sender_report(10000, 123456, 42, 4096, UNIX_EPOCH);
+        let report = RtpSender::build_sender_report(10000, 123456, 42, 4096, UNIX_EPOCH, Vec::new());
 
         assert_eq!(report.sender_ssrc, 10000);
         assert_eq!(report.rtp_timestamp, 123456);
