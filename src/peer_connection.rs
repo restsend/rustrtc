@@ -6536,8 +6536,14 @@ impl RtpSender {
 
                                     packet.header.timestamp = src_ts.wrapping_add(timestamp_offset);
 
-                                    // Rewrite sequence number
-                                    packet.header.sequence_number = next_seq.fetch_add(1, Ordering::Relaxed);
+                                    // Sequence number was already stamped by
+                                    // into_rtp_packet (which advanced the local
+                                    // counter and persisted it into next_seq at
+                                    // line ~6501). Re-stamping here with
+                                    // fetch_add consumed a SECOND number per
+                                    // packet: wire seq advanced +2 per packet,
+                                    // so RFC 3550 receivers computed a constant
+                                    // phantom ~50% loss. Do not touch it again.
                                 }
 
                                 let dst_addr = transport.remote_addr();
