@@ -669,6 +669,13 @@ struct PeerConnectionInner {
     remote_dtls_fingerprint: Mutex<Option<String>>,
     dtls_transport: Mutex<Option<Arc<DtlsTransport>>>,
     rtp_transport: Mutex<Option<Arc<RtpTransport>>>,
+    /// Observers registered via [`PeerConnection::add_observer`] before any
+    /// RTP transport exists. The RtpTransport is created asynchronously for
+    /// WebRTC (after ICE selects a pair) and during remote-SDP application for
+    /// direct RTP — observers registered earlier would otherwise miss the
+    /// first inbound packets (e.g. RFC 4733 telephone-event / DTMF) until a
+    /// caller-side poll attached them. New transports re-attach this list.
+    rtp_observers: Mutex<Vec<Arc<dyn RtpObserver>>>,
     rtp_media_ice_transports: Mutex<HashMap<u64, IceTransport>>,
     rtp_media_transports: Mutex<HashMap<u64, Arc<RtpTransport>>>,
     sctp_transport: Mutex<Option<Arc<SctpTransport>>>,
@@ -792,6 +799,7 @@ impl PeerConnection {
             remote_dtls_fingerprint: Mutex::new(None),
             dtls_transport: Mutex::new(None),
             rtp_transport: Mutex::new(None),
+            rtp_observers: Mutex::new(Vec::new()),
             rtp_media_ice_transports: Mutex::new(HashMap::new()),
             rtp_media_transports: Mutex::new(HashMap::new()),
             sctp_transport: Mutex::new(None),
@@ -933,11 +941,34 @@ impl PeerConnection {
     /// [`RtcConfigurationBuilder`]) instead.
     ///
     /// Applied to the primary transport and all muxed media transports.
+    ///
+    /// Observers may be registered before any transport exists (a WebRTC
+    /// transport only appears after ICE selects a pair): they are remembered
+    /// here and attached automatically when transports are created, so the
+    /// first inbound packets are never missed.
     pub fn add_observer(&self, observer: Arc<dyn RtpObserver>) {
+        {
+            let mut observers = self.inner.rtp_observers.lock();
+            if observers
+                .iter()
+                .any(|existing| Arc::ptr_eq(existing, &observer))
+            {
+                return;
+            }
+            observers.push(observer.clone());
+        }
         if let Some(transport) = self.inner.rtp_transport.lock().clone() {
             transport.add_observer(observer.clone());
         }
         for transport in self.inner.rtp_media_transports.lock().values() {
+            transport.add_observer(observer.clone());
+        }
+    }
+
+    /// Attach every registered observer to a freshly created RTP transport.
+    /// Idempotent: `RtpTransport::add_observer` dedups by pointer.
+    fn attach_registered_observers(&self, transport: &Arc<RtpTransport>) {
+        for observer in self.inner.rtp_observers.lock().iter() {
             transport.add_observer(observer.clone());
         }
     }
@@ -2103,6 +2134,7 @@ impl PeerConnection {
                 as std::sync::Weak<dyn crate::transports::PacketReceiver>);
         }
         *self.inner.rtp_transport.lock() = Some(rtp_transport.clone());
+        self.attach_registered_observers(&rtp_transport);
 
         {
             let transceivers = self.inner.transceivers.lock();
@@ -2433,6 +2465,7 @@ impl PeerConnection {
         }
 
         *self.inner.rtp_transport.lock() = Some(rtp_transport.clone());
+        self.attach_registered_observers(&rtp_transport);
         Ok(())
     }
 
@@ -2516,6 +2549,7 @@ impl PeerConnection {
 
                     // Update the inner transport to ensure future transceivers get the correct one
                     *self.inner.rtp_transport.lock() = Some(rtp_transport.clone());
+                    self.attach_registered_observers(&rtp_transport);
                 }
                 Err(e) => {
                     warn!("Failed to create SRTP session: {}", e);
@@ -7551,6 +7585,78 @@ mod tests {
     use super::*;
     use crate::transports::ice::IceTransportState;
     use crate::{Direction, MediaKind, RtcConfiguration};
+
+    /// Regression test: an `RtpObserver` registered BEFORE the RTP transport
+    /// exists (e.g. rustpbx attaches its IngressTap at leg construction) must
+    /// observe the FIRST inbound packets once the transport is created.
+    /// Before the PC-level observer registry, `add_observer` was a no-op with
+    /// no transport yet and callers had to poll-and-reattach — any packet
+    /// arriving in that window (notably the first RFC 4733 telephone-event /
+    /// DTMF right after answer) was silently invisible to stats/DTMF/recording.
+    #[tokio::test]
+    async fn rtp_observer_registered_before_transport_sees_first_packets() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::UdpSocket;
+
+        struct IngressCounter(std::sync::Arc<AtomicUsize>);
+        impl RtpObserver for IngressCounter {
+            fn on_ingress(&self, _packet: &crate::rtp::RtpPacket, _src: std::net::SocketAddr) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let counter = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut cfg = RtcConfiguration::default();
+        cfg.transport_mode = TransportMode::Rtp;
+        let pc = PeerConnection::new(cfg);
+        // Register BEFORE any RTP transport exists.
+        pc.add_observer(std::sync::Arc::new(IngressCounter(counter.clone())));
+
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        let offer = pc.create_offer().await.unwrap();
+        pc.set_local_description(offer).unwrap();
+
+        let answer_sdp = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nc=IN IP4 127.0.0.1\r\nm=audio 5004 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n";
+        let answer = SessionDescription::parse(SdpType::Answer, answer_sdp).unwrap();
+        pc.set_remote_description(answer).await.unwrap();
+
+        pc.wait_for_rtp_transport_ready(std::time::Duration::from_secs(5))
+            .await
+            .expect("rtp transport");
+
+        // Send a packet to the address the local offer advertised.
+        let sdp = pc
+            .local_description()
+            .expect("local description")
+            .to_sdp_string();
+        let port: u16 = sdp
+            .lines()
+            .find_map(|l| l.strip_prefix("m=audio "))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|p| p.parse().ok())
+            .expect("audio port in local offer");
+        let ip: std::net::IpAddr = sdp
+            .lines()
+            .find_map(|l| l.strip_prefix("c=IN IP4 "))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        assert!(port > 0);
+
+        // Minimal RTP packet (PT 0 / PCMU).
+        let pkt: [u8; 14] = [0x80, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 1, 0xff, 0xff];
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sock.send_to(&pkt, (ip, port)).await.unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while counter.load(Ordering::Relaxed) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "observer registered before transport never saw the first packet"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
 
     const AUDIO_PAYLOAD_TYPE: u8 = 111;
     const VIDEO_PAYLOAD_TYPE: u8 = 96;
