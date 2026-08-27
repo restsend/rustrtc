@@ -172,6 +172,47 @@ async fn policy_relay_only_gathers_relay_candidates() -> Result<()> {
 }
 
 #[tokio::test]
+async fn default_gather_excludes_loopback_host_candidates() -> Result<()> {
+    let config = RtcConfiguration::default();
+    let (tx, _) = broadcast::channel(100);
+    let (socket_tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let gatherer = IceGatherer::new(config, tx, socket_tx);
+    gatherer.gather().await?;
+    let candidates = gatherer.local_candidates();
+
+    assert!(
+        !candidates
+            .iter()
+            .any(|c| c.typ == IceCandidateType::Host && c.address.ip().is_loopback()),
+        "default gathering must not advertise loopback host candidates: {:?}",
+        candidates
+            .iter()
+            .map(|c| c.address)
+            .collect::<Vec<SocketAddr>>()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn include_loopback_option_gathers_loopback_candidate() -> Result<()> {
+    let mut config = RtcConfiguration::default();
+    config.ice_include_loopback_candidates = true;
+    let (tx, _) = broadcast::channel(100);
+    let (socket_tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let gatherer = IceGatherer::new(config, tx, socket_tx);
+    gatherer.gather().await?;
+    let candidates = gatherer.local_candidates();
+
+    assert!(
+        candidates
+            .iter()
+            .any(|c| c.typ == IceCandidateType::Host && c.address.ip().is_loopback()),
+        "opt-in must re-enable loopback host candidates"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 #[serial]
 async fn turn_client_can_create_permission() -> Result<()> {
     let mut turn_server = TestTurnServer::start().await?;
@@ -243,7 +284,9 @@ async fn turn_connection_relay_to_host() -> Result<()> {
     tokio::spawn(runner1);
 
     // Agent 2: Host only
-    let config2 = RtcConfiguration::default();
+    let mut config2 = RtcConfiguration::default();
+    // Same-host TURN relay delivers to loopback-only destinations.
+    config2.ice_include_loopback_candidates = true;
     let (transport2, runner2) = IceTransportBuilder::new(config2)
         .role(IceRole::Controlled)
         .build();
@@ -1317,10 +1360,14 @@ fn test_base_address_returns_address_when_no_related_address() {
 async fn test_ice_connection_with_external_ip() -> Result<()> {
     // Configure both sides with a dummy external IP
     // Using 203.0.113.x which is in the TEST-NET-3 range (documentation purpose)
+    // Loopback stays on: the rewritten LAN candidates point at TEST-NET-3 and
+    // the same-host raw loopback pair is what actually carries checks here.
     let mut config1 = RtcConfiguration::default();
+    config1.ice_include_loopback_candidates = true;
     config1.external_ip = Some("203.0.113.10".to_string());
 
     let mut config2 = RtcConfiguration::default();
+    config2.ice_include_loopback_candidates = true;
     config2.external_ip = Some("203.0.113.20".to_string());
 
     let (controlling, controlled) = setup_host_pair(config1, config2).await;
@@ -1377,9 +1424,11 @@ async fn test_ice_connection_with_external_ip() -> Result<()> {
 #[serial]
 async fn test_nomination_with_external_ip() -> Result<()> {
     let mut config1 = RtcConfiguration::default();
+    config1.ice_include_loopback_candidates = true;
     config1.external_ip = Some("203.0.113.10".to_string());
 
     let mut config2 = RtcConfiguration::default();
+    config2.ice_include_loopback_candidates = true;
     config2.external_ip = Some("203.0.113.20".to_string());
 
     let (controlling, controlled) = setup_host_pair(config1, config2).await;

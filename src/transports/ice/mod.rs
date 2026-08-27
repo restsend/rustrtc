@@ -3794,8 +3794,12 @@ impl IceGatherer {
                 bind_ips.push(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
             }
         } else {
-            // Default: bind to loopback and all LAN IPs
-            bind_ips.push(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+            // Default: bind to all LAN IPs. Loopback is only added on explicit
+            // opt-in (`ice_include_loopback_candidates`) — advertising 127.0.0.1
+            // to remote peers is useless and wastes their permissions/checks.
+            if self.config.ice_include_loopback_candidates {
+                bind_ips.push(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+            }
 
             use local_ip_address::list_afinet_netifas;
             if let Ok(interfaces) = list_afinet_netifas() {
@@ -3918,7 +3922,10 @@ impl IceGatherer {
 
         const ACTIVE_PLACEHOLDER_PORT: u16 = 9;
 
-        let mut bind_ips = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
+        let mut bind_ips = Vec::new();
+        if self.config.ice_include_loopback_candidates {
+            bind_ips.push(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        }
         if let Ok(local_ip) = get_local_ip()
             && !bind_ips.contains(&local_ip)
         {
@@ -3956,7 +3963,9 @@ impl IceGatherer {
             }
         } else {
             let mut ips = Vec::new();
-            ips.push(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+            if self.config.ice_include_loopback_candidates {
+                ips.push(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+            }
             use local_ip_address::list_afinet_netifas;
             if let Ok(interfaces) = list_afinet_netifas() {
                 for (name, addr) in interfaces {

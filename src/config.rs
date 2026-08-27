@@ -503,6 +503,17 @@ pub struct RtcConfiguration {
     pub rtp_start_port: Option<u16>,
     pub rtp_end_port: Option<u16>,
     pub ice_gather_udp_hosts: bool,
+    /// Whether to gather and advertise loopback (127.0.0.1 / ::1) host
+    /// candidates when no explicit `bind_ip` is configured.
+    ///
+    /// Default: false — loopback candidates are unreachable by any remote
+    /// peer: they leak host internals in SDP and make remote agents waste
+    /// TURN permissions and connectivity checks on dead candidates (a same-
+    /// host TURN relay can even forward them back to itself). Set to `true`
+    /// for same-host testing where no non-loopback interface exists. An
+    /// explicit `bind_ip = "127.0.0.1"` is unaffected by this flag.
+    #[serde(default)]
+    pub ice_include_loopback_candidates: bool,
     pub tcp_port_range_start: Option<u16>,
     pub tcp_port_range_end: Option<u16>,
     pub enable_latching: bool,
@@ -615,6 +626,7 @@ impl PartialEq for RtcConfiguration {
             && self.rtp_start_port == other.rtp_start_port
             && self.rtp_end_port == other.rtp_end_port
             && self.ice_gather_udp_hosts == other.ice_gather_udp_hosts
+            && self.ice_include_loopback_candidates == other.ice_include_loopback_candidates
             && self.tcp_port_range_start == other.tcp_port_range_start
             && self.tcp_port_range_end == other.tcp_port_range_end
             && self.enable_latching == other.enable_latching
@@ -677,6 +689,7 @@ impl Default for RtcConfiguration {
             rtp_start_port: None,
             rtp_end_port: None,
             ice_gather_udp_hosts: true,
+            ice_include_loopback_candidates: false,
             tcp_port_range_start: None,
             tcp_port_range_end: None,
             enable_latching: false,
@@ -866,6 +879,13 @@ impl RtcConfigurationBuilder {
 
     pub fn ice_gather_udp_hosts(mut self, enable: bool) -> Self {
         self.inner.ice_gather_udp_hosts = enable;
+        self
+    }
+
+    /// Gather and advertise loopback host candidates (default false). See
+    /// `RtcConfiguration::ice_include_loopback_candidates`.
+    pub fn ice_include_loopback_candidates(mut self, enable: bool) -> Self {
+        self.inner.ice_include_loopback_candidates = enable;
         self
     }
 
