@@ -3094,6 +3094,161 @@ async fn use_candidate_no_renomination_after_nomination() -> Result<()> {
     Ok(())
 }
 
+/// Regression test (nominated-pair freeze): a USE-CANDIDATE arriving on a
+/// DIFFERENT, strictly higher-priority pair after nomination must NOT
+/// replace the nominated pair.
+///
+/// Before the freeze, the controlled agent "upgraded" to the higher-priority
+/// pair, retargeting media mid-session onto a path the controlling agent
+/// never selected. Observed against Chrome: consent keepalives stay green
+/// while the peer hears ~300ms of media and then permanent silence.
+#[tokio::test]
+async fn use_candidate_higher_priority_pair_frozen_after_nomination() -> Result<()> {
+    let (t1, t2) = setup_host_pair(RtcConfiguration::default(), RtcConfiguration::default())
+        .await;
+
+    assert!(
+        wait_ice_connected(t1.subscribe_state(), Duration::from_secs(10)).await,
+        "controlling agent failed to connect"
+    );
+    let mut nom_rx = t2.subscribe_nomination_complete();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if nom_rx.borrow_and_update().is_some() {
+                return Ok::<_, anyhow::Error>(());
+            }
+            if nom_rx.changed().await.is_err() {
+                anyhow::bail!("nomination channel closed");
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for nomination")??;
+
+    let nominated_pair = t2
+        .get_selected_pair()
+        .expect("controlled side must have a selected pair after nomination");
+
+    // Register a second remote candidate at a NEW address with a strictly
+    // higher priority than any gathered candidate, then inject a raw
+    // USE-CANDIDATE from it (handle_stun_request accepts unsigned requests).
+    use tokio::net::UdpSocket;
+    let second_socket = UdpSocket::bind("127.0.0.1:0").await?;
+    let second_addr = second_socket.local_addr()?;
+    let mut high_priority = IceCandidate::host(second_addr, 1);
+    high_priority.priority = u32::MAX;
+    t2.add_remote_candidate(high_priority);
+
+    let controlled_addr = nominated_pair.local.base_address();
+    let tx_id = random_bytes::<12>();
+    let mut msg = StunMessage::binding_request(tx_id, None);
+    msg.attributes.push(StunAttribute::UseCandidate);
+    let bytes = msg.encode(None, false)?;
+    second_socket.send_to(&bytes, controlled_addr).await?;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let final_pair = t2
+        .get_selected_pair()
+        .expect("selected pair should still be present");
+    assert_eq!(
+        nominated_pair.remote.address, final_pair.remote.address,
+        "post-nomination UseCandidate on a higher-priority pair must NOT replace the frozen pair"
+    );
+
+    Ok(())
+}
+
+/// ICE-layer latching (same port, different IP retarget) must not apply to
+/// WebRTC transports: the SRTP media path stays pinned to the nominated pair.
+/// In RTP mode the retarget remains enabled (legacy trunk behaviour).
+async fn latching_retarget_setup(
+    mode: crate::TransportMode,
+) -> Result<(IceTransport, IceCandidatePair, std::net::SocketAddr)> {
+    let (t1, t2) = setup_host_pair(RtcConfiguration::default(), {
+        let mut cfg = RtcConfiguration::default();
+        cfg.transport_mode = mode;
+        cfg.enable_latching = true;
+        cfg
+    })
+    .await;
+
+    assert!(
+        wait_ice_connected(t1.subscribe_state(), Duration::from_secs(10)).await,
+        "controlling agent failed to connect"
+    );
+    let mut nom_rx = t2.subscribe_nomination_complete();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if nom_rx.borrow_and_update().is_some() {
+                return Ok::<_, anyhow::Error>(());
+            }
+            if nom_rx.changed().await.is_err() {
+                anyhow::bail!("nomination channel closed");
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for nomination")??;
+
+    let nominated_pair = t2
+        .get_selected_pair()
+        .expect("controlled side must have a selected pair after nomination");
+
+    // Spoof source: same port as the nominated remote, different IP. Pick
+    // the "other" local IP so we never collide with the peer's real socket
+    // (the pair may have formed over either loopback or the LAN address).
+    let lan_ip = crate::transports::get_local_ip().context("no non-loopback local IP")?;
+    let spoof_ip = if nominated_pair.remote.address.ip().is_loopback() {
+        lan_ip
+    } else {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    };
+    let spoof_addr = std::net::SocketAddr::new(spoof_ip, nominated_pair.remote.address.port());
+    let spoof_socket = tokio::net::UdpSocket::bind(spoof_addr)
+        .await
+        .context("bind spoof socket")?;
+
+    let controlled_addr = nominated_pair.local.base_address();
+    let tx_id = random_bytes::<12>();
+    let msg = StunMessage::binding_request(tx_id, None);
+    let bytes = msg.encode(None, false)?;
+    spoof_socket.send_to(&bytes, controlled_addr).await?;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    Ok((t2, nominated_pair, spoof_addr))
+}
+
+#[tokio::test]
+async fn webrtc_mode_ignores_ice_latching_retarget() -> Result<()> {
+    let (t2, nominated_pair, _spoof_addr) =
+        latching_retarget_setup(crate::TransportMode::WebRtc).await?;
+
+    let final_pair = t2
+        .get_selected_pair()
+        .expect("selected pair should still be present");
+    assert_eq!(
+        nominated_pair.remote.address, final_pair.remote.address,
+        "WebRTC mode must not retarget the selected pair via ICE latching"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn rtp_mode_still_applies_ice_latching_retarget() -> Result<()> {
+    let (t2, _nominated_pair, spoof_addr) =
+        latching_retarget_setup(crate::TransportMode::Rtp).await?;
+
+    let final_pair = t2
+        .get_selected_pair()
+        .expect("selected pair should still be present");
+    assert_eq!(
+        spoof_addr, final_pair.remote.address,
+        "RTP mode should keep retargeting the selected pair via ICE latching"
+    );
+    Ok(())
+}
+
 /// Verifies that DTLS packets buffered in the ICE transport BEFORE set_data_receiver
 /// are correctly delivered to the dtls_receiver when it is registered FIRST.
 ///

@@ -2450,7 +2450,16 @@ async fn handle_stun_request(
 
         let _ = inner.cmd_tx.send(IceCommand::RunChecks);
     }
-    if inner.config.enable_latching {
+    // ICE-layer latching retargets the selected pair when an inbound STUN
+    // arrives from the same port on a different IP. That is an RTP/SRTP-mode
+    // concept (plain RTP peers may legitimately change source addresses
+    // mid-stream). For WebRTC the SRTP media path must stay pinned to the
+    // nominated pair: retargeting it onto an address the peer never nominated
+    // blackholes media while consent keepalives still flow on the original
+    // socket.
+    if inner.config.enable_latching
+        && inner.config.transport_mode != crate::TransportMode::WebRtc
+    {
         let current_pair = inner.selected_pair.lock().clone();
         if let Some(pair) = current_pair
             && pair.remote.address.port() == addr.port()
@@ -2537,8 +2546,23 @@ async fn handle_stun_request(
                             if same {
                                 false
                             } else if already_nominated {
-                                // Only upgrade to a strictly higher-priority pair.
-                                pair.priority(role) > cur.priority(role)
+                                // RFC 8445 §7.3.1.5: the pair the controlling
+                                // agent nominated first is authoritative for
+                                // the rest of the session. Swapping to a
+                                // "better" pair mid-session retargets media
+                                // onto a path the peer never selected (e.g.
+                                // the peer's NAT silently drops it), while
+                                // consent keepalives keep flowing on the
+                                // original socket — the remote then hears
+                                // permanent silence. Freeze the pair instead.
+                                debug!(
+                                    "Ignoring post-nomination UseCandidate {} -> {} (frozen on {} -> {})",
+                                    pair.local.address,
+                                    pair.remote.address,
+                                    cur.local.address,
+                                    cur.remote.address
+                                );
+                                false
                             } else {
                                 true
                             }

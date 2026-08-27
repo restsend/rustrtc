@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use tokio::sync::watch;
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 /// Per-source-address state tracked during the latching probation period.
 ///
@@ -236,6 +236,12 @@ impl IceConn {
             return;
         }
 
+        if current != addr {
+            debug!(
+                "IceConn: selected-pair remote changed {} -> {} ({})",
+                current, addr, reason
+            );
+        }
         *self.remote_addr.write() = addr;
     }
 
