@@ -5278,6 +5278,18 @@ impl PeerConnectionInner {
                 .media_sections
                 .iter()
                 .find(|section| section.kind == kind && section.mid == mid)
+                // Peers that omit a=mid on re-INVITEs (plain SIP SDP) leave
+                // this section without a matching mid even though the local
+                // transceiver carries one. Fall back to a kind match — the
+                // single-audio-stream case is unambiguous — so the answer
+                // still follows the NEW offer instead of re-advertising the
+                // original negotiation.
+                .or_else(|| {
+                    remote_desc
+                        .media_sections
+                        .iter()
+                        .find(|section| section.kind == kind)
+                })
         }?;
 
         let local_caps = Self::configured_audio_capabilities(&self.config);
