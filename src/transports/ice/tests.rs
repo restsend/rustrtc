@@ -4642,3 +4642,69 @@ async fn rewrite_bridge_relays_rtp_to_turn_leg() -> Result<()> {
     turn_server.stop().await?;
     Ok(())
 }
+
+/// Regression test for the Windows WSAECONNRESET (os error 10054) UDP read
+/// loop death.
+///
+/// On Windows, sending a datagram to a closed UDP port makes the OS deliver
+/// the ICMP "Port Unreachable" reply as an error on the *next* recv call.
+/// Before the fix, `run_udp_read_loop` treated `ConnectionReset` as fatal
+/// and returned, silently killing every packet flow (RTP/SRTP/ICE) served by
+/// that socket. After the fix the loop logs the error and keeps serving.
+///
+/// Linux does not surface ICMP errors on unconnected UDP sockets, so this
+/// test is Windows-only. For the same OS behavior and fix class see
+/// tokio-rs/tokio#2017 and aws/s2n-quic#1448.
+#[cfg(windows)]
+#[tokio::test]
+#[serial]
+async fn udp_read_loop_survives_wsaconnreset() -> Result<()> {
+    let (transport, runner) = IceTransport::new(RtcConfiguration::default());
+    tokio::spawn(runner);
+    let inner = transport.inner.clone();
+
+    // A closed UDP port on loopback: bind, note the address, then drop.
+    let probe = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let closed_addr = probe.local_addr()?;
+    drop(probe);
+
+    // The socket the read loop serves.
+    let sock = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await?);
+    tokio::spawn(IceTransportRunner::run_udp_read_loop(
+        sock.clone(),
+        inner.clone(),
+    ));
+
+    // Trigger the ICMP "Port Unreachable" -> WSAECONNRESET delivery. The read
+    // loop consumes the error on its next recv; this is where the pre-fix
+    // loop exited and never came back.
+    sock.send_to(b"probe", closed_addr).await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The loop must still be alive: deliver a real RTP-looking packet (first
+    // byte >= 2 so it takes the non-STUN path) and observe it land in the
+    // transport's packet buffer (no data receiver is registered).
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    peer.send_to(b"rtp-payload", sock.local_addr()?).await?;
+    let received = timeout(Duration::from_secs(2), async {
+        loop {
+            if inner
+                .buffered_packets
+                .lock()
+                .iter()
+                .any(|(p, _)| p == b"rtp-payload")
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        received,
+        "UDP read loop died after WSAECONNRESET: subsequent packet not received"
+    );
+
+    Ok(())
+}
