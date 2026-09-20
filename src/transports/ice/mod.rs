@@ -415,6 +415,17 @@ impl IceTransportRunner {
                             Err(e) if e.kind() == ErrorKind::WouldBlock => {
                                 break;
                             }
+                            Err(e) if e.kind() == ErrorKind::ConnectionReset => {
+                                // Windows surfaces the ICMP "Port Unreachable" reply to an
+                                // earlier send as WSAECONNRESET (os error 10054) on the next
+                                // recv. UDP is connectionless, so this is not a fatal socket
+                                // error — return to the outer select and keep serving this
+                                // socket (same class of fix as tokio-rs/tokio#2017 and
+                                // aws/s2n-quic#1448; matches the tolerant handling already
+                                // used by the shared-UDP recv loop).
+                                debug!("Socket recv error (connection reset, continuing): {}", e);
+                                break;
+                            }
                             Err(e) => {
                                 debug!("Socket recv error: {}", e);
                                 return;
