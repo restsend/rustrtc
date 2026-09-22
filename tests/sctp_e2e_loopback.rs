@@ -6,8 +6,8 @@
 // recovery inflation, receiver backpressure, and TLP.
 #![allow(clippy::field_reassign_with_default)]
 use anyhow::Result;
-use rustrtc::transports::sctp::{DataChannelConfig, DataChannelEvent};
 use rustrtc::transports::ice::IceGathererState;
+use rustrtc::transports::sctp::{DataChannelConfig, DataChannelEvent};
 use rustrtc::{PeerConnection, RtcConfiguration};
 use std::sync::Arc;
 use std::time::Duration;
@@ -63,11 +63,7 @@ async fn drain_until(
     let start = std::time::Instant::now();
     while buf.len() < total {
         if start.elapsed() > deadline {
-            anyhow::bail!(
-                "receive timeout: got {} / {} bytes",
-                buf.len(),
-                total
-            );
+            anyhow::bail!("receive timeout: got {} / {} bytes", buf.len(), total);
         }
         match timeout(Duration::from_secs(5), dc.recv()).await {
             Ok(Some(DataChannelEvent::Message(b))) => buf.extend_from_slice(&b),
@@ -154,8 +150,14 @@ async fn e2e_loopback_large_bidirectional_transfer() -> Result<()> {
 
     assert_eq!(got_at_a.len(), TOTAL, "B->A: short delivery");
     assert_eq!(got_at_b.len(), TOTAL, "A->B: short delivery");
-    assert_eq!(*payload_b, got_at_a, "B->A: byte-for-byte integrity/order failed");
-    assert_eq!(*payload_a, got_at_b, "A->B: byte-for-byte integrity/order failed");
+    assert_eq!(
+        *payload_b, got_at_a,
+        "B->A: byte-for-byte integrity/order failed"
+    );
+    assert_eq!(
+        *payload_a, got_at_b,
+        "A->B: byte-for-byte integrity/order failed"
+    );
 
     pc1.close();
     pc2.close();
@@ -226,12 +228,19 @@ async fn e2e_loopback_many_small_messages_no_loss() -> Result<()> {
 
     // Must be exactly 0,1,2,...,COUNT-1 in order, with no gaps.
     for (idx, val) in got.iter().enumerate() {
-        assert_eq!(*val, idx as u32, "small-msg: out-of-order/missing at {}", idx);
+        assert_eq!(
+            *val, idx as u32,
+            "small-msg: out-of-order/missing at {}",
+            idx
+        );
     }
-    assert_eq!(got.len(), COUNT, "small-msg: must deliver all with zero loss");
+    assert_eq!(
+        got.len(),
+        COUNT,
+        "small-msg: must deliver all with zero loss"
+    );
 
     pc1.close();
     pc2.close();
     Ok(())
 }
-

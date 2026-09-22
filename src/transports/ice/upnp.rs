@@ -262,13 +262,16 @@ impl UpnpPortMapper {
 
         let internal_sock_addr = SocketAddrV4::new(local_ip, self.local_addr.port());
 
-        match timeout(DEFAULT_UPNP_SOAP_TIMEOUT, gateway.add_port(
-            PortMappingProtocol::UDP,
-            requested_port,
-            internal_sock_addr,
-            self.default_lease_duration,
-            &description,
-        ))
+        match timeout(
+            DEFAULT_UPNP_SOAP_TIMEOUT,
+            gateway.add_port(
+                PortMappingProtocol::UDP,
+                requested_port,
+                internal_sock_addr,
+                self.default_lease_duration,
+                &description,
+            ),
+        )
         .await
         {
             Ok(Ok(())) => {
@@ -308,8 +311,7 @@ impl UpnpPortMapper {
             Err(_) => {
                 warn!(
                     "UPnP AddPortMapping timed out after {:?}, trying random port: {}",
-                    DEFAULT_UPNP_SOAP_TIMEOUT,
-                    requested_port
+                    DEFAULT_UPNP_SOAP_TIMEOUT, requested_port
                 );
                 // Avoid recursion by manually trying a random port
                 self.add_mapping_random_port(gateway, external_ip, local_ip)
@@ -515,9 +517,7 @@ impl UpnpPortMapper {
                         DEFAULT_UPNP_SOAP_TIMEOUT
                     )
                 })?
-                .map_err(|e| {
-                    anyhow!("Failed to re-add UPnP mapping after conflict: {}", e)
-                })?;
+                .map_err(|e| anyhow!("Failed to re-add UPnP mapping after conflict: {}", e))?;
                 true
             }
             Ok(Err(AddPortError::OnlyPermanentLeasesSupported)) => {

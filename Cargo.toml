@@ -9,7 +9,7 @@ readme = "README.md"
 keywords = ["rtp", "srtp", "webrtc", "fax", "turn"]
 categories = ["network-programming"]
 license = "MIT"
-exelcude = ["flamegraph.svg","examples", "tests", "rustrtc_sfu.png", "output.ulaw"]
+exclude = ["flamegraph.svg","examples", "tests", "rustrtc_sfu.png", "output.ulaw"]
 
 [dependencies]
 anyhow = "1"
@@ -48,7 +48,6 @@ rcgen = { version = "0.14.8", default-features = false, features = [
     "pem",
     "ring",
 ] }
-spandsp-sys = { version = "0.1.5", optional = true }
 
 [dev-dependencies]
 axum = { version = "0.8", features = ["multipart"] }
@@ -88,7 +87,8 @@ tower-http = { version = "0.6", features = ["fs"] }
 [features]
 default = []
 simulator = []
-t38 = ["dep:spandsp-sys"]
+t38 = []
+t38-interop = []
 
 # Local dev/test build speedups. These only apply when rustrtc is the root crate
 # (e.g. `cargo test` here); downstream consumers use their own profiles. The big

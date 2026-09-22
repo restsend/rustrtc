@@ -682,8 +682,8 @@ impl Default for RtcConfiguration {
             sctp_heartbeat_interval: std::time::Duration::from_secs(15),
             sctp_max_heartbeat_failures: 4,
             sctp_max_tsn_retransmits: 8,
-            sctp_max_burst: 0,         // 0 = use default heuristic
-            sctp_max_cwnd: 256 * 1024, // 256 KB
+            sctp_max_burst: 0,                    // 0 = use default heuristic
+            sctp_max_cwnd: 256 * 1024,            // 256 KB
             sctp_max_buffered_amount: 256 * 1024, // 256 KB
             dtls_buffer_size: 2048,
             rtp_start_port: None,
@@ -746,8 +746,7 @@ impl Debug for RecorderInterceptors {
 
 impl PartialEq for RecorderInterceptors {
     fn eq(&self, other: &Self) -> bool {
-        self.receivers.len() == other.receivers.len()
-            && self.senders.len() == other.senders.len()
+        self.receivers.len() == other.receivers.len() && self.senders.len() == other.senders.len()
     }
 }
 
@@ -1021,20 +1020,14 @@ impl RtcConfigurationBuilder {
 
     /// Append a receiver interceptor (fires on every incoming RTP packet,
     /// pre-depacketize).
-    pub fn receiver_interceptor(
-        mut self,
-        interceptor: Arc<dyn RtpReceiverInterceptor>,
-    ) -> Self {
+    pub fn receiver_interceptor(mut self, interceptor: Arc<dyn RtpReceiverInterceptor>) -> Self {
         self.inner.recorder_interceptors.receivers.push(interceptor);
         self
     }
 
     /// Append a sender interceptor (fires on every outgoing RTP packet,
     /// post seq/timestamp rewrite).
-    pub fn sender_interceptor(
-        mut self,
-        interceptor: Arc<dyn RtpSenderInterceptor>,
-    ) -> Self {
+    pub fn sender_interceptor(mut self, interceptor: Arc<dyn RtpSenderInterceptor>) -> Self {
         self.inner.recorder_interceptors.senders.push(interceptor);
         self
     }

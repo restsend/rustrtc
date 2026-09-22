@@ -1034,25 +1034,21 @@ impl IceTransport {
         let inner = self.inner.clone();
         debug!("ICE: nudging passive TCP nomination (controlled, awaiting inbound TCP)");
         let rt_handle = inner.config.runtime_handle.clone();
-        crate::spawn_rtc(
-            rt_handle.as_ref(),
-            tracing::Span::current(),
-            async move {
-                let streams: Vec<_> = inner
-                    .gatherer
-                    .tcp_streams
-                    .lock()
-                    .values()
-                    .cloned()
-                    .collect();
-                for wrapper in streams {
-                    if let IceSocketWrapper::TcpStream(_, _, peer) = wrapper {
-                        complete_controlled_inbound_tcp_nomination(&wrapper, peer, inner).await;
-                        return;
-                    }
+        crate::spawn_rtc(rt_handle.as_ref(), tracing::Span::current(), async move {
+            let streams: Vec<_> = inner
+                .gatherer
+                .tcp_streams
+                .lock()
+                .values()
+                .cloned()
+                .collect();
+            for wrapper in streams {
+                if let IceSocketWrapper::TcpStream(_, _, peer) = wrapper {
+                    complete_controlled_inbound_tcp_nomination(&wrapper, peer, inner).await;
+                    return;
                 }
-            },
-        );
+            }
+        });
     }
 
     pub fn gather_state(&self) -> IceGathererState {
@@ -1855,7 +1851,10 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
             } else {
                 "controlled"
             },
-            p.local.address, p.local.typ, p.remote.address, p.remote.typ
+            p.local.address,
+            p.local.typ,
+            p.remote.address,
+            p.remote.typ
         );
     }
 
@@ -1869,7 +1868,10 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         // re-nomination is only expected after an ICE restart, which resets
         // nomination state).
         if inner.nomination_complete.borrow().is_some() {
-            debug!(label = inner.config.label.as_deref().unwrap_or("-"), "ICE checks complete (controlling): already nominated, keeping selected pair");
+            debug!(
+                label = inner.config.label.as_deref().unwrap_or("-"),
+                "ICE checks complete (controlling): already nominated, keeping selected pair"
+            );
             return;
         }
 
@@ -1900,14 +1902,14 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
             debug!(
                 label = inner.config.label.as_deref().unwrap_or("-"),
                 "Controlling agent nominating pair: {} -> {}",
-                pair.local.address, pair.remote.address
+                pair.local.address,
+                pair.remote.address
             );
             match perform_binding_check(&pair.local, &pair.remote, &inner, role, true).await {
                 Ok(_) => {
                     debug!(
                         label = inner.config.label.as_deref().unwrap_or("-"),
-                        "Nomination succeeded: {} -> {}",
-                        pair.local.address, pair.remote.address
+                        "Nomination succeeded: {} -> {}", pair.local.address, pair.remote.address
                     );
                     nominated_pair = Some(pair.clone());
                     break;
@@ -1916,7 +1918,9 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
                     debug!(
                         label = inner.config.label.as_deref().unwrap_or("-"),
                         "Nomination failed for {} -> {}: {}",
-                        pair.local.address, pair.remote.address, e
+                        pair.local.address,
+                        pair.remote.address,
+                        e
                     );
                 }
             }
@@ -1937,7 +1941,8 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         debug!(
             label = inner.config.label.as_deref().unwrap_or("-"),
             "ICE checks complete. Selected pair: {} -> {}",
-            final_pair.local.address, final_pair.remote.address
+            final_pair.local.address,
+            final_pair.remote.address
         );
 
         if nominated {
@@ -1957,7 +1962,10 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         // by late (e.g. peer-reflexive) candidates would otherwise stomp the
         // nominated pair with a locally-preferred one the peer never chose.
         if inner.nomination_complete.borrow().is_some() {
-            debug!(label = inner.config.label.as_deref().unwrap_or("-"), "ICE checks complete (controlled): keeping peer-nominated pair");
+            debug!(
+                label = inner.config.label.as_deref().unwrap_or("-"),
+                "ICE checks complete (controlled): keeping peer-nominated pair"
+            );
             return;
         }
         let pair = &successful_pairs[0];
@@ -1973,8 +1981,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         }
         debug!(
             label = inner.config.label.as_deref().unwrap_or("-"),
-            "ICE checks complete. Selected pair: {} -> {}",
-            pair.local.address, pair.remote.address
+            "ICE checks complete. Selected pair: {} -> {}", pair.local.address, pair.remote.address
         );
     }
 }
@@ -2431,9 +2438,7 @@ async fn handle_stun_request(
     // nominated pair: retargeting it onto an address the peer never nominated
     // blackholes media while consent keepalives still flow on the original
     // socket.
-    if inner.config.enable_latching
-        && inner.config.transport_mode != crate::TransportMode::WebRtc
-    {
+    if inner.config.enable_latching && inner.config.transport_mode != crate::TransportMode::WebRtc {
         let current_pair = inner.selected_pair.lock().clone();
         if let Some(pair) = current_pair
             && pair.remote.address.port() == addr.port()
@@ -2517,7 +2522,8 @@ async fn handle_stun_request(
                     debug!(
                         label = inner.config.label.as_deref().unwrap_or("-"),
                         "Controlled agent following UseCandidate: {} -> {}",
-                        pair.local.address, pair.remote.address
+                        pair.local.address,
+                        pair.remote.address
                     );
                     *inner.selected_pair.lock() = Some(pair.clone());
                     let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
@@ -3697,12 +3703,17 @@ impl IceGatherer {
         // can never stall the whole gather — UPnP still runs and the
         // gather completes with whatever candidates arrived in time.
         let stun_public_ip = if self.config.enable_upnp {
-            timeout(Duration::from_secs(5), self.gather_servers_and_get_public_ip())
-                .await
-                .unwrap_or_else(|_| {
-                    debug!("STUN/TURN gathering timed out after 5s, skipping UPnP double-NAT detection");
-                    None
-                })
+            timeout(
+                Duration::from_secs(5),
+                self.gather_servers_and_get_public_ip(),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                debug!(
+                    "STUN/TURN gathering timed out after 5s, skipping UPnP double-NAT detection"
+                );
+                None
+            })
         } else {
             if let Err(e) = self.gather_servers().await {
                 debug!("Server gathering failed: {}", e);

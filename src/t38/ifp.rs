@@ -1,5 +1,6 @@
 use crate::errors::{RtcError, RtcResult};
 use crate::t38::per::{BitReader, BitWriter, PerCodec};
+use bytes::Bytes;
 
 /// T.30 Indicator types (T.38 Annex A / ITU-T Recommendation T.38 §7.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,11 +25,13 @@ pub enum T30Indicator {
     V8Signal = 17,
     V34Preamble = 18,
     V34ControlChannel = 19,
+    V34CcRetrain = 20,
+    V3312000Training = 21,
+    V3314400Training = 22,
 }
 
 impl T30Indicator {
-    /// Maximum known indicator value (for range checking).
-    const MAX_VAL: u8 = 19;
+    const MAX_VAL: u8 = 22;
 
     /// Create from integer value.
     pub fn from_u8(val: u8) -> Option<Self> {
@@ -53,6 +56,9 @@ impl T30Indicator {
             17 => Some(Self::V8Signal),
             18 => Some(Self::V34Preamble),
             19 => Some(Self::V34ControlChannel),
+            20 => Some(Self::V34CcRetrain),
+            21 => Some(Self::V3312000Training),
+            22 => Some(Self::V3314400Training),
             _ => None,
         }
     }
@@ -68,10 +74,11 @@ pub enum DataFieldType {
     HdlcFcsOkSigEnd = 4,
     HdlcFcsBadSigEnd = 5,
     T4NonEcm = 6,
+    T4NonEcmSigEnd = 7,
 }
 
 impl DataFieldType {
-    const MAX_VAL: u8 = 6;
+    const MAX_VAL: u8 = 7;
 
     pub fn from_u8(val: u8) -> Option<Self> {
         match val {
@@ -82,6 +89,7 @@ impl DataFieldType {
             4 => Some(Self::HdlcFcsOkSigEnd),
             5 => Some(Self::HdlcFcsBadSigEnd),
             6 => Some(Self::T4NonEcm),
+            7 => Some(Self::T4NonEcmSigEnd),
             _ => None,
         }
     }
@@ -91,7 +99,7 @@ impl DataFieldType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataField {
     pub field_type: DataFieldType,
-    pub data: Vec<u8>,
+    pub data: Bytes,
 }
 
 /// IFP packet types (T.38 §7.2).
@@ -145,50 +153,6 @@ impl IfpPacket {
         Ok(buf.into_bytes())
     }
 
-    /// Encode this IFP packet in spandsp-compatible (simplified) format.
-    ///
-    /// spandsp (FreeSWITCH/Asterisk) uses a non-standard lightweight binary format
-    /// instead of T.38 Annex A ASN.1 PER. This format is NOT interoperable with
-    /// standard T.38 — use only when talking to spandsp-based endpoints.
-    ///
-    /// Format (indicators, 1 byte):
-    ///   byte[0] = (type_of_msg << 7) | (indicator_value << 1)
-    ///   type_of_msg: 0 = t30-indicator
-    ///   indicator_value: T.38 indicator value (0-22)
-    ///
-    /// Format (data, variable):
-    ///   byte[0] = 0x80 | (field_count << 1)  // type=1(data), count in bits 6-2
-    ///   followed by field entries per spandsp's internal format
-    ///
-    /// Note: For data packets, spandsp uses a complex internal format that we
-    /// don't fully replicate here. Use `encode()` for standard T.38 PER encoding.
-    pub fn encode_spandsp(&self) -> RtcResult<Vec<u8>> {
-        match self {
-            Self::T30Indicator(indicators) => {
-                if indicators.len() > 1 {
-                    return Err(RtcError::Protocol(
-                        "spandsp format only supports single indicators".into(),
-                    ));
-                }
-                let val = if let Some(ind) = indicators.first() {
-                    *ind as u8
-                } else {
-                    0
-                };
-                // type_of_msg=0 (bit 7=0), value << 1 (bits 6-2), padding (bits 1-0)
-                Ok(vec![val << 1])
-            }
-            Self::T30Data(_fields) => {
-                // spandsp's data format is internal/opaque. Use encode() for
-                // standard T.38 PER that other T.38 implementations can decode.
-                Err(RtcError::NotImplemented(
-                    "spandsp data encoding not implemented — use encode() for standard T.38 PER",
-                ))
-            }
-        }
-    }
-
-    /// Decode an IFP packet from bytes.
     pub fn decode(data: &[u8]) -> RtcResult<Self> {
         let mut buf = BitReader::new(data.to_vec());
 
@@ -217,7 +181,10 @@ impl IfpPacket {
                         RtcError::Protocol(format!("invalid DataFieldType: {}", ft))
                     })?;
                     let data = PerCodec::decode_octet_string(&mut buf, 65535)?;
-                    fields.push(DataField { field_type, data });
+                    fields.push(DataField {
+                        field_type,
+                        data: Bytes::from(data),
+                    });
                 }
                 Ok(Self::T30Data(fields))
             }
@@ -252,11 +219,11 @@ mod tests {
         let packet = IfpPacket::T30Data(vec![
             DataField {
                 field_type: DataFieldType::HdlcData,
-                data: vec![0xFF, 0x01, 0x02],
+                data: Bytes::from(vec![0xFF, 0x01, 0x02]),
             },
             DataField {
                 field_type: DataFieldType::T4NonEcm,
-                data: vec![0x00; 64],
+                data: Bytes::from(vec![0x00; 64]),
             },
         ]);
 
@@ -284,7 +251,7 @@ mod tests {
 
     #[test]
     fn test_encode_decode_single_indicator() {
-        for ind in 0..=19 {
+        for ind in 0..=22 {
             let indicator = T30Indicator::from_u8(ind).unwrap();
             let packet = IfpPacket::T30Indicator(vec![indicator]);
             let encoded = packet.encode().unwrap();
@@ -301,7 +268,7 @@ mod tests {
 
     #[test]
     fn test_t30_indicator_roundtrip_all_variants() {
-        let all: Vec<T30Indicator> = (0..=19)
+        let all: Vec<T30Indicator> = (0..=22)
             .map(|i| T30Indicator::from_u8(i).unwrap())
             .collect();
         let packet = IfpPacket::T30Indicator(all);
@@ -317,7 +284,7 @@ mod tests {
             let field_type = DataFieldType::from_u8(ft).unwrap();
             fields.push(DataField {
                 field_type,
-                data: vec![ft as u8; ft as usize + 1],
+                data: Bytes::from(vec![ft; ft as usize + 1]),
             });
         }
         let packet = IfpPacket::T30Data(fields);
@@ -328,7 +295,7 @@ mod tests {
 
     #[test]
     fn test_large_data_field() {
-        let data = (0..255).collect::<Vec<_>>();
+        let data = Bytes::from((0..255).collect::<Vec<_>>());
         let packet = IfpPacket::T30Data(vec![DataField {
             field_type: DataFieldType::HdlcFcsOk,
             data,
@@ -340,61 +307,14 @@ mod tests {
 
     #[test]
     fn test_t30_indicator_unknown() {
-        assert!(T30Indicator::from_u8(20).is_none());
+        assert!(T30Indicator::from_u8(23).is_none());
         assert!(T30Indicator::from_u8(255).is_none());
     }
 
     #[test]
     fn test_data_field_type_unknown() {
-        assert!(DataFieldType::from_u8(7).is_none());
+        assert!(DataFieldType::from_u8(8).is_none());
         assert!(DataFieldType::from_u8(255).is_none());
-    }
-
-    #[test]
-    fn test_encode_spandsp_cng() {
-        let packet = IfpPacket::T30Indicator(vec![T30Indicator::Cng]);
-        let encoded = packet.encode_spandsp().unwrap();
-        assert_eq!(encoded, vec![0x02]);
-    }
-
-    #[test]
-    fn test_encode_spandsp_v21() {
-        let packet = IfpPacket::T30Indicator(vec![T30Indicator::V21Preamble]);
-        let encoded = packet.encode_spandsp().unwrap();
-        assert_eq!(encoded, vec![0x06]);
-    }
-
-    #[test]
-    fn test_encode_spandsp_all_indicators() {
-        for val in 0..=19 {
-            let Some(ind) = T30Indicator::from_u8(val) else {
-                continue;
-            };
-            let packet = IfpPacket::T30Indicator(vec![ind]);
-            let encoded = packet.encode_spandsp().unwrap();
-            assert_eq!(
-                encoded.len(),
-                1,
-                "spandsp format should be 1 byte for {:?}",
-                ind
-            );
-            assert_eq!(encoded[0], val << 1, "mismatch for indicator {:?}", ind);
-        }
-    }
-
-    #[test]
-    fn test_encode_spandsp_rejects_multi_indicator() {
-        let packet = IfpPacket::T30Indicator(vec![T30Indicator::Cng, T30Indicator::Ced]);
-        assert!(packet.encode_spandsp().is_err());
-    }
-
-    #[test]
-    fn test_encode_spandsp_rejects_data() {
-        let packet = IfpPacket::T30Data(vec![DataField {
-            field_type: DataFieldType::HdlcFcsOk,
-            data: vec![],
-        }]);
-        assert!(packet.encode_spandsp().is_err());
     }
 
     #[test]
@@ -402,7 +322,7 @@ mod tests {
         let fields = (0..10)
             .map(|i| DataField {
                 field_type: DataFieldType::from_u8(i % 7).unwrap(),
-                data: vec![i as u8; ((i + 1) * 10) as usize],
+                data: Bytes::from(vec![i; ((i + 1) * 10) as usize]),
             })
             .collect();
         let packet = IfpPacket::T30Data(fields);

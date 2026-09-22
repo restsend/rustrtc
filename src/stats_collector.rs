@@ -239,8 +239,7 @@ fn evict_stale_ssrcs<V>(map: &mut HashMap<u32, V>, last_seen: impl Fn(&V) -> Ins
     let now = Instant::now();
     map.retain(|_, v| now.duration_since(last_seen(v)) < SENT_SR_TIME_MAX_AGE);
     if map.len() >= SSRC_STATS_HIGH_WATERMARK {
-        let mut by_age: Vec<(u32, Instant)> =
-            map.iter().map(|(k, v)| (*k, last_seen(v))).collect();
+        let mut by_age: Vec<(u32, Instant)> = map.iter().map(|(k, v)| (*k, last_seen(v))).collect();
         by_age.sort_by_key(|(_, t)| *t);
         let excess = map.len() - SSRC_STATS_HIGH_WATERMARK / 2;
         for (k, _) in by_age.into_iter().take(excess) {
@@ -297,10 +296,7 @@ impl StatsCollector {
                 .get(ssrc)
                 .map(|r| {
                     let lsr = r.last_sr_ntp_least;
-                    let dlsr = r
-                        .last_sr_received_at
-                        .map(delay_since_sr)
-                        .unwrap_or(0);
+                    let dlsr = r.last_sr_received_at.map(delay_since_sr).unwrap_or(0);
                     (lsr, dlsr)
                 })
                 .unwrap_or((0, 0));

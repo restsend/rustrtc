@@ -34,7 +34,7 @@ async fn recv_timeout(
     tokio::time::timeout(timeout, async {
         loop {
             if let Ok(Some(data)) = transport.recv(buf).await {
-                return Some(data);
+                return Some(data.to_vec());
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }

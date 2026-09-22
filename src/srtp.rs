@@ -431,8 +431,9 @@ impl SrtpContext {
 
         // Run AES-CM
         let mut out = vec![0u8; len];
-        let mut cipher = <Aes128Ctr as ctr::cipher::KeyIvInit>::new_from_slices(&master_key[..16], &iv)
-            .map_err(|_| SrtpError::UnsupportedProfile)?;
+        let mut cipher =
+            <Aes128Ctr as ctr::cipher::KeyIvInit>::new_from_slices(&master_key[..16], &iv)
+                .map_err(|_| SrtpError::UnsupportedProfile)?;
         cipher.apply_keystream(&mut out);
 
         Ok(out)
@@ -754,7 +755,9 @@ impl SrtpContext {
                     "invalid decrypted RTP padding length".to_string(),
                 ));
             }
-            packet.body.truncate(packet.body.len() - padding_len as usize);
+            packet
+                .body
+                .truncate(packet.body.len() - padding_len as usize);
             padding_len
         } else {
             0

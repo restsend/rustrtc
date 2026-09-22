@@ -20,13 +20,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rustrtc::{
-    transports::sctp::{DataChannelConfig, DataChannelEvent},
     IceCandidateType, IceServer, PeerConnection, PeerConnectionEvent, RtcConfiguration,
+    transports::sctp::{DataChannelConfig, DataChannelEvent},
 };
 use tokio::time::timeout;
 use turn::relay::relay_static::RelayAddressGeneratorStatic;
-use turn::server::config::{ConnConfig, ServerConfig};
 use turn::server::Server;
+use turn::server::config::{ConnConfig, ServerConfig};
 use webrtc_util::vnet::net::Net;
 
 /// Minimal long-term-auth TURN server on loopback (mirrors rport-server).
@@ -158,22 +158,22 @@ async fn test_controlling_side_selects_highest_priority_pair() -> anyhow::Result
         "controlling side selected a lower-priority pair ({} {:?} -> {} {:?}); \
          the host->host pair should win the nomination even when it responds \
          more slowly than the relay path",
-        pair_a.local.address, pair_a.local.typ, pair_a.remote.address, pair_a.remote.typ,
+        pair_a.local.address,
+        pair_a.local.typ,
+        pair_a.remote.address,
+        pair_a.remote.typ,
     );
 
     // The two ends must converge on the same path.
     assert_eq!(
-        pair_a.remote.address,
-        pair_b.local.address,
+        pair_a.remote.address, pair_b.local.address,
         "controlling and controlled sides selected incompatible pairs"
     );
 
     // Sanity: data actually flows end to end over the chosen path.
     let dc_b = {
         let mut received = None;
-        while let Ok(Some(event)) =
-            timeout(Duration::from_secs(5), pc_b.recv()).await
-        {
+        while let Ok(Some(event)) = timeout(Duration::from_secs(5), pc_b.recv()).await {
             if let PeerConnectionEvent::DataChannel(dc) = event {
                 received = Some(dc);
                 break;
@@ -189,7 +189,10 @@ async fn test_controlling_side_selects_highest_priority_pair() -> anyhow::Result
             break;
         }
     }
-    assert!(dc_a_open, "data channel should open on the controlling side");
+    assert!(
+        dc_a_open,
+        "data channel should open on the controlling side"
+    );
 
     pc_a.send_data(dc_a.id, b"hello-over-host-path").await?;
     let mut echoed = false;

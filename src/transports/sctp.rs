@@ -56,7 +56,7 @@ pub(crate) fn sctp_crc32c_append(crc: u32, data: &[u8]) -> u32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.2")]
 unsafe fn crc32c_append_x86(crc: u32, data: &[u8]) -> u32 {
-    use std::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8};
+    use std::arch::x86_64::{_mm_crc32_u8, _mm_crc32_u64};
     let mut c = (crc ^ 0xFFFF_FFFF) as u64;
     let mut chunks = data.chunks_exact(8);
     for chunk in chunks.by_ref() {
@@ -1426,8 +1426,7 @@ impl SctpInner {
                     // the association fails (RFC 4960 §6.1.1). Abandoning a
                     // reliable chunk with no FORWARD-TSN to unblock it would
                     // permanently freeze the cumulative ACK point.
-                    let is_pr_sctp =
-                        record.max_retransmits.is_some() || record.expiry.is_some();
+                    let is_pr_sctp = record.max_retransmits.is_some() || record.expiry.is_some();
                     if is_pr_sctp && record.transmit_count >= self.max_tsn_retransmits {
                         record.abandoned = true;
                         debug!(
@@ -2033,8 +2032,7 @@ impl SctpInner {
                     // the retransmitted holes and keep the pipe full during
                     // recovery. Without this the window is frozen for the whole
                     // episode and throughput collapses on any loss.
-                    let done_bytes =
-                        outcome.bytes_acked_by_cum_tsn + outcome.bytes_acked_by_gap;
+                    let done_bytes = outcome.bytes_acked_by_cum_tsn + outcome.bytes_acked_by_gap;
                     if done_bytes > 0 && cwnd < self.max_cwnd {
                         let new_cwnd = (cwnd + done_bytes).min(self.max_cwnd);
                         let actual_increase = new_cwnd - cwnd;
@@ -2098,7 +2096,7 @@ impl SctpInner {
                 }
 
                 self.flow_control_notify.notify_one();
-            self.flow_control_notify.notify_waiters();
+                self.flow_control_notify.notify_waiters();
             }
 
             if outcome.head_moved || outcome.flight_reduction > 0 {
@@ -2992,7 +2990,10 @@ impl SctpInner {
             }
             self.tlp_probe_sent.store(true, Ordering::Relaxed);
             self.stats_tlp_probes.fetch_add(1, Ordering::Relaxed);
-            trace!("TLP: probing tail TSN {} (transmit #{})", tail_tsn, record.transmit_count);
+            trace!(
+                "TLP: probing tail TSN {} (transmit #{})",
+                tail_tsn, record.transmit_count
+            );
             self.timer_notify.notify_one();
             return true;
         }
@@ -3004,8 +3005,7 @@ impl SctpInner {
         // Only arm a probe if there's in-flight unacked data; otherwise no TLP.
         let has_inflight = {
             let sq = self.sent_queue.lock();
-            sq.values()
-                .any(|r| !r.acked && !r.abandoned && r.in_flight)
+            sq.values().any(|r| !r.acked && !r.abandoned && r.in_flight)
         };
         if !has_inflight || self.tlp_probe_sent.load(Ordering::Relaxed) {
             return Duration::from_secs(3600);
@@ -4403,8 +4403,7 @@ mod tests {
         // capped at RETRANSMIT_BURST. The rest are sent_time-reset so they do
         // not immediately re-trigger T3.
         assert_eq!(
-            marked,
-            RETRANSMIT_BURST as usize,
+            marked, RETRANSMIT_BURST as usize,
             "FIX: T3 should retransmit up to RETRANSMIT_BURST chunks per cycle"
         );
         // The 5th chunk (beyond the burst) must NOT be marked, but its
@@ -8497,7 +8496,9 @@ mod tests {
             // Simulate a sustained full window: more than cwnd in flight, so
             // after acking one chunk (reducing flight by pkt_size) the window
             // is still fully utilized and slow-start can grow cwnd.
-            sctp.inner.flight_size.store(cwnd + pkt_size, Ordering::SeqCst);
+            sctp.inner
+                .flight_size
+                .store(cwnd + pkt_size, Ordering::SeqCst);
 
             let sack = build_sack_packet(tsn, 1024 * 1024, vec![], vec![]);
             sctp.inner.handle_sack(sack).await.unwrap();
@@ -9407,7 +9408,9 @@ mod tests {
         );
         tokio::spawn(runner);
         *sctp.inner.state.lock() = SctpState::Connecting;
-        sctp.inner.remote_verification_tag.store(12345, Ordering::SeqCst);
+        sctp.inner
+            .remote_verification_tag
+            .store(12345, Ordering::SeqCst);
 
         // Backoff RTO to 10s; computed = srtt + 4*rttvar = 1.0 + 4*0.25 = 2.0s
         {
@@ -9603,15 +9606,21 @@ mod tests {
         );
         tokio::spawn(runner);
         *sctp.inner.state.lock() = SctpState::Connected;
-        sctp.inner.remote_verification_tag.store(12345, Ordering::SeqCst);
+        sctp.inner
+            .remote_verification_tag
+            .store(12345, Ordering::SeqCst);
 
         // Pretend we just entered Fast Recovery: cwnd cut to ssthresh.
         let cwnd_at_entry = 6 * MAX_SCTP_PACKET_SIZE; // 7200
         sctp.inner.cwnd_tx.store(cwnd_at_entry, Ordering::SeqCst);
         sctp.inner.ssthresh.store(cwnd_at_entry, Ordering::SeqCst);
-        sctp.inner.fast_recovery_active.store(true, Ordering::SeqCst);
+        sctp.inner
+            .fast_recovery_active
+            .store(true, Ordering::SeqCst);
         // exit_tsn far ahead so a cum_ack of 150 keeps us in recovery
-        sctp.inner.fast_recovery_exit_tsn.store(200, Ordering::SeqCst);
+        sctp.inner
+            .fast_recovery_exit_tsn
+            .store(200, Ordering::SeqCst);
 
         // One in-flight chunk that a SACK will cum-ack (done_bytes > 0).
         let payload_len = 4 * MAX_SCTP_PACKET_SIZE;
@@ -9636,7 +9645,9 @@ mod tests {
             },
         );
         // Window fully utilized so the growth/inflation path is reachable.
-        sctp.inner.flight_size.store(cwnd_at_entry + payload_len, Ordering::SeqCst);
+        sctp.inner
+            .flight_size
+            .store(cwnd_at_entry + payload_len, Ordering::SeqCst);
 
         let sack = build_sack_packet(150, 1024 * 1024, vec![], vec![]);
         sctp.inner.handle_sack(sack).await.unwrap();
@@ -9647,7 +9658,9 @@ mod tests {
         assert!(
             cwnd_after >= cwnd_at_entry + payload_len,
             "FIX B.5: cwnd should inflate during fast recovery (was {}, now {}, expected ~+{})",
-            cwnd_at_entry, cwnd_after, payload_len
+            cwnd_at_entry,
+            cwnd_after,
+            payload_len
         );
 
         // Now drive cum_ack past exit_tsn to leave Fast Recovery; cwnd must
@@ -9718,7 +9731,9 @@ mod tests {
         );
         tokio::spawn(runner);
         *sctp.inner.state.lock() = SctpState::Connected;
-        sctp.inner.remote_verification_tag.store(12345, Ordering::SeqCst);
+        sctp.inner
+            .remote_verification_tag
+            .store(12345, Ordering::SeqCst);
 
         // Simulate a near-full out-of-order reassembly queue made of MANY small
         // chunks (well under the byte rwnd, so byte-backpressure never engages).
@@ -9745,7 +9760,10 @@ mod tests {
         // And byte-based rwnd still works when the chunk queue is small.
         sctp.inner.received_queue.lock().clear();
         let adv_normal = sctp.inner.advertised_rwnd();
-        assert!(adv_normal > 0, "rwnd should be non-empty when queue is small");
+        assert!(
+            adv_normal > 0,
+            "rwnd should be non-empty when queue is small"
+        );
     }
 
     /// B.8 verification: default max_burst is 4 (RFC 8261 §5), not 16. With a
@@ -9778,12 +9796,18 @@ mod tests {
         );
         tokio::spawn(runner);
         *sctp.inner.state.lock() = SctpState::Connected;
-        sctp.inner.remote_verification_tag.store(12345, Ordering::SeqCst);
+        sctp.inner
+            .remote_verification_tag
+            .store(12345, Ordering::SeqCst);
         // Open a big window and a big peer rwnd so only burst_limit caps sends.
-        sctp.inner.cwnd_tx.store(50 * MAX_SCTP_PACKET_SIZE, Ordering::SeqCst);
+        sctp.inner
+            .cwnd_tx
+            .store(50 * MAX_SCTP_PACKET_SIZE, Ordering::SeqCst);
         sctp.inner.ssthresh.store(usize::MAX, Ordering::SeqCst);
         sctp.inner.flight_size.store(0, Ordering::SeqCst);
-        sctp.inner.peer_rwnd.store(8 * 1024 * 1024, Ordering::SeqCst);
+        sctp.inner
+            .peer_rwnd
+            .store(8 * 1024 * 1024, Ordering::SeqCst);
 
         // Enqueue many small outbound chunks.
         {
@@ -9807,7 +9831,8 @@ mod tests {
         assert!(
             inflight <= max_burst_bytes,
             "B.8: default burst must be <= 4*MTU ({}), got {} bytes in flight",
-            max_burst_bytes, inflight
+            max_burst_bytes,
+            inflight
         );
     }
 
@@ -9843,7 +9868,9 @@ mod tests {
         );
         tokio::spawn(runner);
         *sctp.inner.state.lock() = SctpState::Connected;
-        sctp.inner.remote_verification_tag.store(12345, Ordering::SeqCst);
+        sctp.inner
+            .remote_verification_tag
+            .store(12345, Ordering::SeqCst);
 
         // Give a valid SRTT so PTO = 2*SRTT is well defined and small.
         {
@@ -9886,7 +9913,10 @@ mod tests {
         // The TAIL chunk (highest TSN = 101) is the one probed.
         let q = sctp.inner.sent_queue.lock();
         let tail = q.get(&101).unwrap();
-        assert!(tail.needs_retransmit, "tail chunk must be marked for retransmit");
+        assert!(
+            tail.needs_retransmit,
+            "tail chunk must be marked for retransmit"
+        );
         assert_eq!(tail.transmit_count, 2, "probe increments transmit_count");
         let head = q.get(&100).unwrap();
         assert!(!head.needs_retransmit, "non-tail chunk must not be probed");
@@ -9936,7 +9966,7 @@ mod tests {
         // Small SRTT so RTO == rto_min (=200ms).
         {
             let mut rto = sctp.inner.rto_state.lock();
-            rto.srtt = 0.05;   // 50ms → PTO = max(100ms, floor)  = max(100ms, 100ms) = 100ms
+            rto.srtt = 0.05; // 50ms → PTO = max(100ms, floor)  = max(100ms, 100ms) = 100ms
             rto.rttvar = 0.025; // RTO = max(50+4*25=150ms, 200ms) = 200ms
         }
 
@@ -9991,7 +10021,9 @@ mod tests {
         );
         tokio::spawn(runner);
         *sctp.inner.state.lock() = SctpState::Connected;
-        sctp.inner.remote_verification_tag.store(12345, Ordering::SeqCst);
+        sctp.inner
+            .remote_verification_tag
+            .store(12345, Ordering::SeqCst);
 
         // Set SRTT so that PTO (250ms) < RTO (500ms):
         //   SRTT = 100ms, rttvar = 50ms
@@ -10028,17 +10060,27 @@ mod tests {
         // Simulate the sleep-branch logic: call TLP first, then T3.
         let probes_before = sctp.inner.stats_tlp_probes.load(Ordering::Relaxed);
         let tlp_fired = sctp.inner.maybe_send_tlp_probe(Instant::now());
-        assert!(tlp_fired, "TLP should fire — PTO (250ms) has elapsed (age=400ms)");
+        assert!(
+            tlp_fired,
+            "TLP should fire — PTO (250ms) has elapsed (age=400ms)"
+        );
 
         let probes_after_tlp = sctp.inner.stats_tlp_probes.load(Ordering::Relaxed);
-        assert_eq!(probes_after_tlp, probes_before + 1, "TLP probe counter must increment");
+        assert_eq!(
+            probes_after_tlp,
+            probes_before + 1,
+            "TLP probe counter must increment"
+        );
 
         // The tail TSN must be marked for retransmission by TLP.
         {
             let q = sctp.inner.sent_queue.lock();
             let record = q.get(&100).unwrap();
             assert!(record.needs_retransmit, "TLP must mark TSN for retransmit");
-            assert_eq!(record.transmit_count, 2, "TLP increments transmit_count to 2");
+            assert_eq!(
+                record.transmit_count, 2,
+                "TLP increments transmit_count to 2"
+            );
         }
 
         // Now call handle_timeout — T3 should NOT fire because RTO (500ms) hasn't elapsed yet (age=400ms).
@@ -10086,7 +10128,9 @@ mod tests {
         );
         tokio::spawn(runner);
         *sctp.inner.state.lock() = SctpState::Connected;
-        sctp.inner.remote_verification_tag.store(12345, Ordering::SeqCst);
+        sctp.inner
+            .remote_verification_tag
+            .store(12345, Ordering::SeqCst);
 
         // SRTT = 100ms, rttvar = 50ms, rto_min = 500ms
         // PTO = max(200ms, 250ms) = 250ms, RTO = 500ms
@@ -10139,10 +10183,7 @@ mod tests {
             record.transmit_count >= 2,
             "transmit_count must be at least 2 (TLP=2, T3 may also bump)"
         );
-        assert!(
-            record.needs_retransmit,
-            "TSN must be marked for retransmit"
-        );
+        assert!(record.needs_retransmit, "TSN must be marked for retransmit");
     }
 
     /// B.10 verification (RFC 4960 §8.1): a HEARTBEAT round-trip must update the
@@ -10174,7 +10215,9 @@ mod tests {
         );
         tokio::spawn(runner);
         *sctp.inner.state.lock() = SctpState::Connected;
-        sctp.inner.remote_verification_tag.store(12345, Ordering::SeqCst);
+        sctp.inner
+            .remote_verification_tag
+            .store(12345, Ordering::SeqCst);
 
         let srtt_before = sctp.inner.rto_state.lock().srtt;
 
@@ -10196,7 +10239,8 @@ mod tests {
         assert!(
             srtt_after > 0.0 && srtt_after != srtt_before,
             "B.10: HEARTBEAT RTT must update SRTT (before={}, after={})",
-            srtt_before, srtt_after
+            srtt_before,
+            srtt_after
         );
         assert!(
             (srtt_after - 0.04).abs() < 0.01,

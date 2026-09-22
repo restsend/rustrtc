@@ -1070,14 +1070,8 @@ async fn test_trickle_ice_no_premature_failure() -> Result<()> {
         wait_ice_connected(ctrl_state, Duration::from_secs(10)),
         wait_ice_connected(ctrd_state, Duration::from_secs(10)),
     );
-    assert!(
-        ok1,
-        "Controlling should connect after correct remote added"
-    );
-    assert!(
-        ok2,
-        "Controlled should connect after correct remote added"
-    );
+    assert!(ok1, "Controlling should connect after correct remote added");
+    assert!(ok2, "Controlled should connect after correct remote added");
 
     Ok(())
 }

@@ -353,8 +353,7 @@ impl RewriteBridge {
         // replaying a stale pin; the very first packet on a fresh outgoing
         // timeline may pin to the destination leg's prior local playback
         // (paced sender).
-        let is_timeline_switch =
-            matches!(timeline.last_src_ssrc, Some(src) if src != src_ssrc);
+        let is_timeline_switch = matches!(timeline.last_src_ssrc, Some(src) if src != src_ssrc);
         let mut switched_stream = false;
         if timeline.last_output_timestamp.is_none() {
             if let Some(desired_out) = self.options.initial_output_timestamp {
@@ -817,8 +816,7 @@ impl RtpTransport {
             let mut packet = RtpPacket::parse(buf)?;
 
             // Inject abs-send-time if enabled.
-            if let Some(id) =
-                decode_ext_id(self.abs_send_time_extension_id.load(Ordering::Relaxed))
+            if let Some(id) = decode_ext_id(self.abs_send_time_extension_id.load(Ordering::Relaxed))
             {
                 let abs_send_time =
                     crate::rtp::calculate_abs_send_time(std::time::SystemTime::now());
@@ -1638,7 +1636,10 @@ mod tests {
             "source delta must be preserved after the pinned first timestamp"
         );
         assert!(first.header.marker, "first pinned packet must be marked");
-        assert!(!second.header.marker, "subsequent packets keep source marker");
+        assert!(
+            !second.header.marker,
+            "subsequent packets keep source marker"
+        );
     }
 
     /// Reproduction of the incident behind the ring→answer mute: a plain-RTP
@@ -1698,7 +1699,10 @@ mod tests {
             header.marker = marker;
             let mut packet = RtpPacket::new(header, vec![0xd5u8; 160]);
             bridge.rewrite_packet(&mut packet);
-            assert_eq!(packet.header.ssrc, 0xABCD, "destination SSRC must stay fixed");
+            assert_eq!(
+                packet.header.ssrc, 0xABCD,
+                "destination SSRC must stay fixed"
+            );
             emitted.push((
                 packet.header.sequence_number,
                 packet.header.timestamp,
@@ -1760,13 +1764,24 @@ mod tests {
 
         // 3) The stream switch into phase 2 continues the timeline right
         //    after the last packet of phase 1 (one 20 ms frame step).
-        assert_eq!(tss[13], tss[12] + 160, "phase-2 must continue phase-1 timeline");
-        assert!(markers[13], "first packet after a source switch must carry the marker bit");
+        assert_eq!(
+            tss[13],
+            tss[12] + 160,
+            "phase-2 must continue phase-1 timeline"
+        );
+        assert!(
+            markers[13],
+            "first packet after a source switch must carry the marker bit"
+        );
 
         // 4) The switch BACK to the resumed main stream continues AFTER the
         //    ringback tail — this is exactly where the incident discarded
         //    117 packets.
-        assert_eq!(tss[143], tss[142] + 160, "resumed stream must continue the ringback tail");
+        assert_eq!(
+            tss[143],
+            tss[142] + 160,
+            "resumed stream must continue the ringback tail"
+        );
         assert!(markers[143], "resume packet must carry the marker bit");
     }
 
@@ -1945,7 +1960,11 @@ mod tests {
         // (consecutive audio packets are one 160-sample source frame apart).
         for w in audio_out.windows(2) {
             assert_eq!(w[1].0.wrapping_sub(w[0].0), 1, "audio seq must stay +1");
-            assert_eq!(w[1].1.wrapping_sub(w[0].1), 160, "audio ts must track src frames");
+            assert_eq!(
+                w[1].1.wrapping_sub(w[0].1),
+                160,
+                "audio ts must track src frames"
+            );
         }
         // Video: consecutive sequence numbers, source-cadence timestamps.
         for w in video_out.windows(2) {

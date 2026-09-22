@@ -157,8 +157,8 @@ mod tests {
 
     #[test]
     fn head_and_tail_are_cache_line_separated() {
-        use std::sync::atomic::AtomicUsize;
         use super::CachePadded;
+        use std::sync::atomic::AtomicUsize;
         // Each padded atomic must occupy exactly one 64-byte cache line so the
         // producer's `tail` and consumer's `head` cannot false-share.
         assert_eq!(std::mem::size_of::<CachePadded<AtomicUsize>>(), 64);

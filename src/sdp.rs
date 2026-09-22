@@ -63,9 +63,13 @@ impl SessionDescription {
 
     pub fn add_candidates_incremental(&mut self, candidates: &[String]) {
         for section in &mut self.media_sections {
-            section.attributes.retain(|a| a.key != "candidate" && a.key != "end-of-candidates");
+            section
+                .attributes
+                .retain(|a| a.key != "candidate" && a.key != "end-of-candidates");
             for c in candidates {
-                section.attributes.push(Attribute::new("candidate", Some(c.clone())));
+                section
+                    .attributes
+                    .push(Attribute::new("candidate", Some(c.clone())));
             }
         }
     }
@@ -1341,15 +1345,12 @@ impl MediaSection {
         // mid, which Chrome rejects with "Invalid SDP line" when parsing a
         // rustrtc-generated SDP as an offer (re-INVITE). Split attributes
         // into transport-level (emitted first) and media-level (after mid).
-        let (transport, media): (Vec<_>, Vec<_>) = self
-            .attributes
-            .iter()
-            .partition(|a| {
-                matches!(
-                    a.key.as_str(),
-                    "ice-ufrag" | "ice-pwd" | "fingerprint" | "setup" | "candidate"
-                )
-            });
+        let (transport, media): (Vec<_>, Vec<_>) = self.attributes.iter().partition(|a| {
+            matches!(
+                a.key.as_str(),
+                "ice-ufrag" | "ice-pwd" | "fingerprint" | "setup" | "candidate"
+            )
+        });
         for attr in &transport {
             attr.write_line(out)?;
         }

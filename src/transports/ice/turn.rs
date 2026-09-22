@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow, bail};
 use md5::{Digest as Md5Digest, Md5};
+use parking_lot::Mutex as SyncMutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -7,7 +8,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
-use parking_lot::Mutex as SyncMutex;
 use tokio::time::timeout;
 
 use super::stun::{StunAttribute, StunClass, StunMessage, StunMethod, random_bytes};
@@ -101,9 +101,7 @@ impl TurnClient {
             IceTransportProtocol::Tcp => {
                 let stream = timeout(DEFAULT_STUN_TIMEOUT, TcpStream::connect(addr))
                     .await
-                    .map_err(|_| {
-                        anyhow::anyhow!("TURN TCP connect to {} timed out", addr)
-                    })??;
+                    .map_err(|_| anyhow::anyhow!("TURN TCP connect to {} timed out", addr))??;
                 let (read, write) = stream.into_split();
                 TurnTransport::Tcp {
                     read: Arc::new(Mutex::new(read)),

@@ -385,7 +385,6 @@ impl RtpPacket {
             buffer[payload_end..].fill(packet.padding_len);
         }
     }
-
 }
 
 pub fn calculate_abs_send_time(time: SystemTime) -> u32 {

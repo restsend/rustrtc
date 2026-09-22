@@ -1,6 +1,7 @@
 #![cfg(feature = "t38")]
 
 use rustrtc::config::MediaCapabilities;
+use rustrtc::t38::t30::{T30Role, T30State};
 use rustrtc::*;
 
 /// Helper: create a configuration with T.38 fax capabilities.
@@ -232,4 +233,108 @@ async fn test_t38_default_config_without_t38_caps() {
         "SDP should contain m=image even with defaults:\n{}",
         sdp
     );
+}
+
+fn from_hex(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+fn load_page() -> Vec<u8> {
+    #[derive(serde::Deserialize)]
+    struct Pkt {
+        dir: u8,
+        hex: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Raw {
+        t4_stream_len: usize,
+        packets: Vec<Pkt>,
+    }
+    let path = format!(
+        "{}/tests/fixtures/t38_session_v3.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let raw: Raw = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let mut bits: Vec<u8> = Vec::new();
+    for p in &raw.packets {
+        if p.dir != 0 {
+            continue;
+        }
+        if let Ok(rustrtc::t38::wire::WirePacket::Data { data_type, fields }) =
+            rustrtc::t38::wire::decode_wire(&from_hex(&p.hex))
+        {
+            if data_type == 0 {
+                continue;
+            }
+            for f in fields {
+                if f.field_type == 6 {
+                    for &by in &f.data {
+                        for k in (0..8).rev() {
+                            bits.push((by >> k) & 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let page: Vec<u8> = bits
+        .chunks(8)
+        .map(|c| c.iter().fold(0u8, |a, &b| (a << 1) | b))
+        .collect();
+    assert_eq!(page.len(), raw.t4_stream_len);
+    page
+}
+
+#[tokio::test]
+async fn test_t38_fax_call_over_peerconnection() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let mut caller_config = make_t38_config();
+    caller_config.external_ip = Some("127.0.0.1".to_string());
+    let mut callee_config = make_t38_config();
+    callee_config.external_ip = Some("127.0.0.1".to_string());
+
+    let caller = PeerConnection::new(caller_config);
+    let callee = PeerConnection::new(callee_config);
+
+    caller.add_transceiver(MediaKind::Image, TransceiverDirection::SendRecv);
+    callee.add_transceiver(MediaKind::Image, TransceiverDirection::SendRecv);
+
+    let offer = caller.create_offer().await.unwrap();
+    let offer_sdp = offer.to_sdp_string();
+    assert!(offer_sdp.contains("m=image"), "offer: {offer_sdp}");
+    let _ = caller.set_local_description(offer.clone());
+
+    let _ = callee.set_remote_description(offer).await;
+    let answer = callee.create_answer().await.unwrap();
+    let answer_sdp = answer.to_sdp_string();
+    assert!(answer_sdp.contains("m=image"), "answer: {answer_sdp}");
+    let _ = callee.set_local_description(answer.clone());
+    let _ = caller.set_remote_description(answer).await;
+
+    let caller_fax = caller
+        .init_t38_fax_with(rustrtc::t38::t30::T30FaxConfig::default(), T30Role::Caller)
+        .await
+        .unwrap();
+    let callee_fax = callee
+        .init_t38_fax_with(rustrtc::t38::t30::T30FaxConfig::default(), T30Role::Callee)
+        .await
+        .unwrap();
+
+    let page = load_page();
+    caller_fax.session.lock().await.set_tx_page(page.clone());
+    caller_fax.session.lock().await.set_two_dim_coding(true);
+
+    let (ce, fe) = tokio::join!(caller_fax.run_call(60_000), callee_fax.run_call(60_000));
+
+    let caller_state = caller_fax.session.lock().await.state;
+    let callee_state = callee_fax.session.lock().await.state;
+    assert_eq!(caller_state, T30State::Complete, "caller events: {ce:?}");
+    assert_eq!(callee_state, T30State::Complete, "callee events: {fe:?}");
+
+    let received = callee_fax.session.lock().await.take_page_data();
+    assert_eq!(received, page, "page differs over PC transports");
 }

@@ -60,7 +60,11 @@ impl JitterBuffer {
                 f.rtp_timestamp,
                 sample_ssrc(&sample),
                 f.marker,
-                if f.clock_rate == 0 { 8000 } else { f.clock_rate },
+                if f.clock_rate == 0 {
+                    8000
+                } else {
+                    f.clock_rate
+                },
             ),
             MediaSample::Video(f) => (
                 f.sequence_number,

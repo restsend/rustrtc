@@ -176,6 +176,12 @@ pub struct BitWriter {
     pos: usize, // bit position within data
 }
 
+impl Default for BitWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BitWriter {
     pub fn new() -> Self {
         Self {

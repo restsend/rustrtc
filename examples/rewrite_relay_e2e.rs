@@ -10,12 +10,10 @@
 //! Run: cargo run --example rewrite_relay_e2e -- --port 3000
 use anyhow::Result;
 use rustrtc::{
-    transports::ice::conn::IceConn,
-    transports::rtp::RtpTransport,
-    SdpType, SessionDescription,
+    SdpType, SessionDescription, transports::ice::conn::IceConn, transports::rtp::RtpTransport,
 };
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::watch;
 
@@ -136,7 +134,11 @@ async fn wait_audio_transport(pc: &rustrtc::PeerConnection) -> Option<Arc<RtpTra
     None
 }
 
-async fn handle_offer(offer_sdp: String, source: Arc<RtpTransport>, source_addr: std::net::SocketAddr) -> Result<String> {
+async fn handle_offer(
+    offer_sdp: String,
+    source: Arc<RtpTransport>,
+    source_addr: std::net::SocketAddr,
+) -> Result<String> {
     let offer = SessionDescription::parse(SdpType::Offer, &offer_sdp)?;
     let mut config = rustrtc::RtcConfiguration::default();
     let mut caps = rustrtc::config::MediaCapabilities::default();
@@ -153,7 +155,8 @@ async fn handle_offer(offer_sdp: String, source: Arc<RtpTransport>, source_addr:
     pc.set_remote_description(offer).await?;
     // Attach a sender to the offered audio m-line (PCMU/8000, PT 0) so the
     // answer is sendrecv and the browser gets a playout track.
-    let (_source_queue, track, _fb) = rustrtc::media::sample_track(rustrtc::media::MediaKind::Audio, 64);
+    let (_source_queue, track, _fb) =
+        rustrtc::media::sample_track(rustrtc::media::MediaKind::Audio, 64);
     let params = rustrtc::RtpCodecParameters {
         payload_type: 0,
         name: "PCMU".to_string(),
@@ -178,7 +181,12 @@ async fn handle_offer(offer_sdp: String, source: Arc<RtpTransport>, source_addr:
         let inject = format!("a=ssrc:10000 cname:e2e-bridge\r\n");
         sdp.insert_str(pos, &inject);
     }
-    eprintln!("[e2e] final answer to browser: recvonly={} sendrecv={} ssrc={}", sdp.contains("a=recvonly"), sdp.contains("a=sendrecv"), sdp.contains("a=ssrc:10000"));
+    eprintln!(
+        "[e2e] final answer to browser: recvonly={} sendrecv={} ssrc={}",
+        sdp.contains("a=recvonly"),
+        sdp.contains("a=sendrecv"),
+        sdp.contains("a=ssrc:10000")
+    );
 
     // Arm the RewriteBridge once DTLS/SRTP completes with the browser (the
     // per-sender transport only exists after connect), then pump.
@@ -186,7 +194,9 @@ async fn handle_offer(offer_sdp: String, source: Arc<RtpTransport>, source_addr:
         let mut state_rx = pc.subscribe_ice_connection_state();
         tokio::spawn(async move {
             loop {
-                if state_rx.changed().await.is_err() { break; }
+                if state_rx.changed().await.is_err() {
+                    break;
+                }
                 eprintln!("[e2e] ice state: {:?}", *state_rx.borrow());
             }
         });
@@ -196,24 +206,42 @@ async fn handle_offer(offer_sdp: String, source: Arc<RtpTransport>, source_addr:
             Some(dst) => {
                 struct CountObserver(std::sync::atomic::AtomicUsize);
                 impl rustrtc::peer_connection::RtpObserver for CountObserver {
-                    fn on_ingress(&self, packet: &rustrtc::rtp::RtpPacket, _addr: std::net::SocketAddr) {
+                    fn on_ingress(
+                        &self,
+                        packet: &rustrtc::rtp::RtpPacket,
+                        _addr: std::net::SocketAddr,
+                    ) {
                         let n = self.0.fetch_add(1, Ordering::SeqCst);
                         if n % 50 == 0 {
-                            eprintln!("[e2e][obs] src ingress #{} ssrc={} seq={}", n, packet.header.ssrc, packet.header.sequence_number);
+                            eprintln!(
+                                "[e2e][obs] src ingress #{} ssrc={} seq={}",
+                                n, packet.header.ssrc, packet.header.sequence_number
+                            );
                         }
                     }
                 }
-                source.add_observer(Arc::new(CountObserver(std::sync::atomic::AtomicUsize::new(0))));
+                source.add_observer(Arc::new(CountObserver(
+                    std::sync::atomic::AtomicUsize::new(0),
+                )));
                 struct EgressObserver(std::sync::atomic::AtomicUsize);
                 impl rustrtc::peer_connection::RtpObserver for EgressObserver {
-                    fn on_egress(&self, packet: &rustrtc::rtp::RtpPacket, addr: std::net::SocketAddr) {
+                    fn on_egress(
+                        &self,
+                        packet: &rustrtc::rtp::RtpPacket,
+                        addr: std::net::SocketAddr,
+                    ) {
                         let n = self.0.fetch_add(1, Ordering::SeqCst);
                         if n % 50 == 0 {
-                            eprintln!("[e2e][obs] dst egress #{} -> {} ssrc={} seq={}", n, addr, packet.header.ssrc, packet.header.sequence_number);
+                            eprintln!(
+                                "[e2e][obs] dst egress #{} -> {} ssrc={} seq={}",
+                                n, addr, packet.header.ssrc, packet.header.sequence_number
+                            );
                         }
                     }
                 }
-                dst.add_observer(Arc::new(EgressObserver(std::sync::atomic::AtomicUsize::new(0))));
+                dst.add_observer(Arc::new(EgressObserver(
+                    std::sync::atomic::AtomicUsize::new(0),
+                )));
                 source.bridge_rewrite_rules_to(
                     dst,
                     rustrtc::RtpRewriteBridgeOptions {

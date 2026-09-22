@@ -178,6 +178,39 @@ config.rtp_end_port = Some(50100);
 config.enable_upnp = true;
 ```
 
+## T.38 fax
+
+The `t38` feature provides a complete T.38 v3 terminal: IFP wire codec, UDPTL
+transport (with redundancy and gap recovery), a T.30 session engine
+(CED/DIS → DCS/TCF → CFR → page → EOP/MCF → DCN, with timers and retries),
+and V.21/V.27ter DSP for audio-gateway use.
+
+```rust
+use rustrtc::t38::endpoint::{FaxEndpoint, ReceiveCodec};
+use rustrtc::t38::t30::{T30FaxConfig, T30Role, T30Session};
+
+let mut session = T30Session::new(T30FaxConfig::default());
+session.role = T30Role::Callee;
+let endpoint = FaxEndpoint::from_socket(socket, remote, session);
+endpoint.set_codec(ReceiveCodec::Wire);
+let events = endpoint.run_call(60_000).await; // drives the whole fax session
+```
+
+### spandsp interop e2e
+
+`tests/t38_spandsp_interop.rs` runs real fax sessions against a spandsp-based
+T.38 terminal (`tools/t38-peer/t38_peer.py`, ctypes over the system
+libspandsp). Both directions are covered: rustrtc-caller→spandsp-callee
+(pixel-exact page verification) and spandsp-caller→rustrtc-callee.
+
+```
+# requires: python3 + PIL, and libspandsp (brew install spandsp)
+cargo test --features t38,t38-interop --test t38_spandsp_interop
+```
+
+Without the `t38-interop` feature the tests compile to nothing; with the
+feature but without python3/libspandsp they skip at runtime.
+
 ## Examples
 
 You can run the examples provided in the repository.
