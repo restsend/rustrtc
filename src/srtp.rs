@@ -109,12 +109,49 @@ pub enum SrtpDirection {
     Receiver,
 }
 
+/// RFC 4568 caps the negotiated MKI length at 128 octets.
+pub const MKI_MAX_LEN: usize = 128;
+
+/// Negotiated MKI configuration for an [`SrtpSession`] (RFC 3711 §4.2,
+/// RFC 4568 §4.1.2).
+///
+/// When an `a=crypto` line carries `|<mki-value>:<mki-length>`, senders append
+/// a `mki-length`-octet MKI field between the (padded) payload and the
+/// authentication tag, and the MKI is NOT covered by the authentication tag.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MkiParams {
+    /// Outbound MKI: raw bytes written on protect (big-endian encoding of the
+    /// negotiated decimal MKI value) and its length in octets.
+    pub tx: Option<(Vec<u8>, usize)>,
+    /// Inbound MKI length expected on unprotect. The received MKI value is
+    /// ignored (single-master-key sessions only need the length to locate the
+    /// authentication tag and payload boundary).
+    pub rx_len: Option<usize>,
+}
+
+impl MkiParams {
+    /// Outbound MKI length in octets (0 when not negotiated).
+    pub fn tx_len(&self) -> usize {
+        self.tx.as_ref().map_or(0, |(_, len)| *len)
+    }
+
+    /// Inbound MKI length in octets (0 when not negotiated).
+    pub fn rx_len(&self) -> usize {
+        self.rx_len.unwrap_or(0)
+    }
+}
+
 pub struct SrtpSession {
     profile: SrtpProfile,
     tx_keying: SrtpKeyingMaterial,
     rx_keying: SrtpKeyingMaterial,
     tx_contexts: HashMap<u32, SrtpContext>,
     rx_contexts: HashMap<u32, SrtpContext>,
+    /// MKI negotiated from the SDES `a=crypto` attributes.
+    mki: MkiParams,
+    /// Adaptive inbound MKI mode for SRTCP (session-wide: one RTCP remote per
+    /// session), settled on the first authenticated packet.
+    rtcp_rx_mki_active: Option<bool>,
 }
 
 /// Above this many per-SSRC contexts, stale ones (not seen for
@@ -139,7 +176,46 @@ impl SrtpSession {
             rx_keying,
             tx_contexts: HashMap::new(),
             rx_contexts: HashMap::new(),
+            mki: MkiParams::default(),
+            rtcp_rx_mki_active: None,
         })
+    }
+
+    /// Configure the outbound MKI (RFC 4568): every protected RTP/SRTCP packet
+    /// carries `value` (`len` octets, network byte order) between the payload
+    /// and the authentication tag. The MKI is excluded from the MAC.
+    pub fn set_tx_mki(&mut self, value: Vec<u8>, len: usize) -> Result<(), SrtpError> {
+        if len == 0 || len > MKI_MAX_LEN {
+            return Err(SrtpError::Internal(format!(
+                "MKI length {len} out of range 1..={MKI_MAX_LEN}"
+            )));
+        }
+        if value.len() != len {
+            return Err(SrtpError::Internal(format!(
+                "MKI value is {} bytes but negotiated length is {len}",
+                value.len()
+            )));
+        }
+        self.mki.tx = Some((value, len));
+        Ok(())
+    }
+
+    /// Configure the inbound MKI length (RFC 4568): packets from the remote may
+    /// carry an `len`-octet MKI field before the authentication tag. The value
+    /// is ignored; only the length matters to locate the tag.
+    pub fn set_rx_mki_len(&mut self, len: usize) -> Result<(), SrtpError> {
+        if len == 0 || len > MKI_MAX_LEN {
+            return Err(SrtpError::Internal(format!(
+                "MKI length {len} out of range 1..={MKI_MAX_LEN}"
+            )));
+        }
+        self.mki.rx_len = Some(len);
+        Ok(())
+    }
+
+    /// MKI configuration currently applied to this session.
+    pub fn mki_params(&self) -> &MkiParams {
+        &self.mki
     }
 
     pub fn protected_rtp_len(&self, packet: &RtpPacket) -> usize {
@@ -147,19 +223,25 @@ impl SrtpSession {
             + packet.payload.len()
             + packet.padding_len as usize
             + self.profile.tag_len()
+            + self.mki.tx_len()
     }
 
     pub fn protect_rtp(&mut self, packet: &RtpPacket, output: &mut [u8]) -> SrtpResult<()> {
         let ssrc = packet.header.ssrc;
         self.evict_stale_tx(ssrc);
+        let mki = self.mki.clone();
         let ctx = match self.tx_contexts.entry(ssrc) {
             Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => e.insert(SrtpContext::new(
-                ssrc,
-                self.profile,
-                self.tx_keying.clone(),
-                SrtpDirection::Sender,
-            )?),
+            Entry::Vacant(e) => {
+                let mut ctx = SrtpContext::new(
+                    ssrc,
+                    self.profile,
+                    self.tx_keying.clone(),
+                    SrtpDirection::Sender,
+                )?;
+                ctx.mki = mki;
+                e.insert(ctx)
+            }
         };
         ctx.last_used = std::time::Instant::now();
         ctx.protect(packet, output)
@@ -168,14 +250,19 @@ impl SrtpSession {
     pub fn unprotect_rtp(&mut self, packet: SrtpPacket) -> SrtpResult<RtpPacket> {
         let ssrc = packet.header.ssrc;
         self.evict_stale_rx(ssrc);
+        let mki = self.mki.clone();
         let ctx = match self.rx_contexts.entry(ssrc) {
             Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => e.insert(SrtpContext::new(
-                ssrc,
-                self.profile,
-                self.rx_keying.clone(),
-                SrtpDirection::Receiver,
-            )?),
+            Entry::Vacant(e) => {
+                let mut ctx = SrtpContext::new(
+                    ssrc,
+                    self.profile,
+                    self.rx_keying.clone(),
+                    SrtpDirection::Receiver,
+                )?;
+                ctx.mki = mki;
+                e.insert(ctx)
+            }
         };
         ctx.last_used = std::time::Instant::now();
         ctx.unprotect(packet)
@@ -188,14 +275,19 @@ impl SrtpSession {
         let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
 
         self.evict_stale_tx(ssrc);
+        let mki = self.mki.clone();
         let ctx = match self.tx_contexts.entry(ssrc) {
             Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => e.insert(SrtpContext::new(
-                ssrc,
-                self.profile,
-                self.tx_keying.clone(),
-                SrtpDirection::Sender,
-            )?),
+            Entry::Vacant(e) => {
+                let mut ctx = SrtpContext::new(
+                    ssrc,
+                    self.profile,
+                    self.tx_keying.clone(),
+                    SrtpDirection::Sender,
+                )?;
+                ctx.mki = mki;
+                e.insert(ctx)
+            }
         };
         ctx.last_used = std::time::Instant::now();
         ctx.protect_rtcp(packet)
@@ -209,17 +301,62 @@ impl SrtpSession {
         let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
 
         self.evict_stale_rx(ssrc);
+        let mki = self.mki.clone();
         let ctx = match self.rx_contexts.entry(ssrc) {
             Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => e.insert(SrtpContext::new(
-                ssrc,
-                self.profile,
-                self.rx_keying.clone(),
-                SrtpDirection::Receiver,
-            )?),
+            Entry::Vacant(e) => {
+                let mut ctx = SrtpContext::new(
+                    ssrc,
+                    self.profile,
+                    self.rx_keying.clone(),
+                    SrtpDirection::Receiver,
+                )?;
+                ctx.mki = mki;
+                e.insert(ctx)
+            }
         };
         ctx.last_used = std::time::Instant::now();
-        ctx.unprotect_rtcp(packet)
+
+        // Adaptive inbound MKI, mirroring the RTP path: some deployed stacks
+        // advertise `|...|1:1` in SDP but never send the MKI field, so try the
+        // advertised length first, then fall back to no-MKI. The winning mode
+        // is cached session-wide (one RTCP remote per session).
+        let advertised_mki_len = self.mki.rx_len();
+        let candidates: Vec<usize> = match self.rtcp_rx_mki_active {
+            Some(true) => vec![advertised_mki_len],
+            Some(false) => vec![0],
+            None => {
+                let mut v = Vec::with_capacity(2);
+                if advertised_mki_len > 0 {
+                    v.push(advertised_mki_len);
+                }
+                v.push(0);
+                v
+            }
+        };
+
+        let original = if candidates.len() > 1 {
+            packet.clone()
+        } else {
+            Vec::new()
+        };
+        let mut last_err = SrtpError::AuthenticationFailed;
+
+        for (idx, &mki_len) in candidates.iter().enumerate() {
+            match ctx.unprotect_rtcp_with_mki(packet, mki_len) {
+                Ok(()) => {
+                    self.rtcp_rx_mki_active = Some(mki_len > 0);
+                    return Ok(());
+                }
+                Err(e) => {
+                    last_err = e;
+                    if idx + 1 < candidates.len() {
+                        *packet = original.clone();
+                    }
+                }
+            }
+        }
+        Err(last_err)
     }
 
     /// Evict stale transmit contexts once the map crosses the high-water mark.
@@ -281,6 +418,13 @@ pub struct SrtpContext {
     /// contexts for SSRCs that have gone away (prevents unbounded growth as
     /// SSRCs churn across a long call / relay).
     last_used: std::time::Instant,
+    /// Negotiated MKI handling (RFC 4568/RFC 3711): outbound MKI bytes are
+    /// appended on protect; inbound packets are expected to carry an MKI of
+    /// `mki.rx_len()` octets before the auth tag.
+    mki: MkiParams,
+    /// Adaptive inbound MKI mode (see [`SrtpContext::unprotect`]): `None`
+    /// until the first packet settles it, then locked per SSRC.
+    rx_mki_active: Option<bool>,
 }
 
 impl fmt::Debug for SrtpContext {
@@ -370,6 +514,8 @@ impl SrtpContext {
             rtcp_index: 0,
             auth_scratch: Vec::new(),
             last_used: std::time::Instant::now(),
+            mki: MkiParams::default(),
+            rx_mki_active: None,
         })
     }
 
@@ -444,6 +590,7 @@ impl SrtpContext {
         let index = self.rtcp_index;
         // E-bit = 1 (Encrypted)
         let index_with_e = index | 0x8000_0000;
+        let mki_len = self.mki.tx_len();
 
         if let SrtpProfile::AeadAes128Gcm = self._profile {
             let nonce = self.build_gcm_rtcp_nonce(index);
@@ -469,10 +616,13 @@ impl SrtpContext {
                 .encrypt(Nonce::from_slice(&nonce), payload)
                 .map_err(|_| SrtpError::AuthenticationFailed)?;
 
-            // Reconstruct packet: Header || Ciphertext || Index
+            // Reconstruct packet: Header || Ciphertext || Index || [MKI]
             packet.truncate(8);
             packet.extend_from_slice(&ciphertext);
             packet.extend_from_slice(&index_with_e.to_be_bytes());
+            if let Some((value, _)) = self.mki.tx.as_ref() {
+                packet.extend_from_slice(&value[..mki_len]);
+            }
 
             return Ok(());
         }
@@ -486,23 +636,38 @@ impl SrtpContext {
         // Append SRTCP Index
         packet.extend_from_slice(&index_with_e.to_be_bytes());
 
-        // Authenticate
+        // Authenticate: the tag covers the packet up to and including the
+        // SRTCP index — the MKI (appended after the index) is excluded
+        // (RFC 3711 §3.4).
         let mut tag = [0u8; SHA1_LEN];
         self.auth_tag_rtcp_into(packet, &mut tag)?;
+        if let Some((value, _)) = self.mki.tx.as_ref() {
+            packet.extend_from_slice(&value[..mki_len]);
+        }
         packet.extend_from_slice(&tag[..self._profile.tag_len()]);
 
         Ok(())
     }
 
-    pub fn unprotect_rtcp(&mut self, packet: &mut Vec<u8>) -> SrtpResult<()> {
+    /// Attempt the SRTCP unprotect of `packet` assuming an inbound MKI field
+    /// of `mki_len` octets. On success the clear RTCP packet is written back
+    /// into `packet`; on failure the caller must restore the original bytes
+    /// before retrying with a different `mki_len`.
+    pub(crate) fn unprotect_rtcp_with_mki(
+        &mut self,
+        packet: &mut Vec<u8>,
+        mki_len: usize,
+    ) -> SrtpResult<()> {
         let tag_len = self._profile.tag_len();
-        if packet.len() < tag_len + 4 {
+        if packet.len() < tag_len + mki_len + 4 {
             return Err(SrtpError::PacketTooShort);
         }
 
         if let SrtpProfile::AeadAes128Gcm = self._profile {
-            // Read Index
-            let index_bytes = &packet[packet.len() - 4..];
+            // Layout: Header || Ciphertext+Tag || Index || [MKI]
+            let mki_start = packet.len() - mki_len;
+            let index_start = mki_start - 4;
+            let index_bytes = &packet[index_start..mki_start];
             let index_with_e = u32::from_be_bytes([
                 index_bytes[0],
                 index_bytes[1],
@@ -510,11 +675,6 @@ impl SrtpContext {
                 index_bytes[3],
             ]);
             let index = index_with_e & 0x7FFF_FFFF;
-
-            // Replay check
-            if index > self.rtcp_index {
-                self.rtcp_index = index;
-            }
 
             let nonce = self.build_gcm_rtcp_nonce(index);
             let cipher = self
@@ -527,10 +687,9 @@ impl SrtpContext {
             aad.extend_from_slice(&packet[..8]);
             aad.extend_from_slice(&index_with_e.to_be_bytes());
 
-            // Ciphertext = Packet body (after header, before index)
+            // Ciphertext = Packet body (after header, before index).
             // Note: Tag is appended to ciphertext in GCM encrypt output.
-            // So Ciphertext + Tag is what we have between Header and Index.
-            let ciphertext_and_tag = &packet[8..packet.len() - 4];
+            let ciphertext_and_tag = &packet[8..index_start];
 
             let payload = Payload {
                 msg: ciphertext_and_tag,
@@ -541,6 +700,11 @@ impl SrtpContext {
                 .decrypt(Nonce::from_slice(&nonce), payload)
                 .map_err(|_| SrtpError::AuthenticationFailed)?;
 
+            // Replay check (only after successful authentication)
+            if index > self.rtcp_index {
+                self.rtcp_index = index;
+            }
+
             // Reconstruct packet: Header || Plaintext
             packet.truncate(8);
             packet.extend_from_slice(&plaintext);
@@ -548,11 +712,14 @@ impl SrtpContext {
             return Ok(());
         }
 
-        // Split tag
-        let split = packet.len() - tag_len;
+        // Layout: Header || Payload || Index || [MKI] || Tag. The MKI sits
+        // between the index and the tag and is NOT authenticated (RFC 3711
+        // §3.4), so it must be stripped before verifying the tag.
+        let tag_start = packet.len() - tag_len;
         let mut tag = [0u8; SHA1_LEN];
-        tag[..tag_len].copy_from_slice(&packet[split..split + tag_len]);
-        packet.truncate(split);
+        tag[..tag_len].copy_from_slice(&packet[tag_start..tag_start + tag_len]);
+        packet.truncate(tag_start);
+        packet.truncate(packet.len() - mki_len);
 
         // Verify tag
         let mut expected = [0u8; SHA1_LEN];
@@ -574,8 +741,7 @@ impl SrtpContext {
         let e_bit = (index_with_e & 0x8000_0000) != 0;
         let index = index_with_e & 0x7FFF_FFFF;
 
-        // Replay check (simplified: just check if index is newer than last seen?)
-        // For now, we just update.
+        // Replay check (only after successful authentication)
         if index > self.rtcp_index {
             self.rtcp_index = index;
         }
@@ -637,6 +803,7 @@ impl SrtpContext {
             + packet.payload.len()
             + packet.padding_len as usize
             + self._profile.tag_len()
+            + self.mki.tx_len()
     }
 
     pub fn protect(&mut self, packet: &RtpPacket, output: &mut [u8]) -> SrtpResult<()> {
@@ -644,10 +811,11 @@ impl SrtpContext {
         let sequence_number = packet.header.sequence_number;
         let roc = self.estimate_roc(sequence_number);
         let tag_len = self._profile.tag_len();
+        let mki_len = self.mki.tx_len();
         let header_len = packet.header.encoded_len();
         let body_len = packet.payload.len() + packet.padding_len as usize;
         let body_end = header_len + body_len;
-        let protected_len = body_end + tag_len;
+        let protected_len = body_end + mki_len + tag_len;
 
         if output.len() != protected_len {
             return Err(SrtpError::Internal(format!(
@@ -671,10 +839,16 @@ impl SrtpContext {
                 .as_ref()
                 .ok_or(SrtpError::UnsupportedProfile)?;
             let (header, protected_body) = output.split_at_mut(header_len);
-            let (body, tag_output) = protected_body.split_at_mut(body_len);
+            // Packet layout: header || ciphertext || [MKI] || tag. The MKI is
+            // a trailer: neither encrypted nor part of the AEAD AAD.
+            let (body_and_mki, tag_output) = protected_body.split_at_mut(body_len + mki_len);
+            let (body, mki_output) = body_and_mki.split_at_mut(body_len);
             let tag = cipher
                 .encrypt_in_place_detached(Nonce::from_slice(&nonce), header, body)
                 .map_err(|_| SrtpError::AuthenticationFailed)?;
+            if let Some((value, _)) = self.mki.tx.as_ref() {
+                mki_output.copy_from_slice(&value[..mki_len]);
+            }
             tag_output.copy_from_slice(&tag);
         } else {
             let encrypts = !matches!(self._profile, SrtpProfile::NullCipherHmac);
@@ -684,6 +858,8 @@ impl SrtpContext {
                 cipher.apply_keystream(&mut output[header_len..body_end]);
             }
 
+            // The authentication tag covers the RTP header, the payload and
+            // the ROC — NOT the MKI (RFC 3711 §4.2: the MKI is a trailer).
             let mut mac = self
                 .rtp_auth_prototype
                 .as_ref()
@@ -692,7 +868,10 @@ impl SrtpContext {
             mac.update(&output[..body_end]);
             mac.update(&roc.to_be_bytes());
             let result = mac.finalize().into_bytes();
-            output[body_end..].copy_from_slice(&result[..tag_len]);
+            if let Some((value, _)) = self.mki.tx.as_ref() {
+                output[body_end..body_end + mki_len].copy_from_slice(&value[..mki_len]);
+            }
+            output[body_end + mki_len..].copy_from_slice(&result[..tag_len]);
         }
 
         self.update(sequence_number, roc);
@@ -700,8 +879,60 @@ impl SrtpContext {
     }
 
     pub fn unprotect(&mut self, mut packet: SrtpPacket) -> SrtpResult<RtpPacket> {
+        let advertised_mki_len = self.mki.rx_len();
+        // Adaptive inbound MKI (see `unprotect_with_mki`): try the peer's
+        // negotiated MKI length first, then fall back to no-MKI — some
+        // deployed stacks advertise `|...|1:1` in SDP (e.g. rustrtc
+        // ≤ 0.3.138, restsend/sipbot builds) but never actually send the
+        // MKI field. The winning mode is cached per SSRC.
+        let candidates: Vec<usize> = match self.rx_mki_active {
+            Some(true) => vec![advertised_mki_len],
+            Some(false) => vec![0],
+            None => {
+                let mut v = Vec::with_capacity(2);
+                if advertised_mki_len > 0 {
+                    v.push(advertised_mki_len);
+                }
+                v.push(0);
+                v
+            }
+        };
+
+        let original_body = if candidates.len() > 1 {
+            packet.body.clone()
+        } else {
+            BytesMut::new()
+        };
+        let mut last_err = SrtpError::AuthenticationFailed;
+
+        for (idx, &mki_len) in candidates.iter().enumerate() {
+            match self.unprotect_with_mki(&mut packet, mki_len) {
+                Ok(unprotected) => {
+                    self.rx_mki_active = Some(mki_len > 0);
+                    return Ok(unprotected);
+                }
+                Err(e) => {
+                    last_err = e;
+                    if idx + 1 < candidates.len() {
+                        packet.body = original_body.clone();
+                    }
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    /// Attempt the unprotect of `packet` assuming an inbound MKI field of
+    /// `mki_len` octets. On success the clear RTP packet is returned; on
+    /// failure the packet must be restored by the caller before retrying
+    /// with a different `mki_len`.
+    fn unprotect_with_mki(
+        &mut self,
+        packet: &mut SrtpPacket,
+        mki_len: usize,
+    ) -> SrtpResult<RtpPacket> {
         let tag_len = self._profile.tag_len();
-        if packet.body.len() < tag_len {
+        if packet.body.len() < tag_len + mki_len {
             return Err(SrtpError::PacketTooShort);
         }
 
@@ -715,8 +946,10 @@ impl SrtpContext {
                 .rtp_gcm_cipher
                 .as_ref()
                 .ok_or(SrtpError::UnsupportedProfile)?;
-            let split = packet.body.len() - tag_len;
-            let tag = aes_gcm::Tag::clone_from_slice(&packet.body[split..]);
+            // Layout: header || ciphertext || [MKI] || tag.
+            let tag_start = packet.body.len() - tag_len;
+            let split = packet.body.len() - tag_len - mki_len;
+            let tag = aes_gcm::Tag::clone_from_slice(&packet.body[tag_start..]);
             packet.body.truncate(split);
             cipher
                 .decrypt_in_place_detached(
@@ -727,14 +960,17 @@ impl SrtpContext {
                 )
                 .map_err(|_| SrtpError::AuthenticationFailed)?;
         } else {
-            let split = packet.body.len() - tag_len;
+            // Layout: header || payload(+padding) || [MKI] || tag. The sender
+            // computed the tag over header+payload+ROC only, so the MKI must
+            // be excluded from the MAC input here.
+            let split = packet.body.len() - tag_len - mki_len;
             if let Some(proto) = self.rtp_auth_prototype.as_ref() {
                 let mut mac = proto.clone();
                 mac.update(&self.auth_scratch);
                 mac.update(&packet.body[..split]);
                 mac.update(&roc.to_be_bytes());
                 let result = mac.finalize().into_bytes();
-                if !constant_time_eq(&packet.body[split..], &result[..tag_len]) {
+                if !constant_time_eq(&packet.body[split + mki_len..], &result[..tag_len]) {
                     return Err(SrtpError::AuthenticationFailed);
                 }
             }
@@ -762,11 +998,10 @@ impl SrtpContext {
         } else {
             0
         };
-
         self.update(sequence_number, roc);
         Ok(RtpPacket {
-            header: packet.header,
-            payload: packet.body.freeze(),
+            header: packet.header.clone(),
+            payload: packet.body.split().freeze(),
             padding_len,
         })
     }
@@ -1053,6 +1288,348 @@ mod tests {
 
         receiver.unprotect_rtp(p2).unwrap();
         receiver.unprotect_rtp(p1).unwrap();
+    }
+
+    fn mki_session(direction: SrtpDirection) -> SrtpSession {
+        let mut session =
+            SrtpSession::new(SrtpProfile::Aes128Sha1_80, material(), material()).unwrap();
+        match direction {
+            // Sender advertised `a=crypto:1 ... inline:...|2^31|1:1`.
+            SrtpDirection::Sender => session.set_tx_mki(vec![0x01], 1).unwrap(),
+            SrtpDirection::Receiver => session.set_rx_mki_len(1).unwrap(),
+        }
+        session
+    }
+
+    fn srtp_rtcp_packet(ssrc: u32) -> Vec<u8> {
+        // Minimal RTCP Sender Report: V=2, PT=201, one 32-bit word of body.
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&[0x81, 0xC8, 0x00, 0x01]);
+        packet.extend_from_slice(&ssrc.to_be_bytes());
+        packet.extend_from_slice(&[0x00; 4]);
+        packet
+    }
+
+    #[test]
+    fn mki_roundtrip_sha1_80() {
+        let mut sender = mki_session(SrtpDirection::Sender);
+        let mut receiver = mki_session(SrtpDirection::Receiver);
+
+        let packet = sample_packet(1);
+        let original = packet.payload.clone();
+        let mut raw = BytesMut::new();
+        raw.resize(sender.protected_rtp_len(&packet), 0);
+        sender.protect_rtp(&packet, &mut raw).unwrap();
+
+        // MKI (1 octet) sits between the payload and the 10-byte auth tag and
+        // carries the negotiated MKI value.
+        let header_len = packet.header.encoded_len();
+        assert_eq!(raw.len(), header_len + original.len() + 1 + 10);
+        assert_eq!(raw[header_len + original.len()], 0x01);
+
+        let packet = SrtpPacket::parse(raw).unwrap();
+        let packet = receiver.unprotect_rtp(packet).unwrap();
+        assert_eq!(packet.payload, original);
+    }
+
+    #[test]
+    fn mki_roundtrip_gcm() {
+        let mut sender =
+            SrtpSession::new(SrtpProfile::AeadAes128Gcm, material(), material()).unwrap();
+        sender.set_tx_mki(vec![0x01], 1).unwrap();
+        let mut receiver =
+            SrtpSession::new(SrtpProfile::AeadAes128Gcm, material(), material()).unwrap();
+        receiver.set_rx_mki_len(1).unwrap();
+
+        let packet = sample_packet(2);
+        let original = packet.payload.clone();
+        let mut raw = BytesMut::new();
+        raw.resize(sender.protected_rtp_len(&packet), 0);
+        sender.protect_rtp(&packet, &mut raw).unwrap();
+        assert_eq!(
+            raw.len(),
+            packet.header.encoded_len() + original.len() + 1 + 16
+        );
+
+        let packet = SrtpPacket::parse(raw).unwrap();
+        let packet = receiver.unprotect_rtp(packet).unwrap();
+        assert_eq!(packet.payload, original);
+    }
+
+    /// Regression test for the Groundwire interop failure (rustpbx issue
+    /// #281): a peer that negotiated `|1:1` MKI appends the MKI octet before
+    /// the auth tag. A receiver without MKI support must reject those packets
+    /// with an authentication failure (not silently accept corrupted
+    /// payloads), and a receiver WITH the negotiated MKI length must accept
+    /// them.
+    #[test]
+    fn sender_mki_requires_receiver_mki_support() {
+        let mut sender = mki_session(SrtpDirection::Sender);
+
+        let packet = sample_packet(3);
+        let mut raw = BytesMut::new();
+        raw.resize(sender.protected_rtp_len(&packet), 0);
+        sender.protect_rtp(&packet, &mut raw).unwrap();
+        let srtp_packet = SrtpPacket::parse(raw.clone()).unwrap();
+
+        // Receiver without negotiated MKI: tag check must fail (previously
+        // every such packet was dropped as "SRTP authentication failed").
+        let mut plain =
+            SrtpSession::new(SrtpProfile::Aes128Sha1_80, material(), material()).unwrap();
+        let err = plain
+            .unprotect_rtp(SrtpPacket::parse(raw.clone()).unwrap())
+            .unwrap_err();
+        assert!(matches!(err, SrtpError::AuthenticationFailed));
+
+        // Receiver with the negotiated MKI length accepts the packet.
+        let mut receiver = mki_session(SrtpDirection::Receiver);
+        receiver.unprotect_rtp(srtp_packet).unwrap();
+    }
+
+    /// A "lying" peer: advertises `|1:1` MKI in its SDP (the way rustrtc
+    /// ≤ 0.3.138 and old sipbot/rustpbx community builds do) but never
+    /// actually sends MKI bytes. The adaptive receiver must still
+    /// authenticate those packets after the first failed attempt.
+    #[test]
+    fn adaptive_receiver_accepts_mki_advertising_peer_without_mki_bytes() {
+        // The remote "protects" with no MKI even though its SDP said 1:1.
+        let mut remote =
+            SrtpSession::new(SrtpProfile::Aes128Sha1_80, material(), material()).unwrap();
+
+        // We negotiated rx_mki_len=1 from the remote's advertised crypto.
+        let mut receiver = mki_session(SrtpDirection::Receiver);
+
+        for seq in [11u16, 12, 13] {
+            let packet = sample_packet(seq);
+            let original = packet.payload.clone();
+            let mut raw = BytesMut::new();
+            raw.resize(remote.protected_rtp_len(&packet), 0);
+            remote.protect_rtp(&packet, &mut raw).unwrap();
+
+            let packet = receiver
+                .unprotect_rtp(SrtpPacket::parse(raw).unwrap())
+                .unwrap();
+            assert_eq!(packet.payload, original);
+        }
+    }
+
+    #[test]
+    fn srtcp_mki_roundtrip_and_without_support_fails() {
+        let mut sender = mki_session(SrtpDirection::Sender);
+        let mut receiver = mki_session(SrtpDirection::Receiver);
+
+        let mut packet = srtp_rtcp_packet(0xdead_beef);
+        sender.protect_rtcp(&mut packet).unwrap();
+
+        // Packet(12) + index(4) + MKI(1) + tag(10)
+        assert_eq!(packet.len(), 12 + 4 + 1 + 10);
+
+        let mut without_mki =
+            SrtpSession::new(SrtpProfile::Aes128Sha1_80, material(), material()).unwrap();
+        let mut rejected = packet.clone();
+        assert!(matches!(
+            without_mki.unprotect_rtcp(&mut rejected),
+            Err(SrtpError::AuthenticationFailed)
+        ));
+
+        receiver.unprotect_rtcp(&mut packet).unwrap();
+        assert_eq!(packet, srtp_rtcp_packet(0xdead_beef));
+    }
+
+    /// SRTCP counterpart of the Groundwire regression: a "lying" peer whose
+    /// SDP advertises `|1:1` MKI but whose packets carry no MKI field must
+    /// still be accepted by the adaptive fallback.
+    #[test]
+    fn srtcp_adaptive_accepts_mki_advertising_peer_without_mki_bytes() {
+        // Remote advertises MKI but protects WITHOUT one (old rustrtc builds).
+        let mut remote =
+            SrtpSession::new(SrtpProfile::Aes128Sha1_80, material(), material()).unwrap();
+        // We negotiated rx_mki_len=1 from the remote's advertised crypto.
+        let mut receiver = mki_session(SrtpDirection::Receiver);
+
+        for ssrc in [0x1111_2222u32, 0x3333_4444] {
+            let mut packet = srtp_rtcp_packet(ssrc);
+            remote.protect_rtcp(&mut packet).unwrap();
+            receiver.unprotect_rtcp(&mut packet).unwrap();
+            assert_eq!(packet, srtp_rtcp_packet(ssrc));
+        }
+    }
+
+    #[test]
+    fn srtcp_mki_roundtrip_gcm() {
+        let mut sender =
+            SrtpSession::new(SrtpProfile::AeadAes128Gcm, material(), material()).unwrap();
+        sender.set_tx_mki(vec![0x05], 1).unwrap();
+        let mut receiver =
+            SrtpSession::new(SrtpProfile::AeadAes128Gcm, material(), material()).unwrap();
+        receiver.set_rx_mki_len(1).unwrap();
+
+        let mut packet = srtp_rtcp_packet(0x1234);
+        sender.protect_rtcp(&mut packet).unwrap();
+        receiver.unprotect_rtcp(&mut packet).unwrap();
+        assert_eq!(packet, srtp_rtcp_packet(0x1234));
+    }
+
+    #[test]
+    fn set_mki_validates_lengths() {
+        let mut session =
+            SrtpSession::new(SrtpProfile::Aes128Sha1_80, material(), material()).unwrap();
+        assert!(session.set_tx_mki(vec![0x01; 2], 1).is_err());
+        assert!(session.set_tx_mki(vec![0x01], 0).is_err());
+        assert!(
+            session
+                .set_tx_mki(
+                    vec![0x01; crate::srtp::MKI_MAX_LEN + 1],
+                    crate::srtp::MKI_MAX_LEN + 1
+                )
+                .is_err()
+        );
+        assert!(session.set_rx_mki_len(0).is_err());
+        assert!(session.set_rx_mki_len(crate::srtp::MKI_MAX_LEN).is_ok());
+        assert_eq!(session.mki_params().rx_len, Some(crate::srtp::MKI_MAX_LEN));
+    }
+
+    // ── Independent RFC 3711 wire-format verification ──────────────────────
+    //
+    // The roundtrip tests above prove rustrtc ↔ rustrtc consistency, but a
+    // shared misreading of the spec would pass them both. The helpers below
+    // re-implement the AES-CM key derivation, the AES-CM counter IV, and the
+    // HMAC-SHA1 authentication input exactly as specified by RFC 3711 (and
+    // verified line-by-line against libsrtp's srtp_kdf_generate /
+    // srtp_protect), so a regression in KDF labels, IV layout, ROC handling
+    // or MKI framing fails here even if both sides regress identically.
+
+    /// RFC 3711 §4.3 AES-CM key derivation: AES-CTR keystream under the master
+    /// key with IV = (master_salt || 00 00) XOR (label << 64).
+    fn rfc3711_kdf(master_key: &[u8], master_salt: &[u8], label: u8, out_len: usize) -> Vec<u8> {
+        let mut iv = [0u8; 16];
+        iv[..master_salt.len()].copy_from_slice(master_salt);
+        iv[7] ^= label; // label * 2^64 in the big-endian block
+        let mut out = vec![0u8; out_len];
+        <Aes128Ctr as ctr::cipher::KeyIvInit>::new_from_slices(master_key, &iv)
+            .expect("kdf cipher")
+            .apply_keystream(&mut out);
+        out
+    }
+
+    /// RFC 3711 §4.1.1 AES-CM packet IV (verified against libsrtp
+    /// srtp_protect): salt || 00 00, XOR ssrc@4..8, XOR index(48-bit)<<16 in
+    /// the trailing 64-bit word.
+    fn rfc3711_rtp_iv(session_salt: &[u8], ssrc: u32, roc: u32, seq: u16) -> [u8; 16] {
+        let index = ((roc as u64) << 16) | seq as u64;
+        let mut iv = [0u8; 16];
+        iv[..14].copy_from_slice(&session_salt[..14]);
+        for (i, b) in ssrc.to_be_bytes().iter().enumerate() {
+            iv[4 + i] ^= b;
+        }
+        let shifted = (index << 16).to_be_bytes();
+        for (i, b) in shifted.iter().enumerate() {
+            iv[8 + i] ^= b;
+        }
+        iv
+    }
+
+    /// Groundwire wire format (rustpbx issue #281), verified without going
+    /// through SrtpSession's own KDF/MAC: protect a packet with a 1-octet MKI
+    /// under a fixed master key, then independently derive the session keys,
+    /// decrypt the payload and recompute the HMAC-SHA1 tag.
+    #[test]
+    fn rfc3711_wire_format_independent_verification() {
+        let master_key = vec![0x5au8; 16];
+        let master_salt = vec![0xa5u8; 14];
+        let keying = SrtpKeyingMaterial::new(master_key.clone(), master_salt.clone());
+
+        let mut sender =
+            SrtpSession::new(SrtpProfile::Aes128Sha1_80, keying.clone(), keying.clone()).unwrap();
+        sender.set_tx_mki(vec![0x7f], 1).unwrap();
+
+        let seq: u16 = 0x3047;
+        let roc: u32 = 0;
+        let packet = sample_packet(seq);
+        let original = packet.payload.clone();
+        let ssrc = packet.header.ssrc;
+
+        let mut raw = BytesMut::new();
+        raw.resize(sender.protected_rtp_len(&packet), 0);
+        sender.protect_rtp(&packet, &mut raw).unwrap();
+
+        // Independent key derivation (labels per RFC 3711 §4.3).
+        let session_key = rfc3711_kdf(&master_key, &master_salt, 0x00, 16);
+        let auth_key = rfc3711_kdf(&master_key, &master_salt, 0x01, 20);
+        let session_salt = rfc3711_kdf(&master_key, &master_salt, 0x02, 14);
+
+        let header_len = packet.header.encoded_len();
+        let payload = &raw[header_len..header_len + original.len()];
+        assert_eq!(
+            raw[header_len + original.len()],
+            0x7f,
+            "MKI must sit between payload and tag"
+        );
+
+        // Independent AES-CM decryption of the payload.
+        let iv = rfc3711_rtp_iv(&session_salt, ssrc, roc, seq);
+        let mut clear = payload.to_vec();
+        <Aes128Ctr as ctr::cipher::KeyIvInit>::new_from_slices(&session_key, &iv)
+            .expect("packet cipher")
+            .apply_keystream(&mut clear);
+        assert_eq!(clear, original, "payload must decrypt with the RFC 3711 IV");
+
+        // Independent HMAC-SHA1 tag over header || encrypted payload || ROC
+        // (the MKI is NOT part of the authenticated portion, RFC 3711 §4.2 —
+        // libsrtp srtp_protect authenticates auth_start..rtp_len then mixes
+        // the ROC via srtp_auth_compute).
+        let mut mac =
+            <HmacSha1 as hmac::digest::KeyInit>::new_from_slice(&auth_key).expect("auth key");
+        mac.update(&raw[..header_len + original.len()]);
+        mac.update(&roc.to_be_bytes());
+        let expected = mac.finalize().into_bytes();
+        let tag = &raw[header_len + original.len() + 1..];
+        assert_eq!(tag.len(), 10, "SHA1_80 tag length");
+        assert_eq!(
+            tag,
+            &expected[..10],
+            "tag must match an independent HMAC computation"
+        );
+    }
+
+    /// The same independent verification for a packet WITHOUT MKI (the plain
+    /// Groundwire-offered crypto shape on the caller leg).
+    #[test]
+    fn rfc3711_wire_format_without_mki() {
+        let master_key = vec![0x3cu8; 16];
+        let master_salt = vec![0xc3u8; 14];
+        let keying = SrtpKeyingMaterial::new(master_key.clone(), master_salt.clone());
+        let mut sender =
+            SrtpSession::new(SrtpProfile::Aes128Sha1_80, keying.clone(), keying.clone()).unwrap();
+
+        let seq: u16 = 7;
+        let packet = sample_packet(seq);
+        let original = packet.payload.clone();
+        let ssrc = packet.header.ssrc;
+        let mut raw = BytesMut::new();
+        raw.resize(sender.protected_rtp_len(&packet), 0);
+        sender.protect_rtp(&packet, &mut raw).unwrap();
+
+        let session_key = rfc3711_kdf(&master_key, &master_salt, 0x00, 16);
+        let auth_key = rfc3711_kdf(&master_key, &master_salt, 0x01, 20);
+        let session_salt = rfc3711_kdf(&master_key, &master_salt, 0x02, 14);
+
+        let header_len = packet.header.encoded_len();
+        let payload = &raw[header_len..header_len + original.len()];
+        assert_eq!(payload.len(), original.len());
+        let mut clear = payload.to_vec();
+        let iv = rfc3711_rtp_iv(&session_salt, ssrc, 0, seq);
+        <Aes128Ctr as ctr::cipher::KeyIvInit>::new_from_slices(&session_key, &iv)
+            .expect("packet cipher")
+            .apply_keystream(&mut clear);
+        assert_eq!(clear, original);
+
+        let mut mac =
+            <HmacSha1 as hmac::digest::KeyInit>::new_from_slice(&auth_key).expect("auth key");
+        mac.update(&raw[..header_len + original.len()]);
+        mac.update(&0u32.to_be_bytes());
+        let expected = mac.finalize().into_bytes();
+        assert_eq!(&raw[header_len + original.len()..], &expected[..10]);
     }
 }
 

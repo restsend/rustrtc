@@ -707,13 +707,27 @@ pub(crate) fn generate_sdes_key_params() -> String {
     format!("inline:{}", encoded)
 }
 
-pub(crate) fn parse_sdes_key_params(params: &str) -> RtcResult<Vec<u8>> {
+/// Parsed SDES `inline:` key-params (RFC 4568 §4.1.2):
+/// `inline:<key|salt>["|" lifetime]["|" <mki-value> ":" <mki-length>]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SdesKeyParams {
+    /// Decoded master key + master salt bytes.
+    pub key_salt: Vec<u8>,
+    /// Raw `|<lifetime>` segment as written in the SDP (e.g. `2^31`).
+    pub lifetime: Option<String>,
+    /// Raw `|<mki-value>:<mki-length>` segment as written in the SDP.
+    pub mki_raw: Option<String>,
+    /// Decoded MKI: the decimal `mki-value` encoded big-endian in
+    /// `mki-length` octets (the bytes carried in each protected packet).
+    pub mki: Option<(Vec<u8>, usize)>,
+}
+
+pub(crate) fn parse_sdes_key_params_full(params: &str) -> RtcResult<SdesKeyParams> {
     if !params.starts_with("inline:") {
         return Err(RtcError::Internal("Unsupported key params".into()));
     }
-    let key_salt_base64 = &params[7..];
-    let key_salt_base64 = key_salt_base64
-        .split('|')
+    let mut segments = params[7..].split('|');
+    let key_salt_base64 = segments
         .next()
         .ok_or_else(|| RtcError::Internal("Empty key params after 'inline:' prefix".into()))?;
     if key_salt_base64.is_empty() {
@@ -721,9 +735,64 @@ pub(crate) fn parse_sdes_key_params(params: &str) -> RtcResult<Vec<u8>> {
             "Empty key params after 'inline:' prefix".into(),
         ));
     }
-    BASE64_STANDARD
+    let key_salt = BASE64_STANDARD
         .decode(key_salt_base64)
-        .map_err(|e| RtcError::Internal(format!("Invalid base64 key: {}", e)))
+        .map_err(|e| RtcError::Internal(format!("Invalid base64 key: {}", e)))?;
+
+    let lifetime = segments.next().map(str::trim).filter(|s| !s.is_empty());
+    let lifetime = lifetime.map(str::to_string);
+    let mki_raw = segments.next().map(str::trim).filter(|s| !s.is_empty());
+    let mki = match mki_raw {
+        Some(raw) => {
+            let (value, length) = raw.split_once(':').ok_or_else(|| {
+                RtcError::Internal(format!(
+                    "Invalid MKI params '{raw}', expected <value>:<length>"
+                ))
+            })?;
+            let length = length
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| RtcError::Internal(format!("Invalid MKI length '{length}'")))?;
+            if length == 0 || length > crate::srtp::MKI_MAX_LEN {
+                return Err(RtcError::Internal(format!(
+                    "MKI length {length} out of range 1..={}",
+                    crate::srtp::MKI_MAX_LEN
+                )));
+            }
+            let value = value.trim();
+            let numeric: u64 = value
+                .parse()
+                .map_err(|_| RtcError::Internal(format!("Invalid MKI value '{value}'")))?;
+            // The value must fit in `length` octets (u64 values cannot exceed
+            // 8; longer MKI fields can only carry zero-padded values).
+            if length < 8 && numeric >= (1u64 << (8 * length)) {
+                return Err(RtcError::Internal(format!(
+                    "MKI value {numeric} does not fit in {length} octets"
+                )));
+            }
+            if length > 8 && numeric != 0 {
+                return Err(RtcError::Internal(format!(
+                    "MKI value {numeric} does not fit in {length} octets"
+                )));
+            }
+            // RFC 4568: the MKI carried in packets is the binary encoding of
+            // the decimal mki-value in mki-length octets (network byte order).
+            let bytes = if length > 8 {
+                vec![0u8; length]
+            } else {
+                numeric.to_be_bytes()[8 - length..].to_vec()
+            };
+            Some((bytes, length))
+        }
+        None => None,
+    };
+
+    Ok(SdesKeyParams {
+        key_salt,
+        lifetime,
+        mki_raw: mki_raw.map(str::to_string),
+        mki,
+    })
 }
 
 pub(crate) fn map_crypto_suite(suite: &str) -> RtcResult<crate::srtp::SrtpProfile> {
@@ -735,6 +804,27 @@ pub(crate) fn map_crypto_suite(suite: &str) -> RtcResult<crate::srtp::SrtpProfil
             "Unsupported crypto suite: {}",
             suite
         ))),
+    }
+}
+
+/// Resolve the MKI parameters for an SDES session from the crypto attributes
+/// each side wrote (`local` = our attribute, `remote` = the peer's).
+///
+/// Policy: we NEVER send MKI, even when the peer's SDP advertises it. Several
+/// deployed stacks write `|...|1:1` into their SDP without implementing the
+/// MKI packet format (e.g. rustrtc ≤ 0.3.138, restsend/sipbot builds) — a
+/// compliant MKI-bearing send from us would fail authentication on every
+/// packet there. Inbound stays adaptive: [`crate::srtp::SrtpSession`]
+/// receives with the peer's advertised MKI length when their packets actually
+/// carry one, and falls back to no-MKI framing otherwise.
+pub(crate) fn negotiate_sdes_mki(
+    local: &SdesKeyParams,
+    remote: &SdesKeyParams,
+) -> crate::srtp::MkiParams {
+    let _ = local;
+    crate::srtp::MkiParams {
+        tx: None,
+        rx_len: remote.mki.as_ref().map(|(_, len)| *len),
     }
 }
 
@@ -2060,6 +2150,46 @@ impl PeerConnection {
         })
     }
 
+    /// Block until both the local and remote descriptions carry `a=crypto`
+    /// attributes (SDES negotiation complete), or the timeout expires.
+    async fn wait_for_sdes_attributes(
+        inner: &std::sync::Arc<PeerConnectionInner>,
+        timeout: std::time::Duration,
+    ) -> RtcResult<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            {
+                let remote = inner.remote_description.lock();
+                let local = inner.local_description.lock();
+                let has_remote_crypto = remote
+                    .as_ref()
+                    .map(|d| {
+                        d.media_sections
+                            .iter()
+                            .any(|m| !m.get_crypto_attributes().is_empty())
+                    })
+                    .unwrap_or(false);
+                let has_local_crypto = local
+                    .as_ref()
+                    .map(|d| {
+                        d.media_sections
+                            .iter()
+                            .any(|m| !m.get_crypto_attributes().is_empty())
+                    })
+                    .unwrap_or(false);
+                if has_remote_crypto && has_local_crypto {
+                    return Ok(());
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(RtcError::Internal(
+                    "Timed out waiting for SDES crypto attributes".into(),
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
     pub(crate) async fn start_dtls(
         &self,
         is_client: bool,
@@ -2084,7 +2214,17 @@ impl PeerConnection {
             self.config().label.clone(),
             self.config().probation_max_packets,
         );
-        if self.config().transport_mode == TransportMode::Rtp && self.config().enable_latching {
+        // Symmetric-RTP latching: SDES legs are direct UDP like plain RTP, so
+        // a NAT'd peer whose SDP advertises a private `c=` still needs egress
+        // to follow its observed packet source. SRTP packets keep the clear
+        // RTP header, so the latch's header inspection is compatible.
+        if (self.config().transport_mode == TransportMode::Rtp
+            || self.config().transport_mode == TransportMode::Srtp)
+            && self.config().enable_latching
+        {
+            self.inner.pc_span.in_scope(|| {
+                debug!("start_dtls: enabling symmetric-RTP latch (direct mode)");
+            });
             ice_conn.enable_latch_on_rtp();
         }
 
@@ -2147,6 +2287,13 @@ impl PeerConnection {
                 .ice_transport
                 .set_data_receiver(ice_conn.clone())
                 .await;
+            // The direct transport can reach "connected" the moment its
+            // socket binds — on the ANSWERER side that may be before the
+            // local answer exists, so `setup_sdes` would fail with "Missing
+            // crypto attributes" and leave the leg permanently without SRTP
+            // (rustpbx issue #281 e2e flake). Wait for the negotiation to
+            // complete instead of failing the transport start.
+            Self::wait_for_sdes_attributes(&self.inner, std::time::Duration::from_secs(10)).await?;
             self.setup_sdes(&rtp_transport)?;
             let rtcp_loop = Self::create_rtcp_loop(
                 rtp_transport.clone(),
@@ -2373,7 +2520,7 @@ impl PeerConnection {
     }
 
     fn setup_sdes(&self, rtp_transport: &Arc<RtpTransport>) -> RtcResult<()> {
-        let (tx_keying, rx_keying, profile) = {
+        let (tx_keying, rx_keying, profile, mki) = {
             let remote_desc = self.inner.remote_description.lock();
             let local_desc = self.inner.local_description.lock();
 
@@ -2393,8 +2540,8 @@ impl PeerConnection {
                     return Err(RtcError::Internal("Crypto suite mismatch".into()));
                 }
 
-                let rx_key_salt = parse_sdes_key_params(&remote.key_params)?;
-                let tx_key_salt = parse_sdes_key_params(&local.key_params)?;
+                let rx_params = parse_sdes_key_params_full(&remote.key_params)?;
+                let tx_params = parse_sdes_key_params_full(&local.key_params)?;
 
                 let (key_len, salt_len) = match profile {
                     crate::srtp::SrtpProfile::Aes128Sha1_80
@@ -2403,21 +2550,31 @@ impl PeerConnection {
                     _ => (16, 14),
                 };
 
-                if rx_key_salt.len() < key_len + salt_len || tx_key_salt.len() < key_len + salt_len
+                if rx_params.key_salt.len() < key_len + salt_len
+                    || tx_params.key_salt.len() < key_len + salt_len
                 {
                     return Err(RtcError::Internal("Invalid key length".into()));
                 }
 
                 let rx_keying = crate::srtp::SrtpKeyingMaterial::new(
-                    rx_key_salt[..key_len].to_vec(),
-                    rx_key_salt[key_len..key_len + salt_len].to_vec(),
+                    rx_params.key_salt[..key_len].to_vec(),
+                    rx_params.key_salt[key_len..key_len + salt_len].to_vec(),
                 );
                 let tx_keying = crate::srtp::SrtpKeyingMaterial::new(
-                    tx_key_salt[..key_len].to_vec(),
-                    tx_key_salt[key_len..key_len + salt_len].to_vec(),
+                    tx_params.key_salt[..key_len].to_vec(),
+                    tx_params.key_salt[key_len..key_len + salt_len].to_vec(),
                 );
 
-                (tx_keying, rx_keying, profile)
+                // RFC 4568 §5: MKI is only in effect when BOTH sides carry
+                // it — the answerer must echo the offered MKI params. A peer
+                // that answers with a bare `inline:` (e.g. baresip builds its
+                // own crypto template and never echoes MKI) has rejected the
+                // MKI operation, so we must not send MKI even though we
+                // advertised it in our offer; otherwise the peer would fail
+                // authentication on every packet we send.
+                let mki = negotiate_sdes_mki(&tx_params, &rx_params);
+
+                (tx_keying, rx_keying, profile, mki)
             } else {
                 return Err(RtcError::Internal(
                     "Missing crypto attributes for SDES".into(),
@@ -2425,8 +2582,18 @@ impl PeerConnection {
             }
         };
 
-        let session = crate::srtp::SrtpSession::new(profile, tx_keying, rx_keying)
+        let mut session = crate::srtp::SrtpSession::new(profile, tx_keying, rx_keying)
             .map_err(|e| RtcError::Internal(format!("SRTP error: {}", e)))?;
+        if let Some((value, len)) = mki.tx.clone()
+            && let Err(e) = session.set_tx_mki(value, len)
+        {
+            return Err(RtcError::Internal(format!("SRTP error: {}", e)));
+        }
+        if let Some(len) = mki.rx_len
+            && let Err(e) = session.set_rx_mki_len(len)
+        {
+            return Err(RtcError::Internal(format!("SRTP error: {}", e)));
+        }
 
         rtp_transport.start_srtp(session);
 
@@ -5107,22 +5274,37 @@ impl PeerConnectionInner {
             }
 
             if self.config.transport_mode == TransportMode::Srtp {
+                // RFC 4568 §7.1.2: an answer echoes the selected offer
+                // crypto's suite and tag (and lifetime); we deliberately do
+                // NOT echo (or advertise) an MKI — see negotiate_sdes_mki.
+                // Offers use our defaults (tag 1, lifetime 2^31, no MKI).
                 let mut suite = "AES_CM_128_HMAC_SHA1_80".to_string();
+                let mut tag = "1".to_string();
+                let mut tail = "|2^31".to_string();
                 if sdp_type == SdpType::Answer {
                     let remote_desc = self.remote_description.lock();
-                    if let Some(remote) = &*remote_desc
-                        && let Some(c) = remote
+                    if let Some(c) = remote_desc.as_ref().and_then(|remote| {
+                        remote
                             .media_sections
                             .iter()
                             .flat_map(|m| m.get_crypto_attributes())
                             .find(|c| map_crypto_suite(&c.crypto_suite).is_ok())
-                    {
+                    }) {
                         suite = c.crypto_suite.clone();
+                        tag = c.tag.to_string();
+                        if let Ok(params) = parse_sdes_key_params_full(&c.key_params) {
+                            let mut rebuilt = String::new();
+                            if let Some(ref lifetime) = params.lifetime {
+                                rebuilt.push('|');
+                                rebuilt.push_str(lifetime);
+                            }
+                            tail = rebuilt;
+                        }
                     }
                 }
 
                 let key_params = generate_sdes_key_params();
-                let crypto_val = format!("1 {} {}|2^31|1:1", suite, key_params);
+                let crypto_val = format!("{tag} {suite} {key_params}{tail}");
                 section
                     .attributes
                     .push(Attribute::new("crypto", Some(crypto_val)));
@@ -8938,12 +9120,75 @@ a=ssrc:67890 cname:foo\r\n";
         let params = generate_sdes_key_params();
         assert!(params.starts_with("inline:"));
 
-        let key = parse_sdes_key_params(&params).expect("Failed to parse generated params");
-        assert_eq!(key.len(), 30); // 30 bytes for AES_CM_128_HMAC_SHA1_80 (16 key + 14 salt)
+        let parsed = parse_sdes_key_params_full(&params).expect("Failed to parse generated params");
+        assert_eq!(parsed.key_salt.len(), 30); // 30 bytes for AES_CM_128_HMAC_SHA1_80 (16 key + 14 salt)
+        assert_eq!(parsed.lifetime, None);
+        assert_eq!(parsed.mki, None);
 
         // Test invalid params
-        assert!(parse_sdes_key_params("invalid").is_err());
-        assert!(parse_sdes_key_params("inline:invalid_base64").is_err());
+        assert!(parse_sdes_key_params_full("invalid").is_err());
+        assert!(parse_sdes_key_params_full("inline:invalid_base64").is_err());
+    }
+
+    #[test]
+    fn test_sdes_key_parsing_with_lifetime_and_mki() {
+        // Groundwire-style crypto line: lifetime + MKI 1:1 (issue #281).
+        let key_salt = BASE64_STANDARD.encode([0xABu8; 30]);
+        let params = parse_sdes_key_params_full(&format!("inline:{key_salt}|2^31|1:1"))
+            .expect("lifetime+MKI params must parse");
+        assert_eq!(params.key_salt, vec![0xABu8; 30]);
+        assert_eq!(params.lifetime.as_deref(), Some("2^31"));
+        assert_eq!(params.mki_raw.as_deref(), Some("1:1"));
+        assert_eq!(params.mki, Some((vec![0x01u8], 1)));
+
+        // MKI value 0x0102 with 2-octet length encodes big-endian.
+        let params = parse_sdes_key_params_full(&format!("inline:{key_salt}|2^31|258:2"))
+            .expect("2-octet MKI must parse");
+        assert_eq!(params.mki, Some((vec![0x01u8, 0x02], 2)));
+
+        // A lone second segment is a lifetime (informational, leniently
+        // accepted); malformed MKI segments are rejected, not ignored.
+        let params = parse_sdes_key_params_full(&format!("inline:{key_salt}|nope"))
+            .expect("informational lifetime is accepted verbatim");
+        assert_eq!(params.lifetime.as_deref(), Some("nope"));
+        assert_eq!(params.mki, None);
+        assert!(parse_sdes_key_params_full(&format!("inline:{key_salt}|2^31|1:")).is_err());
+        assert!(parse_sdes_key_params_full(&format!("inline:{key_salt}|2^31|1:0")).is_err());
+        assert!(parse_sdes_key_params_full(&format!("inline:{key_salt}|2^31|1:300")).is_err());
+        assert!(
+            parse_sdes_key_params_full(&format!("inline:{key_salt}|2^31|123456789012:2")).is_err()
+        );
+        assert!(parse_sdes_key_params_full(&format!("inline:{key_salt}|2^31|x:1")).is_err());
+    }
+
+    fn sdes_params(key_params: &str) -> SdesKeyParams {
+        parse_sdes_key_params_full(key_params).expect("key params must parse")
+    }
+
+    #[test]
+    fn test_negotiate_sdes_mki_policy() {
+        let base64_key = BASE64_STANDARD.encode([0x11u8; 30]);
+        let bare = sdes_params(&format!("inline:{base64_key}"));
+        let with_mki = sdes_params(&format!("inline:{base64_key}|2^31|1:1"));
+
+        // Policy: we never send MKI regardless of what either side
+        // advertised; inbound stays adaptive on the peer's advertised
+        // length.
+        let mki = negotiate_sdes_mki(&with_mki, &with_mki);
+        assert_eq!(mki.tx, None, "we never send MKI");
+        assert_eq!(mki.rx_len, Some(1), "peer-advertised MKI length drives rx");
+
+        let mki = negotiate_sdes_mki(&with_mki, &bare);
+        assert_eq!(mki.tx, None);
+        assert_eq!(mki.rx_len, None);
+
+        let mki = negotiate_sdes_mki(&bare, &with_mki);
+        assert_eq!(mki.tx, None);
+        assert_eq!(mki.rx_len, Some(1));
+
+        let mki = negotiate_sdes_mki(&bare, &bare);
+        assert_eq!(mki.tx, None);
+        assert_eq!(mki.rx_len, None);
     }
 
     #[tokio::test]
@@ -9004,6 +9249,86 @@ a=sendrecv\r\n";
         );
         let crypto = section.attributes.iter().find(|a| a.key == "crypto");
         assert!(crypto.is_some(), "SRTP answer must include a=crypto");
+    }
+
+    /// RFC 4568 §7.1.2: the answer must echo the offer's selected crypto tag,
+    /// suite and lifetime. MKI is deliberately NOT echoed (see
+    /// negotiate_sdes_mki): deployed stacks that advertise MKI without
+    /// implementing it (rustpbx issue #281) would fail on every MKI-bearing
+    /// packet we send.
+    #[tokio::test]
+    async fn create_answer_srtp_mode_echoes_offer_mki_and_tag() {
+        use crate::TransportMode;
+        let remote_offer = "v=0\r\n\
+o=root 1 1 IN IP4 168.86.151.229\r\n\
+s=-\r\n\
+c=IN IP4 168.86.151.229\r\n\
+t=0 0\r\n\
+m=audio 19960 RTP/SAVP 0 8 101\r\n\
+a=crypto:2 AES_CM_128_HMAC_SHA1_32 inline:89V4GlaGoakgb7PsBmJewbHgseDfcgDmwPqSeSte|2^31|1:1\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:8 PCMA/8000\r\n\
+a=rtpmap:101 telephone-event/8000\r\n\
+a=sendrecv\r\n";
+
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Srtp;
+        let pc = PeerConnection::new(config);
+        let offer = SessionDescription::parse(SdpType::Offer, remote_offer).expect("parse offer");
+        pc.set_remote_description(offer).await.expect("set remote");
+
+        let answer = pc.create_answer().await.unwrap();
+        let crypto = answer.media_sections[0]
+            .attributes
+            .iter()
+            .find(|a| a.key == "crypto")
+            .expect("SRTP answer must include a=crypto");
+        let crypto_val = crypto.value.as_ref().unwrap();
+
+        // Echo tag (2), suite (SHA1_32 per the selected offer line) and the
+        // lifetime; the MKI params are intentionally dropped.
+        assert!(
+            crypto_val.starts_with("2 AES_CM_128_HMAC_SHA1_32 inline:"),
+            "answer must echo offer tag/suite, got: {crypto_val}"
+        );
+        assert!(
+            crypto_val.ends_with("|2^31"),
+            "answer must keep the offer lifetime, got: {crypto_val}"
+        );
+        assert!(
+            !crypto_val.ends_with("1:1"),
+            "answer must NOT advertise MKI, got: {crypto_val}"
+        );
+    }
+
+    /// Offers generated in Srtp mode are universally receivable: bare
+    /// `inline:<key>` with a lifetime and NO MKI (an MKI offer combined with
+    /// our no-MKI send policy would break peers that take the offer
+    /// literally... and every peer that ignores MKI — i.e. everyone).
+    #[tokio::test]
+    async fn create_offer_srtp_mode_has_no_mki() {
+        use crate::TransportMode;
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Srtp;
+        let pc = PeerConnection::new(config);
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+
+        let offer = pc.create_offer().await.unwrap();
+        let crypto = offer.media_sections[0]
+            .attributes
+            .iter()
+            .find(|a| a.key == "crypto")
+            .expect("SRTP offer must include a=crypto");
+        let crypto_val = crypto.value.as_ref().unwrap();
+        assert!(
+            crypto_val.starts_with("1 AES_CM_128_HMAC_SHA1_80 inline:")
+                && crypto_val.ends_with("|2^31"),
+            "offer must be bare inline + lifetime, got: {crypto_val}"
+        );
+        assert!(
+            !crypto_val.contains("1:1"),
+            "offer must not advertise MKI, got: {crypto_val}"
+        );
     }
 
     #[tokio::test]
