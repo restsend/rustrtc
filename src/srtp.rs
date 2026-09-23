@@ -182,8 +182,9 @@ impl SrtpSession {
     }
 
     /// Configure the outbound MKI (RFC 4568): every protected RTP/SRTCP packet
-    /// carries `value` (`len` octets, network byte order) between the payload
-    /// and the authentication tag. The MKI is excluded from the MAC.
+    /// carries `value` (`len` octets, network byte order). For AES-CM it precedes
+    /// the authentication tag; for AES-GCM it follows the tag (and SRTCP index).
+    /// The MKI is excluded from authentication.
     pub fn set_tx_mki(&mut self, value: Vec<u8>, len: usize) -> Result<(), SrtpError> {
         if len == 0 || len > MKI_MAX_LEN {
             return Err(SrtpError::Internal(format!(
@@ -201,8 +202,8 @@ impl SrtpSession {
     }
 
     /// Configure the inbound MKI length (RFC 4568): packets from the remote may
-    /// carry an `len`-octet MKI field before the authentication tag. The value
-    /// is ignored; only the length matters to locate the tag.
+    /// carry a `len`-octet MKI field at the profile-specific trailer position.
+    /// The value is ignored; only the length matters to locate the tag.
     pub fn set_rx_mki_len(&mut self, len: usize) -> Result<(), SrtpError> {
         if len == 0 || len > MKI_MAX_LEN {
             return Err(SrtpError::Internal(format!(
@@ -839,10 +840,10 @@ impl SrtpContext {
                 .as_ref()
                 .ok_or(SrtpError::UnsupportedProfile)?;
             let (header, protected_body) = output.split_at_mut(header_len);
-            // Packet layout: header || ciphertext || [MKI] || tag. The MKI is
-            // a trailer: neither encrypted nor part of the AEAD AAD.
-            let (body_and_mki, tag_output) = protected_body.split_at_mut(body_len + mki_len);
-            let (body, mki_output) = body_and_mki.split_at_mut(body_len);
+            // RFC 7714: header || ciphertext || tag || [MKI].
+            // The MKI is neither encrypted nor part of the AEAD AAD.
+            let (body, trailer) = protected_body.split_at_mut(body_len);
+            let (tag_output, mki_output) = trailer.split_at_mut(tag_len);
             let tag = cipher
                 .encrypt_in_place_detached(Nonce::from_slice(&nonce), header, body)
                 .map_err(|_| SrtpError::AuthenticationFailed)?;
@@ -946,10 +947,9 @@ impl SrtpContext {
                 .rtp_gcm_cipher
                 .as_ref()
                 .ok_or(SrtpError::UnsupportedProfile)?;
-            // Layout: header || ciphertext || [MKI] || tag.
-            let tag_start = packet.body.len() - tag_len;
+            // RFC 7714: header || ciphertext || tag || [MKI].
             let split = packet.body.len() - tag_len - mki_len;
-            let tag = aes_gcm::Tag::clone_from_slice(&packet.body[tag_start..]);
+            let tag = aes_gcm::Tag::clone_from_slice(&packet.body[split..split + tag_len]);
             packet.body.truncate(split);
             cipher
                 .decrypt_in_place_detached(
