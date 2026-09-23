@@ -9251,7 +9251,8 @@ a=ssrc:67890 cname:foo\r\n";
             *pc.inner.local_description.lock() = Some(answer.clone());
             let (_tx, socket_rx) = tokio::sync::watch::channel(None);
             let transport = Arc::new(RtpTransport::new(
-                IceConn::new(socket_rx, "127.0.0.1:4000".parse().unwrap(), None), true,
+                IceConn::new(socket_rx, "127.0.0.1:4000".parse().unwrap(), None),
+                true,
             ));
             pc.setup_sdes(&transport).unwrap();
             for bad_len in [key_len - 1, key_len + 2] {
@@ -9259,10 +9260,16 @@ a=ssrc:67890 cname:foo\r\n";
                 let bad_sdp = sdp.replace(&encoded, &bad_key);
                 let malformed = SessionDescription::parse(SdpType::Offer, &bad_sdp).unwrap();
                 *pc.inner.remote_description.lock() = Some(malformed.clone());
-                assert!(pc.setup_sdes(&transport).is_err(), "{suite} RX length {bad_len}");
+                assert!(
+                    pc.setup_sdes(&transport).is_err(),
+                    "{suite} RX length {bad_len}"
+                );
                 *pc.inner.remote_description.lock() = Some(offer.clone());
                 *pc.inner.local_description.lock() = Some(malformed);
-                assert!(pc.setup_sdes(&transport).is_err(), "{suite} TX length {bad_len}");
+                assert!(
+                    pc.setup_sdes(&transport).is_err(),
+                    "{suite} TX length {bad_len}"
+                );
                 *pc.inner.local_description.lock() = Some(answer.clone());
             }
             pc.close();
