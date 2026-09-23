@@ -68,14 +68,14 @@ impl SrtpProfile {
         }
     }
 
-    fn salt_len(&self) -> usize {
+    pub(crate) fn salt_len(&self) -> usize {
         match self {
             Self::AeadAes128Gcm => 12,
             _ => 14,
         }
     }
 
-    fn key_len(&self) -> usize {
+    pub(crate) fn key_len(&self) -> usize {
         16
     }
 

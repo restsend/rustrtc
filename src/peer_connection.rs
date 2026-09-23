@@ -700,9 +700,9 @@ struct PeerConnectionInner {
     pc_span: tracing::Span,
 }
 
-pub(crate) fn generate_sdes_key_params() -> String {
-    let mut key_salt = [0u8; 30];
-    rand::fill(&mut key_salt);
+pub(crate) fn generate_sdes_key_params(profile: crate::srtp::SrtpProfile) -> String {
+    let mut key_salt = vec![0u8; profile.key_len() + profile.salt_len()];
+    rand::fill(key_salt.as_mut_slice());
     let encoded = BASE64_STANDARD.encode(key_salt);
     format!("inline:{}", encoded)
 }
@@ -2543,15 +2543,11 @@ impl PeerConnection {
                 let rx_params = parse_sdes_key_params_full(&remote.key_params)?;
                 let tx_params = parse_sdes_key_params_full(&local.key_params)?;
 
-                let (key_len, salt_len) = match profile {
-                    crate::srtp::SrtpProfile::Aes128Sha1_80
-                    | crate::srtp::SrtpProfile::Aes128Sha1_32 => (16, 14),
-                    crate::srtp::SrtpProfile::AeadAes128Gcm => (16, 12),
-                    _ => (16, 14),
-                };
+                let key_len = profile.key_len();
+                let salt_len = profile.salt_len();
 
-                if rx_params.key_salt.len() < key_len + salt_len
-                    || tx_params.key_salt.len() < key_len + salt_len
+                if rx_params.key_salt.len() != key_len + salt_len
+                    || tx_params.key_salt.len() != key_len + salt_len
                 {
                     return Err(RtcError::Internal("Invalid key length".into()));
                 }
@@ -5303,7 +5299,7 @@ impl PeerConnectionInner {
                     }
                 }
 
-                let key_params = generate_sdes_key_params();
+                let key_params = generate_sdes_key_params(map_crypto_suite(&suite)?);
                 let crypto_val = format!("{tag} {suite} {key_params}{tail}");
                 section
                     .attributes
@@ -9117,7 +9113,7 @@ a=ssrc:67890 cname:foo\r\n";
 
     #[test]
     fn test_sdes_key_generation_and_parsing() {
-        let params = generate_sdes_key_params();
+        let params = generate_sdes_key_params(crate::srtp::SrtpProfile::Aes128Sha1_80);
         assert!(params.starts_with("inline:"));
 
         let parsed = parse_sdes_key_params_full(&params).expect("Failed to parse generated params");
@@ -9216,6 +9212,61 @@ a=ssrc:67890 cname:foo\r\n";
 
         let crypto_val = crypto.unwrap().value.as_ref().unwrap();
         assert!(crypto_val.starts_with("1 AES_CM_128_HMAC_SHA1_80 inline:"));
+    }
+
+    #[tokio::test]
+    async fn sdes_answer_key_length_matches_selected_suite() {
+        for (suite, key_len) in [
+            ("AEAD_AES_128_GCM", 28),
+            ("AES_CM_128_HMAC_SHA1_80", 30),
+            ("AES_CM_128_HMAC_SHA1_32", 30),
+        ] {
+            let pc = PeerConnection::new(RtcConfiguration {
+                transport_mode: TransportMode::Srtp,
+                ..Default::default()
+            });
+            let peer_key = vec![0x11; key_len];
+            let encoded = BASE64_STANDARD.encode(&peer_key);
+            let fallback = BASE64_STANDARD.encode([0x22; 30]);
+            let sdp = format!(
+                "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+                 m=audio 4000 RTP/SAVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n\
+                 a=crypto:1 {suite} inline:{encoded}\r\n\
+                 a=crypto:2 AES_CM_128_HMAC_SHA1_80 inline:{fallback}\r\n"
+            );
+            let offer = SessionDescription::parse(SdpType::Offer, &sdp).unwrap();
+            pc.set_remote_description(offer.clone()).await.unwrap();
+            let answer = pc.create_answer().await.unwrap();
+            let crypto = answer.media_sections[0].get_crypto_attributes();
+            assert_eq!(crypto.len(), 1);
+            assert_eq!(crypto[0].crypto_suite, suite);
+            let params = parse_sdes_key_params_full(&crypto[0].key_params).unwrap();
+            let key_salt = params.key_salt;
+            assert_eq!(key_salt.len(), key_len, "{suite}");
+            assert_ne!(key_salt, peer_key, "each direction needs its own key");
+            assert!(params.mki.is_none());
+
+            // Exercise the production SDES setup with the generated answer,
+            // then ensure neither short nor oversized material is accepted.
+            *pc.inner.local_description.lock() = Some(answer.clone());
+            let (_tx, socket_rx) = tokio::sync::watch::channel(None);
+            let transport = Arc::new(RtpTransport::new(
+                IceConn::new(socket_rx, "127.0.0.1:4000".parse().unwrap(), None), true,
+            ));
+            pc.setup_sdes(&transport).unwrap();
+            for bad_len in [key_len - 1, key_len + 2] {
+                let bad_key = BASE64_STANDARD.encode(vec![0x33; bad_len]);
+                let bad_sdp = sdp.replace(&encoded, &bad_key);
+                let malformed = SessionDescription::parse(SdpType::Offer, &bad_sdp).unwrap();
+                *pc.inner.remote_description.lock() = Some(malformed.clone());
+                assert!(pc.setup_sdes(&transport).is_err(), "{suite} RX length {bad_len}");
+                *pc.inner.remote_description.lock() = Some(offer.clone());
+                *pc.inner.local_description.lock() = Some(malformed);
+                assert!(pc.setup_sdes(&transport).is_err(), "{suite} TX length {bad_len}");
+                *pc.inner.local_description.lock() = Some(answer.clone());
+            }
+            pc.close();
+        }
     }
 
     #[tokio::test]
