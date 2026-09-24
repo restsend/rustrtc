@@ -1229,8 +1229,17 @@ impl PeerConnection {
         }
         transceiver.set_receiver(Some(receiver));
 
-        let mut list = self.inner.transceivers.lock();
-        list.push(transceiver.clone());
+        self.inner.transceivers.lock().push(transceiver.clone());
+
+        // If the transport is already up (renegotiation), record it so a sender
+        // installed later via set_sender is connected. Direct RTP records it
+        // once the remote description selects the media transport.
+        if matches!(kind, MediaKind::Audio | MediaKind::Video)
+            && self.inner.config.transport_mode != TransportMode::Rtp
+            && let Some(transport) = self.inner.rtp_transport.lock().as_ref()
+        {
+            transceiver.set_rtp_transport(Arc::downgrade(transport));
+        }
         transceiver
     }
 
@@ -1972,6 +1981,9 @@ impl PeerConnection {
                     if self.inner.config.transport_mode != TransportMode::Rtp {
                         let transport_guard = self.inner.rtp_transport.lock();
                         if let Some(transport) = &*transport_guard {
+                            // Record it on the transceiver too, so a sender
+                            // installed later via set_sender is connected.
+                            t.set_rtp_transport(Arc::downgrade(transport));
                             receiver.set_transport(
                                 transport.clone(),
                                 Some(self.inner.event_tx.clone()),
