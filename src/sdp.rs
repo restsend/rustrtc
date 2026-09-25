@@ -78,6 +78,10 @@ impl SessionDescription {
         let mut session = SessionSection::default();
         let mut current_media: Option<MediaSection> = None;
         let mut media_sections = Vec::new();
+        // Whether each media section (and the current one) states its own
+        // direction attribute.
+        let mut media_has_direction: Vec<bool> = Vec::new();
+        let mut current_has_direction = false;
         let mut saw_version = false;
         let mut saw_origin = false;
         let mut saw_name = false;
@@ -126,6 +130,7 @@ impl SessionDescription {
                 "a" => {
                     let attr = Attribute::from_line(value);
                     if let Some(media) = current_media.as_mut() {
+                        current_has_direction |= Direction::from_attribute(&attr.key).is_some();
                         media.apply_attribute(attr);
                     } else {
                         session.attributes.push(attr);
@@ -134,7 +139,9 @@ impl SessionDescription {
                 "m" => {
                     if let Some(media) = current_media.take() {
                         media_sections.push(media);
+                        media_has_direction.push(current_has_direction);
                     }
+                    current_has_direction = false;
                     current_media = Some(MediaSection::from_m_line(value)?);
                 }
                 _ => {
@@ -148,6 +155,25 @@ impl SessionDescription {
 
         if let Some(media) = current_media {
             media_sections.push(media);
+            media_has_direction.push(current_has_direction);
+        }
+
+        // RFC 8866 §6.7: a session-level direction attribute applies to every
+        // media section that does not state its own.
+        if let Some(session_direction) = session
+            .attributes
+            .iter()
+            .rev()
+            .find_map(|attr| Direction::from_attribute(&attr.key))
+        {
+            for (media, has_direction) in media_sections.iter_mut().zip(&media_has_direction) {
+                // Not SCTP data channels: they ignore direction attributes
+                // (RFC 8841 §9.2).
+                let sctp = media.kind == MediaKind::Application && media.protocol.contains("SCTP");
+                if !has_direction && !sctp {
+                    media.direction = session_direction;
+                }
+            }
         }
 
         if !saw_version {
