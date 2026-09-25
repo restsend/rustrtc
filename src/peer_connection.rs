@@ -4947,11 +4947,23 @@ impl PeerConnectionInner {
             IceGathererState::Complete
         );
         let mut desc = SessionDescription::new(sdp_type);
-        desc.session.origin = default_origin();
-        if let Some(ext_ip) = &self.config.external_ip {
-            desc.session.origin.unicast_address = ext_ip.clone();
+        // RFC 3264 §8, RFC 8829 §5.2.2 / §5.3.2: after the first description,
+        // keep the previous local o= line and increment its version by one.
+        let previous_origin = self
+            .local_description
+            .lock()
+            .as_ref()
+            .map(|previous| previous.session.origin.clone());
+        if let Some(mut origin) = previous_origin {
+            origin.session_version = origin.session_version.wrapping_add(1);
+            desc.session.origin = origin;
+        } else {
+            desc.session.origin = default_origin();
+            if let Some(ext_ip) = &self.config.external_ip {
+                desc.session.origin.unicast_address = ext_ip.clone();
+            }
+            desc.session.origin.session_version += 1;
         }
-        desc.session.origin.session_version += 1;
         if !desc
             .session
             .attributes
