@@ -27,10 +27,11 @@ pub mod t38;
 pub mod transports;
 
 pub use config::{
-    ApplicationCapability, AudioCapability, BundlePolicy, CertificateConfig, IceCredentialType,
-    IceServer, IceTcpPolicy, IceTransportPolicy, MediaCapabilities, RecorderInterceptors,
-    RtcConfiguration, RtcConfigurationBuilder, RtcpMuxPolicy, SdpCompatibilityMode, T38Capability,
-    T38FaxRateManagement, T38UdpEC, TransportMode, VideoCapability,
+    ApplicationCapability, AudioCapability, BundlePolicy, CertificateConfig,
+    ExternalIpCandidateType, IceCredentialType, IceServer, IceTcpPolicy, IceTransportPolicy,
+    MediaCapabilities, RecorderInterceptors, RtcConfiguration, RtcConfigurationBuilder,
+    RtcpMuxPolicy, SdpCompatibilityMode, T38Capability, T38FaxRateManagement, T38UdpEC,
+    TransportMode, VideoCapability,
 };
 pub use errors::{RtcError, RtcResult, SdpError, SdpResult};
 pub use peer_connection::{

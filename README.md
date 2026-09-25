@@ -131,6 +131,7 @@ All configuration goes through `RtcConfiguration` (or its builder `RtcConfigurat
 - **`ice_transport_policy`** — `All` or `Relay`.
 - **`rtp_start_port` / `rtp_end_port`** — Restrict RTP/ICE to a port range.
 - **`external_ip`** — Override the external IP for ICE candidates (NAT scenarios).
+- **`external_ip_candidate_type`** — How ICE advertises `external_ip`: `Host` (default) replaces the host candidate's address; `ServerReflexive` keeps the host candidate and adds `external_ip` as a srflx candidate on the same socket (1:1 NAT, RFC 8445 §5.1.1.2). WebRTC mode only.
 - **`bind_ip`** — Bind to a specific local IP.
 - **`disable_ipv6`** — Disable IPv6 candidate gathering.
 - **`enable_ice_lite`** — Enable ICE Lite mode.

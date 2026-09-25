@@ -105,6 +105,21 @@ pub enum BufferDropStrategy {
     DropOldest,
 }
 
+/// How `external_ip` is advertised in ICE candidates.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum ExternalIpCandidateType {
+    /// Replace each non-loopback host candidate's address with `external_ip`
+    /// (the private bind address is not advertised).
+    #[default]
+    Host,
+    /// Keep the host candidate on the bind address and advertise
+    /// `external_ip` alongside it as a server-reflexive candidate, as for a
+    /// 1:1 NAT (RFC 8445 §5.1.1.2). Peers on the private network keep a
+    /// direct path. ICE (WebRTC mode) only; with `IceTransportPolicy::Relay`
+    /// it behaves as `Host`.
+    ServerReflexive,
+}
+
 /// Tracks user-supplied certificate material.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct CertificateConfig {
@@ -475,6 +490,10 @@ pub struct RtcConfiguration {
     /// use this IP instead of the local bind IP. The local bind address is
     /// stored in `related_address` on the candidate.
     pub external_ip: Option<String>,
+    /// How ICE candidates advertise `external_ip` (default: replace the host
+    /// candidate's address).
+    #[serde(default)]
+    pub external_ip_candidate_type: ExternalIpCandidateType,
     /// Override the advertised port in SDP `m=` line and candidates
     /// (for NAT port forwarding).
     ///
@@ -645,6 +664,7 @@ impl PartialEq for RtcConfiguration {
             && self.enable_gcc == other.enable_gcc
             && self.media_capabilities == other.media_capabilities
             && self.external_ip == other.external_ip
+            && self.external_ip_candidate_type == other.external_ip_candidate_type
             && self.external_port == other.external_port
             && self.bind_ip == other.bind_ip
             && self.disable_ipv6 == other.disable_ipv6
@@ -709,6 +729,7 @@ impl Default for RtcConfiguration {
             enable_gcc: default_enable_gcc(),
             media_capabilities: None,
             external_ip: None,
+            external_ip_candidate_type: ExternalIpCandidateType::default(),
             external_port: None,
             bind_ip: None,
             disable_ipv6: false,
@@ -892,6 +913,11 @@ impl RtcConfigurationBuilder {
 
     pub fn external_ip(mut self, ip: String) -> Self {
         self.inner.external_ip = Some(ip);
+        self
+    }
+
+    pub fn external_ip_candidate_type(mut self, typ: ExternalIpCandidateType) -> Self {
+        self.inner.external_ip_candidate_type = typ;
         self
     }
 
