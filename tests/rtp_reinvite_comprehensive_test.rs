@@ -827,3 +827,107 @@ async fn test_direction_reads_current_direction_not_the_reoffer_preference() {
     assert_eq!(t.direction(), TransceiverDirection::RecvOnly);
     assert_eq!(reoffer(&pc, Direction::RecvOnly).await, Direction::RecvOnly);
 }
+
+/// RFC 3264 §6.1 / RFC 8829 §5.3.1: an answer is the reverse of the offered
+/// direction limited to our own intent (`set_direction`), not a mirror of the
+/// offer. Holds we started survive the remote's offers.
+#[tokio::test]
+async fn test_answer_combines_offer_with_local_direction() {
+    use peer_connection::TransceiverDirection as Local;
+    // (our direction, remote offer, expected answer)
+    let cases = [
+        (Local::SendOnly, Direction::SendRecv, Direction::SendOnly),
+        (Local::SendOnly, Direction::SendOnly, Direction::Inactive),
+        (Local::SendOnly, Direction::RecvOnly, Direction::SendOnly),
+        (Local::RecvOnly, Direction::SendRecv, Direction::RecvOnly),
+        (Local::RecvOnly, Direction::RecvOnly, Direction::Inactive),
+        (Local::Inactive, Direction::SendRecv, Direction::Inactive),
+        (Local::SendRecv, Direction::SendOnly, Direction::RecvOnly),
+        (Local::SendRecv, Direction::Inactive, Direction::Inactive),
+    ];
+    for (local, offered, expected) in cases {
+        let pc = rtp_pc_with_audio_sender();
+        answer_remote_offer(&pc, Direction::SendRecv).await;
+        pc.get_transceivers()[0].set_direction(local);
+        assert_eq!(
+            answer_remote_offer(&pc, offered).await,
+            expected,
+            "local {local:?}, remote offered {offered:?}"
+        );
+        // Answering keeps our preference: the next offer still carries it.
+        assert_eq!(reoffer(&pc, Direction::SendRecv).await, local.into());
+    }
+}
+
+/// `set_direction` between applying the remote offer and answering states
+/// the direction we want to answer with (W3C `transceiver.direction`).
+#[tokio::test]
+async fn test_set_direction_after_remote_offer_limits_the_answer() {
+    use peer_connection::TransceiverDirection as Local;
+    for (local, expected) in [
+        (Local::RecvOnly, Direction::RecvOnly),
+        (Local::SendOnly, Direction::SendOnly),
+        (Local::Inactive, Direction::Inactive),
+        (Local::SendRecv, Direction::SendRecv),
+    ] {
+        let pc = rtp_pc_with_audio_sender();
+        let offer = create_minimal_sdp(SdpType::Offer, "0", Direction::SendRecv);
+        pc.set_remote_description(offer).await.unwrap();
+        pc.get_transceivers()[0].set_direction(local);
+        let answer = pc.create_answer().await.unwrap();
+        assert_eq!(answer.media_sections[0].direction, expected, "{local:?}");
+    }
+}
+
+/// MID-less SIP offers: each answer section answers its own m= line.
+#[tokio::test]
+async fn test_answer_directions_for_mid_less_m_lines() {
+    let pc = rtp_pc_with_audio_sender();
+    let (_source, track, _) =
+        rustrtc::media::track::sample_track(rustrtc::media::MediaKind::Audio, 10);
+    pc.add_track(
+        track,
+        RtpCodecParameters {
+            payload_type: 0,
+            name: "PCMU".to_string(),
+            clock_rate: 8000,
+            channels: 1,
+        },
+    )
+    .unwrap();
+    let raw = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nc=IN IP4 127.0.0.1\r\n\
+               m=audio 40000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\na=sendonly\r\n\
+               m=audio 40002 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=recvonly\r\n";
+    let offer = SessionDescription::parse(SdpType::Offer, raw).unwrap();
+    pc.set_remote_description(offer).await.unwrap();
+    let answer = pc.create_answer().await.unwrap();
+    let directions: Vec<_> = answer
+        .media_sections
+        .iter()
+        .map(|section| section.direction)
+        .collect();
+    assert_eq!(directions, vec![Direction::RecvOnly, Direction::SendOnly]);
+}
+
+/// T.38 (`m=image`) answers follow the same rule, in both SIP transport modes.
+#[tokio::test]
+async fn test_image_answer_combines_offer_with_local_direction() {
+    for mode in [TransportMode::Rtp, TransportMode::Srtp] {
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = mode.clone();
+        let pc = PeerConnection::new(config);
+        let raw = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nc=IN IP4 127.0.0.1\r\n\
+                   m=image 40000 udptl t38\r\na=T38FaxVersion:0\r\na=sendrecv\r\n";
+        let offer = SessionDescription::parse(SdpType::Offer, raw).unwrap();
+        pc.set_remote_description(offer).await.unwrap();
+        let t = pc.get_transceivers()[0].clone();
+        t.set_direction(TransceiverDirection::RecvOnly);
+        let answer = pc.create_answer().await.unwrap();
+        assert_eq!(answer.media_sections[0].kind, MediaKind::Image);
+        assert_eq!(
+            answer.media_sections[0].direction,
+            Direction::RecvOnly,
+            "{mode:?}"
+        );
+    }
+}
