@@ -95,6 +95,9 @@ pub struct SampleStreamSource {
     queue: Arc<SpscRing<MediaSample>>,
     notify: Arc<Notify>,
     pop_lock: Arc<SyncMutex<()>>,
+    /// Serializes pushes: `queue` is single-producer, but clones of a source
+    /// share it.
+    push_lock: Arc<SyncMutex<()>>,
     source_closed: Arc<AtomicBool>,
     active_senders: Arc<std::sync::atomic::AtomicUsize>,
     drop_count: Arc<AtomicU64>,
@@ -143,6 +146,7 @@ pub fn sample_track(
         queue,
         notify,
         pop_lock,
+        push_lock: Arc::new(SyncMutex::new(())),
         source_closed,
         active_senders,
         drop_count,
@@ -160,6 +164,7 @@ impl Clone for SampleStreamSource {
             queue: self.queue.clone(),
             notify: self.notify.clone(),
             pop_lock: self.pop_lock.clone(),
+            push_lock: self.push_lock.clone(),
             source_closed: self.source_closed.clone(),
             active_senders: self.active_senders.clone(),
             drop_count: self.drop_count.clone(),
@@ -173,6 +178,7 @@ impl SampleStreamSource {
             return Err(MediaError::Closed);
         }
 
+        let _push_guard = self.push_lock.lock();
         let sample = match self.queue.push(sample) {
             Ok(()) => {
                 self.notify.notify_one();
@@ -258,6 +264,7 @@ impl SampleStreamSource {
             return Err(MediaError::Closed);
         }
 
+        let _push_guard = self.push_lock.try_lock().ok_or(MediaError::WouldBlock)?;
         self.queue
             .push(sample)
             .map_err(|_| MediaError::WouldBlock)?;
