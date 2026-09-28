@@ -559,3 +559,233 @@ async fn test_reinvite_updates_remote_addr() {
         "reinvite should update RTP remote address"
     );
 }
+
+/// Helper: an RTP-mode peer connection with an audio sender, so offers are
+/// not downgraded for lack of a track.
+fn rtp_pc_with_audio_sender() -> PeerConnection {
+    let mut config = RtcConfiguration::default();
+    config.transport_mode = TransportMode::Rtp;
+    let pc = PeerConnection::new(config);
+    let (_source, track, _) =
+        rustrtc::media::track::sample_track(rustrtc::media::MediaKind::Audio, 10);
+    let params = RtpCodecParameters {
+        payload_type: 111,
+        name: "opus".to_string(),
+        clock_rate: 48000,
+        channels: 2,
+    };
+    pc.add_track(track, params).unwrap();
+    pc
+}
+
+/// Remote offers `direction`; we answer and return the answer's direction.
+async fn answer_remote_offer(pc: &PeerConnection, direction: Direction) -> Direction {
+    let offer = create_minimal_sdp(SdpType::Offer, "0", direction);
+    pc.set_remote_description(offer).await.unwrap();
+    let answer = pc.create_answer().await.unwrap();
+    let answered = answer.media_sections[0].direction;
+    pc.set_local_description(answer).unwrap();
+    answered
+}
+
+/// We offer and the remote answers `direction`; returns our offer's direction.
+async fn reoffer(pc: &PeerConnection, remote_answer: Direction) -> Direction {
+    let offer = pc.create_offer().await.unwrap();
+    let offered = offer.media_sections[0].direction;
+    pc.set_local_description(offer).unwrap();
+    let answer = create_minimal_sdp(SdpType::Answer, "0", remote_answer);
+    pc.set_remote_description(answer).await.unwrap();
+    offered
+}
+
+/// Test 11: after answering a remote hold (`sendonly` answered `recvonly`),
+/// our next offer (e.g. for a re-INVITE without SDP) must carry OUR direction,
+/// never echo the remote's `sendonly`. We did not initiate the hold, so we
+/// offer `sendrecv` (RFC 3264 §6.1, RFC 6337 §5.3); the remote keeps its hold
+/// by answering `sendonly`.
+#[tokio::test]
+async fn test_reoffer_after_remote_hold_uses_local_direction() {
+    let pc = rtp_pc_with_audio_sender();
+    assert_eq!(
+        answer_remote_offer(&pc, Direction::SendRecv).await,
+        Direction::SendRecv
+    );
+    assert_eq!(
+        answer_remote_offer(&pc, Direction::SendOnly).await,
+        Direction::RecvOnly,
+        "a remote hold is answered recvonly"
+    );
+
+    let offered = reoffer(&pc, Direction::SendOnly).await;
+    assert_ne!(
+        offered,
+        Direction::SendOnly,
+        "re-offer must not echo the remote's sendonly"
+    );
+    assert_eq!(offered, Direction::SendRecv, "re-offer after remote hold");
+
+    // The remote kept its hold (answered sendonly); offering again still
+    // expresses our own direction rather than mirroring the answer.
+    assert_eq!(
+        reoffer(&pc, Direction::SendOnly).await,
+        Direction::SendRecv,
+        "re-offer after the remote answered sendonly"
+    );
+}
+
+/// Test 12: after the remote resumes (`sendrecv`), our re-offer is `sendrecv`.
+#[tokio::test]
+async fn test_reoffer_after_remote_resume_is_sendrecv() {
+    let pc = rtp_pc_with_audio_sender();
+    answer_remote_offer(&pc, Direction::SendRecv).await;
+    answer_remote_offer(&pc, Direction::SendOnly).await;
+    assert_eq!(
+        answer_remote_offer(&pc, Direction::SendRecv).await,
+        Direction::SendRecv
+    );
+    assert_eq!(reoffer(&pc, Direction::SendRecv).await, Direction::SendRecv);
+}
+
+/// Test 13: after answering a remote `inactive` hold, our re-offer carries
+/// our own direction, not `inactive`.
+#[tokio::test]
+async fn test_reoffer_after_remote_inactive_uses_local_direction() {
+    let pc = rtp_pc_with_audio_sender();
+    answer_remote_offer(&pc, Direction::SendRecv).await;
+    assert_eq!(
+        answer_remote_offer(&pc, Direction::Inactive).await,
+        Direction::Inactive
+    );
+    assert_eq!(reoffer(&pc, Direction::Inactive).await, Direction::SendRecv);
+}
+
+/// Test 14: a hold WE initiated (`sendonly`, answered `recvonly`) is offered
+/// again on the next re-offer (RFC 6337 §5.3), not flipped to the remote's
+/// `recvonly`; clearing it offers `sendrecv` again.
+#[tokio::test]
+async fn test_reoffer_keeps_locally_initiated_hold() {
+    let pc = rtp_pc_with_audio_sender();
+    answer_remote_offer(&pc, Direction::SendRecv).await;
+
+    let t = pc.get_transceivers()[0].clone();
+    t.set_direction(peer_connection::TransceiverDirection::SendOnly);
+    assert_eq!(reoffer(&pc, Direction::RecvOnly).await, Direction::SendOnly);
+    assert_eq!(
+        reoffer(&pc, Direction::RecvOnly).await,
+        Direction::SendOnly,
+        "a locally initiated hold is offered again"
+    );
+
+    t.set_direction(peer_connection::TransceiverDirection::SendRecv);
+    assert_eq!(reoffer(&pc, Direction::SendRecv).await, Direction::SendRecv);
+}
+
+/// Test 15: a transceiver created by a remote `sendonly` offer, with no local
+/// track, re-offers `recvonly` (what we can do), not `sendonly` or `inactive`.
+#[tokio::test]
+async fn test_reoffer_from_remote_created_transceiver_without_sender() {
+    let mut config = RtcConfiguration::default();
+    config.transport_mode = TransportMode::Rtp;
+    let pc = PeerConnection::new(config);
+    assert_eq!(
+        answer_remote_offer(&pc, Direction::SendOnly).await,
+        Direction::RecvOnly
+    );
+    assert_eq!(reoffer(&pc, Direction::SendOnly).await, Direction::RecvOnly);
+}
+
+/// Test 16: guard — initial offers still carry the transceiver's direction,
+/// and answers still mirror the remote offer, for every direction.
+#[tokio::test]
+async fn test_initial_offer_and_answer_directions_unchanged() {
+    use peer_connection::TransceiverDirection as TD;
+    for (local, offered) in [
+        (TD::SendRecv, Direction::SendRecv),
+        (TD::SendOnly, Direction::SendOnly),
+        (TD::RecvOnly, Direction::RecvOnly),
+        (TD::Inactive, Direction::Inactive),
+    ] {
+        let pc = rtp_pc_with_audio_sender();
+        pc.get_transceivers()[0].set_direction(local);
+        let offer = pc.create_offer().await.unwrap();
+        assert_eq!(offer.media_sections[0].direction, offered, "{local:?}");
+    }
+
+    for (remote, answered) in [
+        (Direction::SendRecv, Direction::SendRecv),
+        (Direction::SendOnly, Direction::RecvOnly),
+        (Direction::RecvOnly, Direction::SendOnly),
+        (Direction::Inactive, Direction::Inactive),
+    ] {
+        let pc = rtp_pc_with_audio_sender();
+        assert_eq!(
+            answer_remote_offer(&pc, remote).await,
+            answered,
+            "{remote:?}"
+        );
+    }
+}
+
+/// Test 17: whatever direction the remote last offered or answered, our next
+/// offer carries our own (default sendrecv) direction.
+#[tokio::test]
+async fn test_reoffer_direction_independent_of_remote_direction() {
+    let all = [
+        Direction::SendRecv,
+        Direction::SendOnly,
+        Direction::RecvOnly,
+        Direction::Inactive,
+    ];
+    for remote in all {
+        // Remote offered `remote`, we answered.
+        let pc = rtp_pc_with_audio_sender();
+        answer_remote_offer(&pc, remote).await;
+        assert_eq!(
+            reoffer(&pc, Direction::SendRecv).await,
+            Direction::SendRecv,
+            "after remote offer {remote:?}"
+        );
+
+        // We offered, remote answered `remote`.
+        let pc = rtp_pc_with_audio_sender();
+        assert_eq!(reoffer(&pc, remote).await, Direction::SendRecv);
+        assert_eq!(
+            reoffer(&pc, Direction::SendRecv).await,
+            Direction::SendRecv,
+            "after remote answer {remote:?}"
+        );
+    }
+}
+
+/// A hold we start with a hand-built offer (`set_local_description` without
+/// `create_offer`) is kept by later re-offers, like one set with
+/// `set_direction` (RFC 6337 §5.3).
+#[tokio::test]
+async fn test_reoffer_keeps_hold_from_hand_built_local_offer() {
+    let pc = rtp_pc_with_audio_sender();
+    answer_remote_offer(&pc, Direction::SendRecv).await;
+
+    let mut hold = pc.create_offer().await.unwrap();
+    hold.media_sections[0].direction = Direction::SendOnly;
+    pc.set_local_description(hold).unwrap();
+    let answer = create_minimal_sdp(SdpType::Answer, "0", Direction::RecvOnly);
+    pc.set_remote_description(answer).await.unwrap();
+
+    assert_eq!(
+        reoffer(&pc, Direction::RecvOnly).await,
+        Direction::SendOnly,
+        "a hand-built hold is offered again"
+    );
+}
+
+/// The same for the very first offer, hand-built without `create_offer`
+/// (the transceiver has no MID until this offer assigns one).
+#[tokio::test]
+async fn test_reoffer_keeps_hold_from_hand_built_initial_offer() {
+    let pc = rtp_pc_with_audio_sender();
+    let hold = create_minimal_sdp(SdpType::Offer, "0", Direction::SendOnly);
+    pc.set_local_description(hold).unwrap();
+    let answer = create_minimal_sdp(SdpType::Answer, "0", Direction::RecvOnly);
+    pc.set_remote_description(answer).await.unwrap();
+    assert_eq!(reoffer(&pc, Direction::RecvOnly).await, Direction::SendOnly);
+}
