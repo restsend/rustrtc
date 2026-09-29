@@ -4950,6 +4950,7 @@ impl PeerConnectionInner {
                     ordered.push((
                         t,
                         section.attributes.iter().any(|attr| attr.key == "rtcp-mux"),
+                        Some(TransceiverDirection::from(section.direction)),
                     ));
                 } else {
                     return Err(RtcError::Internal(format!(
@@ -4979,7 +4980,7 @@ impl PeerConnectionInner {
                     _ => mid_a.cmp(&mid_b),
                 }
             });
-            ordered.into_iter().map(|t| (t, false)).collect()
+            ordered.into_iter().map(|t| (t, false, None)).collect()
         };
 
         let mode = self.config.transport_mode.clone();
@@ -5074,19 +5075,19 @@ impl PeerConnectionInner {
             desc.session.connection = Some(format!("IN IP4 {}", ext_ip));
         }
 
-        for (media_index, (transceiver, remote_offered_rtcp_mux)) in
+        for (media_index, (transceiver, remote_offered_rtcp_mux, offered_direction)) in
             ordered_transceivers.into_iter().enumerate()
         {
             let mid = self.ensure_mid(&transceiver);
             // An offer expresses our own willingness to send/receive, so it
-            // starts from our preferred direction; an answer is derived from
-            // the direction the remote offered.
-            let base_direction = if sdp_type == SdpType::Offer {
-                transceiver.desired_direction()
-            } else {
-                transceiver.direction()
+            // starts from our preferred direction. An answer is the reverse of
+            // the direction the remote offered, limited to what we want
+            // (RFC 3264 §6.1, RFC 8829 §5.3.1).
+            let mut direction = match offered_direction {
+                // The remote m= section this answer section answers.
+                Some(offered) => map_direction(offered).intersect(transceiver.desired_direction()),
+                None => map_direction(transceiver.desired_direction()),
             };
-            let mut direction = map_direction(base_direction);
             let sender_info = if direction.sends() {
                 transceiver.sender.lock().clone()
             } else {
@@ -6159,6 +6160,26 @@ impl TransceiverDirection {
             self,
             TransceiverDirection::SendRecv | TransceiverDirection::SendOnly
         )
+    }
+
+    fn receives(self) -> bool {
+        matches!(
+            self,
+            TransceiverDirection::SendRecv | TransceiverDirection::RecvOnly
+        )
+    }
+
+    /// The direction that both `self` and `other` allow.
+    fn intersect(self, other: Self) -> Self {
+        match (
+            self.sends() && other.sends(),
+            self.receives() && other.receives(),
+        ) {
+            (true, true) => TransceiverDirection::SendRecv,
+            (true, false) => TransceiverDirection::SendOnly,
+            (false, true) => TransceiverDirection::RecvOnly,
+            (false, false) => TransceiverDirection::Inactive,
+        }
     }
 }
 
@@ -8765,7 +8786,9 @@ mod tests {
         pc.set_remote_description(offer.clone()).await.unwrap();
         let answer = pc.create_answer().await.unwrap();
         assert_eq!(answer.media_sections.len(), 1);
-        assert_eq!(answer.media_sections[0].direction, Direction::RecvOnly);
+        // A `sendonly` offer answered by a `sendonly` transceiver: neither
+        // side receives (RFC 3264 §6.1).
+        assert_eq!(answer.media_sections[0].direction, Direction::Inactive);
         pc.set_local_description(answer).unwrap();
         assert_eq!(pc.signaling_state(), SignalingState::Stable);
     }
