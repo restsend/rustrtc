@@ -170,6 +170,7 @@ async fn offer(
                             info!("Data channel closed for client {}", my_id);
                             break;
                         }
+                        Some(DataChannelEvent::BufferedAmountLow(_)) => {}
                     }
                 }
                 res = ice_state_rx.changed() => {

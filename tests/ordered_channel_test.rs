@@ -577,6 +577,9 @@ async fn dcep_ordered_bidirectional_test() -> Result<()> {
             Ok(Some(DataChannelEvent::Close)) => {
                 return Err(anyhow::anyhow!("Channel closed before ping"));
             }
+            Ok(Some(DataChannelEvent::BufferedAmountLow(_))) => {
+                continue;
+            }
             Ok(None) => {
                 return Err(anyhow::anyhow!("Channel recv returned None"));
             }

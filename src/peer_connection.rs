@@ -176,6 +176,12 @@ pub trait RtpSenderInterceptor: Send + Sync {
     fn as_sender_nack_handler(self: Arc<Self>) -> Option<Arc<DefaultRtpSenderNackHandler>> {
         None
     }
+    /// Downcast hook for the GCC bandwidth estimator (GCC loop).
+    fn as_gcc_stats(
+        self: Arc<Self>,
+    ) -> Option<Arc<crate::media::gcc::GccBandwidthEstimator>> {
+        None
+    }
 }
 
 /// NACK / retransmission / RTCP-feedback hook for the RECEIVER side.
@@ -1216,6 +1222,12 @@ impl PeerConnection {
         if nack_enabled {
             builder = builder.nack();
         }
+        if self.inner.config.enable_gcc && self.inner.config.transport_mode == TransportMode::WebRtc
+        {
+            builder = builder.twcc_feedback(Arc::new(
+                crate::media::twcc_feedback::TwccFeedbackGenerator::new(),
+            ));
+        }
         let receiver = builder.build();
         if direction.sends() {
             let rand_val = random_u32();
@@ -1319,9 +1331,16 @@ impl PeerConnection {
         };
 
         if nack_enabled {
-            builder = builder
-                .nack(self.inner.config.nack_buffer_size)
-                .bitrate_controller();
+            builder = builder.nack(self.inner.config.nack_buffer_size);
+            if self.inner.config.enable_gcc {
+                // GCC bandwidth estimator replaces the log-only REMB handler:
+                // it consumes TWCC feedback and publishes target_bitrate.
+                builder = builder.interceptor(std::sync::Arc::new(
+                    crate::media::gcc::GccBandwidthEstimator::new(),
+                ));
+            } else {
+                builder = builder.bitrate_controller();
+            }
         }
 
         let sender = builder.build();
@@ -1748,6 +1767,7 @@ impl PeerConnection {
                 self.inner
                     .ice_transport
                     .start(params)
+                    .await
                     .map_err(|e| crate::RtcError::Internal(format!("ICE error: {}", e)))?;
 
                 for candidate in candidates.iter().cloned() {
@@ -1987,6 +2007,13 @@ impl PeerConnection {
                         builder = builder.nack();
                     } else {
                         debug!("NACK: disabled for new receiver mid={}", mid);
+                    }
+                    if self.inner.config.enable_gcc
+                        && self.inner.config.transport_mode == TransportMode::WebRtc
+                    {
+                        builder = builder.twcc_feedback(Arc::new(
+                            crate::media::twcc_feedback::TwccFeedbackGenerator::new(),
+                        ));
                     }
                     let receiver = builder.build();
                     if let Some(rtx) = rtx_ssrc {
@@ -3219,6 +3246,7 @@ impl PeerConnection {
                         .any(|block| block.ssrc == sender_ssrc)
             }
             RtcpPacket::SenderReport(_) => true,
+            RtcpPacket::TransportWideCc(twcc) => twcc.media_ssrc == sender_ssrc,
             _ => false,
         }
     }
@@ -3678,6 +3706,35 @@ impl PeerConnection {
     pub fn add_ice_candidate(&self, candidate: IceCandidate) -> RtcResult<()> {
         self.inner.ice_transport.add_remote_candidate(candidate);
         Ok(())
+    }
+
+    /// Restart ICE for this connection (RFC 8445 §9), the equivalent of the
+    /// W3C `RTCPeerConnection.restartIce()` / a re-INVITE with fresh
+    /// ice-ufrag/ice-pwd.
+    ///
+    /// Rolls fresh local credentials, resets nomination state and re-runs
+    /// connectivity checks; DTLS/SRTP survive across the restart. Call this
+    /// before `create_offer` so the new offer carries the restart (new
+    /// ice-ufrag/ice-pwd). The peer detects the credential change and restarts
+    /// its own side.
+    pub async fn restart_ice(&self) -> RtcResult<()> {
+        if self.config().transport_mode != TransportMode::WebRtc {
+            return Err(RtcError::InvalidState(
+                "restart_ice only applies to WebRtc transport mode".into(),
+            ));
+        }
+        let state = *self.inner.signaling_state.borrow();
+        if state != SignalingState::Stable {
+            return Err(RtcError::InvalidState(format!(
+                "restart_ice requires Stable signaling state, got {:?}",
+                state
+            )));
+        }
+        self.inner
+            .ice_transport
+            .restart()
+            .await
+            .map_err(|e| RtcError::Internal(format!("ICE restart failed: {}", e)))
     }
 
     /// Handle reinvite - update RTP parameters without recreating tracks
@@ -5523,6 +5580,22 @@ impl PeerConnectionInner {
             ));
         }
 
+        // Add transport-cc extmap (TWCC sequence numbers + feedback) when the
+        // GCC loop is enabled. Answers echo the remote id; offers claim one.
+        if self.config.enable_gcc && self.config.transport_mode == TransportMode::WebRtc {
+            let mut transport_cc_id =
+                self.get_remote_extmap_id(&section.mid, crate::sdp::TRANSPORT_CC_URI);
+            if sdp_type == SdpType::Offer && transport_cc_id.is_none() {
+                transport_cc_id = Some(Self::claim_free_extmap_id(&mut used_extmap_ids, 5));
+            }
+            if let Some(id) = transport_cc_id {
+                section.attributes.push(crate::sdp::Attribute::new(
+                    "extmap",
+                    Some(format!("{} {}", id, crate::sdp::TRANSPORT_CC_URI)),
+                ));
+            }
+        }
+
         // Add sdes:mid extmap for BUNDLE support (RFC 8843).  Answers echo the
         // remote ID when offered; WebRTC offers use a default ID so bundled
         // audio/video can still be demuxed when payload types overlap.
@@ -6421,6 +6494,13 @@ impl RtpTransceiver {
             if let (Some(id), Some(mid)) = (sdes_mid_id, mid_value) {
                 sender_arc.set_sdes_mid(id, Arc::from(mid.as_str()));
             }
+            // Propagate the transport-cc extension id to the sender so it
+            // stamps outgoing packets (GCC loop).
+            let tcc_id = extmap
+                .iter()
+                .find(|(_, uri)| uri.as_str() == crate::sdp::TRANSPORT_CC_URI)
+                .map(|(id, _)| *id);
+            sender_arc.set_transport_cc_ext_id(tcc_id);
         } else {
             // Sender not yet created — defer sdes:mid so set_sender() can apply it.
             let mid_value = self.mid.lock().clone();
@@ -6431,6 +6511,18 @@ impl RtpTransceiver {
             if let (Some(id), Some(mid)) = (sdes_mid_id, mid_value) {
                 *self.pending_sdes_mid.lock() = Some((id, Arc::from(mid.as_str())));
             }
+        }
+
+        // Propagate the transport-cc extension id to the receiver's TWCC
+        // feedback generator (GCC loop).
+        if let Some(receiver) = self.receiver()
+            && let Some(twcc) = &receiver.twcc
+        {
+            let tcc_id = extmap
+                .iter()
+                .find(|(_, uri)| uri.as_str() == crate::sdp::TRANSPORT_CC_URI)
+                .map(|(id, _)| *id);
+            twcc.set_ext_id(tcc_id.unwrap_or(0));
         }
 
         Ok(())
@@ -6465,6 +6557,10 @@ pub struct RtpSender {
     /// sdes:mid extension to inject: (extension header ID, mid value).
     /// Set automatically by update_extmap() when negotiation contains sdes:mid.
     sdes_mid: Arc<Mutex<Option<(u8, Arc<str>)>>>,
+    /// transport-cc extension id to inject with a per-packet sequence number
+    /// (GCC loop). `None` = not negotiated / disabled.
+    transport_cc_ext_id: Arc<Mutex<Option<u8>>>,
+    transport_cc_seq: Arc<AtomicU16>,
     transport_generation: Arc<AtomicU64>,
     transport_change_tx: watch::Sender<u64>,
     /// Correlation span of the owning PeerConnection; instrumented onto the
@@ -6617,6 +6713,8 @@ impl RtpSender {
             last_rtp_timestamp: Arc::new(AtomicU32::new(0)),
             interceptors,
             sdes_mid: Arc::new(Mutex::new(None)),
+            transport_cc_ext_id: Arc::new(Mutex::new(None)),
+            transport_cc_seq: Arc::new(AtomicU16::new(random_u32() as u16)),
             transport_generation: Arc::new(AtomicU64::new(0)),
             transport_change_tx,
             pc_span,
@@ -6626,6 +6724,26 @@ impl RtpSender {
 
     pub fn ssrc(&self) -> u32 {
         self.ssrc
+    }
+
+    /// Current GCC target bitrate estimate (bps), when the GCC loop is
+    /// enabled AND a TWCC-feedback-producing peer is connected. Returns
+    /// `None` when no estimator is installed.
+    pub fn target_bitrate(&self) -> Option<u64> {
+        self.interceptors
+            .iter()
+            .find_map(|i| i.clone().as_gcc_stats().map(|g| g.target_bitrate()))
+    }
+
+    /// Subscribe to GCC target-bitrate changes (bps). Returns `None` when no
+    /// estimator is installed. Applications driving an encoder should spawn a
+    /// task on this receiver and adapt the encoder bitrate.
+    pub fn subscribe_target_bitrate(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.interceptors
+            .iter()
+            .find_map(|i| i.clone().as_gcc_stats().map(|g| g.subscribe_target_bitrate()))
     }
 
     /// Next sequence number the paced send loop will put on the wire.
@@ -6676,6 +6794,13 @@ impl RtpSender {
 
     pub fn set_sdes_mid(&self, ext_id: u8, mid: Arc<str>) {
         *self.sdes_mid.lock() = Some((ext_id, mid));
+    }
+
+    /// Set the negotiated transport-cc extension id; outgoing packets get a
+    /// monotonically increasing transport-wide sequence number stamped into
+    /// it (GCC loop). `None` disables stamping.
+    pub fn set_transport_cc_ext_id(&self, ext_id: Option<u8>) {
+        *self.transport_cc_ext_id.lock() = ext_id;
     }
 
     pub fn sdes_mid(&self) -> Option<(u8, Arc<str>)> {
@@ -6780,6 +6905,8 @@ impl RtpSender {
         let last_rtp_timestamp = self.last_rtp_timestamp.clone();
         let interceptors = self.interceptors.clone();
         let sdes_mid = self.sdes_mid.clone();
+        let transport_cc_ext_id = self.transport_cc_ext_id.clone();
+        let transport_cc_seq = self.transport_cc_seq.clone();
         let mut rtcp_rx = self.rtcp_tx.subscribe();
 
         let pc_span = self.pc_span.clone();
@@ -6966,6 +7093,14 @@ impl RtpSender {
                                     let _ = packet.header.set_extension(id, mid.as_bytes());
                                 }
 
+                                // Auto-inject the transport-cc sequence number
+                                // extension when negotiated (GCC loop).
+                                if let Some(tcc_id) = *transport_cc_ext_id.lock() {
+                                    let seq = transport_cc_seq.fetch_add(1, Ordering::SeqCst);
+                                    let _ = packet
+                                        .header
+                                        .set_extension(tcc_id, &seq.to_be_bytes());
+                                }
                                 let payload_len = packet.payload.len() as u32;
                                 let packet_timestamp = packet.header.timestamp;
 
@@ -7077,6 +7212,9 @@ pub struct RtpReceiver {
     clock_rate_cache_pt: AtomicU8,
     clock_rate_cache: AtomicU32,
     pub depacketizer_factory: Arc<dyn DepacketizerFactory>,
+    /// TWCC feedback generator (present when the GCC loop is enabled). Set via
+    /// the builder; the ext id / feedback ssrc are updated on negotiation.
+    pub twcc: Option<Arc<crate::media::twcc_feedback::TwccFeedbackGenerator>>,
     /// Correlation span of the owning PeerConnection; instrumented onto the
     /// receive-loop task so its logs stay grouped with the rest of the session.
     pc_span: tracing::Span,
@@ -7092,6 +7230,7 @@ pub struct RtpReceiverBuilder {
     payload_map: Arc<RwLock<HashMap<u8, RtpCodecParameters>>>,
     pc_span: tracing::Span,
     runtime_handle: Option<tokio::runtime::Handle>,
+    twcc: Option<Arc<crate::media::twcc_feedback::TwccFeedbackGenerator>>,
 }
 
 impl RtpReceiverBuilder {
@@ -7104,7 +7243,19 @@ impl RtpReceiverBuilder {
             payload_map: Arc::new(RwLock::new(HashMap::new())),
             pc_span: debug_span!("pc"),
             runtime_handle: None,
+            twcc: None,
         }
+    }
+
+    /// Attach a TWCC feedback generator (GCC loop). The generator is also
+    /// registered as a receiver interceptor so inbound packets feed it.
+    pub fn twcc_feedback(
+        mut self,
+        generator: Arc<crate::media::twcc_feedback::TwccFeedbackGenerator>,
+    ) -> Self {
+        self.interceptors.push(generator.clone());
+        self.twcc = Some(generator);
+        self
     }
 
     pub fn depacketizer_factory(mut self, factory: Arc<dyn DepacketizerFactory>) -> Self {
@@ -7195,6 +7346,7 @@ impl RtpReceiverBuilder {
             }),
             pc_span: self.pc_span,
             runtime_handle: self.runtime_handle,
+            twcc: self.twcc,
         })
     }
 }
@@ -7252,6 +7404,7 @@ impl RtpReceiver {
             depacketizer_factory: Arc::new(crate::media::depacketizer::DefaultDepacketizerFactory),
             pc_span: debug_span!("pc"),
             runtime_handle: None,
+            twcc: None,
         }
     }
 
@@ -7601,9 +7754,30 @@ impl RtpReceiver {
         let weak_self = Arc::downgrade(self);
         let pc_span = self.pc_span.clone();
         let rt_handle = self.runtime_handle.clone();
-        crate::spawn_rtc(rt_handle.as_ref(), pc_span, async move {
+        crate::spawn_rtc(rt_handle.as_ref(), pc_span.clone(), async move {
             Self::run_loop(weak_self, cmd_rx, initial_tracks).await;
         });
+
+        // TWCC feedback flush loop (GCC): learns the negotiated ext id from
+        // the transceiver's extmap, then drains the generator every 100 ms.
+        if let Some(twcc) = &self.twcc {
+            if let Some(transceiver) = &route_transceiver {
+                let extmap = transceiver.get_extmap();
+                if let Some((id, uri)) = extmap
+                    .iter()
+                    .find(|(_, uri)| uri.as_str() == crate::sdp::TRANSPORT_CC_URI)
+                {
+                    twcc.set_ext_id(*id);
+                    let _ = uri;
+                }
+            }
+            twcc.set_feedback_ssrc(self.rtcp_feedback_ssrc.lock().unwrap_or(0));
+            let twcc_flush = twcc.clone();
+            let t = transport.clone();
+            crate::spawn_rtc(rt_handle.as_ref(), pc_span, async move {
+                twcc_flush.run_flush_loop(t).await;
+            });
+        }
     }
 
     async fn run_loop(

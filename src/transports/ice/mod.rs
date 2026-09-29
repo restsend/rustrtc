@@ -1,4 +1,5 @@
 pub mod conn;
+pub mod mdns;
 pub mod shared_tcp;
 pub mod shared_udp;
 pub mod stun;
@@ -31,7 +32,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use tokio::net::{TcpListener, TcpStream, UdpSocket, lookup_host};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio::time::timeout;
-use tracing::{debug, instrument, trace, warn};
+use tracing::{debug, error, instrument, trace, warn};
 
 #[cfg(any(test, feature = "simulator"))]
 use self::stun::random_u32;
@@ -183,6 +184,13 @@ pub(crate) struct IceTransportInner {
     /// Controlled side immediately sends `true` (no nomination to do).
     nomination_complete: watch::Sender<Option<bool>>,
     _nomination_complete_rx: watch::Receiver<Option<bool>>,
+    /// Set while a locally-initiated ICE restart is in flight (between
+    /// `restart()` and the next `start()` with the peer's answer). Prevents a
+    /// changed remote ufrag/pwd in that answer from being misread as a
+    /// remote-initiated restart (which would reset ICE a second time).
+    restart_requested: std::sync::atomic::AtomicBool,
+    /// mDNS hostname advertising our host candidates (`enable_mdns`).
+    mdns_hostname: Option<String>,
     /// Guards against overlapping `run_turn_refresh` invocations: the refresh
     /// timer tick skips when a previous refresh is still in flight instead of
     /// cancelling it (which used to orphan pending transactions).
@@ -219,6 +227,32 @@ impl std::fmt::Debug for IceTransportInner {
     }
 }
 
+/// Collect the local addresses to advertise in mDNS answers and start a
+/// responder for the transport's obfuscated hostname.
+fn start_mdns_responder(
+    inner: &Arc<IceTransportInner>,
+) -> Result<crate::transports::ice::mdns::MdnsResponder> {
+    let mut addresses: Vec<std::net::IpAddr> = Vec::new();
+    if let Some(bind) = &inner.config.bind_ip
+        && let Ok(ip) = bind.parse::<std::net::IpAddr>()
+    {
+        addresses.push(ip);
+    }
+    use local_ip_address::list_afinet_netifas;
+    if let Ok(interfaces) = list_afinet_netifas() {
+        for (_name, addr) in interfaces {
+            if !addr.is_loopback() && !addresses.contains(&addr) {
+                addresses.push(addr);
+            }
+        }
+    }
+    let hostname = inner
+        .mdns_hostname
+        .clone()
+        .unwrap_or_else(crate::transports::ice::mdns::MdnsResponder::generate_hostname);
+    crate::transports::ice::mdns::MdnsResponder::start(hostname, addresses)
+}
+
 struct IceTransportRunner {
     inner: Arc<IceTransportInner>,
     socket_rx: mpsc::UnboundedReceiver<IceSocketWrapper>,
@@ -229,6 +263,23 @@ struct IceTransportRunner {
 
 impl IceTransportRunner {
     async fn run(mut self) {
+        // mDNS responder lifetime: started when `enable_mdns` is set, stopped
+        // when the runner loop exits (the guard's Drop signals the task).
+        let _mdns: Option<crate::transports::ice::mdns::MdnsResponder> =
+            if self.inner.config.enable_mdns {
+                match start_mdns_responder(&self.inner) {
+                    Ok(responder) => {
+                        debug!("mDNS responder started for {}", responder.hostname());
+                        Some(responder)
+                    }
+                    Err(e) => {
+                        debug!("mDNS responder failed to start: {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
         let mut interval = tokio::time::interval_at(
             tokio::time::Instant::now() + Duration::from_secs(1),
             Duration::from_secs(1),
@@ -978,6 +1029,10 @@ impl IceTransport {
             checking_pairs: Mutex::new(std::collections::HashSet::new()),
             nomination_complete: nomination_complete_tx,
             _nomination_complete_rx: nomination_complete_rx,
+            restart_requested: std::sync::atomic::AtomicBool::new(false),
+            mdns_hostname: config
+                .enable_mdns
+                .then(crate::transports::ice::mdns::MdnsResponder::generate_hostname),
             turn_refresh_in_progress: std::sync::atomic::AtomicBool::new(false),
             upnp_refresh_in_progress: std::sync::atomic::AtomicBool::new(false),
             buffer_stats: Arc::new(BufferStats::default()),
@@ -1095,6 +1150,82 @@ impl IceTransport {
         *self.inner.remote_parameters.lock() = Some(params);
     }
 
+    /// Restart ICE (RFC 8445 §9): roll fresh local credentials and reset all
+    /// connectivity-check / nomination state so checks re-run end-to-end.
+    ///
+    /// This is a credential-only restart: gathered candidates and their
+    /// sockets stay in place, because the dominant trigger is a re-INVITE /
+    /// `restartIce()` where the local network interfaces did not change. The
+    /// next local description automatically carries the new ufrag/pwd (both
+    /// `build_description` paths read `local_parameters` live). DTLS and SRTP
+    /// state are untouched — media resumes over the (possibly different)
+    /// selected pair once checks and nomination complete again.
+    ///
+    /// A remote-initiated restart (peer offers new ice-ufrag/ice-pwd) is
+    /// detected in [`Self::start`] and calls this method automatically.
+    pub async fn restart(&self) -> Result<()> {
+        // 1. Fresh credentials. A new tie_breaker also makes us win/lose role
+        //    conflicts per RFC 8445 §5.1.1.1 semantics for the new session.
+        *self.inner.local_parameters.lock() = IceParameters::generate();
+
+        // 2. Reset check/nomination state. The selected socket stays published
+        //    so DTLS/SRTP keep running on the old path until a new pair is
+        //    nominated — media pauses, but the session does not tear down.
+        self.inner.checking_pairs.lock().await.clear();
+        self.inner.pending_transactions.lock().clear();
+        *self.inner.selected_pair.lock() = None;
+        let _ = self.inner.selected_pair_notifier.send(None);
+        self.inner
+            .restart_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.inner.nomination_complete.send(None);
+        let _ = self.inner.set_state(IceTransportState::Checking);
+
+        // 3. Shared UDP mux sessions are keyed by server ufrag, so the mux
+        //    socket must be re-registered under the new ufrag or every inbound
+        //    STUN binding request would be demuxed to a dead session.
+        self.rebind_shared_udp_mux().await?;
+
+        debug!(
+            label = self.inner.config.label.as_deref().unwrap_or("-"),
+            "ICE restart: new ufrag={}, pwd=<redacted>",
+            self.inner.local_parameters.lock().username_fragment
+        );
+        Ok(())
+    }
+
+    /// Re-register this transport on the shared UDP mux socket under the
+    /// current (fresh) ufrag. No-op when mux is not in use.
+    async fn rebind_shared_udp_mux(&self) -> Result<()> {
+        let gatherer = &self.inner.gatherer;
+        let listen_key = {
+            let regs = gatherer.shared_udp_regs.lock();
+            let Some(reg) = regs.first() else {
+                return Ok(()); // mux not in use
+            };
+            reg.listen_key()
+        };
+
+        // Dropping the old registrations removes the old ufrag session; the
+        // old read loop exits once its channel's senders are gone.
+        gatherer.shared_udp_regs.lock().clear();
+
+        let ufrag = self.inner.local_parameters.lock().username_fragment.clone();
+        let (_local_addr, handle, registration) =
+            shared_udp::acquire(listen_key, ufrag).await.map_err(|e| {
+                // Fall back to dropping the session entirely rather than
+                // leaving the mux registered under the stale ufrag.
+                anyhow::anyhow!("shared UDP mux rebind failed: {e:#}")
+            })?;
+        gatherer.shared_udp_regs.lock().push(registration);
+
+        let wrapper = IceSocketWrapper::SharedUdp(Arc::new(handle));
+        *gatherer.shared_udp_socket.lock() = Some(wrapper.clone());
+        // Publish the new handle so the runner starts a read loop on it.
+        gatherer.socket_tx.send(wrapper).ok();
+        Ok(())
+    }
+
     fn start_keepalive(&self) {
         // Handled by runner
     }
@@ -1113,7 +1244,41 @@ impl IceTransport {
         Ok(())
     }
 
-    pub fn start(&self, remote: IceParameters) -> Result<()> {
+    pub async fn start(&self, remote: IceParameters) -> Result<()> {
+        // Remote-initiated ICE restart detection (RFC 8445 §9): the peer
+        // signals a restart by changing its ice-ufrag/ice-pwd after the
+        // session was established. When we did NOT ask for a restart
+        // ourselves, mirror it: roll fresh local credentials so our answer
+        // carries new credentials too, and reset check state. (When we DID
+        // request a restart, `restart()` already reset everything — the
+        // changed peer credentials are just the remote half of our restart.)
+        let previous_remote = self.inner.remote_parameters.lock().clone();
+        if let Some(prev) = previous_remote
+            && (prev.username_fragment != remote.username_fragment
+                || prev.password != remote.password)
+        {
+            if self
+                .inner
+                .restart_requested
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                debug!(
+                    label = self.inner.config.label.as_deref().unwrap_or("-"),
+                    "ICE restart completing: peer re-signalled credentials"
+                );
+            } else {
+                debug!(
+                    label = self.inner.config.label.as_deref().unwrap_or("-"),
+                    "remote ICE restart detected (ufrag/pwd changed): restarting locally"
+                );
+                self.restart().await?;
+            }
+        } else {
+            self.inner
+                .restart_requested
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+
         self.start_gathering()?;
         self.start_keepalive();
         {
@@ -1790,9 +1955,16 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
             match res {
                 Ok(_) => Some(IceCandidatePair::new(local, remote)),
                 Err(e) => {
-                    debug!(
+                    // Per-pair failures are expected in mixed networks (unreachable
+                    // LAN candidates, stale addresses, ...) — ICE keeps working via
+                    // the other pairs. Keep them at trace to avoid log spam and tag
+                    // with the configured label (call id) for correlation.
+                    trace!(
+                        label = inner.config.label.as_deref().unwrap_or("-"),
                         "ICE connectivity check failed: {} -> {}: {}",
-                        local.address, remote.address, e
+                        local.address,
+                        remote.address,
+                        e
                     );
                     None
                 }
@@ -3117,6 +3289,11 @@ pub struct IceCandidate {
     pub tcp_type: Option<TcpType>,
     pub related_address: Option<SocketAddr>,
     pub component: u16,
+    /// mDNS hostname advertised in SDP instead of `address.ip()` (RFC 6762 /
+    /// draft-ietf-rtcweb-mdns). The real address is kept internally so
+    /// connectivity checks and pairing work unchanged; only the SDP wire form
+    /// is obfuscated.
+    pub hostname: Option<String>,
 }
 
 impl IceCandidate {
@@ -3148,6 +3325,7 @@ impl IceCandidate {
             tcp_type: None,
             related_address: None,
             component,
+            hostname: None,
         }
     }
 
@@ -3161,6 +3339,7 @@ impl IceCandidate {
             tcp_type: Some(tcp_type),
             related_address: None,
             component,
+            hostname: None,
         }
     }
 
@@ -3176,7 +3355,15 @@ impl IceCandidate {
             tcp_type: Some(tcp_type),
             related_address: None,
             component,
+            hostname: None,
         }
+    }
+
+    /// Advertise this candidate's address in SDP as an mDNS hostname
+    /// (draft-ietf-rtcweb-mdns). The internal address is unchanged.
+    pub fn with_hostname(mut self, hostname: impl Into<String>) -> Self {
+        self.hostname = Some(hostname.into());
+        self
     }
 
     pub fn base_address(&self) -> SocketAddr {
@@ -3197,6 +3384,7 @@ impl IceCandidate {
             tcp_type: None,
             related_address: Some(base),
             component,
+            hostname: None,
         }
     }
 
@@ -3210,6 +3398,7 @@ impl IceCandidate {
             tcp_type: None,
             related_address: None,
             component,
+            hostname: None,
         }
     }
 
@@ -3247,12 +3436,16 @@ impl IceCandidate {
     }
 
     pub fn to_sdp(&self) -> String {
+        let advertised_ip = match &self.hostname {
+            Some(h) => h.clone(),
+            None => self.address.ip().to_string(),
+        };
         let mut parts = vec![
             self.foundation.clone(),
             self.component.to_string(),
             self.transport.to_ascii_lowercase(),
             self.priority.to_string(),
-            self.address.ip().to_string(),
+            advertised_ip,
             self.address.port().to_string(),
             "typ".into(),
             self.typ.as_str().into(),
@@ -3335,6 +3528,7 @@ impl IceCandidate {
             tcp_type,
             related_address: None,
             component,
+            hostname: None,
         })
     }
 }
@@ -3583,7 +3777,22 @@ impl IceGatherer {
             for _ in 0..port_count {
                 match UdpSocket::bind(SocketAddr::new(ip, port)).await {
                     Ok(socket) => return Ok(socket),
-                    Err(_) => {
+                    Err(e) => {
+                        // Only a genuinely busy port is worth retrying with the
+                        // next port in the range. Any other error kind (bind IP
+                        // not assigned to a local interface, permissions, ...)
+                        // fails for every port in the range and must not be
+                        // misreported as port exhaustion below.
+                        if e.kind() != std::io::ErrorKind::AddrInUse {
+                            error!(
+                                label = self.config.label.as_deref().unwrap_or("-"),
+                                "binding RTP port {} on {} failed: {}",
+                                port,
+                                ip,
+                                e
+                            );
+                            bail!("binding RTP port {} on {} failed: {}", port, ip, e);
+                        }
                         port = port.saturating_add(2);
                         if port > end {
                             port = start;
@@ -3591,7 +3800,7 @@ impl IceGatherer {
                     }
                 }
             }
-            bail!("No available even RTP ports in range {}..={}", start, end)
+            bail!("No available even RTP ports in range {}..={} (label={})", start, end, self.config.label.as_deref().unwrap_or("-"))
         } else {
             UdpSocket::bind(SocketAddr::new(ip, 0))
                 .await
@@ -3902,9 +4111,19 @@ impl IceGatherer {
                 }
                 Err(e) => {
                     if self.config.bind_ip.is_some() {
-                        debug!("Failed to bind to requested bind_ip {}: {}", ip, e);
+                        debug!(
+                            label = self.config.label.as_deref().unwrap_or("-"),
+                            "Failed to bind to requested bind_ip {}: {}",
+                            ip,
+                            e
+                        );
                     } else if !ip.is_loopback() && !ip.is_unspecified() {
-                        debug!("Failed to bind socket on {}: {}", ip, e);
+                        debug!(
+                            label = self.config.label.as_deref().unwrap_or("-"),
+                            "Failed to bind socket on {}: {}",
+                            ip,
+                            e
+                        );
                     }
                 }
             }
@@ -4184,14 +4403,24 @@ impl IceGatherer {
                                 match this.probe_stun(&uri).await {
                                     Ok(Some(candidate)) => this.push_candidate(candidate),
                                     Ok(None) => {}
-                                    Err(e) => debug!("STUN probe failed for {}: {}", url, e),
+                                    Err(e) => debug!(
+                                        label = this.config.label.as_deref().unwrap_or("-"),
+                                        "STUN probe failed for {}: {}",
+                                        url,
+                                        e
+                                    ),
                                 }
                             }
                         }
                         IceUriKind::Turn => match this.probe_turn(&uri, &server).await {
                             Ok(Some(candidate)) => this.push_candidate(candidate),
                             Ok(None) => {}
-                            Err(e) => debug!("TURN probe failed for {}: {}", url, e),
+                            Err(e) => debug!(
+                                        label = this.config.label.as_deref().unwrap_or("-"),
+                                        "TURN probe failed for {}: {}",
+                                        url,
+                                        e
+                                    ),
                         },
                     }
                 });
@@ -4240,14 +4469,24 @@ impl IceGatherer {
                                         this.push_candidate(candidate);
                                     }
                                     Ok(None) => {}
-                                    Err(e) => debug!("STUN probe failed for {}: {}", url, e),
+                                    Err(e) => debug!(
+                                        label = this.config.label.as_deref().unwrap_or("-"),
+                                        "STUN probe failed for {}: {}",
+                                        url,
+                                        e
+                                    ),
                                 }
                             }
                         }
                         IceUriKind::Turn => match this.probe_turn(&uri, &server).await {
                             Ok(Some(candidate)) => this.push_candidate(candidate),
                             Ok(None) => {}
-                            Err(e) => debug!("TURN probe failed for {}: {}", url, e),
+                            Err(e) => debug!(
+                                        label = this.config.label.as_deref().unwrap_or("-"),
+                                        "TURN probe failed for {}: {}",
+                                        url,
+                                        e
+                                    ),
                         },
                     }
                 });
@@ -4267,34 +4506,37 @@ impl IceGatherer {
     async fn probe_stun(&self, uri: &IceServerUri) -> Result<Option<IceCandidate>> {
         let addr = uri.resolve(self.config.disable_ipv6).await?;
 
-        // Find a suitable host address to bind to (prefer non-loopback IPv4)
-        let bind_ip = if addr.is_ipv6() {
-            self.local_candidates
-                .lock()
-                .iter()
-                .filter(|c| c.typ == IceCandidateType::Host)
-                .filter_map(|c| match c.address.ip() {
-                    IpAddr::V6(ip) if !ip.is_loopback() && !ip.is_unspecified() => {
-                        Some(IpAddr::V6(ip))
-                    }
-                    _ => None,
-                })
-                .next()
-                .unwrap_or(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED))
-        } else {
-            self.local_candidates
-                .lock()
-                .iter()
-                .filter(|c| c.typ == IceCandidateType::Host)
-                .filter_map(|c| match c.address.ip() {
-                    IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => {
-                        Some(IpAddr::V4(ip))
-                    }
-                    _ => None,
-                })
-                .next()
-                .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)))
+        // Find a suitable host address to bind to (prefer non-loopback IPv4).
+        // Prefer the candidate's `related_address` (the address the socket was
+        // actually bound on): with `external_ip` configured, the candidate
+        // `address` carries the advertised NAT/EIP IP which is NOT assigned to
+        // any local interface — binding on it fails with EADDRNOTAVAIL for
+        // every port in the RTP range.
+        let pick_bind_ip = |c: &IceCandidate| -> Option<IpAddr> {
+            let base = c.related_address.unwrap_or(c.address);
+            match base.ip() {
+                IpAddr::V4(ip) if !addr.is_ipv6() && !ip.is_loopback() && !ip.is_unspecified() => {
+                    Some(IpAddr::V4(ip))
+                }
+                IpAddr::V6(ip) if addr.is_ipv6() && !ip.is_loopback() && !ip.is_unspecified() => {
+                    Some(IpAddr::V6(ip))
+                }
+                _ => None,
+            }
         };
+        let fallback = if addr.is_ipv6() {
+            IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))
+        };
+        let bind_ip = self
+            .local_candidates
+            .lock()
+            .iter()
+            .filter(|c| c.typ == IceCandidateType::Host)
+            .filter_map(pick_bind_ip)
+            .next()
+            .unwrap_or(fallback);
 
         let socket = match uri.transport {
             IceTransportProtocol::Udp => self.bind_socket(bind_ip).await?,
@@ -4349,9 +4591,22 @@ impl IceGatherer {
         )))
     }
 
-    fn push_candidate(&self, candidate: IceCandidate) {
+    fn push_candidate(&self, mut candidate: IceCandidate) {
         if self.config.disable_ipv6 && candidate.address.is_ipv6() {
             return;
+        }
+        // mDNS obfuscation (draft-ietf-rtcweb-mdns): host candidates advertise
+        // our `<random>.local` hostname in SDP; the real address stays
+        // internal so pairing and connectivity checks are unaffected.
+        if candidate.typ == IceCandidateType::Host
+            && let Some(hostname) = self
+                .transport_inner
+                .lock()
+                .as_ref()
+                .and_then(|weak| weak.upgrade())
+                .and_then(|inner| inner.mdns_hostname.clone())
+        {
+            candidate = candidate.with_hostname(hostname);
         }
         let mut candidates = self.local_candidates.lock();
         if candidates.iter().any(|c| c.address == candidate.address) {

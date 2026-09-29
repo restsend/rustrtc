@@ -1,17 +1,19 @@
 pub mod depacketizer;
 pub mod error;
 pub mod frame;
+pub mod gcc;
 pub mod jitter_buffer;
 pub mod packetizer;
 pub mod pipeline;
 pub mod spsc;
 pub mod track;
+pub mod twcc_feedback;
 
-pub use depacketizer::{Depacketizer, H264Depacketizer, PassThroughDepacketizer};
+pub use depacketizer::{Depacketizer, H264Depacketizer, PassThroughDepacketizer, Vp9Depacketizer, parse_vp9_descriptor, Vp9Descriptor};
 pub use error::{MediaError, MediaResult};
 pub use frame::{AudioFrame, MediaKind, MediaSample, VideoFrame, VideoPixelFormat};
 pub use jitter_buffer::JitterBuffer;
-pub use packetizer::{Packetizer, Payloader, SimplePayloader, Vp8Payloader};
+pub use packetizer::{Packetizer, Payloader, SimplePayloader, Vp8Payloader, Vp9Payloader};
 pub use pipeline::{
     ChannelMediaSink, ChannelMediaSource, DynMediaSink, DynMediaSource, MediaSink, MediaSource,
     TrackMediaSink, TrackMediaSource, spawn_media_pump, track_from_source,

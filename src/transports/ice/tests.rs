@@ -326,8 +326,8 @@ async fn turn_connection_relay_to_host() -> Result<()> {
     let state2 = transport2.subscribe_state();
 
     // Start
-    transport1.start(transport2.local_parameters())?;
-    transport2.start(transport1.local_parameters())?;
+    transport1.start(transport2.local_parameters()).await?;
+    transport2.start(transport1.local_parameters()).await?;
 
     // Wait for Connected with better error handling
     let wait_connected = |mut state: watch::Receiver<IceTransportState>, name: &'static str| async move {
@@ -730,7 +730,7 @@ async fn test_ice_lite_connectivity_establishment() -> Result<()> {
     }
 
     // Start full ICE agent to trigger candidate gathering
-    ice_full.start(lite_params.clone())?;
+    ice_full.start(lite_params.clone()).await?;
 
     // Wait a bit for candidate gathering
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -923,9 +923,11 @@ async fn setup_host_pair(
     // Start both agents (this triggers connectivity checks).
     controlling
         .start(controlled.local_parameters())
+        .await
         .expect("controlling.start");
     controlled
         .start(controlling.local_parameters())
+        .await
         .expect("controlled.start");
 
     (controlling, controlled)
@@ -1021,8 +1023,8 @@ async fn test_trickle_ice_no_premature_failure() -> Result<()> {
     // Step 2: Start both transports
     let ctrl_params = controlled.local_parameters();
     let ctrd_params = controlling.local_parameters();
-    controlling.start(ctrl_params)?;
-    controlled.start(ctrd_params)?;
+    controlling.start(ctrl_params).await?;
+    controlled.start(ctrd_params).await?;
 
     assert_eq!(*ctrl_state.borrow(), IceTransportState::Checking);
     assert_eq!(*ctrd_state.borrow(), IceTransportState::Checking);
@@ -2340,8 +2342,8 @@ async fn test_parallel_nomination_with_unreachable_candidate() -> Result<()> {
     controlling.add_remote_candidate(bad_remote);
 
     // Start both transports
-    controlling.start(controlled.local_parameters())?;
-    controlled.start(controlling.local_parameters())?;
+    controlling.start(controlled.local_parameters()).await?;
+    controlled.start(controlling.local_parameters()).await?;
 
     let ctrl_state = controlling.subscribe_state();
     let mut ctrl_nom_rx = controlling.subscribe_nomination_complete();
@@ -2922,8 +2924,8 @@ async fn use_candidate_nominates_first_pair() -> Result<()> {
         }
     });
 
-    t1.start(t2.local_parameters())?;
-    t2.start(t1.local_parameters())?;
+    t1.start(t2.local_parameters()).await?;
+    t2.start(t1.local_parameters()).await?;
 
     let wait_connected = |mut rx: watch::Receiver<IceTransportState>| async move {
         loop {
@@ -2996,8 +2998,8 @@ async fn use_candidate_follows_renomination_from_new_candidate() -> Result<()> {
         }
     });
 
-    t1.start(t2.local_parameters())?;
-    t2.start(t1.local_parameters())?;
+    t1.start(t2.local_parameters()).await?;
+    t2.start(t1.local_parameters()).await?;
 
     let wait_connected = |mut rx: watch::Receiver<IceTransportState>| async move {
         loop {
@@ -3717,9 +3719,11 @@ async fn test_ice_tcp_end_to_end_connectivity() -> Result<()> {
     let controlling_params = controlling.local_parameters();
     controlling
         .start(controlled_params)
+        .await
         .expect("controlling.start");
     controlled
         .start(controlling_params)
+        .await
         .expect("controlled.start");
 
     // Wait for both sides to connect
@@ -3815,9 +3819,11 @@ async fn test_ice_tcp_data_flow_bidirectional() -> Result<()> {
 
     controlling
         .start(controlled.local_parameters())
+        .await
         .expect("controlling.start");
     controlled
         .start(controlling.local_parameters())
+        .await
         .expect("controlled.start");
 
     let ctrl_ok = wait_ice_connected(controlling.subscribe_state(), Duration::from_secs(15)).await;
@@ -4011,8 +4017,8 @@ async fn ice_udp_mux_connects_through_shared_port() -> Result<()> {
         }
     });
 
-    controlling.start(controlled.local_parameters())?;
-    controlled.start(controlling.local_parameters())?;
+    controlling.start(controlled.local_parameters()).await?;
+    controlled.start(controlling.local_parameters()).await?;
 
     let wait_connected = |mut rx: watch::Receiver<IceTransportState>| async move {
         loop {

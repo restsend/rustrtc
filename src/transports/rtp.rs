@@ -1070,7 +1070,12 @@ impl PacketReceiver for RtpTransport {
                         let mut buf = packet.to_vec();
                         let mut srtp = session.lock();
                         match srtp.unprotect_rtcp(&mut buf) {
-                            Ok(()) => Bytes::from(buf),
+                            Ok(()) => {
+                                if std::env::var("RUSTRTC_RTCP_TRACE").is_ok() {
+                                    debug!("RTCP unprotected: {} bytes head={:02x?}", buf.len(), &buf[..buf.len().min(8)]);
+                                }
+                                Bytes::from(buf)
+                            }
                             Err(e) => {
                                 debug!("SRTP unprotect RTCP failed: {}", e);
                                 return;

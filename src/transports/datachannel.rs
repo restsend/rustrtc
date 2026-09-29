@@ -1,7 +1,7 @@
 use anyhow::Result;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicU16, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 
 // DCEP Constants
@@ -107,6 +107,10 @@ pub enum DataChannelEvent {
     Open,
     Message(Bytes),
     Close,
+    /// The per-channel buffered amount dropped to (or below) the configured
+    /// low threshold after having been above it (W3C `bufferedamountlow`).
+    /// Carries the current buffered amount in bytes.
+    BufferedAmountLow(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +143,11 @@ pub struct DataChannelConfig {
     pub max_packet_life_time: Option<u16>,
     pub max_payload_size: Option<usize>,
     pub negotiated: Option<u16>,
+    /// W3C `bufferedAmountLowThreshold`: when the per-channel buffered amount
+    /// falls back to (or below) this value after having exceeded it, a
+    /// `DataChannelEvent::BufferedAmountLow` is emitted. `0` (default) never
+    /// fires the event.
+    pub buffered_amount_low_threshold: usize,
 }
 
 pub struct DataChannel {
@@ -156,6 +165,14 @@ pub struct DataChannel {
     rx: TokioMutex<mpsc::UnboundedReceiver<DataChannelEvent>>,
     pub(crate) reassembly_buffer: Mutex<BytesMut>,
     pub(crate) send_lock: TokioMutex<()>,
+    /// Bytes sent on this channel that SCTP has not acknowledged yet
+    /// (queued + in flight). Mirrored from the transport's per-stream
+    /// accounting; read lock-free by `buffered_amount()`.
+    buffered_amount: AtomicUsize,
+    buffered_amount_low_threshold: AtomicUsize,
+    /// Edge state for `BufferedAmountLow`: `true` once the amount has risen
+    /// above the threshold and the drop event has not been emitted yet.
+    above_low_threshold: AtomicBool,
 }
 
 impl DataChannel {
@@ -176,6 +193,46 @@ impl DataChannel {
             rx: TokioMutex::new(rx),
             reassembly_buffer: Mutex::new(BytesMut::new()),
             send_lock: TokioMutex::new(()),
+            buffered_amount: AtomicUsize::new(0),
+            buffered_amount_low_threshold: AtomicUsize::new(
+                config.buffered_amount_low_threshold,
+            ),
+            above_low_threshold: AtomicBool::new(false),
+        }
+    }
+
+    /// Number of bytes queued for this channel that the SCTP layer has not
+    /// acknowledged yet (W3C `bufferedAmount`).
+    pub fn buffered_amount(&self) -> usize {
+        self.buffered_amount.load(Ordering::SeqCst)
+    }
+
+    /// Set the low-water threshold for `BufferedAmountLow` events
+    /// (W3C `bufferedAmountLowThreshold`).
+    pub fn set_buffered_amount_low_threshold(&self, threshold: usize) {
+        self.buffered_amount_low_threshold
+            .store(threshold, Ordering::SeqCst);
+    }
+
+    pub fn buffered_amount_low_threshold(&self) -> usize {
+        self.buffered_amount_low_threshold.load(Ordering::SeqCst)
+    }
+
+    /// Called by the SCTP transport whenever this channel's buffered amount
+    /// changes. Emits `BufferedAmountLow` on the above → at-or-below edge.
+    pub(crate) fn on_buffered_amount(&self, amount: usize) {
+        let prev = self.buffered_amount.swap(amount, Ordering::SeqCst);
+        if prev == amount {
+            return;
+        }
+        let threshold = self.buffered_amount_low_threshold.load(Ordering::SeqCst);
+        if threshold == 0 {
+            return;
+        }
+        if amount > threshold {
+            self.above_low_threshold.store(true, Ordering::SeqCst);
+        } else if self.above_low_threshold.swap(false, Ordering::SeqCst) {
+            self.send_event(DataChannelEvent::BufferedAmountLow(amount));
         }
     }
 

@@ -251,6 +251,13 @@ pub(crate) struct SharedUdpRegistration {
     ufrag: String,
 }
 
+impl SharedUdpRegistration {
+    /// The `bind_addr` this registration lives on (the shared mux socket key).
+    pub(crate) fn listen_key(&self) -> SocketAddr {
+        self.listen_key
+    }
+}
+
 impl std::fmt::Debug for SharedUdpRegistration {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SharedUdpRegistration")

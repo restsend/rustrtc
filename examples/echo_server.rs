@@ -191,6 +191,9 @@ async fn handle_rustrtc_offer(payload: OfferRequest) -> Json<OfferResponse> {
                         info!("Data channel closed");
                         break;
                     }
+                    rustrtc::DataChannelEvent::BufferedAmountLow(_) => {
+                        info!("Data channel buffered amount low");
+                    }
                 }
             }
         });

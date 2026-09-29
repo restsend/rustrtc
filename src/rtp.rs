@@ -906,6 +906,87 @@ fn parse_twcc_body(body: &[u8]) -> RtpResult<TransportWideCc> {
     })
 }
 
+/// Decoded TWCC feedback entry: (transport-wide sequence number, arrival
+/// delta in microseconds relative to the report's reference time; `None`
+/// means the packet was reported lost).
+pub type TwccReportEntry = (u16, Option<i64>);
+
+/// Decode the status chunks and recv deltas of a TWCC feedback packet
+/// (draft-holmer-rmcat-transport-wide-cc-extensions-01 §3.1 — the wire format
+/// Chrome and pion emit, with a 1-bit chunk type flag). Tolerates truncated
+/// payloads: returns as many entries as the payload fully describes.
+pub fn decode_twcc_feedback(feedback: &TransportWideCc) -> Vec<TwccReportEntry> {
+    let mut out: Vec<TwccReportEntry> = Vec::with_capacity(feedback.packet_status_count as usize);
+    let payload = &feedback.payload;
+    let mut offset = 0usize;
+
+    // Symbols: 00 = not received, 01 = received (small delta),
+    // 10 = received (large delta).
+    let mut symbols: Vec<u8> = Vec::with_capacity(feedback.packet_status_count as usize);
+    while symbols.len() < feedback.packet_status_count as usize {
+        let Some(chunk_hi) = payload.get(offset).copied() else {
+            break;
+        };
+        let Some(chunk_lo) = payload.get(offset + 1).copied() else {
+            break;
+        };
+        offset += 2;
+        let chunk = u16::from_be_bytes([chunk_hi, chunk_lo]);
+        if chunk >> 15 == 0 {
+            // Run length chunk: |0|S(2)|run(13)|.
+            let sym = ((chunk >> 13) & 0b11) as u8;
+            let run = (chunk & 0x1fff) as usize;
+            for _ in 0..run {
+                symbols.push(sym);
+            }
+        } else {
+            // Status vector chunk: |1|S|symbols|.
+            if (chunk >> 14) & 1 == 0 {
+                // S=0: 14 one-bit symbols — 0 = received (small), 1 = not received.
+                for i in 0..14usize {
+                    let bit = (chunk >> (13 - i)) & 1;
+                    symbols.push(if bit == 0 { 0b01 } else { 0b00 });
+                }
+            } else {
+                // S=1: 7 two-bit symbols, most significant first.
+                for i in 0..7usize {
+                    let sym = ((chunk >> (12 - 2 * i)) & 0b11) as u8;
+                    symbols.push(sym);
+                }
+            }
+        }
+    }
+    symbols.truncate(feedback.packet_status_count as usize);
+
+    // Pass 2 — read the deltas for received statuses.
+    for (i, sym) in symbols.iter().enumerate() {
+        let seq = feedback.base_sequence.wrapping_add(i as u16);
+        match sym {
+            0b00 => out.push((seq, None)),
+            0b01 => {
+                // 1-byte delta, 250 µs units, unsigned (0..=63.75 ms).
+                let Some(b) = payload.get(offset).copied() else {
+                    break;
+                };
+                offset += 1;
+                out.push((seq, Some((b as u8 as i64) * 250)));
+            }
+            _ => {
+                // 2-byte delta, 250 µs units, signed.
+                let Some(b0) = payload.get(offset).copied() else {
+                    break;
+                };
+                let Some(b1) = payload.get(offset + 1).copied() else {
+                    break;
+                };
+                offset += 2;
+                out.push((seq, Some((i16::from_be_bytes([b0, b1]) as i64) * 250)));
+            }
+        }
+    }
+    out
+}
+
 fn build_sender_report_body(sr: &SenderReport) -> RtpResult<Vec<u8>> {
     let mut body = Vec::with_capacity(24 + sr.report_blocks.len() * 24);
     body.extend_from_slice(&sr.sender_ssrc.to_be_bytes());

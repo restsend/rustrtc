@@ -253,6 +253,32 @@ impl VideoCapability {
             ..Self::default()
         }
     }
+
+    /// VP9 (RFC 9628), profile 0 — the browser default.
+    pub fn vp9() -> Self {
+        Self {
+            payload_type: 98,
+            codec_name: "VP9".to_string(),
+            clock_rate: 90000,
+            fmtp: Some("profile-id=0".to_string()),
+            rtcp_fbs: vec![
+                "nack".to_string(),
+                "nack pli".to_string(),
+                "ccm fir".to_string(),
+                "goog-remb".to_string(),
+                "transport-cc".to_string(),
+            ],
+            rtx_payload_type: None,
+        }
+    }
+
+    /// VP9 with RTX enabled.
+    pub fn vp9_with_rtx(rtx_payload_type: u8) -> Self {
+        Self {
+            rtx_payload_type: Some(rtx_payload_type),
+            ..Self::vp9()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -387,8 +413,11 @@ impl PartialEq for DepacketizerStrategy {
 
 impl Eq for DepacketizerStrategy {}
 
-fn default_rtp_buffer_capacity() -> usize {
-    100
+fn default_enable_gcc() -> bool {
+    true
+}
+
+fn default_rtp_buffer_capacity() -> usize {    100
 }
 
 fn default_buffer_stats_log_interval() -> std::time::Duration {
@@ -433,6 +462,13 @@ pub struct RtcConfiguration {
     pub certificates: Vec<CertificateConfig>,
     pub transport_mode: TransportMode,
     pub nack_buffer_size: usize,
+    /// Enable the TWCC + GCC bandwidth-adaptation loop: stamp outgoing RTP
+    /// with the transport-cc sequence-number extension, generate TWCC feedback
+    /// for inbound streams, and expose a sender `target_bitrate` estimate.
+    /// Default: true (no in-library send-rate limiting; apps opt in via
+    /// `RtpSender::subscribe_target_bitrate`).
+    #[serde(default = "default_enable_gcc")]
+    pub enable_gcc: bool,
     pub media_capabilities: Option<MediaCapabilities>,
     /// Override the advertised IP address in SDP (for NAT traversal).
     /// When set, the `c=`, `o=`, and candidate addresses in the SDP will
@@ -530,6 +566,12 @@ pub struct RtcConfiguration {
     /// Enable UPnP IGD for automatic port mapping
     #[serde(default = "default_enable_upnp")]
     pub enable_upnp: bool,
+    /// Advertise host candidates via mDNS (draft-ietf-rtcweb-mdns): the SDP
+    /// carries `<random>.local` hostnames instead of local IPs, and an mDNS
+    /// responder answers A/AAAA lookups for them. Real addresses are kept
+    /// internally, so connectivity is unaffected. Default: false.
+    #[serde(default)]
+    pub enable_mdns: bool,
     /// UPnP port mapping lease duration in seconds
     #[serde(default = "default_upnp_lease_duration")]
     pub upnp_lease_duration: u32,
@@ -600,6 +642,7 @@ impl PartialEq for RtcConfiguration {
             && self.certificates == other.certificates
             && self.transport_mode == other.transport_mode
             && self.nack_buffer_size == other.nack_buffer_size
+            && self.enable_gcc == other.enable_gcc
             && self.media_capabilities == other.media_capabilities
             && self.external_ip == other.external_ip
             && self.external_port == other.external_port
@@ -663,6 +706,7 @@ impl Default for RtcConfiguration {
             certificates: Vec::new(),
             transport_mode: TransportMode::default(),
             nack_buffer_size: 200,
+            enable_gcc: default_enable_gcc(),
             media_capabilities: None,
             external_ip: None,
             external_port: None,
@@ -697,6 +741,7 @@ impl Default for RtcConfiguration {
             enable_ice_lite: false,
             prefer_srflx_over_natted_host: false,
             enable_upnp: default_enable_upnp(),
+            enable_mdns: false,
             upnp_lease_duration: default_upnp_lease_duration(),
             upnp_discovery_timeout: default_upnp_discovery_timeout(),
             upnp_refresh_interval: default_upnp_refresh_interval(),
@@ -781,6 +826,16 @@ impl RtcConfigurationBuilder {
 
     pub fn enable_upnp(mut self, enable: bool) -> Self {
         self.inner.enable_upnp = enable;
+        self
+    }
+
+    pub fn enable_mdns(mut self, enable: bool) -> Self {
+        self.inner.enable_mdns = enable;
+        self
+    }
+
+    pub fn enable_gcc(mut self, enable: bool) -> Self {
+        self.inner.enable_gcc = enable;
         self
     }
 

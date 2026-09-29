@@ -324,6 +324,9 @@ struct SctpInner {
     new_data_channel_tx: Option<mpsc::UnboundedSender<Arc<DataChannel>>>,
     is_client: bool,
     sent_queue: Mutex<BTreeMap<u32, ChunkRecord>>,
+    /// Per-stream buffered byte counts (queued + unacked). Mirrored into each
+    /// `DataChannel`'s atomic for `buffered_amount()` / `BufferedAmountLow`.
+    stream_buffered: Mutex<HashMap<u16, usize>>,
     received_queue: Mutex<BTreeMap<u32, (u8, Bytes)>>,
 
     // RTO State
@@ -504,6 +507,9 @@ struct SackOutcome {
     retransmit: Vec<(u32, Bytes)>,
     head_moved: bool,
     max_reported: u32,
+    /// (stream_id, bytes) for every chunk removed from the sent queue —
+    /// drives the per-channel buffered-amount accounting.
+    bytes_acked_per_stream: Vec<(u16, usize)>,
 }
 
 fn apply_sack_to_sent_queue(
@@ -559,6 +565,7 @@ fn apply_sack_to_sent_queue(
     for tsn in to_remove {
         if let Some(record) = sent_queue.remove(&tsn) {
             let len = record.payload.len();
+            outcome.bytes_acked_per_stream.push((record.stream_id, len));
             trace!("SACK acknowledging TSN {} (len={})", tsn, len);
             if record.in_flight {
                 outcome.flight_reduction += len;
@@ -600,6 +607,11 @@ fn apply_sack_to_sent_queue(
                 record.acked = true;
                 let len = record.payload.len();
                 outcome.bytes_acked_by_gap += len;
+                // The payload is freed below; account the per-stream buffered
+                // bytes here (the later cumulative removal sees len 0).
+                outcome
+                    .bytes_acked_per_stream
+                    .push((record.stream_id, len));
 
                 // Always reduce flight_size when a packet is acknowledged,
                 // regardless of whether it was retransmitted
@@ -798,6 +810,7 @@ impl SctpTransport {
             new_data_channel_tx,
             is_client,
             sent_queue: Mutex::new(BTreeMap::new()),
+            stream_buffered: Mutex::new(HashMap::new()),
             received_queue: Mutex::new(BTreeMap::new()),
             rto_state: Mutex::new(RtoCalculator::new(
                 config.sctp_rto_initial.as_secs_f64(),
@@ -921,6 +934,12 @@ impl SctpTransport {
         self.inner.flight_size.load(Ordering::SeqCst)
     }
 
+    /// Per-channel buffered amount: bytes queued for `channel_id` that SCTP
+    /// has not acknowledged yet (W3C `RTCDataChannel.bufferedAmount`).
+    pub fn buffered_amount_for(&self, channel_id: u16) -> usize {
+        self.inner.buffered_amount_for(channel_id)
+    }
+
     /// Returns the reason why the SCTP association closed, if available.
     pub fn close_reason(&self) -> Option<String> {
         self.inner.close_reason.lock().clone()
@@ -993,6 +1012,65 @@ impl Drop for SctpTransport {
 }
 
 impl SctpInner {
+    /// Per-channel buffered amount: bytes queued for `channel_id` that SCTP
+    /// has not acknowledged yet.
+    fn buffered_amount_for(&self, channel_id: u16) -> usize {
+        self.stream_buffered
+            .lock()
+            .get(&channel_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Add `len` bytes to a stream's buffered count and publish the new value
+    /// on the DataChannel (called from the send path).
+    fn account_stream_queued(&self, stream_id: u16, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let amount = {
+            let mut map = self.stream_buffered.lock();
+            let entry = map.entry(stream_id).or_insert(0);
+            *entry = entry.saturating_add(len);
+            *entry
+        };
+        self.publish_stream_buffered(stream_id, amount);
+    }
+
+    /// Remove `len` acknowledged bytes from a stream's buffered count and
+    /// publish the new value on the DataChannel (called from the SACK path).
+    fn account_stream_acked(&self, stream_id: u16, len: usize) {
+        let amount = {
+            let mut map = self.stream_buffered.lock();
+            match map.get_mut(&stream_id) {
+                Some(entry) => {
+                    *entry = entry.saturating_sub(len);
+                    *entry
+                }
+                None => 0,
+            }
+        };
+        self.publish_stream_buffered(stream_id, amount);
+    }
+
+    /// Clear a stream's buffered count (channel closed / association torn down).
+    fn clear_stream_buffered(&self, stream_id: u16) {
+        self.stream_buffered.lock().remove(&stream_id);
+        self.publish_stream_buffered(stream_id, 0);
+    }
+
+    /// Mirror a stream's buffered amount into its DataChannel so
+    /// `buffered_amount()` and the low-watermark event fire lock-free.
+    fn publish_stream_buffered(&self, stream_id: u16, amount: usize) {
+        let channels = self.data_channels.lock();
+        if let Some(dc) = channels
+            .iter()
+            .find_map(|w| w.upgrade().filter(|d| d.id == stream_id))
+        {
+            dc.on_buffered_amount(amount);
+        }
+    }
+
     async fn run_loop(
         &self,
         close_rx: Arc<tokio::sync::Notify>,
@@ -1876,7 +1954,7 @@ impl SctpInner {
             };
 
             let now = Instant::now();
-            let outcome = {
+            let mut outcome = {
                 let mut sent_queue = self.sent_queue.lock();
 
                 // Log SACK receipt with flight size and queue info (inside same lock)
@@ -1914,6 +1992,13 @@ impl SctpInner {
             if !outcome.retransmit.is_empty() {
                 self.stats_retransmissions
                     .fetch_add(outcome.retransmit.len() as u64, Ordering::Relaxed);
+            }
+
+            // Per-channel buffered-amount accounting for acked bytes
+            for (stream_id, len) in outcome.bytes_acked_per_stream.drain(..) {
+                if len > 0 {
+                    self.account_stream_acked(stream_id, len);
+                }
             }
 
             if outcome.bytes_acked_by_cum_tsn > 0 || !outcome.rtt_samples.is_empty() {
@@ -2440,6 +2525,9 @@ impl SctpInner {
     }
 
     pub async fn close_data_channel(&self, channel_id: u16) -> Result<()> {
+        // Release the channel's buffered-amount accounting first so a
+        // subsequent channel reusing this stream id starts from zero.
+        self.clear_stream_buffered(channel_id);
         // 1. Find the channel and set state to Closing
         {
             let channels = self.data_channels.lock();
@@ -2812,6 +2900,9 @@ impl SctpInner {
                         },
                         max_payload_size: None,
                         negotiated: None,
+                        // Remote-opened channels default to no low-watermark
+                        // event; apps can call set_buffered_amount_low_threshold.
+                        buffered_amount_low_threshold: 0,
                     };
 
                     let dc = Arc::new(DataChannel::new(stream_id, config));
@@ -3207,6 +3298,7 @@ impl SctpInner {
         }
 
         self.queued_bytes.fetch_add(total_len, Ordering::Relaxed);
+        self.account_stream_queued(channel_id, total_len);
 
         if total_len == 0 {
             // Handle empty message

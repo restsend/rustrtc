@@ -260,6 +260,215 @@ impl DepacketizerFactory for DefaultDepacketizerFactory {
     }
 }
 
+/// Parsed VP9 payload descriptor (RFC 9628 §4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Vp9Descriptor {
+    /// Picture ID, when the I bit is set (7- or 15-bit unified to u16).
+    pub picture_id: Option<u16>,
+    /// P bit: frame uses inter-picture prediction (`false` = keyframe).
+    pub inter_predicted: bool,
+    /// F bit: flexible mode.
+    pub flexible: bool,
+    /// B bit: first RTP packet of the VP9 frame.
+    pub start_of_frame: bool,
+    /// E bit: last RTP packet of the VP9 frame.
+    pub end_of_frame: bool,
+    /// Byte length of the descriptor (payload starts at this offset).
+    pub header_len: usize,
+}
+
+/// Parse a VP9 payload descriptor. Tolerant of truncated/malformed input:
+/// returns `None` instead of panicking, and skips over optional fields
+/// (layer indices, reference indices, scalability structure) by their RFC 9628
+/// lengths.
+pub fn parse_vp9_descriptor(payload: &[u8]) -> Option<Vp9Descriptor> {
+    let b0 = *payload.first()?;
+    let picture_id_present = b0 & 0x80 != 0;
+    let inter_predicted = b0 & 0x40 != 0;
+    let layer_indices_present = b0 & 0x20 != 0;
+    let flexible = b0 & 0x10 != 0;
+    let start_of_frame = b0 & 0x08 != 0;
+    let end_of_frame = b0 & 0x04 != 0;
+    let ss_present = b0 & 0x02 != 0;
+
+    let mut idx = 1usize;
+    let mut picture_id = None;
+
+    if picture_id_present {
+        let first = *payload.get(idx)?;
+        if first & 0x80 != 0 {
+            let second = *payload.get(idx + 1)?;
+            picture_id = Some((((first & 0x7f) as u16) << 8) | second as u16);
+            idx += 2;
+        } else {
+            picture_id = Some(first as u16);
+            idx += 1;
+        }
+    }
+
+    if layer_indices_present {
+        // One octet: TID(3)|U(1)|SID(3)|D(1).
+        payload.get(idx)?;
+        idx += 1;
+        if !flexible {
+            // TL0PICIDX (non-flexible only).
+            payload.get(idx)?;
+            idx += 1;
+        }
+    }
+
+    if inter_predicted && flexible {
+        // Reference indices: up to 3 chained via the N bit (LSB).
+        for _ in 0..3 {
+            let ri = *payload.get(idx)?;
+            idx += 1;
+            if ri & 0x01 == 0 {
+                break;
+            }
+        }
+    }
+
+    if ss_present {
+        // Scalability structure (RFC 9628 §4.2.1).
+        let ss = *payload.get(idx)?;
+        idx += 1;
+        let n_s = ((ss >> 5) & 0x07) as usize;
+        let y = ss & 0x10 != 0;
+        let g = ss & 0x08 != 0;
+        if y {
+            // (N_S + 1) × (WIDTH(2) + HEIGHT(2)).
+            idx += (n_s + 1) * 4;
+        }
+        if g {
+            let n_g = *payload.get(idx)? as usize;
+            idx += 1;
+            for _ in 0..n_g {
+                // |TID(3)|U(1)|R(2)|res(2)| followed by R P_DIFFs.
+                let ng = *payload.get(idx)?;
+                idx += 1;
+                let r = ((ng >> 2) & 0x03) as usize;
+                idx += r;
+            }
+        }
+        payload.get(idx.checked_sub(1)?)?;
+    }
+
+    Some(Vp9Descriptor {
+        picture_id,
+        inter_predicted,
+        flexible,
+        start_of_frame,
+        end_of_frame,
+        header_len: idx,
+    })
+}
+
+/// VP9 depacketizer (RFC 9628). Reassembles frames from B/E-delimited packet
+/// runs sharing one RTP timestamp; drops packets that arrive without a frame
+/// in progress (the predecessor was lost).
+pub struct Vp9Depacketizer {
+    frame_buffer: Vec<u8>,
+    current_timestamp: u32,
+    frame_in_progress: bool,
+    drop_count: Arc<AtomicU64>,
+}
+
+impl Default for Vp9Depacketizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Vp9Depacketizer {
+    pub fn new() -> Self {
+        Self {
+            frame_buffer: Vec::new(),
+            current_timestamp: 0,
+            frame_in_progress: false,
+            drop_count: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Returns a shared reference to the atomic drop counter.
+    pub fn drop_counter(&self) -> Arc<AtomicU64> {
+        self.drop_count.clone()
+    }
+}
+
+impl Depacketizer for Vp9Depacketizer {
+    fn drop_count(&self) -> u64 {
+        self.drop_count.load(Ordering::Relaxed)
+    }
+
+    fn push(
+        &mut self,
+        packet: RtpPacket,
+        clock_rate: u32,
+        addr: SocketAddr,
+        kind: MediaKind,
+    ) -> MediaResult<Vec<MediaSample>> {
+        if kind == MediaKind::Audio {
+            // Audio never carries a VP9 descriptor; pass it through untouched.
+            return Ok(vec![MediaSample::from_rtp_packet(
+                packet, kind, clock_rate, addr,
+            )]);
+        }
+
+        let mut out = Vec::new();
+        let desc = match parse_vp9_descriptor(&packet.payload) {
+            Some(d) => d,
+            None => {
+                self.drop_count.fetch_add(1, Ordering::Relaxed);
+                return Ok(out);
+            }
+        };
+        if desc.header_len > packet.payload.len() {
+            self.drop_count.fetch_add(1, Ordering::Relaxed);
+            return Ok(out);
+        }
+        let payload = packet.payload.slice(desc.header_len..);
+        let timestamp = packet.header.timestamp;
+
+        let new_picture = timestamp != self.current_timestamp;
+        if desc.start_of_frame {
+            // Discard any incomplete previous frame (its E packet was lost).
+            self.frame_buffer.clear();
+            self.frame_buffer.extend_from_slice(&payload);
+            self.current_timestamp = timestamp;
+            self.frame_in_progress = true;
+        } else if self.frame_in_progress && !new_picture {
+            self.frame_buffer.extend_from_slice(&payload);
+        } else {
+            // Continuation without a start (loss) or a stale tail from a
+            // picture we already flushed: unrecoverable, drop.
+            self.drop_count.fetch_add(1, Ordering::Relaxed);
+            return Ok(out);
+        }
+
+        if desc.end_of_frame || packet.header.marker {
+            let frame = VideoFrame {
+                rtp_timestamp: self.current_timestamp,
+                width: 0,
+                height: 0,
+                format: VideoPixelFormat::Unspecified,
+                rotation_deg: 0,
+                is_last_packet: true,
+                data: Bytes::copy_from_slice(&self.frame_buffer),
+                header_extension: packet.header.extension.clone(),
+                csrcs: packet.header.csrcs.clone(),
+                sequence_number: Some(packet.header.sequence_number),
+                payload_type: Some(packet.header.payload_type),
+                source_addr: Some(addr),
+                raw_packet: Some(packet.clone()),
+            };
+            self.frame_buffer.clear();
+            self.frame_in_progress = false;
+            out.push(MediaSample::Video(frame));
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
