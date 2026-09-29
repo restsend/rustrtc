@@ -147,3 +147,50 @@ async fn the_first_description_gets_a_fresh_origin() -> Result<()> {
     assert_ne!(answer.session.origin.session_id, 0);
     Ok(())
 }
+
+/// A configured `external_ip` lands in the first `o=` line and is then kept
+/// verbatim by every later description, across several renegotiations.
+#[tokio::test]
+async fn reoffers_keep_the_configured_external_ip() -> Result<()> {
+    let pc1 = PeerConnection::new(RtcConfiguration {
+        transport_mode: TransportMode::Rtp,
+        external_ip: Some("203.0.113.10".to_string()),
+        ..RtcConfiguration::default()
+    });
+    let pc2 = rtp_pc();
+    let (_source, track, _) = sample_track(rustrtc::media::MediaKind::Audio, 100);
+    pc1.add_track(track, opus())?;
+
+    let offer = pc1.create_offer().await?;
+    assert_eq!(
+        offer.session.origin.unicast_address, "203.0.113.10",
+        "the first offer carries the configured external_ip"
+    );
+    negotiate(&pc1, &pc2).await?;
+
+    for round in 0..2 {
+        let previous = origin(&pc1.local_description().unwrap());
+        pc1.get_transceivers()[0].set_direction(if round == 0 {
+            TransceiverDirection::SendOnly
+        } else {
+            TransceiverDirection::SendRecv
+        });
+
+        let offer = pc1.create_offer().await?;
+        assert_follows(
+            &previous,
+            &origin(&offer),
+            &format!("external-ip re-offer {round}"),
+        );
+        assert_eq!(
+            offer.session.origin.unicast_address, "203.0.113.10",
+            "re-offer {round}: the kept origin still carries external_ip"
+        );
+        pc1.set_local_description(offer.clone())?;
+        pc2.set_remote_description(offer).await?;
+        let answer = pc2.create_answer().await?;
+        pc2.set_local_description(answer.clone())?;
+        pc1.set_remote_description(answer).await?;
+    }
+    Ok(())
+}

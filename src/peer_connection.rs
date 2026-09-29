@@ -1233,8 +1233,11 @@ impl PeerConnection {
 
         // If the transport is already up (renegotiation), record it so a sender
         // installed later via set_sender is connected. Direct RTP records it
-        // once the remote description selects the media transport.
-        if matches!(kind, MediaKind::Audio | MediaKind::Video)
+        // once the remote description selects the media transport. Image
+        // transceivers send over their own UDPTL transport, but the transport
+        // -up path records the RTP reference for them too, so creation order
+        // does not change what a transceiver carries.
+        if matches!(kind, MediaKind::Audio | MediaKind::Video | MediaKind::Image)
             && self.inner.config.transport_mode != TransportMode::Rtp
             && let Some(transport) = self.inner.rtp_transport.lock().as_ref()
         {

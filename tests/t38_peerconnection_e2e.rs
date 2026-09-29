@@ -338,3 +338,121 @@ async fn test_t38_fax_call_over_peerconnection() {
     let received = callee_fax.session.lock().await.take_page_data();
     assert_eq!(received, page, "page differs over PC transports");
 }
+
+/// A T.38 leg added AFTER the initial negotiation (transport already up):
+/// the Image transceivers are created late, renegotiation picks them up, and
+/// the resulting UDPTL transports actually exchange datagrams.
+#[tokio::test]
+async fn test_t38_image_transceiver_added_after_transport_is_up() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let mut caller_config = make_t38_config();
+    caller_config.external_ip = Some("127.0.0.1".to_string());
+    let mut callee_config = make_t38_config();
+    callee_config.external_ip = Some("127.0.0.1".to_string());
+
+    let caller = PeerConnection::new(caller_config);
+    let callee = PeerConnection::new(callee_config);
+
+    // Initial negotiation is audio-only.
+    let (_source, track, _) =
+        rustrtc::media::track::sample_track(rustrtc::media::MediaKind::Audio, 100);
+    caller
+        .add_track(
+            track,
+            RtpCodecParameters {
+                payload_type: 0,
+                name: "PCMU".to_string(),
+                clock_rate: 8000,
+                channels: 1,
+            },
+        )
+        .unwrap();
+
+    let offer = caller.create_offer().await.unwrap();
+    caller.set_local_description(offer.clone()).unwrap();
+    callee.set_remote_description(offer).await.unwrap();
+    let answer = callee.create_answer().await.unwrap();
+    callee.set_local_description(answer.clone()).unwrap();
+    caller.set_remote_description(answer).await.unwrap();
+    tokio::try_join!(caller.wait_for_connected(), callee.wait_for_connected()).unwrap();
+
+    // Transport is up: add the T.38 leg now, on both sides.
+    let caller_image = caller.add_transceiver(MediaKind::Image, TransceiverDirection::SendRecv);
+    let callee_image = callee.add_transceiver(MediaKind::Image, TransceiverDirection::SendRecv);
+    assert!(caller_image.udtl_transport().is_none());
+    assert!(callee_image.udtl_transport().is_none());
+
+    // Renegotiate: the re-offer must carry a usable m=image with a real port.
+    let offer = caller.create_offer().await.unwrap();
+    let image_section = offer
+        .media_sections
+        .iter()
+        .find(|s| s.kind == MediaKind::Image)
+        .expect("re-offer carries m=image");
+    assert_ne!(
+        image_section.port, 0,
+        "offer m=image port: {image_section:?}"
+    );
+    caller.set_local_description(offer.clone()).unwrap();
+    callee.set_remote_description(offer).await.unwrap();
+
+    let answer = callee.create_answer().await.unwrap();
+    let image_section = answer
+        .media_sections
+        .iter()
+        .find(|s| s.kind == MediaKind::Image)
+        .expect("answer carries m=image");
+    assert_ne!(
+        image_section.port, 0,
+        "answer m=image port: {image_section:?}"
+    );
+    callee.set_local_description(answer.clone()).unwrap();
+    caller.set_remote_description(answer).await.unwrap();
+
+    // SDP generation lazily creates the UDPTL transports.
+    let caller_udtl = caller_image
+        .udtl_transport()
+        .expect("caller udtl transport");
+    let callee_udtl = callee_image
+        .udtl_transport()
+        .expect("callee udtl transport");
+    assert_ne!(caller_udtl.local_addr().unwrap().port(), 0);
+    assert_ne!(callee_udtl.local_addr().unwrap().port(), 0);
+
+    // Fax endpoints attach to the late-created legs.
+    let caller_fax = caller
+        .init_t38_fax_with(rustrtc::t38::t30::T30FaxConfig::default(), T30Role::Caller)
+        .await
+        .unwrap();
+    let callee_fax = callee
+        .init_t38_fax_with(rustrtc::t38::t30::T30FaxConfig::default(), T30Role::Callee)
+        .await
+        .unwrap();
+    assert!(std::sync::Arc::ptr_eq(&caller_fax.transport, &caller_udtl));
+    assert!(std::sync::Arc::ptr_eq(&callee_fax.transport, &callee_udtl));
+
+    // The exchanged SDP addresses must let datagrams flow caller → callee.
+    let payload = [0x07u8, 0xAB, 0xCD, 0x01];
+    caller_fax.transport.send(&payload).await.unwrap();
+    let mut recv_buf = rustrtc::transports::udptl::UdtlReceiveBuffer::default();
+    let mut primary = None;
+    for _ in 0..10 {
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            callee_fax.transport.recv(&mut recv_buf),
+        )
+        .await
+        .expect("timed out waiting for the UDPTL datagram")
+        .unwrap();
+        if let Some(data) = got {
+            primary = Some(data);
+            break;
+        }
+    }
+    assert_eq!(
+        primary.as_deref(),
+        Some(&payload[..]),
+        "UDPTL datagram did not reach the late-added callee leg"
+    );
+}

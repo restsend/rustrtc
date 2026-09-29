@@ -789,3 +789,41 @@ async fn test_reoffer_keeps_hold_from_hand_built_initial_offer() {
     pc.set_remote_description(answer).await.unwrap();
     assert_eq!(reoffer(&pc, Direction::RecvOnly).await, Direction::SendOnly);
 }
+
+/// Public-API contract behind the re-offer fix: `direction()` mirrors the
+/// direction carried by the last applied remote description, while the next
+/// offer carries our own preference. After answering a remote hold, the
+/// transceiver still reads the remote's `sendonly`, yet our re-offer says
+/// `sendrecv` — the offer no longer echoes what `direction()` holds.
+#[tokio::test]
+async fn test_direction_reads_current_direction_not_the_reoffer_preference() {
+    let pc = rtp_pc_with_audio_sender();
+    assert_eq!(
+        answer_remote_offer(&pc, Direction::SendOnly).await,
+        Direction::RecvOnly,
+        "a remote hold is answered recvonly"
+    );
+
+    let t = pc.get_transceivers()[0].clone();
+    assert_eq!(
+        t.direction(),
+        TransceiverDirection::SendOnly,
+        "direction() mirrors the remote offer's direction"
+    );
+    assert_eq!(
+        reoffer(&pc, Direction::SendOnly).await,
+        Direction::SendRecv,
+        "the re-offer carries our own preference, not direction()"
+    );
+    assert_eq!(
+        t.direction(),
+        TransceiverDirection::SendOnly,
+        "generating an offer does not touch direction()"
+    );
+
+    // set_direction sets the preference and is visible immediately; the next
+    // offer follows it.
+    t.set_direction(TransceiverDirection::RecvOnly);
+    assert_eq!(t.direction(), TransceiverDirection::RecvOnly);
+    assert_eq!(reoffer(&pc, Direction::RecvOnly).await, Direction::RecvOnly);
+}
