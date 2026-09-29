@@ -7,7 +7,7 @@ A high-performance, full-stack real-time communication library — **WebRTC, RTP
 
 ## Features
 
-- **High performance** — ~3.4× faster than `webrtc-rs` and ~3.2× faster than `pion` (Go) in throughput, with ~47% less memory than `webrtc-rs` (see the benchmark below).
+- **High performance** — ~3.3× faster than `webrtc-rs` and ~3.2× faster than `pion` (Go) in throughput, with ~52% less memory than `webrtc-rs` (see the benchmark below).
 - **Full protocol stack** — WebRTC, RTP, SRTP, and **T.38 fax** in a single library, plus **UPnP IGD** NAT traversal. Few moving parts, no missing pieces.
 - **Unified `PeerConnection` API** — one interface for every transport mode (`WebRtc` ICE/DTLS/SRTP, `Srtp`, `Rtp`, and T.38). No fragmented APIs.
 - **WebRTC compliant** — interoperable with Chrome/WebRTC and pion; offer/answer, renegotiation, rollback, and standard SDP attributes.
@@ -18,29 +18,70 @@ A high-performance, full-stack real-time communication library — **WebRTC, RTP
 - **NAT traversal & deployment** — RTP latching, UPnP IGD port mapping, and firewall-friendly port ranges (`rtp_start_port`/`rtp_end_port`).
 - **Production extras** — RTP rewrite bridge (SSRC/PT/sequence remapping) and a WebRTC-compatible stats model.
 
-## Benchmark (rustrtc vs webrtc-rs & pion)
+## Benchmark (rustrtc vs webrtc-rs & pion) in 0.3.141
 
-Fresh 3-way comparison (`cargo run -r --example benchmark` builds the webrtc-rs
-and pion harnesses automatically):
+**CPU:** `Intel(R) Core(TM) i7-9700T CPU @ 2.00GHz` (8 cores)  
+**OS:** `Debian 13, 6.12.101+deb13-amd64`  
+**Compiler:** `rustc 1.97.1 (8bab26f4f 2026-07-14)`, `go version go1.24.4 linux/amd64`
 
-| Metric               | webrtc     | rustrtc    | pion       | rustrtc advantage        |
-|----------------------|-----------:|-----------:|-----------:|--------------------------|
-| Throughput (MB/s)    | 159.81     | **550.40** | 171.39     | **3.4× webrtc / 3.2× pion** |
-| Msg Rate (msg/s)     | 163,643    | **563,611**| 175,505    | **3.4× / 3.2×**          |
-| Setup Latency (ms)   | 3.09       | **0.57**   | 1.20       | **5.4× / 2.1× faster**   |
-| CPU Usage (%)        | 674        | 736        | **671**    | comparable (drives 3.4× the throughput) |
-| Memory (MB)          | 40         | **21**     | 54         | **-47% webrtc / -61% pion** |
+```shell
+cargo run -r --example benchmark
 
-**Key findings:**
+Comparison (Baseline: webrtc)
+Metric               | webrtc     | rustrtc    | pion      
+--------------------------------------------------------------------------------
+Duration (s)         | 10.07      | 10.24      | 10.07     
+Setup Latency (ms)   | 25.64      | 0.45       | 3.00      
+Throughput (MB/s)    | 165.98     | 549.04     | 169.58    
+Msg Rate (msg/s)     | 169967.13  | 562214.36  | 173647.96 
+CPU Usage (%)        | 677.95     | 739.62     | 555.20    
+Memory (MB)          | 44.00      | 21.00      | 48.00     
+--------------------------------------------------------------------------------
 
-- **Throughput**: `rustrtc` is ~3.4× faster than `webrtc-rs` and ~3.2× faster than `pion`,
-  with no regression after adding ICE restart, mDNS, VP9, and the TWCC/GCC pipeline.
-- **Memory**: `rustrtc` uses ~47% less memory than `webrtc-rs` and ~61% less than `pion`.
-- **Setup latency**: 0.57 ms vs 3.09 ms (webrtc-rs) / 1.20 ms (pion).
+Performance Charts
+==================
 
-Reproduce with `cargo run -r --example benchmark` (numbers above from an 8-core
-x86-64 Linux box, rustc 1.97 / go1.24; absolute values scale with hardware —
-the ratios are the stable signal).
+Throughput (MB/s) (Higher is better)
+webrtc     | ████████████                             165.98
+rustrtc    | ████████████████████████████████████████ 549.04
+pion       | ████████████                             169.58
+
+Message Rate (msg/s) (Higher is better)
+webrtc     | ████████████                             169967.13
+rustrtc    | ████████████████████████████████████████ 562214.36
+pion       | ████████████                             173647.96
+
+Setup Latency (ms) (Lower is better)
+webrtc     | ████████████████████████████████████████ 25.64
+rustrtc    |                                          0.45
+pion       | ████                                     3.00
+
+CPU Usage (%) (Lower is better)
+webrtc     | ████████████████████████████████████     677.95
+rustrtc    | ████████████████████████████████████████ 739.62
+pion       | ████████████████████████████████████████ 555.20
+
+Memory (MB) (Lower is better)
+webrtc     | ████████████████████████████████████████ 44.00
+rustrtc    | █████████████████                        21.00
+pion       | ████████████████████████████████████████ 48.00
+```
+
+**Key Findings:**
+
+- **Throughput**: `rustrtc` is ~3.3× faster than `webrtc-rs` and ~3.2× faster than `pion`.
+- **Memory**: `rustrtc` uses ~52% less memory than `webrtc-rs` and ~56% less than `pion`.
+- **Setup latency**: 0.45 ms — orders of magnitude faster than `webrtc-rs` (25.6 ms) and ~6.7×
+  faster than `pion` (3.0 ms).
+- **Efficiency per CPU**: 0.74 MB/s per CPU-percent vs 0.31 (pion) and 0.24 (webrtc-rs) —
+  `rustrtc` delivers ~2.3× more throughput per unit of CPU.
+
+**No regression with the new stack:** this run has the TWCC/GCC pipeline **active**
+(`enable_gcc = true`: transport-cc sequence stamping on every outbound packet plus
+receiver-side TWCC feedback generation), and throughput still holds 3.3× / 3.2× over
+`webrtc-rs` / `pion`. ICE restart, mDNS candidate obfuscation, and the VP9 codec are
+likewise pure add-ons — the ratios above are the stable signal across releases
+(0.3.114: 2.95× / 2.7×; 0.3.141: 3.3× / 3.2×).
 
 ## Usage
 
