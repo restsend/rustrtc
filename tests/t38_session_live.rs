@@ -1,3 +1,5 @@
+#![cfg(feature = "t38")]
+
 use std::sync::Arc;
 
 use rustrtc::t38::endpoint::{FaxEndpoint, ReceiveCodec};

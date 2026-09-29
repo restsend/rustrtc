@@ -90,6 +90,12 @@ simulator = []
 t38 = []
 t38-interop = []
 
+# The T.38 benchmark imports `rustrtc::t38`, which only exists with the
+# feature enabled; without this gate plain `cargo test/build` fails on it.
+[[example]]
+name = "t38_bench"
+required-features = ["t38"]
+
 # Local dev/test build speedups. These only apply when rustrtc is the root crate
 # (e.g. `cargo test` here); downstream consumers use their own profiles. The big
 # win is `split-debuginfo = "unpacked"`, which moves debug info out of the
