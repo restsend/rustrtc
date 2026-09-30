@@ -564,6 +564,14 @@ pub struct RtpTransport {
     /// makes the hot-path check a single atomic load (zero cost when unused).
     observers: RwLock<Vec<Arc<dyn RtpObserver>>>,
     has_observers: AtomicBool,
+    /// Whether the negotiated direction lets any stream on this transport
+    /// send RTP. Gates every RTP egress path; RTCP is not affected.
+    rtp_send_allowed: AtomicBool,
+    /// SSRCs of streams on this transport that may not send (e.g. one held
+    /// m= section inside a BUNDLE); `has_blocked_ssrcs` keeps the check a
+    /// single atomic load when empty.
+    blocked_ssrcs: RwLock<Vec<u32>>,
+    has_blocked_ssrcs: AtomicBool,
 }
 
 impl RtpTransport {
@@ -596,7 +604,33 @@ impl RtpTransport {
             srtp_unprotect_failures: AtomicU64::new(0),
             observers: RwLock::new(Vec::new()),
             has_observers: AtomicBool::new(false),
+            rtp_send_allowed: AtomicBool::new(true),
+            blocked_ssrcs: RwLock::new(Vec::new()),
+            has_blocked_ssrcs: AtomicBool::new(false),
         }
+    }
+
+    /// Allow or stop RTP egress on this transport (sent, relayed and
+    /// retransmitted packets alike). RTCP keeps flowing.
+    pub(crate) fn set_rtp_send_allowed(&self, allowed: bool) {
+        self.rtp_send_allowed.store(allowed, Ordering::Relaxed);
+    }
+
+    /// Stop RTP egress for these SSRCs only (replaces the previous set).
+    pub(crate) fn set_blocked_ssrcs(&self, ssrcs: Vec<u32>) {
+        let mut blocked = self.blocked_ssrcs.write();
+        self.has_blocked_ssrcs
+            .store(!ssrcs.is_empty(), Ordering::Release);
+        *blocked = ssrcs;
+    }
+
+    /// Whether RTP with this SSRC may leave on this transport.
+    fn rtp_send_allowed_for(&self, ssrc: u32) -> bool {
+        if !self.rtp_send_allowed.load(Ordering::Relaxed) {
+            return false;
+        }
+        !self.has_blocked_ssrcs.load(Ordering::Acquire)
+            || !self.blocked_ssrcs.read().contains(&ssrc)
     }
 
     /// Feed an already-received plaintext RTP datagram into the transport's
@@ -803,7 +837,16 @@ impl RtpTransport {
         }
     }
 
+    /// Returns `Ok(0)` without sending while the negotiated direction stops
+    /// RTP for the packet's SSRC.
     pub async fn send(&self, buf: &[u8]) -> Result<usize> {
+        let ssrc = buf
+            .get(8..12)
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+            .unwrap_or_default();
+        if !self.rtp_send_allowed_for(ssrc) {
+            return Ok(0);
+        }
         let session = self.srtp_session.lock().as_ref().cloned();
         let Some(session) = session else {
             if self.srtp_required {
@@ -832,7 +875,12 @@ impl RtpTransport {
         self.transport.send(&protected).await
     }
 
+    /// Returns `Ok(0)` without sending while the negotiated direction stops
+    /// RTP for the packet's SSRC.
     pub async fn send_rtp(&self, mut packet: RtpPacket) -> Result<usize> {
+        if !self.rtp_send_allowed_for(packet.header.ssrc) {
+            return Ok(0);
+        }
         // Egress observation: fire on the plaintext packet BEFORE SRTP protect
         // so observers (stats/recording/sipflow) see clear RTP. Zero cost
         // (single Acquire load) when no observer is registered.
@@ -957,6 +1005,10 @@ impl RtpTransport {
             bridge.rewrite_packet(&mut packet);
             target
         };
+        if !target.rtp_send_allowed_for(packet.header.ssrc) {
+            // Relayed, but the destination stream may not send: drop.
+            return None;
+        }
 
         // Fire the destination's egress observer on the plaintext packet
         // (symmetric with the pre-protect hook in send_rtp).
