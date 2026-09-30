@@ -2957,6 +2957,56 @@ async fn use_candidate_nominates_first_pair() -> Result<()> {
     Ok(())
 }
 
+/// Send a raw USE-CANDIDATE binding request from `sock` to `to`, then answer
+/// the controlled agent's path-verification check. A genuine controlling peer
+/// re-nominating onto a new path answers connectivity checks on that path, so
+/// the re-nomination converges under the verify-before-switch rule.
+async fn send_renomination_and_verify(
+    sock: &UdpSocket,
+    to: SocketAddr,
+    controlled_addr: SocketAddr,
+) -> Result<()> {
+    let tx_id = random_bytes::<12>();
+    let mut msg = StunMessage::binding_request(tx_id, None);
+    msg.attributes.push(StunAttribute::UseCandidate);
+    let bytes = msg.encode(None, false)?;
+    sock.send_to(&bytes, controlled_addr).await?;
+
+    let mut buf = [0u8; 1500];
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("no path-verification check received from controlled agent");
+        }
+        let (n, from) = timeout(remaining, sock.recv_from(&mut buf)).await??;
+        let m = StunMessage::decode(&buf[..n])?;
+        if m.class == StunClass::Request && m.method == StunMethod::Binding {
+            let resp = StunMessage::binding_success_response(m.transaction_id, to);
+            sock.send_to(&resp.encode(None, true)?, from).await?;
+            return Ok(());
+        }
+        // else: success response to our own nomination check — keep reading
+    }
+}
+
+async fn wait_selected_remote(
+    transport: &IceTransport,
+    remote: SocketAddr,
+    deadline: Duration,
+) -> Result<()> {
+    let start = std::time::Instant::now();
+    while start.elapsed() < deadline {
+        if let Some(p) = transport.get_selected_pair() {
+            if p.remote.address == remote {
+                return Ok(());
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    anyhow::bail!("selected pair never switched to {}", remote)
+}
+
 /// The controlled agent must FOLLOW a re-nomination: a USE-CANDIDATE that
 /// arrives on a different pair after the first nomination selects that new
 /// pair. That is exactly what a real controlling peer does when its current
@@ -2965,6 +3015,11 @@ async fn use_candidate_nominates_first_pair() -> Result<()> {
 /// wrong address and the call has no media.
 ///
 /// A USE-CANDIDATE on the *same* pair remains a no-op.
+///
+/// The path-verification gate (see `verify_nominated_path`) means a second
+/// nomination must answer the agent's same-path check before the switch: a
+/// genuine controlling peer re-nominating onto a live path answers it, so the
+/// re-nomination still converges; dead paths do not and are ignored.
 #[tokio::test]
 async fn use_candidate_follows_renomination_from_new_candidate() -> Result<()> {
     // 1. Connect two ICE agents (controlling + controlled).
@@ -3055,34 +3110,22 @@ async fn use_candidate_follows_renomination_from_new_candidate() -> Result<()> {
     t2.add_remote_candidate(IceCandidate::host(second_addr, 1));
 
     // 4. Send a raw STUN Binding Request with USE-CANDIDATE from that socket
-    //    directly to the controlled agent's listening address.
-    //    (handle_stun_request does not enforce HMAC, so a bare request suffices.)
+    //    directly to the controlled agent's listening address, and answer the
+    //    agent's path-verification check (a genuine controlling peer answers
+    //    checks on the path it nominated).
     let controlled_addr = nominated_pair.local.base_address();
-    let tx_id = random_bytes::<12>();
-    let mut msg = StunMessage::binding_request(tx_id, None);
-    msg.attributes.push(StunAttribute::UseCandidate);
-    let bytes = msg.encode(None, false)?;
-    second_socket.send_to(&bytes, controlled_addr).await?;
+    send_renomination_and_verify(&second_socket, second_addr, controlled_addr).await?;
 
-    // 5. Allow time for the packet to be received and processed.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // 6. Assert: the controlled agent followed the re-nomination.
-    let final_pair = t2
-        .get_selected_pair()
-        .expect("selected pair should still be present");
-    assert_eq!(
-        final_pair.remote.address, second_addr,
-        "controlled agent must follow a post-nomination USE-CANDIDATE to the new pair"
-    );
+    // 5. Assert: the controlled agent followed the verified re-nomination.
+    wait_selected_remote(&t2.clone(), second_addr, Duration::from_secs(3)).await?;
 
     Ok(())
 }
 
 /// The controlled agent must follow a re-nomination even onto a *higher*-
 /// priority pair: the controlling agent is authoritative, not our local
-/// priority ordering. (Previously the controlled side froze on the first
-/// nominated pair to avoid the "upgrade", which broke real re-nominations.)
+/// priority ordering. The switch is gated on the new path answering the
+/// agent's path-verification check (see `verify_nominated_path`).
 #[tokio::test]
 async fn use_candidate_follows_renomination_to_higher_priority_pair() -> Result<()> {
     let (t1, t2) = setup_host_pair(RtcConfiguration::default(), RtcConfiguration::default()).await;
@@ -3120,21 +3163,9 @@ async fn use_candidate_follows_renomination_to_higher_priority_pair() -> Result<
     t2.add_remote_candidate(high_priority);
 
     let controlled_addr = nominated_pair.local.base_address();
-    let tx_id = random_bytes::<12>();
-    let mut msg = StunMessage::binding_request(tx_id, None);
-    msg.attributes.push(StunAttribute::UseCandidate);
-    let bytes = msg.encode(None, false)?;
-    second_socket.send_to(&bytes, controlled_addr).await?;
+    send_renomination_and_verify(&second_socket, second_addr, controlled_addr).await?;
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    let final_pair = t2
-        .get_selected_pair()
-        .expect("selected pair should still be present");
-    assert_eq!(
-        final_pair.remote.address, second_addr,
-        "controlled agent must follow a post-nomination UseCandidate even to a higher-priority pair"
-    );
+    wait_selected_remote(&t2.clone(), second_addr, Duration::from_secs(3)).await?;
 
     Ok(())
 }
@@ -4706,5 +4737,213 @@ async fn udp_read_loop_survives_wsaconnreset() -> Result<()> {
         "UDP read loop died after WSAECONNRESET: subsequent packet not received"
     );
 
+    Ok(())
+}
+
+/// Reproduction of the 2026-09-30 field failure (za-pbx call
+/// 3bslinsis8fvtrj85ld1, site 14): the remote WebRTC agent only ever exposed
+/// host/srflx/relay candidates and — per the TURN server logs — its own ICE
+/// check scheduler never fired (allocation forwarded zero bytes/messages).
+///
+/// The local full-ICE agent (the PBX leg, Controlled role) must still probe
+/// the remote RELAY candidate directly: packets sent to the peer's relayed
+/// address are delivered into the peer's live allocation even when the peer
+/// never sends a check of its own. This test acts as the "silent browser":
+/// a plain UDP socket plays the remote relay port, dead sockets play the
+/// unreachable host/srflx candidates.
+#[tokio::test]
+async fn silent_remote_relay_candidate_still_gets_probed_and_connects() -> Result<()> {
+    // The "browser's TURN relay port": captures whatever the agent sends
+    // toward the remote relay candidate (miuturn forwards it into the
+    // browser's allocation when permission enforcement is off).
+    let fake_relay = UdpSocket::bind("127.0.0.1:0").await?;
+    let fake_relay_addr = fake_relay.local_addr()?;
+
+    // Unreachable remote host / srflx candidates (checks there must not
+    // stop the relay pair from being probed — mirrors the field call where
+    // direct checks die and only the relay path can work).
+    let dead_host = UdpSocket::bind("127.0.0.1:0").await?;
+    let dead_srflx = UdpSocket::bind("127.0.0.1:0").await?;
+    let _ = (&dead_host, &dead_srflx);
+
+    let mut config = RtcConfiguration::default();
+    config.ice_include_loopback_candidates = true;
+    config.bind_ip = Some("127.0.0.1".to_string());
+
+    let (agent, runner) = IceTransportBuilder::new(config)
+        .role(IceRole::Controlled)
+        .build();
+    tokio::spawn(runner);
+
+    let remote_params = IceParameters::new("ufrag_remote", "pwd_remote_secret");
+
+    // Remote candidates mirroring the field INVITE SDP: host, srflx, relay.
+    let mk = |addr: SocketAddr, typ: IceCandidateType, prio: u32| IceCandidate {
+        foundation: format!("f{}", prio),
+        priority: prio,
+        address: addr,
+        typ,
+        transport: "udp".to_string(),
+        tcp_type: None,
+        component: 1,
+        related_address: None,
+        hostname: None,
+    };
+    let remotes = [
+        mk(dead_host.local_addr()?, IceCandidateType::Host, 21_000_000),
+        mk(dead_srflx.local_addr()?, IceCandidateType::ServerReflexive, 16_000_000),
+        mk(fake_relay_addr, IceCandidateType::Relay, 4_000_000),
+    ];
+    for c in &remotes {
+        agent.add_remote_candidate(c.clone());
+    }
+
+    let mut selected_rx = agent.subscribe_selected_pair();
+
+    agent.start(remote_params.clone()).await?;
+
+    // 1. The remote relay candidate MUST receive a STUN binding request.
+    let mut buf = [0u8; 1500];
+    let (len, from_addr) = timeout(Duration::from_secs(3), fake_relay.recv_from(&mut buf))
+        .await
+        .expect("timed out waiting for a check toward the remote relay candidate")
+        .map_err(|e| anyhow::anyhow!("relay socket recv error: {e}"))?;
+
+    let msg = crate::transports::ice::stun::StunMessage::decode(&buf[..len])?;
+    assert_eq!(
+        msg.method,
+        crate::transports::ice::stun::StunMethod::Binding,
+        "packet sent to the remote relay candidate must be a STUN binding request"
+    );
+    assert_eq!(
+        msg.class,
+        crate::transports::ice::stun::StunClass::Request
+    );
+
+    // 2. Answer like a browser would (miuturn delivers the request into the
+    //    allocation; the browser's ICE answers it on the network thread even
+    //    when its own check scheduler is dead).
+    let success = crate::transports::ice::stun::StunMessage::binding_success_response(
+        msg.transaction_id,
+        from_addr,
+    );
+    let success_bytes = success.encode(Some(remote_params.password.as_bytes()), true)?;
+    fake_relay.send_to(&success_bytes, from_addr).await?;
+
+    // 3. The agent must accept the pair and reach Connected.
+    let selected = timeout(Duration::from_secs(3), async move {
+        loop {
+            if let Some(pair) = selected_rx.borrow_and_update().clone() {
+                return pair;
+            }
+            if selected_rx.changed().await.is_err() {
+                panic!("selected pair channel closed before connectivity");
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the selected pair after the relay-path answer");
+
+    assert_eq!(
+        selected.remote.address, fake_relay_addr,
+        "selected pair must be the remote relay candidate"
+    );
+    assert_eq!(agent.state(), IceTransportState::Connected);
+
+    Ok(())
+}
+
+/// Regression test for the multi-homed dual-nomination media hijack
+/// (production 2026-09-30, call 3bslinsis8fvtrj85ld1): a Controlled agent
+/// that already has a nominated, media-carrying pair must NOT follow a
+/// second USE-CANDIDATE unless the new path proves a round trip.
+///
+/// Case 1: a silent second path (never answers the verification check) must
+///         NOT divert the selected pair.
+/// Case 2: a responsive second path (answers the verification) MUST be
+///         followed — legitimate browser path-failover keeps working.
+#[tokio::test]
+#[serial]
+async fn second_nomination_requires_path_verification() -> Result<()> {
+    let (controlling, controlled) = setup_host_pair(
+        RtcConfiguration::default(),
+        RtcConfiguration::default(),
+    )
+    .await;
+    wait_for_selected_pair(&controlled, Duration::from_secs(5)).await?;
+    let initial = controlled.get_selected_pair().expect("initial selected pair");
+
+    let agent_addr = controlled
+        .local_candidates()
+        .iter()
+        .find(|c| c.transport == "udp" && c.component == 1)
+        .map(|c| c.address)
+        .expect("controlled udp host candidate");
+    let pwd = controlled.local_parameters().password;
+    let username = format!(
+        "{}:{}",
+        controlling.local_parameters().username_fragment,
+        controlled.local_parameters().username_fragment
+    );
+
+    let use_candidate_request = || -> Result<Vec<u8>> {
+        let mut msg = StunMessage::binding_request(random_bytes::<12>(), Some("test"));
+        msg.attributes.push(StunAttribute::Username(username.clone()));
+        msg.attributes.push(StunAttribute::UseCandidate);
+        Ok(msg.encode(Some(pwd.as_bytes()), true)?)
+    };
+
+    // ── Case 1: silent path ──────────────────────────────────────────────
+    let silent = UdpSocket::bind("127.0.0.1:0").await?;
+    silent.send_to(&use_candidate_request()?, agent_addr).await?;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let sel = controlled.get_selected_pair().expect("selected pair after silent nomination");
+    assert_ne!(
+        sel.remote.address,
+        silent.local_addr()?,
+        "unverified second path must not divert the selected pair"
+    );
+
+    // ── Case 2: responsive path ──────────────────────────────────────────
+    let good = UdpSocket::bind("127.0.0.1:0").await?;
+    let good_addr = good.local_addr()?;
+    good.send_to(&use_candidate_request()?, agent_addr).await?;
+
+    // The agent verifies the new path with its own binding request; answer it.
+    // (The first packet may be the agent's success response to OUR nomination
+    // check — keep reading until an actual Request arrives.)
+    let mut buf = [0u8; 1500];
+    let (vreq, from) = {
+        loop {
+            let (n, from) = timeout(Duration::from_secs(3), good.recv_from(&mut buf))
+                .await
+                .expect("timed out waiting for the agent's path-verification check")?;
+            let m = StunMessage::decode(&buf[..n])?;
+            if m.class == StunClass::Request && m.method == StunMethod::Binding {
+                break (m, from);
+            }
+        }
+    };
+    let resp = StunMessage::binding_success_response(vreq.transaction_id, from);
+    good.send_to(&resp.encode(Some(pwd.as_bytes()), true)?, from).await?;
+
+    let switched = timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(p) = controlled.get_selected_pair() {
+                if p.remote.address == good_addr {
+                    return p;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for switch to verified path");
+
+    assert_eq!(
+        switched.remote.address, good_addr,
+        "responsive path must be followed after verification"
+    );
+    let _ = initial;
     Ok(())
 }
