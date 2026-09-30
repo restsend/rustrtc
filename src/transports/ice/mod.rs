@@ -2534,6 +2534,58 @@ async fn handle_packet(
     }
 }
 
+/// Round-trip a binding request on a newly nominated path. Returns true when
+/// the peer answers on that path, proving media can actually flow there.
+///
+/// Used by the Controlled UseCandidate handler: once a session is already
+/// running on a nominated pair, a second nomination must prove the new path
+/// is live (the controlling peer answers checks on a path it truly switched
+/// to) before the SRTP downlink is diverted onto it.
+async fn verify_nominated_path(
+    sender: &IceSocketWrapper,
+    addr: SocketAddr,
+    inner: Arc<IceTransportInner>,
+) -> bool {
+    let remote_params = inner.remote_parameters.lock().clone();
+    let Some(rp) = remote_params else {
+        return false;
+    };
+    let local_params = inner.local_parameters.lock().clone();
+
+    let tx_id = random_bytes::<12>();
+    let mut msg = StunMessage::binding_request(tx_id, Some("rustrtc"));
+    msg.attributes.push(StunAttribute::Username(format!(
+        "{}:{}",
+        rp.username_fragment, local_params.username_fragment
+    )));
+    let bytes = match msg.encode(Some(rp.password.as_bytes()), true) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+
+    let (tx, rx) = oneshot::channel();
+    {
+        let mut map = inner.pending_transactions.lock();
+        map.insert(tx_id, tx);
+    }
+
+    if let Err(e) = sender.send_to(&bytes, addr).await {
+        inner.pending_transactions.lock().remove(&tx_id);
+        debug!("Path verification send to {} failed: {}", addr, e);
+        return false;
+    }
+
+    let verified = timeout(inner.config.stun_timeout, rx)
+        .await
+        .map(|res| res.is_ok())
+        .unwrap_or(false);
+    if !verified {
+        let mut map = inner.pending_transactions.lock();
+        map.remove(&tx_id);
+    }
+    verified
+}
+
 async fn handle_stun_request(
     sender: &IceSocketWrapper,
     msg: &StunDecoded,
@@ -2649,16 +2701,27 @@ async fn handle_stun_request(
             if matches!(sender, IceSocketWrapper::TcpStream(_, _, _)) {
                 return;
             }
-            // The controlling agent is authoritative. As the controlled agent
-            // we simply follow the pair this USE-CANDIDATE arrived on —
-            // including a *re-nomination*. A real controlling peer (e.g. a
-            // browser) legitimately switches pairs when its current path dies
-            // (dead srflx -> relay) and re-sends USE-CANDIDATE on the new pair.
-            // Freezing on the first nomination (previous behaviour) left us
-            // sending DTLS to an address the peer had already abandoned, so
-            // the handshake never completed and the call had no media.
-            // Keepalives on the same pair remain a no-op; a different pair is
-            // followed.
+            // The controlling agent is authoritative, but "authoritative"
+            // does not mean media should be diverted onto an unproven path.
+            // Two failure modes motivated the current design:
+            //
+            //   * Freezing on the first nomination (very old behaviour) broke
+            //     legitimate browser path-failover: a browser whose srflx path
+            //     died re-sends USE-CANDIDATE on its relay path, and a frozen
+            //     controlled agent kept sending DTLS to the abandoned address.
+            //   * Following every USE-CANDIDATE unconditionally let duplicate
+            //     or oscillating nominations (e.g. a browser nominating both
+            //     multi-homed host candidates of the server) divert the SRTP
+            //     downlink onto a path the peer never sends media on, so the
+            //     call keeps "flowing" on PBX counters while the user hears
+            //     nothing.
+            //
+            // The current behaviour follows the RFC 8445 intent while staying
+            // safe: the FIRST nomination is followed immediately; a later
+            // nomination on a different pair must pass a same-path round trip
+            // (see `verify_nominated_path`) before media is switched. Genuine
+            // failovers answer checks on the new path and converge within one
+            // RTT; dead paths never respond and are ignored.
             let local_addr: SocketAddr = match sender {
                 IceSocketWrapper::Udp(s) => s
                     .local_addr()
@@ -2691,20 +2754,29 @@ async fn handle_stun_request(
             };
 
             if let Some(pair) = pair {
-                let should_select = {
+                let same_pair = {
                     let selected = inner.selected_pair.lock();
-                    match selected.as_ref() {
-                        Some(cur) => {
-                            !(cur.local.address == pair.local.address
-                                && cur.remote.address == pair.remote.address)
-                        }
-                        None => true,
-                    }
+                    selected
+                        .as_ref()
+                        .map(|cur| {
+                            cur.local.address == pair.local.address
+                                && cur.remote.address == pair.remote.address
+                        })
+                        .unwrap_or(false)
                 };
-                if should_select {
+                let has_selected = inner.selected_pair.lock().is_some();
+
+                if same_pair {
+                    trace!(
+                        "Controlled agent keeping current pair (UseCandidate {} -> {})",
+                        pair.local.address, pair.remote.address
+                    );
+                } else if !has_selected {
+                    // First nomination: follow immediately so call setup is
+                    // never delayed.
                     debug!(
                         label = inner.config.label.as_deref().unwrap_or("-"),
-                        "Controlled agent following UseCandidate: {} -> {}",
+                        "Controlled agent following UseCandidate (first nomination): {} -> {}",
                         pair.local.address,
                         pair.remote.address
                     );
@@ -2712,10 +2784,43 @@ async fn handle_stun_request(
                     let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
                     publish_selected_socket(&inner, &pair, Some(sender));
                 } else {
-                    trace!(
-                        "Controlled agent keeping current pair (UseCandidate {} -> {})",
-                        pair.local.address, pair.remote.address
+                    // A second nomination on a DIFFERENT pair while already
+                    // connected: verify the new path with a same-path round
+                    // trip before diverting media to it. A controlling peer
+                    // that genuinely switched (dead path → relay failover)
+                    // answers checks on the new path; duplicate or oscillating
+                    // nominations on dead paths never respond and are ignored,
+                    // keeping the working path (and its established DTLS/SRTP
+                    // session) intact.
+                    debug!(
+                        label = inner.config.label.as_deref().unwrap_or("-"),
+                        "Controlled agent deferring switch to newly nominated path {} -> {} until verified",
+                        pair.local.address,
+                        pair.remote.address
                     );
+                    let inner2 = inner.clone();
+                    let sender2 = sender.clone();
+                    let pair2 = pair.clone();
+                    tokio::spawn(async move {
+                        let verified =
+                            verify_nominated_path(&sender2, addr, inner2.clone()).await;
+                        if verified {
+                            debug!(
+                                label = inner2.config.label.as_deref().unwrap_or("-"),
+                                "New nominated path verified, switching: {} -> {}",
+                                pair2.local.address, pair2.remote.address
+                            );
+                            *inner2.selected_pair.lock() = Some(pair2.clone());
+                            let _ = inner2.selected_pair_notifier.send(Some(pair2.clone()));
+                            publish_selected_socket(&inner2, &pair2, Some(&sender2));
+                        } else {
+                            debug!(
+                                label = inner2.config.label.as_deref().unwrap_or("-"),
+                                "New nominated path {} -> {} failed verification; keeping current pair",
+                                pair2.local.address, pair2.remote.address
+                            );
+                        }
+                    });
                 }
                 let _ = inner.set_state(IceTransportState::Connected);
                 let _ = inner.nomination_complete.send(Some(true));
