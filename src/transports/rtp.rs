@@ -564,13 +564,11 @@ pub struct RtpTransport {
     /// makes the hot-path check a single atomic load (zero cost when unused).
     observers: RwLock<Vec<Arc<dyn RtpObserver>>>,
     has_observers: AtomicBool,
-    /// Whether the negotiated direction lets any stream on this transport
-    /// send RTP. Gates every RTP egress path; RTCP is not affected.
+    /// Gates every RTP egress path on the negotiated direction; RTCP unaffected.
     rtp_send_allowed: AtomicBool,
-    /// SSRCs of streams on this transport that may not send (e.g. one held
-    /// m= section inside a BUNDLE); `has_blocked_ssrcs` keeps the check a
-    /// single atomic load when empty.
+    /// SSRCs that may not send (a held m= section inside a BUNDLE).
     blocked_ssrcs: RwLock<Vec<u32>>,
+    /// Keeps the `blocked_ssrcs` check a single atomic load when empty.
     has_blocked_ssrcs: AtomicBool,
 }
 
@@ -610,8 +608,7 @@ impl RtpTransport {
         }
     }
 
-    /// Allow or stop RTP egress on this transport (sent, relayed and
-    /// retransmitted packets alike). RTCP keeps flowing.
+    /// Allow or stop RTP egress on this transport. RTCP keeps flowing.
     pub(crate) fn set_rtp_send_allowed(&self, allowed: bool) {
         self.rtp_send_allowed.store(allowed, Ordering::Relaxed);
     }
@@ -837,8 +834,7 @@ impl RtpTransport {
         }
     }
 
-    /// Returns `Ok(0)` without sending while the negotiated direction stops
-    /// RTP for the packet's SSRC.
+    /// Returns `Ok(0)` without sending while the direction stops this SSRC.
     pub async fn send(&self, buf: &[u8]) -> Result<usize> {
         let ssrc = buf
             .get(8..12)
@@ -875,8 +871,7 @@ impl RtpTransport {
         self.transport.send(&protected).await
     }
 
-    /// Returns `Ok(0)` without sending while the negotiated direction stops
-    /// RTP for the packet's SSRC.
+    /// Returns `Ok(0)` without sending while the direction stops this SSRC.
     pub async fn send_rtp(&self, mut packet: RtpPacket) -> Result<usize> {
         if !self.rtp_send_allowed_for(packet.header.ssrc) {
             return Ok(0);

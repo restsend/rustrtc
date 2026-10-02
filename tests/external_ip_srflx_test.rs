@@ -1,8 +1,5 @@
-//! `external_ip` with `ExternalIpCandidateType::ServerReflexive` advertises
-//! the external address as a server-reflexive candidate ALONGSIDE the host
-//! candidate on the bind address (RFC 8445 §5.1.1.2, the 1:1 NAT case), so
-//! peers on the private network keep a direct path. The default keeps
-//! replacing the host candidate's address.
+//! ServerReflexive mode advertises `external_ip` as a srflx candidate
+//! alongside the host candidate (RFC 8445 §5.1.1.2, the 1:1 NAT case).
 use anyhow::Result;
 use rustrtc::transports::ice::{IceCandidate, IceCandidateType};
 use rustrtc::{

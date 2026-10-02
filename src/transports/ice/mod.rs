@@ -3800,9 +3800,8 @@ impl IceGatherer {
         *self.transport_inner.lock() = Some(inner);
     }
 
-    /// With `ExternalIpCandidateType::ServerReflexive`, the external IP to
-    /// advertise as a server-reflexive candidate for a socket bound on
-    /// `bind_ip` (never for loopback binds, nor under a relay-only policy).
+    /// The external IP to advertise as a srflx candidate (ServerReflexive
+    /// mode, WebRTC, non-loopback bind, non-relay policy).
     fn external_srflx_ip(&self, bind_ip: IpAddr) -> Option<IpAddr> {
         if self.config.external_ip_candidate_type
             != crate::config::ExternalIpCandidateType::ServerReflexive
@@ -3815,10 +3814,9 @@ impl IceGatherer {
         self.config.external_ip.as_ref()?.parse().ok()
     }
 
-    /// Push the host candidate for a socket bound at `local_addr` (on
-    /// `bind_ip`) plus, when configured, `external_ip` as a server-reflexive
-    /// candidate on the same socket (only when both are the same address
-    /// family). Returns false when `external_ip` is not advertised that way.
+    /// Push the host candidate for a socket bound at `local_addr`, plus the
+    /// external IP as a server-reflexive candidate on the same socket.
+    /// Returns false when the mode does not apply.
     fn push_host_with_external_srflx(
         &self,
         local_addr: SocketAddr,
@@ -3841,8 +3839,7 @@ impl IceGatherer {
         if host_addr != local_addr {
             host.related_address = Some(local_addr);
         }
-        // Base = the socket's own address, which is also the host
-        // candidate's base_address(); as for STUN-learned candidates.
+        // Base = the socket's own address, as for STUN-learned candidates.
         let mut srflx = IceCandidate::server_reflexive(
             local_addr,
             SocketAddr::new(external, local_addr.port()),

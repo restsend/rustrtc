@@ -108,15 +108,12 @@ pub enum BufferDropStrategy {
 /// How `external_ip` is advertised in ICE candidates.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum ExternalIpCandidateType {
-    /// Replace each non-loopback host candidate's address with `external_ip`
-    /// (the private bind address is not advertised).
+    /// Replace each non-loopback host candidate's address with `external_ip`.
     #[default]
     Host,
     /// Keep the host candidate on the bind address and advertise
-    /// `external_ip` alongside it as a server-reflexive candidate, as for a
-    /// 1:1 NAT (RFC 8445 §5.1.1.2). Peers on the private network keep a
-    /// direct path. ICE (WebRTC mode) only; with `IceTransportPolicy::Relay`
-    /// it behaves as `Host`.
+    /// `external_ip` alongside it as a server-reflexive candidate
+    /// (1:1 NAT, RFC 8445 §5.1.1.2). WebRTC mode only.
     ServerReflexive,
 }
 
@@ -490,8 +487,7 @@ pub struct RtcConfiguration {
     /// use this IP instead of the local bind IP. The local bind address is
     /// stored in `related_address` on the candidate.
     pub external_ip: Option<String>,
-    /// How ICE candidates advertise `external_ip` (default: replace the host
-    /// candidate's address).
+    /// How ICE candidates advertise `external_ip`.
     #[serde(default)]
     pub external_ip_candidate_type: ExternalIpCandidateType,
     /// Override the advertised port in SDP `m=` line and candidates

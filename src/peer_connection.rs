@@ -1092,8 +1092,8 @@ impl PeerConnection {
     /// transport. It is SRTP-protected and fire&forget (same as
     /// [`RtpTransport::send_rtp`]). Callers should gate DTMF on the leg having
     /// a negotiated profile.
-    /// Like the sample path, it sends nothing (and still returns `Ok`) while
-    /// the negotiated direction does not let the packet's stream send.
+    /// Sends nothing (and still returns `Ok`) while the negotiated direction
+    /// forbids the packet's stream to send.
     pub async fn send_raw_rtp(&self, packet: RtpPacket) -> RtcResult<()> {
         let transport = self
             .get_transceivers()
@@ -1585,8 +1585,7 @@ impl PeerConnection {
             };
             let ours = &local.media_sections[local_idx];
             let theirs = &remote.media_sections[remote_idx];
-            // RFC 3264 §6 / §8.2: a rejected (port 0) section carries no
-            // RTP or RTCP.
+            // RFC 3264 §6: a rejected (port 0) section carries no RTP or RTCP.
             let rejected = section_rejected(&local, ours) || section_rejected(&remote, theirs);
             transceiver.set_rejected(rejected);
             let permitted = !rejected
@@ -1597,10 +1596,9 @@ impl PeerConnection {
         self.sync_transport_send_gates();
     }
 
-    /// A transport may send RTP while at least one audio/video transceiver
-    /// using it may send, or while no transceiver uses it. This gates the
-    /// egress paths that bypass the RtpSender: send_raw_rtp, the
-    /// rewrite-bridge relay and NACK retransmissions.
+    /// Gate the egress paths that bypass the RtpSender (send_raw_rtp, the
+    /// rewrite-bridge relay, NACK retransmissions): a transport may send only
+    /// while an audio/video transceiver using it may send, or none uses it.
     fn sync_transport_send_gates(&self) {
         let primary = self.inner.rtp_transport.lock().clone();
         let media = self.inner.rtp_media_transports.lock().clone();
@@ -1611,8 +1609,8 @@ impl PeerConnection {
             .chain(media.values())
             .map(|transport| (transport.clone(), false, false))
             .collect();
-        // SSRCs of the streams that may not send, blocked on every transport:
-        // raw and relayed RTP may leave on a transport other than the stream's.
+        // Held streams' SSRCs, blocked on every transport: raw and relayed
+        // RTP may leave on a transport other than the stream's.
         let mut blocked = Vec::new();
         for t in transceivers
             .iter()
@@ -5088,9 +5086,8 @@ impl PeerConnectionInner {
         // MUST echo it back -- even with only one media section -- otherwise
         // strict agents such as Chrome reject the answer with
         // "Answer cannot remove m= section ... from already-established BUNDLE
-        // group".  Plain-RTP/SIP offers only group more than one section, for
-        // compatibility; a WebRTC offer always carries a group (RFC 8829
-        // §5.2.1): webrtc-rs and pion answer a section outside it with port 0.
+        // group".  Plain-RTP/SIP offers group only 2+ sections; a WebRTC
+        // offer always carries a group (RFC 8829 §5.2.1).
         let will_bundle = self.config.sdp_compatibility
             != crate::config::SdpCompatibilityMode::LegacySip
             && match sdp_type {
@@ -5527,8 +5524,7 @@ impl PeerConnectionInner {
         }
 
         if !desc.media_sections.is_empty() {
-            // Rejected sections are not bundled (RFC 9143 §7.3.2), so one is
-            // never the tag either.
+            // Rejected sections are not bundled (RFC 9143 §7.3.2).
             let mids: Vec<&str> = (desc.media_sections.iter())
                 .filter(|m| m.port != 0)
                 .map(|m| m.mid.as_str())
@@ -6141,9 +6137,8 @@ impl Drop for PeerConnectionInner {
     }
 }
 
-/// RFC 3264 §6 / §8.2: a media section with port 0 is rejected (or
-/// disabled), except a `bundle-only` section in a BUNDLE group other than
-/// the group's tag, which shares the group's transport (RFC 9143 §7).
+/// RFC 3264 §6: a port-0 section is rejected, except a `bundle-only` non-tag
+/// section inside a BUNDLE group (RFC 9143 §7).
 fn section_rejected(desc: &SessionDescription, section: &MediaSection) -> bool {
     let bundle_only = section.attributes.iter().any(|a| a.key == "bundle-only");
     let bundled_non_tag = || {
@@ -9912,9 +9907,8 @@ a=sendrecv\r\n";
         }
     }
 
-    /// NACK retransmissions and `RtpTransport::send` go straight to the
-    /// transport; they must stop while the negotiated direction forbids
-    /// sending (RFC 3264 §6.1).
+    /// NACK retransmissions and `RtpTransport::send` bypass the sender loop;
+    /// they must stop while the direction forbids sending (RFC 3264 §6.1).
     #[tokio::test]
     async fn nack_retransmission_respects_the_transport_send_gate() {
         use crate::rtp::RtpHeader;

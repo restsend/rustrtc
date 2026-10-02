@@ -1,7 +1,5 @@
-//! The negotiated send direction (RFC 3264 §6.1 / §7, RFC 8829 §5.11)
-//! applies to every RTP egress path, not only the RtpSender's sample loop:
-//! `send_raw_rtp` (e.g. RFC 4733 DTMF) and the rewrite-bridge relay stop
-//! while the remote does not receive, and resume when it does.
+//! The negotiated send direction (RFC 3264 §6.1/§7, RFC 8829 §5.11) applies
+//! to every RTP egress path, not only the RtpSender's sample loop.
 use anyhow::Result;
 use bytes::Bytes;
 use rustrtc::media::frame::{AudioFrame, MediaSample};

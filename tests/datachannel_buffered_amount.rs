@@ -99,17 +99,18 @@ async fn buffered_amount_low_fires_once_after_drain() -> Result<()> {
     }
     assert!(connected, "pair must connect");
 
-    // Arm the edge: push well above the threshold.
+    // Arm the edge: push well above the threshold. Queued bytes are counted
+    // synchronously, so sample right after each send — sleeping lets a fast
+    // loopback drain everything before we look.
     let burst = vec![0xABu8; THRESHOLD * 3];
+    let mut peak = 0usize;
     for _ in 0..4 {
         pc_a.send_data(dc_a.id, &burst).await?;
+        peak = peak.max(dc_a.buffered_amount());
     }
-    // Give the sends a moment to register in the buffered amount.
-    tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
-        dc_a.buffered_amount() > THRESHOLD,
-        "buffered_amount should exceed the threshold after a large burst, got {}",
-        dc_a.buffered_amount()
+        peak > THRESHOLD,
+        "buffered_amount should exceed the threshold during a large burst, peak {peak}"
     );
 
     // Wait for the drain edge event.
