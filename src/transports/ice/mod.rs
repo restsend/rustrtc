@@ -3800,7 +3800,75 @@ impl IceGatherer {
         *self.transport_inner.lock() = Some(inner);
     }
 
+    /// With `ExternalIpCandidateType::ServerReflexive`, the external IP to
+    /// advertise as a server-reflexive candidate for a socket bound on
+    /// `bind_ip` (never for loopback binds, nor under a relay-only policy).
+    fn external_srflx_ip(&self, bind_ip: IpAddr) -> Option<IpAddr> {
+        if self.config.external_ip_candidate_type
+            != crate::config::ExternalIpCandidateType::ServerReflexive
+            || self.config.transport_mode != crate::config::TransportMode::WebRtc
+            || self.config.ice_transport_policy != IceTransportPolicy::All
+            || bind_ip.is_loopback()
+        {
+            return None;
+        }
+        self.config.external_ip.as_ref()?.parse().ok()
+    }
+
+    /// Push the host candidate for a socket bound at `local_addr` (on
+    /// `bind_ip`) plus, when configured, `external_ip` as a server-reflexive
+    /// candidate on the same socket (only when both are the same address
+    /// family). Returns false when `external_ip` is not advertised that way.
+    fn push_host_with_external_srflx(
+        &self,
+        local_addr: SocketAddr,
+        bind_ip: IpAddr,
+        tcp_type: Option<TcpType>,
+    ) -> bool {
+        let Some(external) = self.external_srflx_ip(bind_ip) else {
+            return false;
+        };
+        let mut host_addr = local_addr;
+        if bind_ip.is_unspecified()
+            && let Ok(local_ip) = get_local_ip()
+        {
+            host_addr.set_ip(local_ip);
+        }
+        let mut host = match tcp_type {
+            Some(tcp_type) => IceCandidate::host_tcp(host_addr, 1, tcp_type),
+            None => IceCandidate::host(host_addr, 1),
+        };
+        if host_addr != local_addr {
+            host.related_address = Some(local_addr);
+        }
+        // Base = the socket's own address, which is also the host
+        // candidate's base_address(); as for STUN-learned candidates.
+        let mut srflx = IceCandidate::server_reflexive(
+            local_addr,
+            SocketAddr::new(external, local_addr.port()),
+            1,
+        );
+        if let Some(tcp_type) = tcp_type {
+            srflx = srflx.with_tcp_type(tcp_type);
+            srflx.foundation = IceCandidate::compute_foundation(
+                IceCandidateType::ServerReflexive,
+                local_addr,
+                "tcp",
+            );
+            srflx.priority =
+                IceCandidate::priority_for_tcp(IceCandidateType::ServerReflexive, 1, tcp_type);
+        }
+        self.push_candidate(host);
+        if external.is_ipv4() == local_addr.is_ipv4() {
+            self.push_candidate(srflx);
+        }
+        true
+    }
+
     fn push_tcp_passive_candidate(&self, local_addr: SocketAddr, bind_ip: IpAddr) {
+        if self.push_host_with_external_srflx(local_addr, bind_ip, Some(TcpType::Passive)) {
+            return;
+        }
         if let Some(ext_ip) = &self.config.external_ip
             && let Ok(parsed_ip) = ext_ip.parse::<IpAddr>()
         {
@@ -4100,6 +4168,9 @@ impl IceGatherer {
         *self.shared_udp_socket.lock() = Some(wrapper.clone());
         let _ = self.socket_tx.send(wrapper);
 
+        if self.push_host_with_external_srflx(local_addr, bind_ip, None) {
+            return Ok(());
+        }
         // Derive the advertised candidate address (mirror the per-IP path).
         let mut cand_addr = local_addr;
         if let Some(ext_ip) = &self.config.external_ip
@@ -4188,7 +4259,9 @@ impl IceGatherer {
                         self.sockets.lock().push(socket.clone());
                         let _ = self.socket_tx.send(IceSocketWrapper::Udp(socket));
 
-                        if let Some(ext_ip) = &self.config.external_ip
+                        if self.push_host_with_external_srflx(addr, ip, None) {
+                            // host + external server-reflexive pushed
+                        } else if let Some(ext_ip) = &self.config.external_ip
                             && let Ok(parsed_ip) = ext_ip.parse::<IpAddr>()
                         {
                             if !ip.is_loopback() {
@@ -4246,6 +4319,9 @@ impl IceGatherer {
                             let _ = self.socket_tx.send(IceSocketWrapper::TcpListener(listener));
 
                             let tcp_type = TcpType::Passive;
+                            if self.push_host_with_external_srflx(addr, ip, Some(tcp_type)) {
+                                continue;
+                            }
                             let mut cand = IceCandidate::host_tcp(addr, 1, tcp_type);
                             if ip.is_unspecified()
                                 && let Ok(local_ip) = get_local_ip()
