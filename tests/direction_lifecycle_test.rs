@@ -289,3 +289,83 @@ async fn restart_ice_preserves_direction_intent() {
         "restart offer must preserve the negotiated direction"
     );
 }
+
+/// The direction a fresh senderless transceiver offers: created by a remote
+/// offer (and answered) or locally as recvonly, then `set` if given.
+async fn senderless_offer(
+    mode: TransportMode,
+    kind: MediaKind,
+    from_remote: bool,
+    set: Option<TransceiverDirection>,
+) -> Direction {
+    let config = || RtcConfiguration {
+        transport_mode: mode.clone(),
+        ..RtcConfiguration::default()
+    };
+    let pc = PeerConnection::new(config());
+    if from_remote {
+        let remote = PeerConnection::new(config());
+        remote.add_transceiver(kind, TransceiverDirection::RecvOnly);
+        pc.set_remote_description(remote.create_offer().await.unwrap())
+            .await
+            .unwrap();
+        let answer = pc.create_answer().await.unwrap();
+        pc.set_local_description(answer).unwrap();
+    } else {
+        pc.add_transceiver(kind, TransceiverDirection::RecvOnly);
+    }
+    let t = pc.get_transceivers()[0].clone();
+    if let Some(set) = set {
+        t.set_direction(set);
+        assert_eq!(t.direction(), set);
+    }
+    pc.create_offer().await.unwrap().media_sections[0].direction
+}
+
+/// A direction the application sets is offered as is, with or without a
+/// sender (RFC 8829 §4.2.3), whichever side created the transceiver. Only a
+/// transceiver created by a remote offer and never configured waits for a
+/// sender before it offers to send.
+#[tokio::test]
+async fn set_direction_is_offered_without_a_sender() {
+    use TransceiverDirection as TD;
+    for mode in [
+        TransportMode::Rtp,
+        TransportMode::Srtp,
+        TransportMode::WebRtc,
+    ] {
+        for kind in [MediaKind::Audio, MediaKind::Video] {
+            for (from_remote, set, expected) in [
+                (false, Some(TD::SendRecv), Direction::SendRecv),
+                (false, Some(TD::SendOnly), Direction::SendOnly),
+                (true, Some(TD::SendRecv), Direction::SendRecv),
+                (true, Some(TD::SendOnly), Direction::SendOnly),
+                (true, None, Direction::RecvOnly),
+            ] {
+                let offered = senderless_offer(mode.clone(), kind, from_remote, set).await;
+                assert_eq!(
+                    offered, expected,
+                    "{mode:?} {kind:?} from_remote={from_remote} set={set:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A local offer whose direction the application rewrote becomes its
+/// preference for a senderless transceiver too, once that direction is its own.
+#[tokio::test]
+async fn rewritten_offer_direction_is_adopted_without_a_sender() {
+    let mut config = RtcConfiguration::default();
+    config.transport_mode = TransportMode::Rtp;
+    let pc = PeerConnection::new(config);
+    let t = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::RecvOnly);
+    t.set_direction(TransceiverDirection::SendRecv);
+    let mut offer = pc.create_offer().await.unwrap();
+    offer.media_sections[0].direction = Direction::RecvOnly;
+    pc.set_local_description(offer).unwrap();
+    let answer = minimal_sdp(SdpType::Answer, "0", Direction::SendOnly);
+    pc.set_remote_description(answer).await.unwrap();
+    let next = pc.create_offer().await.unwrap();
+    assert_eq!(next.media_sections[0].direction, Direction::RecvOnly);
+}

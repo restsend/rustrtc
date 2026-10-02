@@ -2055,6 +2055,7 @@ impl PeerConnection {
                     // preference, so offer sendrecv (downgraded while we have
                     // no sender) rather than mirroring the remote's direction.
                     *t.desired_direction.lock() = TransceiverDirection::SendRecv;
+                    t.implicit_direction.store(true, Ordering::Relaxed);
                     t.set_mid(mid.clone());
 
                     let receiver_ssrc = ssrc.unwrap_or(0);
@@ -5217,10 +5218,12 @@ impl PeerConnectionInner {
                 false
             };
 
-            // If we are supposed to send, but have no sender (and it's not Application),
-            // we must downgrade direction to avoid ghost tracks.
+            // A transceiver the remote offer created and the application never
+            // configured offers to send only once it has a sender. A direction
+            // set by the application is offered as is (RFC 8829 §4.2.3).
             let has_sender_ssrc = transceiver.sender_ssrc.lock().is_some();
             if direction.sends()
+                && transceiver.implicit_direction.load(Ordering::Relaxed)
                 && sender_info.is_none()
                 && !has_sender_ssrc
                 && transceiver.kind() != MediaKind::Application
@@ -6366,6 +6369,9 @@ pub struct RtpTransceiver {
     /// re-offer expresses our willingness rather than echoing the remote's
     /// (RFC 3264 §6.1, RFC 6337 §5.3).
     desired_direction: Mutex<TransceiverDirection>,
+    /// `desired_direction` was chosen for a transceiver created by a remote
+    /// offer, not by the application; cleared by [`Self::set_direction`].
+    implicit_direction: AtomicBool,
     mid: Mutex<Option<String>>,
     sender: Mutex<Option<Arc<RtpSender>>>,
     receiver: Mutex<Option<Arc<RtpReceiver>>>,
@@ -6394,6 +6400,7 @@ impl RtpTransceiver {
             kind,
             direction: Mutex::new(direction),
             desired_direction: Mutex::new(direction),
+            implicit_direction: AtomicBool::new(false),
             mid: Mutex::new(None),
             sender: Mutex::new(None),
             receiver: Mutex::new(None),
@@ -6449,6 +6456,7 @@ impl RtpTransceiver {
     pub fn set_direction(&self, direction: TransceiverDirection) {
         *self.direction.lock() = direction;
         *self.desired_direction.lock() = direction;
+        self.implicit_direction.store(false, Ordering::Relaxed);
     }
 
     /// Record the direction carried by a remote description without touching
@@ -6462,17 +6470,19 @@ impl RtpTransceiver {
     }
 
     /// Adopt the direction of a local offer as our preference, unless it is
-    /// the preference itself or the downgrade create_offer applies while the
-    /// transceiver has no sender.
+    /// the preference itself or the downgrade create_offer applies to an
+    /// implicit preference while the transceiver has no sender.
     fn record_offered_direction(&self, offered: TransceiverDirection) {
         let mut desired = self.desired_direction.lock();
+        let implicit = self.implicit_direction.load(Ordering::Relaxed);
         let downgraded = match *desired {
-            TransceiverDirection::SendRecv => TransceiverDirection::RecvOnly,
-            TransceiverDirection::SendOnly => TransceiverDirection::Inactive,
+            TransceiverDirection::SendRecv if implicit => TransceiverDirection::RecvOnly,
+            TransceiverDirection::SendOnly if implicit => TransceiverDirection::Inactive,
             other => other,
         };
         if offered != *desired && offered != downgraded {
             *desired = offered;
+            self.implicit_direction.store(false, Ordering::Relaxed);
         }
     }
 
