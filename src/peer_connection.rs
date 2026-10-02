@@ -1585,9 +1585,12 @@ impl PeerConnection {
             };
             let ours = &local.media_sections[local_idx];
             let theirs = &remote.media_sections[remote_idx];
-            // Only the direction decides: port 0 is not treated as a
-            // rejection here (some WebRTC stacks answer port 0 with ICE).
-            let permitted = matches!(ours.direction, Direction::SendRecv | Direction::SendOnly)
+            // RFC 3264 §6 / §8.2: a rejected (port 0) section carries no
+            // RTP or RTCP.
+            let rejected = section_rejected(&local, ours) || section_rejected(&remote, theirs);
+            transceiver.set_rejected(rejected);
+            let permitted = !rejected
+                && matches!(ours.direction, Direction::SendRecv | Direction::SendOnly)
                 && matches!(theirs.direction, Direction::SendRecv | Direction::RecvOnly);
             transceiver.set_send_permitted(permitted);
         }
@@ -4251,7 +4254,8 @@ fn update_local_description_on_gather(
         if let Some(candidate) = candidates.first() {
             let mut local_guard = inner.local_description.lock();
             if let Some(desc) = local_guard.as_mut() {
-                for media in &mut desc.media_sections {
+                // A rejected (port 0) section stays rejected.
+                for media in desc.media_sections.iter_mut().filter(|m| m.port != 0) {
                     media.port = candidate.address.port();
                     let ip_str = candidate.address.ip().to_string();
                     let ip_ver = if candidate.address.is_ipv4() {
@@ -5042,6 +5046,7 @@ impl PeerConnectionInner {
                         t,
                         section.attributes.iter().any(|attr| attr.key == "rtcp-mux"),
                         Some(TransceiverDirection::from(section.direction)),
+                        section_rejected(remote, section),
                     ));
                 } else {
                     return Err(RtcError::Internal(format!(
@@ -5071,7 +5076,10 @@ impl PeerConnectionInner {
                     _ => mid_a.cmp(&mid_b),
                 }
             });
-            ordered.into_iter().map(|t| (t, false, None)).collect()
+            ordered
+                .into_iter()
+                .map(|t| (t, false, None, false))
+                .collect()
         };
 
         let mode = self.config.transport_mode.clone();
@@ -5080,12 +5088,13 @@ impl PeerConnectionInner {
         // MUST echo it back -- even with only one media section -- otherwise
         // strict agents such as Chrome reject the answer with
         // "Answer cannot remove m= section ... from already-established BUNDLE
-        // group".  For offers we only group when there is more than one section
-        // to stay compatible with plain-RTP/SIP peers.
+        // group".  Plain-RTP/SIP offers only group more than one section, for
+        // compatibility; a WebRTC offer always carries a group (RFC 8829
+        // §5.2.1): webrtc-rs and pion answer a section outside it with port 0.
         let will_bundle = self.config.sdp_compatibility
             != crate::config::SdpCompatibilityMode::LegacySip
             && match sdp_type {
-                SdpType::Offer => ordered_transceivers.len() > 1,
+                SdpType::Offer => ordered_transceivers.len() > 1 || mode == TransportMode::WebRtc,
                 SdpType::Answer => remote_offered_bundle,
                 _ => false,
             };
@@ -5166,8 +5175,10 @@ impl PeerConnectionInner {
             desc.session.connection = Some(format!("IN IP4 {}", ext_ip));
         }
 
-        for (media_index, (transceiver, remote_offered_rtcp_mux, offered_direction)) in
-            ordered_transceivers.into_iter().enumerate()
+        for (
+            media_index,
+            (transceiver, remote_offered_rtcp_mux, offered_direction, offer_rejected),
+        ) in ordered_transceivers.into_iter().enumerate()
         {
             let mid = self.ensure_mid(&transceiver);
             // An offer expresses our own willingness to send/receive, so it
@@ -5508,12 +5519,21 @@ impl PeerConnectionInner {
                     .push(Attribute::new("crypto", Some(crypto_val)));
             }
 
+            // RFC 3264 §6: a stream offered with port 0 is answered with port 0.
+            if offer_rejected {
+                section.port = 0;
+            }
             desc.media_sections.push(section);
         }
 
         if !desc.media_sections.is_empty() {
-            if will_bundle {
-                let mids: Vec<String> = desc.media_sections.iter().map(|m| m.mid.clone()).collect();
+            // Rejected sections are not bundled (RFC 9143 §7.3.2), so one is
+            // never the tag either.
+            let mids: Vec<&str> = (desc.media_sections.iter())
+                .filter(|m| m.port != 0)
+                .map(|m| m.mid.as_str())
+                .collect();
+            if will_bundle && !mids.is_empty() {
                 let value = format!("BUNDLE {}", mids.join(" "));
                 desc.session
                     .attributes
@@ -6121,6 +6141,25 @@ impl Drop for PeerConnectionInner {
     }
 }
 
+/// RFC 3264 §6 / §8.2: a media section with port 0 is rejected (or
+/// disabled), except a `bundle-only` section in a BUNDLE group other than
+/// the group's tag, which shares the group's transport (RFC 9143 §7).
+fn section_rejected(desc: &SessionDescription, section: &MediaSection) -> bool {
+    let bundle_only = section.attributes.iter().any(|a| a.key == "bundle-only");
+    let bundled_non_tag = || {
+        desc.session.attributes.iter().any(|a| {
+            let mut mids = (a.value.as_deref())
+                .filter(|_| a.key == "group")
+                .and_then(|v| v.strip_prefix("BUNDLE "))
+                .unwrap_or_default()
+                .split_whitespace()
+                .skip(1);
+            mids.any(|mid| mid == section.mid)
+        })
+    };
+    section.port == 0 && !(bundle_only && bundled_non_tag())
+}
+
 fn default_origin() -> Origin {
     let mut origin = Origin::default();
     let now = SystemTime::now()
@@ -6349,6 +6388,8 @@ pub struct RtpTransceiver {
     pending_sdes_mid: Mutex<Option<(u8, Arc<str>)>>,
     /// Whether the last completed negotiation lets this transceiver send.
     send_permitted: AtomicBool,
+    /// Whether the last completed negotiation rejected this media section.
+    rejected: AtomicBool,
 }
 
 impl RtpTransceiver {
@@ -6372,6 +6413,7 @@ impl RtpTransceiver {
             extmap: Arc::new(RwLock::new(HashMap::new())),
             pending_sdes_mid: Mutex::new(None),
             send_permitted: AtomicBool::new(true),
+            rejected: AtomicBool::new(false),
         }
     }
 
@@ -6478,6 +6520,7 @@ impl RtpTransceiver {
         if let Some(ref s) = sender {
             // Before the send loop can start below.
             s.set_send_enabled(self.send_permitted.load(Ordering::Relaxed));
+            s.set_rtcp_enabled(!self.rejected.load(Ordering::Relaxed));
             // If transport is already established, connect the sender to it
             if let Some(weak_transport) = self.rtp_transport.lock().as_ref()
                 && let Some(transport) = weak_transport.upgrade()
@@ -6526,6 +6569,7 @@ impl RtpTransceiver {
         let mut current = self.sender.lock();
         if let Some(ref s) = sender {
             s.set_send_enabled(self.send_permitted.load(Ordering::Relaxed));
+            s.set_rtcp_enabled(!self.rejected.load(Ordering::Relaxed));
         }
         *current = sender;
     }
@@ -6539,6 +6583,15 @@ impl RtpTransceiver {
         self.send_permitted.store(permitted, Ordering::Relaxed);
         if let Some(sender) = sender.as_ref() {
             sender.set_send_enabled(permitted);
+        }
+    }
+
+    /// A rejected media section sends no RTCP either (RFC 3264 §6).
+    fn set_rejected(&self, rejected: bool) {
+        let sender = self.sender.lock();
+        self.rejected.store(rejected, Ordering::Relaxed);
+        if let Some(sender) = sender.as_ref() {
+            sender.set_rtcp_enabled(!rejected);
         }
     }
 
@@ -6700,6 +6753,8 @@ pub struct RtpSender {
     transport_change_tx: watch::Sender<u64>,
     /// Whether the negotiated direction lets this sender transmit RTP.
     send_enabled: Arc<AtomicBool>,
+    /// Whether this sender sends Sender Reports (not on a rejected section).
+    rtcp_enabled: Arc<AtomicBool>,
     /// Correlation span of the owning PeerConnection; instrumented onto the
     /// send-loop task so its logs stay grouped with the rest of the session.
     pc_span: tracing::Span,
@@ -6855,6 +6910,7 @@ impl RtpSender {
             transport_generation: Arc::new(AtomicU64::new(0)),
             transport_change_tx,
             send_enabled: Arc::new(AtomicBool::new(true)),
+            rtcp_enabled: Arc::new(AtomicBool::new(true)),
             pc_span,
             runtime_handle,
         }
@@ -6864,6 +6920,10 @@ impl RtpSender {
     /// while disabled are dropped.
     fn set_send_enabled(&self, enabled: bool) {
         self.send_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    fn set_rtcp_enabled(&self, enabled: bool) {
+        self.rtcp_enabled.store(enabled, Ordering::Relaxed);
     }
 
     pub fn ssrc(&self) -> u32 {
@@ -7052,6 +7112,7 @@ impl RtpSender {
         let transport_cc_ext_id = self.transport_cc_ext_id.clone();
         let transport_cc_seq = self.transport_cc_seq.clone();
         let send_enabled = self.send_enabled.clone();
+        let rtcp_enabled = self.rtcp_enabled.clone();
         let mut rtcp_rx = self.rtcp_tx.subscribe();
 
         let pc_span = self.pc_span.clone();
@@ -7089,7 +7150,8 @@ impl RtpSender {
                             Err(_) => break,
                         }
                     }
-                    _ = rtcp_interval.tick(), if packets_sent.load(Ordering::Relaxed) > 0 => {
+                    _ = rtcp_interval.tick(), if packets_sent.load(Ordering::Relaxed) > 0
+                        && rtcp_enabled.load(Ordering::Relaxed) => {
                         if transport_generation.load(Ordering::SeqCst) != generation {
                             break;
                         }
