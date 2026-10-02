@@ -449,7 +449,8 @@ impl RtpSenderInterceptor for DefaultRtpSenderNackHandler {
                         "NACK: RTX retransmit primary_seq={} rtx_seq={} rtx_ssrc={}",
                         seq_num, rtx_seq, cfg.rtx_ssrc
                     );
-                    if transport.send_rtp(rtx_packet).await.is_ok() {
+                    // Ok(0): dropped by the transport's send gate.
+                    if matches!(transport.send_rtp(rtx_packet).await, Ok(n) if n > 0) {
                         self.rtx_sent_count.fetch_add(1, Ordering::Relaxed);
                     }
                 } else {
@@ -1091,6 +1092,8 @@ impl PeerConnection {
     /// transport. It is SRTP-protected and fire&forget (same as
     /// [`RtpTransport::send_rtp`]). Callers should gate DTMF on the leg having
     /// a negotiated profile.
+    /// Like the sample path, it sends nothing (and still returns `Ok`) while
+    /// the negotiated direction does not let the packet's stream send.
     pub async fn send_raw_rtp(&self, packet: RtpPacket) -> RtcResult<()> {
         let transport = self
             .get_transceivers()
@@ -1587,6 +1590,45 @@ impl PeerConnection {
             let permitted = matches!(ours.direction, Direction::SendRecv | Direction::SendOnly)
                 && matches!(theirs.direction, Direction::SendRecv | Direction::RecvOnly);
             transceiver.set_send_permitted(permitted);
+        }
+        self.sync_transport_send_gates();
+    }
+
+    /// A transport may send RTP while at least one audio/video transceiver
+    /// using it may send, or while no transceiver uses it. This gates the
+    /// egress paths that bypass the RtpSender: send_raw_rtp, the
+    /// rewrite-bridge relay and NACK retransmissions.
+    fn sync_transport_send_gates(&self) {
+        let primary = self.inner.rtp_transport.lock().clone();
+        let media = self.inner.rtp_media_transports.lock().clone();
+        let transceivers = self.inner.transceivers.lock().clone();
+        // (transport, used by any transceiver, used by a sending one)
+        let mut gates: Vec<(Arc<RtpTransport>, bool, bool)> = primary
+            .iter()
+            .chain(media.values())
+            .map(|transport| (transport.clone(), false, false))
+            .collect();
+        // SSRCs of the streams that may not send, blocked on every transport:
+        // raw and relayed RTP may leave on a transport other than the stream's.
+        let mut blocked = Vec::new();
+        for t in transceivers
+            .iter()
+            .filter(|t| matches!(t.kind(), MediaKind::Audio | MediaKind::Video))
+        {
+            if !t.send_permitted() {
+                blocked.extend([t.sender_ssrc(), t.sender_rtx_ssrc()].into_iter().flatten());
+            }
+            let Some(transport) = media.get(&t.id()).or(primary.as_ref()) else {
+                continue;
+            };
+            if let Some(gate) = gates.iter_mut().find(|g| Arc::ptr_eq(&g.0, transport)) {
+                gate.1 = true;
+                gate.2 |= t.send_permitted();
+            }
+        }
+        for (transport, used, sending) in gates {
+            transport.set_rtp_send_allowed(sending || !used);
+            transport.set_blocked_ssrcs(blocked.clone());
         }
     }
 
@@ -2364,6 +2406,7 @@ impl PeerConnection {
         }
         *self.inner.rtp_transport.lock() = Some(rtp_transport.clone());
         self.attach_registered_observers(&rtp_transport);
+        self.sync_transport_send_gates();
 
         {
             let transceivers = self.inner.transceivers.lock();
@@ -2715,9 +2758,11 @@ impl PeerConnection {
                 }
             }
         }
+        drop(transceivers);
 
         *self.inner.rtp_transport.lock() = Some(rtp_transport.clone());
         self.attach_registered_observers(&rtp_transport);
+        self.sync_transport_send_gates();
         Ok(())
     }
 
@@ -2799,9 +2844,12 @@ impl PeerConnection {
                         }
                     }
 
+                    drop(transceivers);
+
                     // Update the inner transport to ensure future transceivers get the correct one
                     *self.inner.rtp_transport.lock() = Some(rtp_transport.clone());
                     self.attach_registered_observers(&rtp_transport);
+                    self.sync_transport_send_gates();
                 }
                 Err(e) => {
                     warn!("Failed to create SRTP session: {}", e);
@@ -3137,6 +3185,7 @@ impl PeerConnection {
             .rtp_media_transports
             .lock()
             .insert(transceiver.id(), rtp_transport.clone());
+        self.sync_transport_send_gates();
 
         let rtcp_loop = Self::create_rtcp_loop(
             rtp_transport.clone(),
@@ -6481,6 +6530,10 @@ impl RtpTransceiver {
         *current = sender;
     }
 
+    fn send_permitted(&self) -> bool {
+        self.send_permitted.load(Ordering::Relaxed)
+    }
+
     fn set_send_permitted(&self, permitted: bool) {
         let sender = self.sender.lock();
         self.send_permitted.store(permitted, Ordering::Relaxed);
@@ -9795,6 +9848,90 @@ a=sendrecv\r\n";
         } else {
             panic!("Expected GenericNack");
         }
+    }
+
+    /// NACK retransmissions and `RtpTransport::send` go straight to the
+    /// transport; they must stop while the negotiated direction forbids
+    /// sending (RFC 3264 §6.1).
+    #[tokio::test]
+    async fn nack_retransmission_respects_the_transport_send_gate() {
+        use crate::rtp::RtpHeader;
+        use crate::transports::ice::conn::IceConn;
+        use crate::transports::rtp::RtpTransport;
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        #[derive(Default)]
+        struct Egress(AtomicU32);
+        impl RtpObserver for Egress {
+            fn on_egress(&self, _packet: &RtpPacket, _dst: SocketAddr) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let sent_packet_100 = || async {
+            let handler = DefaultRtpSenderNackHandler::new(10);
+            let packet = RtpPacket::new(RtpHeader::new(96, 100, 0, 1234), vec![1, 2, 3]);
+            handler
+                .on_packet_sent(&packet, test_addr(), test_addr())
+                .await;
+            handler
+        };
+
+        let (_, socket_rx) = tokio::sync::watch::channel(None);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1234);
+        let transport = Arc::new(RtpTransport::new(
+            IceConn::new(socket_rx, addr, None),
+            false,
+        ));
+        let egress = Arc::new(Egress::default());
+        transport.add_observer(egress.clone());
+        let nack = || {
+            RtcpPacket::GenericNack(GenericNack {
+                sender_ssrc: 0,
+                media_ssrc: 1234,
+                lost_packets: vec![100],
+            })
+        };
+
+        // Held transport-wide (the only stream on it).
+        transport.set_rtp_send_allowed(false);
+        sent_packet_100()
+            .await
+            .on_rtcp_received(&nack(), transport.clone())
+            .await;
+        assert_eq!(
+            egress.0.load(Ordering::Relaxed),
+            0,
+            "retransmitted while held"
+        );
+
+        // Held individually on an otherwise open transport (BUNDLE).
+        transport.set_rtp_send_allowed(true);
+        transport.set_blocked_ssrcs(vec![1234]);
+        sent_packet_100()
+            .await
+            .on_rtcp_received(&nack(), transport.clone())
+            .await;
+        assert_eq!(
+            egress.0.load(Ordering::Relaxed),
+            0,
+            "retransmitted a held stream"
+        );
+        // RtpTransport::send (a pre-built datagram) reads the SSRC from bytes 8..12.
+        let raw = RtpPacket::new(RtpHeader::new(96, 1, 0, 1234), vec![1]);
+        let sent = transport.send(&raw.marshal().unwrap()).await;
+        assert!(matches!(sent, Ok(0)), "sent a held stream: {sent:?}");
+
+        transport.set_blocked_ssrcs(Vec::new());
+        sent_packet_100()
+            .await
+            .on_rtcp_received(&nack(), transport.clone())
+            .await;
+        assert_eq!(
+            egress.0.load(Ordering::Relaxed),
+            1,
+            "retransmission after resume"
+        );
     }
 
     #[tokio::test]
