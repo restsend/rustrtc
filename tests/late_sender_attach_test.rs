@@ -11,6 +11,7 @@ use rustrtc::media::MediaStreamTrack;
 use rustrtc::media::frame::{AudioFrame, MediaSample};
 use rustrtc::media::track::{SampleStreamSource, sample_track};
 use rustrtc::peer_connection::{RtpSender, RtpTransceiver};
+use rustrtc::sdp::Direction;
 use rustrtc::{
     MediaKind, PeerConnection, RtcConfiguration, RtpCodecParameters, TransceiverDirection,
     TransportMode,
@@ -231,4 +232,44 @@ async fn sender_installed_on_transceiver_added_after_connect_srtp() -> Result<()
 #[tokio::test]
 async fn sender_installed_on_transceiver_added_after_connect_rtp() -> Result<()> {
     sender_installed_on_transceiver_added_after_connect(TransportMode::Rtp).await
+}
+
+/// The answerer's transceiver from the initial offer has no sender. Once the
+/// application sets it sendrecv, its re-offer says so, and a sender installed
+/// after that negotiation reaches the wire without another offer/answer.
+async fn sender_installed_after_senderless_sendrecv_reoffer(mode: TransportMode) -> Result<()> {
+    let config = || RtcConfiguration {
+        transport_mode: mode.clone(),
+        ..RtcConfiguration::default()
+    };
+    let pc1 = PeerConnection::new(config());
+    let pc2 = PeerConnection::new(config());
+    pc1.add_transceiver(MediaKind::Audio, TransceiverDirection::RecvOnly);
+    negotiate_initial(&pc1, &pc2).await?;
+
+    let t2 = pc2.get_transceivers()[0].clone();
+    t2.set_direction(TransceiverDirection::SendRecv);
+    let offer = pc2.create_offer().await?;
+    assert_eq!(offer.media_sections[0].direction, Direction::SendRecv);
+    pc2.set_local_description(offer.clone())?;
+    pc1.set_remote_description(offer).await?;
+    let answer = pc1.create_answer().await?;
+    pc1.set_local_description(answer.clone())?;
+    pc2.set_remote_description(answer).await?;
+
+    let source = install_sender(&t2, 44444);
+    let t1 = pc1.get_transceivers()[0].clone();
+    let what = format!("{mode:?} sender after senderless re-offer");
+    assert_media_flows(source, &t1, &what).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sender_installed_after_senderless_sendrecv_reoffer_webrtc() -> Result<()> {
+    sender_installed_after_senderless_sendrecv_reoffer(TransportMode::WebRtc).await
+}
+
+#[tokio::test]
+async fn sender_installed_after_senderless_sendrecv_reoffer_rtp() -> Result<()> {
+    sender_installed_after_senderless_sendrecv_reoffer(TransportMode::Rtp).await
 }
