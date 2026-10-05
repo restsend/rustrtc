@@ -1,7 +1,6 @@
 use crate::prelude::*;
 use super::{IceSocketWrapper, should_drop_packet};
 use crate::errors::{RtcError, RtcResult};
-#[cfg(feature = "std")]
 use crate::stats::{StatsEntry, StatsId, StatsKind, StatsProvider};
 use crate::transports::PacketReceiver;
 use async_trait::async_trait;
@@ -760,10 +759,8 @@ impl PacketReceiver for IceConn {
     }
 }
 
-#[async_trait]
-#[cfg(feature = "std")]
 impl StatsProvider for IceConn {
-    async fn collect(&self) -> RtcResult<Vec<StatsEntry>> {
+    fn collect(&self) -> RtcResult<Vec<StatsEntry>> {
         let rx_packets = self.rx_packets.load(Ordering::Relaxed);
         let rx_bytes = self.rx_bytes.load(Ordering::Relaxed);
         let tx_packets = self.tx_packets.load(Ordering::Relaxed);

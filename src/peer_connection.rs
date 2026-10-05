@@ -3753,7 +3753,7 @@ impl PeerConnection {
         // The `.clone()` is required for the `Arc<StatsCollector>` ->
         // `Arc<dyn StatsProvider>` unsizing coercion into the slice; from_ref
         // would not coerce.
-        gather_once(&[self.inner.stats_collector.clone()]).await
+        gather_once(&[self.inner.stats_collector.clone()])
     }
 
     /// Collect transport-level (UDP tx/rx) stats from all active IceConn instances.
@@ -3769,7 +3769,7 @@ impl PeerConnection {
             }
             v
         };
-        gather_once(&providers).await
+        gather_once(&providers)
     }
 
     pub async fn wait_for_gathering_complete(&self) {

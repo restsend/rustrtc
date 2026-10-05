@@ -455,9 +455,8 @@ impl RtpReceiverInterceptor for StatsCollector {
     }
 }
 
-#[async_trait]
 impl StatsProvider for StatsCollector {
-    async fn collect(&self) -> RtcResult<Vec<StatsEntry>> {
+    fn collect(&self) -> RtcResult<Vec<StatsEntry>> {
         let mut entries = Vec::new();
 
         {
@@ -575,7 +574,7 @@ mod tests {
             "RFC 3550 LSR is the middle 32 NTP bits, including seconds"
         );
 
-        let stats = collector.collect().await.unwrap();
+        let stats = collector.collect().unwrap();
         assert_eq!(stats.len(), 3);
 
         let remote_outbound = stats
@@ -620,7 +619,7 @@ mod tests {
             .on_packet_received(&packet_in, test_addr(), test_addr())
             .await;
 
-        let stats = collector.collect().await.unwrap();
+        let stats = collector.collect().unwrap();
 
         let outbound = stats
             .iter()

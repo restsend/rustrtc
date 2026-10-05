@@ -1,6 +1,4 @@
 use crate::prelude::*;
-#[cfg(feature = "std")]
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use alloc::collections::BTreeMap;
@@ -9,7 +7,6 @@ use crate::platform::time::Instant;
 
 use crate::errors::RtcResult;
 
-#[cfg(feature = "std")]
 pub type DynProvider = dyn StatsProvider + Send + Sync + 'static;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -105,20 +102,17 @@ impl core::fmt::Display for StatsReport {
     }
 }
 
-// The provider trait lives behind `std`: async_trait pulls a std crate and
-// its implementors (IceConn, StatsCollector) are std-side anyway. The plain
-// stats structs above stay available to the no_std data plane.
-#[cfg(feature = "std")]
-#[async_trait]
+/// Sync collect on purpose: implementations read atomic counters, so no
+/// awaiting is needed — and a sync trait stays dyn-compatible without
+/// async_trait, keeping it available to the no_std build.
 pub trait StatsProvider: Send + Sync {
-    async fn collect(&self) -> RtcResult<Vec<StatsEntry>>;
+    fn collect(&self) -> RtcResult<Vec<StatsEntry>>;
 }
 
-#[cfg(feature = "std")]
-pub async fn gather_once(providers: &[Arc<DynProvider>]) -> RtcResult<StatsReport> {
+pub fn gather_once(providers: &[Arc<DynProvider>]) -> RtcResult<StatsReport> {
     let mut entries = Vec::new();
     for provider in providers {
-        entries.extend(provider.collect().await?);
+        entries.extend(provider.collect()?);
     }
     Ok(StatsReport::new(entries))
 }
