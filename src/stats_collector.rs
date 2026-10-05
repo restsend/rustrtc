@@ -46,8 +46,8 @@ struct RemoteOutboundStats {
     packets_sent: u32,
     bytes_sent: u32,
     remote_timestamp: u32,
-    /// NTP least-significant 32 bits of the last SR from this SSRC (for LSR).
-    last_sr_ntp_least: u32,
+    /// Compact NTP timestamp (middle 32 bits) of the last SR from this SSRC (for LSR).
+    last_sr_compact_ntp: u32,
     /// When we received that SR (for DLSR).
     last_sr_received_at: Option<Instant>,
     last_seen: Instant,
@@ -59,7 +59,7 @@ impl Default for RemoteOutboundStats {
             packets_sent: 0,
             bytes_sent: 0,
             remote_timestamp: 0,
-            last_sr_ntp_least: 0,
+            last_sr_compact_ntp: 0,
             last_sr_received_at: None,
             last_seen: Instant::now(),
         }
@@ -220,7 +220,7 @@ pub struct StatsCollector {
     remote_outbound: Mutex<HashMap<u32, RemoteOutboundStats>>,
     local_inbound: Mutex<HashMap<u32, LocalInboundStats>>,
     local_outbound: Mutex<HashMap<u32, LocalOutboundStats>>,
-    /// Maps ntp_least → Instant for outgoing Sender Reports, used to compute
+    /// Maps compact NTP → Instant for outgoing Sender Reports, used to compute
     /// round-trip time from the LSR/DLSR fields of incoming Receiver Reports.
     sent_sr_times: Mutex<HashMap<u32, std::time::Instant>>,
     last_rr_sent: Mutex<Option<Instant>>,
@@ -271,7 +271,7 @@ impl StatsCollector {
         dlsr as f64 / 65536.0
     }
 
-    pub fn record_sr_sent(&self, _ssrc: u32, ntp_least: u32) {
+    pub fn record_sr_sent(&self, _ssrc: u32, compact_ntp: u32) {
         let mut times = self.sent_sr_times.lock();
         // Evict stale entries once the high-water mark is reached so the map
         // does not grow without bound over a long-lived call. RTT samples older
@@ -280,7 +280,7 @@ impl StatsCollector {
             let now = Instant::now();
             times.retain(|_, t| now.duration_since(*t) < SENT_SR_TIME_MAX_AGE);
         }
-        times.insert(ntp_least, Instant::now());
+        times.insert(compact_ntp, Instant::now());
     }
 
     /// Build RFC 3550 reception report blocks for all locally received SSRCs.
@@ -295,7 +295,7 @@ impl StatsCollector {
             let (lsr, dlsr) = remote
                 .get(ssrc)
                 .map(|r| {
-                    let lsr = r.last_sr_ntp_least;
+                    let lsr = r.last_sr_compact_ntp;
                     let dlsr = r.last_sr_received_at.map(delay_since_sr).unwrap_or(0);
                     (lsr, dlsr)
                 })
@@ -313,7 +313,7 @@ impl StatsCollector {
             stats.packets_sent = sr.packet_count;
             stats.bytes_sent = sr.octet_count;
             stats.remote_timestamp = sr.ntp_least;
-            stats.last_sr_ntp_least = sr.ntp_least;
+            stats.last_sr_compact_ntp = sr.compact_ntp();
             stats.last_sr_received_at = Some(Instant::now());
             stats.last_seen = Instant::now();
         }
@@ -354,6 +354,25 @@ impl StatsCollector {
                 }
             }
         }
+    }
+
+    pub(crate) fn observe_packet(&self, packet: &RtpPacket, clock_rate: u32) -> Option<RtcpPacket> {
+        let size = Self::packet_size(packet);
+        let now = Instant::now();
+        {
+            let mut inbound = self.local_inbound.lock();
+            evict_stale_ssrcs(&mut inbound, |v| v.last_seen);
+            let stats = inbound.entry(packet.header.ssrc).or_default();
+            stats.bytes_received += size;
+            stats.update(
+                packet.header.sequence_number,
+                packet.header.timestamp,
+                clock_rate,
+                now,
+            );
+        }
+        // Opportunistic RR so recv-only / silent-send legs still emit feedback.
+        self.maybe_receiver_report(0)
     }
 
     fn packet_size(packet: &RtpPacket) -> u64 {
@@ -415,8 +434,8 @@ impl RtpSenderInterceptor for StatsCollector {
         stats.last_seen = Instant::now();
     }
 
-    fn on_sr_sent(&self, ssrc: u32, ntp_least: u32) {
-        self.record_sr_sent(ssrc, ntp_least);
+    fn on_sr_sent(&self, ssrc: u32, compact_ntp: u32) {
+        self.record_sr_sent(ssrc, compact_ntp);
     }
 
     fn reception_report_blocks(&self) -> Vec<ReportBlock> {
@@ -432,24 +451,7 @@ impl RtpReceiverInterceptor for StatsCollector {
         _src_addr: std::net::SocketAddr,
         _local_addr: std::net::SocketAddr,
     ) -> Option<RtcpPacket> {
-        let size = Self::packet_size(packet);
-        let now = Instant::now();
-        {
-            let mut inbound = self.local_inbound.lock();
-            evict_stale_ssrcs(&mut inbound, |v| v.last_seen);
-            let stats = inbound.entry(packet.header.ssrc).or_default();
-            stats.bytes_received += size;
-            // Clock rate unknown here; jitter uses 90k default until known.
-            // Audio (8k/48k) still produces a usable relative estimate.
-            stats.update(
-                packet.header.sequence_number,
-                packet.header.timestamp,
-                stats.clock_rate,
-                now,
-            );
-        }
-        // Opportunistic RR so recv-only / silent-send legs still emit feedback.
-        self.maybe_receiver_report(0)
+        self.observe_packet(packet, 90000)
     }
 }
 
@@ -538,12 +540,12 @@ mod tests {
     use crate::rtp::{ReportBlock, SenderReport};
 
     #[tokio::test]
-    async fn test_stats_collector_sr() {
+    async fn test_stats_collector_sr_lsr() {
         let collector = StatsCollector::new();
         let sr = SenderReport {
             sender_ssrc: 12345,
-            ntp_most: 0,
-            ntp_least: 1000,
+            ntp_most: 0x1234_5678,
+            ntp_least: 0x9abc_def0,
             rtp_timestamp: 0,
             packet_count: 50,
             octet_count: 5000,
@@ -558,10 +560,23 @@ mod tests {
             }],
         };
 
+        let packet = RtpPacket::new(
+            crate::rtp::RtpHeader::new(0, 1, 160, 12345),
+            vec![0xff; 160],
+        );
+        collector
+            .on_packet_received(&packet, test_addr(), test_addr())
+            .await;
         collector.process_rtcp(&RtcpPacket::SenderReport(sr));
+        let blocks = collector.build_report_blocks();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].last_sender_report, 0x5678_9abc,
+            "RFC 3550 LSR is the middle 32 NTP bits, including seconds"
+        );
 
         let stats = collector.collect().await.unwrap();
-        assert_eq!(stats.len(), 2);
+        assert_eq!(stats.len(), 3);
 
         let remote_outbound = stats
             .iter()

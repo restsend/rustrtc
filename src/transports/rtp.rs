@@ -1,4 +1,4 @@
-use crate::peer_connection::RtpObserver;
+use crate::peer_connection::{RtpObserver, RtpReceiver};
 use crate::rtp::{RtcpPacket, RtpPacket, is_rtcp, marshal_rtcp_packets, parse_rtcp_packets};
 use crate::srtp::{SrtpPacket, SrtpSession};
 use crate::transports::PacketReceiver;
@@ -11,8 +11,8 @@ use parking_lot::{Mutex, RwLock};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use tokio::sync::mpsc;
 use tracing::{debug, trace};
 
@@ -417,6 +417,7 @@ struct ListenerRoute {
     payload_types: Vec<u8>,
     tx: mpsc::Sender<(RtpPacket, SocketAddr)>,
     provisional: bool,
+    receiver: Option<Weak<RtpReceiver>>,
 }
 
 impl ListenerRegistry {
@@ -444,6 +445,7 @@ impl ListenerRegistry {
             payload_types: Vec::new(),
             tx: tx.clone(),
             provisional: false,
+            receiver: None,
         });
         self.routes.last_mut().unwrap()
     }
@@ -692,6 +694,14 @@ impl RtpTransport {
     pub fn register_provisional_listener(&self, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
         let mut listeners = self.listeners.lock();
         listeners.register_provisional(tx);
+    }
+
+    pub(crate) fn register_reception_stats(
+        &self,
+        tx: mpsc::Sender<(RtpPacket, SocketAddr)>,
+        receiver: Weak<RtpReceiver>,
+    ) {
+        self.listeners.lock().route_for_sender_mut(&tx).receiver = Some(receiver);
     }
 
     pub fn set_rid_extension_id(&self, id: Option<u8>) {
@@ -1238,10 +1248,6 @@ impl PacketReceiver for RtpTransport {
             // (single Acquire load) when no observer is registered.
             self.fire_ingress(&rtp_packet, addr);
 
-            let Some(rtp_packet) = self.try_bridge_rewrite_rtp(rtp_packet, marshal_buf) else {
-                return;
-            };
-
             let ssrc = rtp_packet.header.ssrc;
             let pt = rtp_packet.header.payload_type;
 
@@ -1253,7 +1259,7 @@ impl PacketReceiver for RtpTransport {
             let rid_bytes = rid_id.and_then(|id| rtp_packet.header.get_extension(id));
             let mid_bytes = mid_id.and_then(|id| rtp_packet.header.get_extension(id));
 
-            let listener = {
+            let (listener, receiver) = {
                 let mut listeners = self.listeners.lock();
                 let mut selected = None;
                 let mut bind_ssrc = false;
@@ -1294,7 +1300,26 @@ impl PacketReceiver for RtpTransport {
                     listeners.bind_ssrc_route(ssrc, tx.clone());
                 }
 
-                selected
+                let receiver = selected.as_ref().and_then(|tx| {
+                    listeners
+                        .routes
+                        .iter()
+                        .find(|route| route.tx.same_channel(tx))
+                        .and_then(|route| route.receiver.as_ref())
+                        .and_then(Weak::upgrade)
+                });
+                (selected, receiver)
+            };
+
+            // Account on the original SSRC before either forwarding or depacketization.
+            if let Some(receiver) = receiver
+                && let Some(report) = receiver.observe_reception(&rtp_packet)
+                && let Err(error) = self.send_rtcp(&[report]).await
+            {
+                trace!(%error, "Failed to send reception report");
+            }
+            let Some(rtp_packet) = self.try_bridge_rewrite_rtp(rtp_packet, marshal_buf) else {
+                return;
             };
 
             if let Some(tx) = listener {
