@@ -189,6 +189,12 @@ pub(crate) struct IceTransportInner {
     /// changed remote ufrag/pwd in that answer from being misread as a
     /// remote-initiated restart (which would reset ICE a second time).
     restart_requested: std::sync::atomic::AtomicBool,
+    /// Monotonic counter bumped for every new controlled-side nomination and on
+    /// every ICE restart. A deferred path-verification task only commits its
+    /// pair while its captured generation is still current, so a stale
+    /// nomination whose verification finishes late cannot switch media back to
+    /// a superseded path (RFC 8445 §8.1.1).
+    nomination_generation: AtomicU64,
     /// mDNS hostname advertising our host candidates (`enable_mdns`).
     mdns_hostname: Option<String>,
     /// Guards against overlapping `run_turn_refresh` invocations: the refresh
@@ -1030,6 +1036,7 @@ impl IceTransport {
             nomination_complete: nomination_complete_tx,
             _nomination_complete_rx: nomination_complete_rx,
             restart_requested: std::sync::atomic::AtomicBool::new(false),
+            nomination_generation: AtomicU64::new(0),
             mdns_hostname: config
                 .enable_mdns
                 .then(crate::transports::ice::mdns::MdnsResponder::generate_hostname),
@@ -1162,8 +1169,25 @@ impl IceTransport {
     /// selected pair once checks and nomination complete again.
     ///
     /// A remote-initiated restart (peer offers new ice-ufrag/ice-pwd) is
-    /// detected in [`Self::start`] and calls this method automatically.
+    /// detected in [`Self::start`], which runs the same reset via
+    /// `restart_internal` *without* marking it as locally initiated.
     pub async fn restart(&self) -> Result<()> {
+        // Mark this as locally initiated *before* rolling credentials, so the
+        // peer's answer (which carries our new ufrag/pwd) is recognised as the
+        // completion of our own restart rather than a fresh remote one. This
+        // flag must NOT be set by a remote-triggered restart: leaving it set
+        // after `restart_internal` would make the *next* remote restart look
+        // like the completion of a local restart and skip it (issue #54).
+        self.inner
+            .restart_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.restart_internal().await
+    }
+
+    /// Shared restart body used by both locally- and remotely-initiated
+    /// restarts. Deliberately does not touch `restart_requested`; see
+    /// [`Self::restart`] for why only the local path may set that flag.
+    async fn restart_internal(&self) -> Result<()> {
         // 1. Fresh credentials. A new tie_breaker also makes us win/lose role
         //    conflicts per RFC 8445 §5.1.1.1 semantics for the new session.
         *self.inner.local_parameters.lock() = IceParameters::generate();
@@ -1175,9 +1199,11 @@ impl IceTransport {
         self.inner.pending_transactions.lock().clear();
         *self.inner.selected_pair.lock() = None;
         let _ = self.inner.selected_pair_notifier.send(None);
+        // Invalidate any in-flight path-verification task from before the
+        // restart so it cannot re-select the old pair afterwards.
         self.inner
-            .restart_requested
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+            .nomination_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let _ = self.inner.nomination_complete.send(None);
         let _ = self.inner.set_state(IceTransportState::Checking);
 
@@ -1271,7 +1297,7 @@ impl IceTransport {
                     label = self.inner.config.label.as_deref().unwrap_or("-"),
                     "remote ICE restart detected (ufrag/pwd changed): restarting locally"
                 );
-                self.restart().await?;
+                self.restart_internal().await?;
             }
         } else {
             self.inner
@@ -2231,6 +2257,30 @@ fn publish_selected_socket(
     }
 }
 
+/// Apply a verified controlled-side nomination only if it is still the most
+/// recent one. `generation` is the value captured when the USE-CANDIDATE that
+/// spawned the verification was handled; any newer nomination (or an ICE
+/// restart) bumps `nomination_generation`, in which case this returns `false`
+/// and leaves the currently selected pair untouched.
+fn commit_verified_nomination(
+    inner: &IceTransportInner,
+    generation: u64,
+    pair: &IceCandidatePair,
+    sender: &IceSocketWrapper,
+) -> bool {
+    if inner
+        .nomination_generation
+        .load(std::sync::atomic::Ordering::SeqCst)
+        != generation
+    {
+        return false;
+    }
+    *inner.selected_pair.lock() = Some(pair.clone());
+    let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
+    publish_selected_socket(inner, pair, Some(sender));
+    true
+}
+
 async fn complete_controlled_inbound_tcp_nomination(
     sender: &IceSocketWrapper,
     addr: SocketAddr,
@@ -2278,6 +2328,10 @@ async fn complete_controlled_inbound_tcp_nomination(
             "Controlled agent selected pair via inbound TCP nomination: {} -> {}",
             pair.local.address, pair.remote.address
         );
+        // A TCP nomination supersedes any pending UDP path verification.
+        inner
+            .nomination_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         *inner.selected_pair.lock() = Some(pair.clone());
         let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
         publish_selected_socket(&inner, &pair, Some(sender));
@@ -2701,6 +2755,14 @@ async fn handle_stun_request(
             if matches!(sender, IceSocketWrapper::TcpStream(_, _, _)) {
                 return;
             }
+            // A newer USE-CANDIDATE supersedes any pending path verification:
+            // the most recent nomination wins (RFC 8445 §8.1.1). Capture this
+            // nomination's generation so a deferred verifier can detect that it
+            // has since been superseded and must not move media (issue #55).
+            let use_candidate_generation = inner
+                .nomination_generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
             // The controlling agent is authoritative, but "authoritative"
             // does not mean media should be diverted onto an unproven path.
             // Two failure modes motivated the current design:
@@ -2804,19 +2866,27 @@ async fn handle_stun_request(
                     tokio::spawn(async move {
                         let verified =
                             verify_nominated_path(&sender2, addr, inner2.clone()).await;
-                        if verified {
+                        if !verified {
+                            debug!(
+                                label = inner2.config.label.as_deref().unwrap_or("-"),
+                                "New nominated path {} -> {} failed verification; keeping current pair",
+                                pair2.local.address, pair2.remote.address
+                            );
+                        } else if commit_verified_nomination(
+                            &inner2,
+                            use_candidate_generation,
+                            &pair2,
+                            &sender2,
+                        ) {
                             debug!(
                                 label = inner2.config.label.as_deref().unwrap_or("-"),
                                 "New nominated path verified, switching: {} -> {}",
                                 pair2.local.address, pair2.remote.address
                             );
-                            *inner2.selected_pair.lock() = Some(pair2.clone());
-                            let _ = inner2.selected_pair_notifier.send(Some(pair2.clone()));
-                            publish_selected_socket(&inner2, &pair2, Some(&sender2));
                         } else {
                             debug!(
                                 label = inner2.config.label.as_deref().unwrap_or("-"),
-                                "New nominated path {} -> {} failed verification; keeping current pair",
+                                "New nominated path {} -> {} verified but superseded by a newer nomination; keeping current pair",
                                 pair2.local.address, pair2.remote.address
                             );
                         }

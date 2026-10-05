@@ -4947,3 +4947,143 @@ async fn second_nomination_requires_path_verification() -> Result<()> {
     let _ = initial;
     Ok(())
 }
+
+/// Regression for issue #54: every remote-initiated ICE restart must reset the
+/// local agent. `restart()` used to set `restart_requested` even when it merely
+/// mirrored a remote restart, so the flag stayed set and the *second* remote
+/// restart was mistaken for the completion of a local one and skipped.
+#[tokio::test]
+#[serial]
+async fn second_remote_ice_restart_still_restarts() -> Result<()> {
+    let (transport, runner) = IceTransportBuilder::new(RtcConfiguration::default()).build();
+    tokio::spawn(runner);
+
+    // Initial start: no previous remote parameters, so this is not a restart.
+    transport.start(IceParameters::generate()).await?;
+    let initial = transport.local_parameters();
+
+    // First remote restart: changed credentials must roll our own.
+    transport.start(IceParameters::generate()).await?;
+    let after_first = transport.local_parameters();
+    assert_ne!(
+        initial.username_fragment, after_first.username_fragment,
+        "the first remote restart must roll local credentials"
+    );
+    assert!(
+        !transport
+            .inner
+            .restart_requested
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "a remote-triggered restart must not leave restart_requested set"
+    );
+
+    // Second remote restart: must reset again (this failed before the fix).
+    transport.start(IceParameters::generate()).await?;
+    let after_second = transport.local_parameters();
+    assert_ne!(
+        after_first.username_fragment, after_second.username_fragment,
+        "a second remote restart must roll local credentials again (issue #54)"
+    );
+
+    Ok(())
+}
+
+/// Regression for issue #55: when two controlled-side nominations arrive close
+/// together and the *older* one's deferred path verification completes last, it
+/// must not move media back to the superseded path. The most recent nomination
+/// wins (RFC 8445 §8.1.1).
+#[tokio::test]
+#[serial]
+async fn superseded_nomination_does_not_override_newer() -> Result<()> {
+    let (controlling, controlled) = setup_host_pair(
+        RtcConfiguration::default(),
+        RtcConfiguration::default(),
+    )
+    .await;
+    wait_for_selected_pair(&controlled, Duration::from_secs(5)).await?;
+
+    let agent_addr = controlled
+        .local_candidates()
+        .iter()
+        .find(|c| c.transport == "udp" && c.component == 1)
+        .map(|c| c.address)
+        .expect("controlled udp host candidate");
+    let pwd = controlled.local_parameters().password;
+    let username = format!(
+        "{}:{}",
+        controlling.local_parameters().username_fragment,
+        controlled.local_parameters().username_fragment
+    );
+    let use_candidate_request = || -> Result<Vec<u8>> {
+        let mut msg = StunMessage::binding_request(random_bytes::<12>(), Some("test"));
+        msg.attributes.push(StunAttribute::Username(username.clone()));
+        msg.attributes.push(StunAttribute::UseCandidate);
+        Ok(msg.encode(Some(pwd.as_bytes()), true)?)
+    };
+
+    // Nomination A (older): send USE-CANDIDATE but never answer its
+    // verification until after B is selected, so A's verifier stays pending.
+    let older = UdpSocket::bind("127.0.0.1:0").await?;
+    older.send_to(&use_candidate_request()?, agent_addr).await?;
+
+    // Nomination B (newer).
+    let newer = UdpSocket::bind("127.0.0.1:0").await?;
+    let newer_addr = newer.local_addr()?;
+    newer.send_to(&use_candidate_request()?, agent_addr).await?;
+
+    // Answer every binding request the agent sends to B until B becomes the
+    // selected pair (some may be ordinary connectivity checks).
+    let mut buf = [0u8; 1500];
+    timeout(Duration::from_secs(4), async {
+        loop {
+            let Ok((n, from)) = newer.recv_from(&mut buf).await else {
+                continue;
+            };
+            if let Ok(m) = StunMessage::decode(&buf[..n])
+                && m.class == StunClass::Request
+                && m.method == StunMethod::Binding
+            {
+                let resp = StunMessage::binding_success_response(m.transaction_id, from);
+                if let Ok(bytes) = resp.encode(Some(pwd.as_bytes()), true) {
+                    let _ = newer.send_to(&bytes, from).await;
+                }
+            }
+            if controlled
+                .get_selected_pair()
+                .is_some_and(|p| p.remote.address == newer_addr)
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the newer nomination to be selected");
+
+    // Now answer everything the agent sent to A (including the stale
+    // verification request). Its verifier may resolve, but it has been
+    // superseded and must be ignored.
+    while let Ok(Ok((n, from))) =
+        timeout(Duration::from_millis(250), older.recv_from(&mut buf)).await
+    {
+        if let Ok(m) = StunMessage::decode(&buf[..n])
+            && m.class == StunClass::Request
+            && m.method == StunMethod::Binding
+        {
+            let resp = StunMessage::binding_success_response(m.transaction_id, from);
+            if let Ok(bytes) = resp.encode(Some(pwd.as_bytes()), true) {
+                let _ = older.send_to(&bytes, from).await;
+            }
+        }
+    }
+
+    // Give the stale verifier a moment to (wrongly) apply, then assert B is
+    // still selected.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let selected = controlled.get_selected_pair().expect("selected pair");
+    assert_eq!(
+        selected.remote.address, newer_addr,
+        "an older nomination's late verification must not move media back (issue #55)"
+    );
+
+    Ok(())
+}
