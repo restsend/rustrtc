@@ -162,9 +162,9 @@ pub trait RtpSenderInterceptor: Send + Sync {
     ) {
     }
     /// Fires after a Sender Report (RTCP SR) has been built and sent.
-    /// Carries the outgoing SSRC and the NTP least field so the receiver
-    /// can compute RTT from the LSR/DLSR on the return path.
-    fn on_sr_sent(&self, _ssrc: u32, _ntp_least: u32) {}
+    /// Carries the outgoing SSRC and the compact NTP timestamp (middle 32 bits)
+    /// so the receiver can compute RTT from LSR/DLSR on the return path.
+    fn on_sr_sent(&self, _ssrc: u32, _compact_ntp: u32) {}
     async fn on_rtcp_received(&self, _packet: &RtcpPacket, _transport: Arc<RtpTransport>) {}
     /// Reception report blocks to attach to an outgoing Sender Report (RFC 3550).
     fn reception_report_blocks(&self) -> Vec<crate::rtp::ReportBlock> {
@@ -1200,7 +1200,7 @@ impl PeerConnection {
             .payload_map(transceiver.payload_map.clone())
             .pc_span(self.inner.pc_span.clone())
             .runtime_handle(self.inner.config.runtime_handle.clone())
-            .interceptor(self.inner.stats_collector.clone())
+            .reception_stats(self.inner.stats_collector.clone())
             .depacketizer_factory(self.inner.config.depacketizer_strategy.factory.clone());
         for i in &self.inner.config.recorder_interceptors.receivers {
             builder = builder.interceptor(i.clone());
@@ -2064,7 +2064,7 @@ impl PeerConnection {
                         .payload_map(t.payload_map.clone())
                         .pc_span(self.inner.pc_span.clone())
                         .runtime_handle(self.inner.config.runtime_handle.clone())
-                        .interceptor(self.inner.stats_collector.clone());
+                        .reception_stats(self.inner.stats_collector.clone());
 
                     let nack_enabled = if let Some(caps) = &self.inner.config.media_capabilities {
                         match kind {
@@ -7182,7 +7182,7 @@ impl RtpSender {
                             report_blocks,
                         );
 
-                        let ntp_least = report.ntp_least;
+                        let compact_ntp = report.compact_ntp();
                         if let Err(e) = transport
                             .send_rtcp(&[RtcpPacket::SenderReport(report)])
                             .await
@@ -7190,7 +7190,7 @@ impl RtpSender {
                             trace!("Failed to send Sender Report: {}", e);
                         }
                         for interceptor in &*interceptors {
-                            interceptor.on_sr_sent(ssrc, ntp_least);
+                            interceptor.on_sr_sent(ssrc, compact_ntp);
                         }
                     }
                     rtcp = rtcp_rx.recv() => {
@@ -7416,6 +7416,7 @@ pub struct RtpReceiver {
     >,
     runner_tx: Mutex<Option<mpsc::UnboundedSender<ReceiverCommand>>>,
     interceptors: Vec<Arc<dyn RtpReceiverInterceptor>>,
+    reception_stats: Option<Arc<StatsCollector>>,
     track_ready_event_tx: Mutex<Option<mpsc::UnboundedSender<PeerConnectionEvent>>>,
     track_ready_transceiver: Mutex<Option<Weak<RtpTransceiver>>>,
     track_event_sent: AtomicBool,
@@ -7439,6 +7440,7 @@ pub struct RtpReceiverBuilder {
     kind: MediaKind,
     ssrc: u32,
     interceptors: Vec<Arc<dyn RtpReceiverInterceptor>>,
+    reception_stats: Option<Arc<StatsCollector>>,
     depacketizer_factory: Option<Arc<dyn DepacketizerFactory>>,
     payload_map: Arc<RwLock<HashMap<u8, RtpCodecParameters>>>,
     pc_span: tracing::Span,
@@ -7452,6 +7454,7 @@ impl RtpReceiverBuilder {
             kind,
             ssrc,
             interceptors: Vec::new(),
+            reception_stats: None,
             depacketizer_factory: None,
             payload_map: Arc::new(RwLock::new(HashMap::new())),
             pc_span: debug_span!("pc"),
@@ -7492,6 +7495,11 @@ impl RtpReceiverBuilder {
 
     pub fn interceptor(mut self, interceptor: Arc<dyn RtpReceiverInterceptor>) -> Self {
         self.interceptors.push(interceptor);
+        self
+    }
+
+    fn reception_stats(mut self, stats: Arc<StatsCollector>) -> Self {
+        self.reception_stats = Some(stats);
         self
     }
 
@@ -7549,6 +7557,7 @@ impl RtpReceiverBuilder {
             simulcast_tracks: Mutex::new(HashMap::new()),
             runner_tx: Mutex::new(None),
             interceptors: self.interceptors,
+            reception_stats: self.reception_stats,
             track_ready_event_tx: Mutex::new(None),
             track_ready_transceiver: Mutex::new(None),
             track_event_sent: AtomicBool::new(false),
@@ -7609,6 +7618,7 @@ impl RtpReceiver {
             simulcast_tracks: Mutex::new(HashMap::new()),
             runner_tx: Mutex::new(None),
             interceptors,
+            reception_stats: None,
             track_ready_event_tx: Mutex::new(None),
             track_ready_transceiver: Mutex::new(None),
             track_event_sent: AtomicBool::new(false),
@@ -7634,7 +7644,8 @@ impl RtpReceiver {
             let transport = self.transport.lock().clone();
             if let Some(transport) = transport {
                 let (packet_tx, packet_rx) = mpsc::channel(RTP_RECEIVER_PACKET_CAPACITY);
-                transport.register_rid_listener(rid.clone(), packet_tx);
+                transport.register_rid_listener(rid.clone(), packet_tx.clone());
+                transport.register_reception_stats(packet_tx, Arc::downgrade(self));
 
                 let cmd = ReceiverCommand::AddTrack {
                     rid: Some(rid.clone()),
@@ -7720,6 +7731,20 @@ impl RtpReceiver {
             .store(payload_type, Ordering::Relaxed);
         self.clock_rate_cache.store(rate, Ordering::Relaxed);
         rate
+    }
+
+    pub(crate) fn observe_reception(&self, packet: &RtpPacket) -> Option<RtcpPacket> {
+        let stats = self.reception_stats.as_ref()?;
+        // Only negotiated input clock rates can turn RTP timestamps into reception jitter.
+        let clock_rate = self
+            .payload_map
+            .read()
+            .get(&packet.header.payload_type)?
+            .clock_rate;
+        if clock_rate == 0 {
+            return None;
+        }
+        stats.observe_packet(packet, clock_rate)
     }
 
     pub fn rtx_ssrc(&self) -> Option<u32> {
@@ -7922,6 +7947,7 @@ impl RtpReceiver {
             }
         }
         transport.register_payload_list_listener(payload_types.clone(), tx.clone());
+        transport.register_reception_stats(tx.clone(), Arc::downgrade(self));
         if let Some(rtx_ssrc) = *self.rtx_ssrc.lock() {
             transport.register_listener_sync(rtx_ssrc, tx.clone());
         }
@@ -7953,7 +7979,8 @@ impl RtpReceiver {
         let tracks_guard = self.simulcast_tracks.lock();
         for (rid, (source, _, feedback_rx, simulcast_ssrc)) in tracks_guard.iter() {
             let (tx, rx) = mpsc::channel(RTP_RECEIVER_PACKET_CAPACITY);
-            transport.register_rid_listener(rid.clone(), tx);
+            transport.register_rid_listener(rid.clone(), tx.clone());
+            transport.register_reception_stats(tx, Arc::downgrade(self));
             initial_tracks.push(ReceiverCommand::AddTrack {
                 rid: Some(rid.clone()),
                 packet_rx: rx,
@@ -8488,6 +8515,195 @@ mod tests {
                 "observer registered before transport never saw the first packet"
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn rewrite_bridge_preserves_inbound_report_stats() {
+        use crate::rtp::{ReportBlock, parse_rtcp_packets};
+        use crate::stats::StatsKind;
+        use tokio::net::UdpSocket;
+
+        for (direct, dynamic_rid) in [(false, false), (true, false), (false, true)] {
+            let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut config = RtcConfiguration::default();
+            config.transport_mode = TransportMode::Rtp;
+            config.bind_ip = Some("127.0.0.1".into());
+            config.rtcp_mux_policy = crate::RtcpMuxPolicy::Require;
+            let pc = PeerConnection::new(config);
+            let (_source, track, _feedback) =
+                sample_track(crate::media::frame::MediaKind::Audio, 64);
+            let sender = pc
+                .add_track(
+                    track,
+                    RtpCodecParameters {
+                        payload_type: 0,
+                        name: "PCMU".into(),
+                        clock_rate: 8000,
+                        channels: 1,
+                    },
+                )
+                .unwrap();
+            let offer = pc.create_offer().await.unwrap();
+            pc.set_local_description(offer).unwrap();
+            let answer = format!(
+                "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nc=IN IP4 127.0.0.1\r\n\
+                 m=audio {} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\na=sendrecv\r\n",
+                remote.local_addr().unwrap().port(),
+            );
+            pc.set_remote_description(SessionDescription::parse(SdpType::Answer, &answer).unwrap())
+                .await
+                .unwrap();
+            pc.wait_for_rtp_transport_ready(Duration::from_secs(2))
+                .await
+                .unwrap();
+            let local = sender.transport().unwrap().local_addr();
+            let late_track = if dynamic_rid {
+                let transceiver = pc.get_transceivers().remove(0);
+                transceiver
+                    .update_extmap(HashMap::from([(
+                        3,
+                        "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id".into(),
+                    )]))
+                    .unwrap();
+                Some(
+                    transceiver
+                        .receiver()
+                        .unwrap()
+                        .add_simulcast_track("late".into()),
+                )
+            } else {
+                None
+            };
+            if direct {
+                pc.bridge_rtp_with_rewrite_to_self(RtpRewriteBridgeParams {
+                    fixed_out_ssrc: Some(sender.ssrc()),
+                    ..Default::default()
+                })
+                .unwrap();
+            }
+
+            let mut report: Option<ReportBlock> = None;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                let mut buffer = [0u8; 1500];
+                for sequence in 1u16..=50 {
+                    let mut header =
+                        crate::rtp::RtpHeader::new(0, sequence, sequence as u32 * 160, 4242);
+                    if dynamic_rid {
+                        header.set_extension(3, b"late").unwrap();
+                    }
+                    let packet = RtpPacket::new(header, vec![0xff; 160]);
+                    remote
+                        .send_to(&packet.marshal().unwrap(), local)
+                        .await
+                        .unwrap();
+                    if let Some(track) = &late_track {
+                        let sample = track.recv().await.unwrap();
+                        let crate::media::MediaSample::Audio(frame) = sample else {
+                            panic!("the dynamically registered RID must receive audio");
+                        };
+                        assert_eq!(frame.data.as_ref(), &packet.payload[..]);
+                    }
+                    if direct {
+                        // The rewritten UDP response is the fast path's packet-completion contract.
+                        loop {
+                            let (size, _) = remote.recv_from(&mut buffer).await.unwrap();
+                            if buffer[1] == 201 {
+                                if let RtcpPacket::ReceiverReport(rr) =
+                                    parse_rtcp_packets(&buffer[..size], None).unwrap().remove(0)
+                                {
+                                    report = rr
+                                        .report_blocks
+                                        .into_iter()
+                                        .find(|block| block.ssrc == 4242);
+                                }
+                                continue;
+                            }
+                            let forwarded = RtpPacket::parse(&buffer[..size]).unwrap();
+                            assert_eq!(forwarded.header.ssrc, sender.ssrc());
+                            assert_eq!(forwarded.payload, packet.payload);
+                            break;
+                        }
+                    }
+                }
+                if !direct && !dynamic_rid {
+                    // Receipt of RR proves the normal receiver processed all 50 packets.
+                    let (size, _) = remote.recv_from(&mut buffer).await.unwrap();
+                    if let RtcpPacket::ReceiverReport(rr) =
+                        parse_rtcp_packets(&buffer[..size], None).unwrap().remove(0)
+                    {
+                        report = rr
+                            .report_blocks
+                            .into_iter()
+                            .find(|block| block.ssrc == 4242);
+                    }
+                }
+            })
+            .await
+            .expect("all RTP packets must complete the negotiated UDP path");
+            let stats = pc.get_stats().await.unwrap();
+            let inbound = stats
+                .entries
+                .iter()
+                .find(|entry| entry.kind == StatsKind::InboundRtp && entry.values["ssrc"] == 4242);
+            assert_eq!(
+                inbound.and_then(|entry| entry.values["packetsReceived"].as_u64()),
+                Some(50),
+                "reception must count each packet once (direct={direct}, dynamic_rid={dynamic_rid})"
+            );
+            if report.is_none() {
+                let mut buffer = [0u8; 1500];
+                let (size, _) =
+                    tokio::time::timeout(Duration::from_secs(1), remote.recv_from(&mut buffer))
+                        .await
+                        .expect("the peer must receive the direct reception report")
+                        .unwrap();
+                if let RtcpPacket::ReceiverReport(rr) =
+                    parse_rtcp_packets(&buffer[..size], None).unwrap().remove(0)
+                {
+                    report = rr
+                        .report_blocks
+                        .into_iter()
+                        .find(|block| block.ssrc == 4242);
+                }
+            }
+            let report =
+                report.expect("wire RR must contain the original inbound SSRC's report block");
+            assert_eq!(report.highest_sequence, 50);
+            assert_eq!(report.packets_lost, 0);
+            assert_eq!(report.fraction_lost, 0);
+            if direct {
+                let unknown = RtpPacket::new(
+                    crate::rtp::RtpHeader::new(127, 51, 8160, 4343),
+                    vec![7; 160],
+                );
+                remote
+                    .send_to(&unknown.marshal().unwrap(), local)
+                    .await
+                    .unwrap();
+                let mut buffer = [0u8; 1500];
+                let (size, _) =
+                    tokio::time::timeout(Duration::from_secs(1), remote.recv_from(&mut buffer))
+                        .await
+                        .expect("unknown codecs must retain the existing direct forwarding path")
+                        .unwrap();
+                assert_eq!(
+                    RtpPacket::parse(&buffer[..size]).unwrap().payload,
+                    unknown.payload
+                );
+                assert!(
+                    pc.get_stats()
+                        .await
+                        .unwrap()
+                        .entries
+                        .iter()
+                        .all(|entry| entry.kind != StatsKind::InboundRtp
+                            || entry.values["ssrc"] != 4343),
+                    "unknown negotiated clocks must not invent reception statistics"
+                );
+            }
+            pc.clear_rtp_rewrite_bridge();
+            pc.close();
         }
     }
 
@@ -12100,6 +12316,102 @@ a=mid:0
             role,
             crate::transports::ice::IceRole::Controlled,
             "ICE-lite should set role to Controlled"
+        );
+    }
+
+    #[tokio::test]
+    async fn sender_report_wire_lsr_produces_rtt() {
+        use crate::media::frame::AudioFrame;
+        use crate::stats::StatsKind;
+        use tokio::net::UdpSocket;
+
+        let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+        config.bind_ip = Some("127.0.0.1".into());
+        config.rtcp_mux_policy = crate::RtcpMuxPolicy::Require;
+        let pc = PeerConnection::new(config);
+        let (source, track, _feedback) = sample_track(crate::media::frame::MediaKind::Audio, 64);
+        let sender = pc
+            .add_track(
+                track,
+                RtpCodecParameters {
+                    payload_type: 0,
+                    name: "PCMU".into(),
+                    clock_rate: 8000,
+                    channels: 1,
+                },
+            )
+            .unwrap();
+        let offer = pc.create_offer().await.unwrap();
+        pc.set_local_description(offer).unwrap();
+        let answer = format!(
+            "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nc=IN IP4 127.0.0.1\r\n\
+             m=audio {} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\na=sendrecv\r\n",
+            remote.local_addr().unwrap().port(),
+        );
+        pc.set_remote_description(SessionDescription::parse(SdpType::Answer, &answer).unwrap())
+            .await
+            .unwrap();
+        pc.wait_for_rtp_transport_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        source
+            .try_send_audio(AudioFrame {
+                clock_rate: 8000,
+                data: bytes::Bytes::from(vec![0xff; 160]),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // The peer derives LSR directly from SR wire bytes, independently of both collectors.
+        let (lsr, address) = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut buffer = [0u8; 1500];
+            loop {
+                let (size, address) = remote.recv_from(&mut buffer).await.unwrap();
+                if size >= 28 && buffer[1] == 200 {
+                    assert_eq!(
+                        u32::from_be_bytes(buffer[4..8].try_into().unwrap()),
+                        sender.ssrc()
+                    );
+                    break (
+                        u32::from_be_bytes(buffer[10..14].try_into().unwrap()),
+                        address,
+                    );
+                }
+            }
+        })
+        .await
+        .expect("production sender must automatically emit SR");
+        // RFC 3550 RR: one block, matching SSRC, standard LSR, no receiver delay.
+        let mut rr = [0u8; 32];
+        rr[..4].copy_from_slice(&[0x81, 201, 0, 7]);
+        rr[4..8].copy_from_slice(&999u32.to_be_bytes());
+        rr[8..12].copy_from_slice(&sender.ssrc().to_be_bytes());
+        rr[24..28].copy_from_slice(&lsr.to_be_bytes());
+        remote.send_to(&rr, address).await.unwrap();
+        let entry = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let stats = pc.get_stats().await.unwrap();
+                if let Some(entry) = stats.entries.into_iter().find(|entry| {
+                    entry.kind == StatsKind::RemoteInboundRtp
+                        && entry.values["ssrc"] == sender.ssrc()
+                }) {
+                    break entry;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("standard UDP RR must reach the statistics collector");
+        pc.close();
+        assert!(
+            entry
+                .values
+                .get("roundTripTime")
+                .and_then(|value| value.as_f64())
+                .is_some_and(|rtt| rtt > 0.0),
+            "automatic SR bookkeeping must accept standard wire LSR"
         );
     }
 

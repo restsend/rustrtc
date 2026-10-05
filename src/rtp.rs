@@ -422,6 +422,13 @@ pub struct SenderReport {
     pub report_blocks: Vec<ReportBlock>,
 }
 
+impl SenderReport {
+    /// Middle 32 bits of the NTP timestamp used by RFC 3550 LSR/DLSR.
+    pub fn compact_ntp(&self) -> u32 {
+        (self.ntp_most << 16) | (self.ntp_least >> 16)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiverReport {
     pub sender_ssrc: u32,
