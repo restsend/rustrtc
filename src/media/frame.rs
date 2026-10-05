@@ -1,16 +1,20 @@
+use crate::prelude::*;
 use bytes::Bytes;
+#[cfg_attr(feature = "std", allow(unused_imports))]
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use core::net::SocketAddr;
 
 use crate::rtp::{RtpHeader, RtpHeaderExtension, RtpPacket};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaKind {
     Audio,
     Video,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VideoPixelFormat {
     I420,
     Nv12,
@@ -20,7 +24,8 @@ pub enum VideoPixelFormat {
     Unspecified,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioFrame {
     pub rtp_timestamp: u32,
     pub clock_rate: u32,
@@ -28,11 +33,11 @@ pub struct AudioFrame {
     pub sequence_number: Option<u16>,
     pub payload_type: Option<u8>,
     pub marker: bool,
-    #[serde(skip)]
+    #[cfg_attr(feature = "std", serde(skip))]
     pub header_extension: Option<RtpHeaderExtension>,
-    #[serde(skip)]
+    #[cfg_attr(feature = "std", serde(skip))]
     pub source_addr: Option<SocketAddr>,
-    #[serde(skip)]
+    #[cfg_attr(feature = "std", serde(skip))]
     pub raw_packet: Option<RtpPacket>,
 }
 
@@ -52,7 +57,8 @@ impl Default for AudioFrame {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VideoFrame {
     pub rtp_timestamp: u32,
     pub width: u16,
@@ -65,9 +71,9 @@ pub struct VideoFrame {
     pub csrcs: Vec<u32>,
     pub sequence_number: Option<u16>,
     pub payload_type: Option<u8>,
-    #[serde(skip)]
+    #[cfg_attr(feature = "std", serde(skip))]
     pub source_addr: Option<SocketAddr>,
-    #[serde(skip)]
+    #[cfg_attr(feature = "std", serde(skip))]
     pub raw_packet: Option<RtpPacket>,
 }
 
@@ -91,7 +97,8 @@ impl Default for VideoFrame {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaSample {
     Audio(AudioFrame),
     Video(VideoFrame),

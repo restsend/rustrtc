@@ -1,26 +1,44 @@
+#[cfg(feature = "std")]
 pub mod datachannel;
+#[cfg(feature = "std")]
 pub mod dtls;
 pub mod ice;
+#[cfg(feature = "std")]
 pub mod rtp;
+#[cfg(feature = "std")]
 pub mod sctp;
+#[cfg(feature = "std")]
 pub mod udptl;
 
-use async_trait::async_trait;
-use bytes::Bytes;
-use parking_lot::Mutex;
-use std::net::{IpAddr, SocketAddr};
-use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+#[cfg(not(feature = "std"))]
+use crate::prelude::*;
 
+#[cfg_attr(feature = "std", allow(unused_imports))]
+use async_trait::async_trait;
+#[cfg_attr(feature = "std", allow(unused_imports))]
+use bytes::Bytes;
+#[cfg(feature = "std")]
+use parking_lot::Mutex;
+use core::net::{IpAddr, SocketAddr};
+#[cfg(feature = "std")]
+use std::sync::OnceLock;
+use core::time::Duration;
+#[cfg(feature = "std")]
+use std::time::Instant;
+
+#[cfg(feature = "std")]
 const DEFAULT_LOCAL_IP_CACHE_TTL: Duration = Duration::from_secs(5);
+#[cfg(feature = "std")]
 const LOCAL_IP_CACHE_TTL_ENV: &str = "RUSTRTC_LOCAL_IP_CACHE_TTL_SECS";
 
+#[cfg(feature = "std")]
 #[derive(Clone, Copy)]
 struct LocalIpCacheEntry {
     ip: IpAddr,
     expires_at: Instant,
 }
 
+#[cfg(feature = "std")]
 static LOCAL_IP_CACHE: OnceLock<Mutex<Option<LocalIpCacheEntry>>> = OnceLock::new();
 
 #[async_trait]
@@ -28,6 +46,16 @@ pub trait PacketReceiver: Send + Sync {
     async fn receive(&self, packet: Bytes, addr: SocketAddr, marshal_buf: &mut Vec<u8>);
 }
 
+/// No_std placeholder: the embedder's socket adapter reports the real
+/// local address, so interface enumeration never runs on the target.
+#[cfg(not(feature = "std"))]
+pub fn get_local_ip() -> Result<IpAddr, crate::errors::RtcError> {
+    Err(crate::errors::RtcError::Internal(
+        alloc::string::String::from("get_local_ip: no_std target (adapter supplies IP)"),
+    ))
+}
+
+#[cfg(feature = "std")]
 pub fn get_local_ip() -> Result<IpAddr, anyhow::Error> {
     let ttl = local_ip_cache_ttl();
     if ttl.is_zero() {
@@ -58,6 +86,7 @@ pub fn get_local_ip() -> Result<IpAddr, anyhow::Error> {
     Ok(ip)
 }
 
+#[cfg(feature = "std")]
 fn local_ip_cache_ttl() -> Duration {
     static TTL: OnceLock<Duration> = OnceLock::new();
 
@@ -78,6 +107,7 @@ fn local_ip_cache_ttl() -> Duration {
     })
 }
 
+#[cfg(feature = "std")]
 fn resolve_local_ip_uncached() -> Result<IpAddr, anyhow::Error> {
     use local_ip_address::list_afinet_netifas;
     if let Ok(interfaces) = list_afinet_netifas() {
@@ -115,6 +145,7 @@ fn resolve_local_ip_uncached() -> Result<IpAddr, anyhow::Error> {
     Err(anyhow::anyhow!("No suitable network interface found"))
 }
 
+#[cfg(feature = "std")]
 fn interface_priority(name: &str, ip: &std::net::Ipv4Addr) -> i32 {
     let mut score = 0;
 

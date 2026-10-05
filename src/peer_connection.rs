@@ -7400,7 +7400,7 @@ pub struct RtpReceiver {
     rtcp_feedback_ssrc: Mutex<Option<u32>>,
     rtx_ssrc: Mutex<Option<u32>>,
     /// RTX payload type → primary payload type (from SDP `a=fmtp:<rtx> apt=<primary>`).
-    rtx_apt: Mutex<HashMap<u8, u8>>,
+    rtx_apt: Mutex<alloc::collections::BTreeMap<u8, u8>>,
     fir_seq: AtomicU8,
     feedback_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<crate::media::track::FeedbackEvent>>>,
     simulcast_tracks: Mutex<
@@ -7551,7 +7551,7 @@ impl RtpReceiverBuilder {
             packet_tx: Mutex::new(None),
             rtcp_feedback_ssrc: Mutex::new(None),
             rtx_ssrc: Mutex::new(None),
-            rtx_apt: Mutex::new(HashMap::new()),
+            rtx_apt: Mutex::new(alloc::collections::BTreeMap::new()),
             fir_seq: AtomicU8::new(0),
             feedback_rx: Arc::new(tokio::sync::Mutex::new(feedback_rx)),
             simulcast_tracks: Mutex::new(HashMap::new()),
@@ -7612,7 +7612,7 @@ impl RtpReceiver {
             packet_tx: Mutex::new(None),
             rtcp_feedback_ssrc: Mutex::new(None),
             rtx_ssrc: Mutex::new(None),
-            rtx_apt: Mutex::new(HashMap::new()),
+            rtx_apt: Mutex::new(alloc::collections::BTreeMap::new()),
             fir_seq: AtomicU8::new(0),
             feedback_rx: Arc::new(tokio::sync::Mutex::new(feedback_rx)),
             simulcast_tracks: Mutex::new(HashMap::new()),
@@ -7788,7 +7788,7 @@ impl RtpReceiver {
 
     /// Store RTX→primary payload-type associations from SDP `apt=` and register
     /// the RTX payload types on the transport so retransmissions are demuxed.
-    pub fn set_rtx_apt_map(&self, apt_map: HashMap<u8, u8>) {
+    pub fn set_rtx_apt_map(&self, apt_map: alloc::collections::BTreeMap<u8, u8>) {
         if apt_map.is_empty() {
             return;
         }

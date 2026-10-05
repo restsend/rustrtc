@@ -1,8 +1,9 @@
-use anyhow::{Result, bail};
+use crate::prelude::*;
+use crate::errors::{RtcError, RtcResult};
 use crc32fast::Hasher;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const MAGIC_COOKIE: u32 = 0x2112A442;
 const FINGERPRINT_XOR: u32 = 0x5354_554e;
@@ -49,11 +50,11 @@ impl StunMessage {
         }
     }
 
-    pub fn encode(&self, integrity_key: Option<&[u8]>, fingerprint: bool) -> Result<Vec<u8>> {
+    pub fn encode(&self, integrity_key: Option<&[u8]>, fingerprint: bool) -> RtcResult<Vec<u8>> {
         encode_stun_message(self, integrity_key, fingerprint)
     }
 
-    pub fn decode(data: &[u8]) -> Result<StunDecoded> {
+    pub fn decode(data: &[u8]) -> RtcResult<StunDecoded> {
         decode_stun_message(data)
     }
 }
@@ -118,7 +119,7 @@ fn encode_stun_message(
     msg: &StunMessage,
     integrity_key: Option<&[u8]>,
     fingerprint: bool,
-) -> Result<Vec<u8>> {
+) -> RtcResult<Vec<u8>> {
     let mut buffer = vec![0u8; 20];
     let method_bits = match msg.method {
         StunMethod::Binding => 0x0001,
@@ -278,7 +279,7 @@ fn append_xor_address(buffer: &mut Vec<u8>, typ: u16, addr: &SocketAddr, tx_id: 
 
 fn pad_four_bytes(buffer: &mut Vec<u8>) {
     let pad = (4 - (buffer.len() % 4)) % 4;
-    buffer.extend(std::iter::repeat_n(0, pad));
+    buffer.extend(core::iter::repeat_n(0, pad));
 }
 
 fn update_length_field(buffer: &mut [u8]) {
@@ -290,14 +291,14 @@ fn write_length_field(buffer: &mut [u8], length: usize) {
     buffer[2..4].copy_from_slice(&(length as u16).to_be_bytes());
 }
 
-fn decode_stun_message(bytes: &[u8]) -> Result<StunDecoded> {
+fn decode_stun_message(bytes: &[u8]) -> RtcResult<StunDecoded> {
     if bytes.len() < 20 {
-        bail!("STUN message too short");
+        return Err(RtcError::Internal(format!("STUN message too short")));
     }
     let msg_type = u16::from_be_bytes([bytes[0], bytes[1]]);
     let length = u16::from_be_bytes([bytes[2], bytes[3]]) as usize;
     if length + 20 != bytes.len() {
-        bail!("STUN message length mismatch");
+        return Err(RtcError::Internal(format!("STUN message length mismatch")));
     }
     let method = match msg_type & 0x3EEF {
         0x0001 => StunMethod::Binding,
@@ -307,14 +308,14 @@ fn decode_stun_message(bytes: &[u8]) -> Result<StunDecoded> {
         0x0009 => StunMethod::ChannelBind,
         0x0006 => StunMethod::Send,
         0x0007 => StunMethod::Data,
-        _ => bail!("unsupported STUN method"),
+        _ => return Err(RtcError::Internal(format!("unsupported STUN method"))),
     };
     let class = match msg_type & 0x0110 {
         0x0000 => StunClass::Request,
         0x0010 => StunClass::Indication,
         0x0100 => StunClass::SuccessResponse,
         0x0110 => StunClass::ErrorResponse,
-        _ => bail!("unsupported STUN class"),
+        _ => return Err(RtcError::Internal(format!("unsupported STUN class"))),
     };
     let mut transaction_id = [0u8; 12];
     transaction_id.copy_from_slice(&bytes[8..20]);
@@ -359,12 +360,12 @@ fn decode_stun_message(bytes: &[u8]) -> Result<StunDecoded> {
                 }
             }
             0x0014 => {
-                if let Ok(text) = std::str::from_utf8(value) {
+                if let Ok(text) = core::str::from_utf8(value) {
                     realm = Some(text.to_string());
                 }
             }
             0x0015 => {
-                if let Ok(text) = std::str::from_utf8(value) {
+                if let Ok(text) = core::str::from_utf8(value) {
                     nonce = Some(text.to_string());
                 }
             }
@@ -401,7 +402,7 @@ fn decode_stun_message(bytes: &[u8]) -> Result<StunDecoded> {
     })
 }
 
-fn parse_xor_address(value: &[u8], transaction_id: &[u8; 12]) -> Result<Option<SocketAddr>> {
+fn parse_xor_address(value: &[u8], transaction_id: &[u8; 12]) -> RtcResult<Option<SocketAddr>> {
     if value.len() < 4 {
         return Ok(None);
     }
@@ -457,20 +458,44 @@ fn crc32(data: &[u8]) -> u32 {
     hasher.finalize()
 }
 
+#[cfg(feature = "std")]
 use rand::{Rng, RngExt};
 
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     let mut buf = [0u8; N];
+    #[cfg(feature = "std")]
     rand::rng().fill_bytes(&mut buf);
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = &mut buf;
+    }
     buf
 }
 
 pub fn random_u64() -> u64 {
-    rand::rng().random()
+    {
+        #[cfg(feature = "std")]
+        {
+            rand::rng().random()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            0
+        }
+    }
 }
 
 pub fn random_u32() -> u32 {
-    rand::rng().random()
+    {
+        #[cfg(feature = "std")]
+        {
+            rand::rng().random()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            0
+        }
+    }
 }
 
 #[cfg(test)]

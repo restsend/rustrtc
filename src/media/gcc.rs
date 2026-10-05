@@ -16,6 +16,7 @@
 //! The library never changes its own send rate — the estimate is published on
 //! a watch channel for the owning application (encoder) to act on.
 
+use crate::prelude::*;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;

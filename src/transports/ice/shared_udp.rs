@@ -15,16 +15,20 @@
 //!
 //! This mirrors [`super::shared_tcp`] for the UDP case.
 
-use super::shared_tcp::peer_ufrag_from_binding_request;
-use anyhow::{Context, Result, bail};
-use parking_lot::Mutex;
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
-use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use crate::prelude::*;
+use crate::errors::{RtcError, RtcResult};
+use crate::platform::sync::Mutex;
+use alloc::collections::BTreeMap;
+use core::net::SocketAddr;
+use crate::platform::atomic64::AtomicU64;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use crate::platform::sync::OnceLock;
+use alloc::sync::Arc;
+use core::time::Duration;
+#[cfg(feature = "std")]
+use crate::platform::net::tokio_impl;
+use crate::platform::net::UdpSocket;
+use crate::platform::sync::mpsc;
 use tracing::{debug, trace};
 
 /// Per-session incoming packet (bytes + source address).
@@ -39,12 +43,12 @@ pub(crate) type SharedUdpPacket = (Vec<u8>, SocketAddr);
 const SHARED_UDP_CHANNEL_CAPACITY: usize = 512;
 
 /// Shared `peer_addr -> ufrag` routing table (cloned into every handle).
-type PeerMap = Arc<Mutex<HashMap<SocketAddr, String>>>;
+type PeerMap = Arc<Mutex<BTreeMap<SocketAddr, String>>>;
 
-static SHARED_PORTS: OnceLock<Mutex<HashMap<SocketAddr, Arc<SharedUdpPort>>>> = OnceLock::new();
+static SHARED_PORTS: OnceLock<Mutex<BTreeMap<SocketAddr, Arc<SharedUdpPort>>>> = OnceLock::new();
 
-fn registry() -> &'static Mutex<HashMap<SocketAddr, Arc<SharedUdpPort>>> {
-    SHARED_PORTS.get_or_init(|| Mutex::new(HashMap::new()))
+fn registry() -> &'static Mutex<BTreeMap<SocketAddr, Arc<SharedUdpPort>>> {
+    SHARED_PORTS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 struct Session {
@@ -52,9 +56,9 @@ struct Session {
 }
 
 struct SharedUdpPort {
-    socket: Arc<UdpSocket>,
+    socket: Arc<dyn UdpSocket>,
     /// ufrag -> session channel
-    sessions: Mutex<HashMap<String, Session>>,
+    sessions: Mutex<BTreeMap<String, Session>>,
     /// remote peer source addr -> ufrag (routing for non-STUN packets)
     peers: PeerMap,
     ref_count: AtomicUsize,
@@ -64,11 +68,11 @@ struct SharedUdpPort {
 }
 
 impl SharedUdpPort {
-    fn new(socket: Arc<UdpSocket>) -> Self {
+    fn new(socket: Arc<dyn UdpSocket>) -> Self {
         Self {
             socket,
-            sessions: Mutex::new(HashMap::new()),
-            peers: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Mutex::new(BTreeMap::new()),
+            peers: Arc::new(Mutex::new(BTreeMap::new())),
             ref_count: AtomicUsize::new(0),
             shutting_down: AtomicBool::new(false),
             dropped_full: AtomicU64::new(0),
@@ -77,17 +81,21 @@ impl SharedUdpPort {
 
     fn spawn_recv_loop(self: &Arc<Self>) {
         let port = Arc::clone(self);
-        tokio::spawn(async move {
+        crate::platform::task::spawn(async move {
             let mut buf = [0u8; 1500];
             loop {
                 if port.shutting_down.load(Ordering::Relaxed) {
                     break;
                 }
-                let recv = port.socket.recv_from(&mut buf);
-                tokio::select! {
-                    biased;
-                    _ = port.shutdown_signal() => break,
-                    res = recv => {
+                // shutdown arm first each wake (matches the old `biased;`)
+                let which = {
+                    let mut shutdown_fut = core::pin::pin!(port.shutdown_signal());
+                    let mut recv_fut = core::pin::pin!(port.socket.recv_from(&mut buf));
+                    crate::platform::select::select2(&mut shutdown_fut, &mut recv_fut).await
+                };
+                match which {
+                    crate::platform::select::Either::A(()) => break,
+                    crate::platform::select::Either::B(res) => {
                         match res {
                             Ok((len, peer_addr)) => {
                                 if len == 0 {
@@ -100,7 +108,7 @@ impl SharedUdpPort {
                                     break;
                                 }
                                 debug!("shared UDP recv error: {}", e);
-                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                crate::platform::task::sleep(Duration::from_millis(50)).await;
                             }
                         }
                     }
@@ -119,7 +127,7 @@ impl SharedUdpPort {
             if self.shutting_down.load(Ordering::Relaxed) {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            crate::platform::task::sleep(Duration::from_millis(250)).await;
         }
     }
 
@@ -157,7 +165,7 @@ impl SharedUdpPort {
         if let Some(tx) = tx {
             match tx.try_send((packet.to_vec(), peer_addr)) {
                 Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
+                Err(mpsc::TrySendError::Full(_)) => {
                     // Backpressure: the session's read loop is draining slower
                     // than packets arrive. Drop the newest packet (UDP semantics)
                     // and count it so operators can spot sustained overload.
@@ -172,7 +180,7 @@ impl SharedUdpPort {
                         );
                     }
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(mpsc::TrySendError::Closed(_)) => {
                     // Receiver dropped; the registration cleanup will follow.
                     trace!(
                         "shared UDP: session {} channel closed while forwarding packet from {}",
@@ -191,17 +199,17 @@ impl SharedUdpPort {
 /// traffic (e.g. a controlled agent's STUN connectivity check) are routed back
 /// to this session even though they carry no ufrag.
 pub struct SharedUdpHandle {
-    socket: Arc<UdpSocket>,
+    socket: Arc<dyn UdpSocket>,
     /// Incoming packets from the demux loop. `tokio::sync::Mutex` (not
     /// parking_lot) because the guard is held across `recv().await`. The
     /// underlying channel is bounded (`SHARED_UDP_CHANNEL_CAPACITY`).
-    rx: Arc<tokio::sync::Mutex<mpsc::Receiver<SharedUdpPacket>>>,
+    rx: Arc<crate::platform::sync::AsyncMutex<mpsc::Receiver<SharedUdpPacket>>>,
     peers: PeerMap,
     ufrag: String,
 }
 
-impl std::fmt::Debug for SharedUdpHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for SharedUdpHandle {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SharedUdpHandle")
             .field("ufrag", &self.ufrag)
             .field(
@@ -217,11 +225,11 @@ impl std::fmt::Debug for SharedUdpHandle {
 }
 
 impl SharedUdpHandle {
-    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.socket.local_addr()
+    pub fn local_addr(&self) -> RtcResult<SocketAddr> {
+        self.socket.local_addr().map_err(|e| RtcError::Internal(alloc::format!("{e}")))
     }
 
-    pub fn socket(&self) -> &Arc<UdpSocket> {
+    pub fn socket(&self) -> &Arc<dyn UdpSocket> {
         &self.socket
     }
 
@@ -233,9 +241,9 @@ impl SharedUdpHandle {
     }
 
     /// Record `dest` as a peer belonging to this session, then send.
-    pub async fn send_to(&self, data: &[u8], dest: SocketAddr) -> std::io::Result<usize> {
+    pub async fn send_to(&self, data: &[u8], dest: SocketAddr) -> RtcResult<usize> {
         self.register_peer(dest);
-        self.socket.send_to(data, dest).await
+        self.socket.send_to(data, dest).await.map_err(RtcError::from)
     }
 
     /// Receive the next demuxed packet for this session.
@@ -258,8 +266,8 @@ impl SharedUdpRegistration {
     }
 }
 
-impl std::fmt::Debug for SharedUdpRegistration {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for SharedUdpRegistration {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SharedUdpRegistration")
             .field("listen_key", &self.listen_key)
             .field("ufrag", &self.ufrag)
@@ -290,15 +298,26 @@ impl Drop for SharedUdpRegistration {
 pub(crate) async fn acquire(
     bind_addr: SocketAddr,
     local_ufrag: String,
-) -> Result<(SocketAddr, SharedUdpHandle, SharedUdpRegistration)> {
+) -> RtcResult<(SocketAddr, SharedUdpHandle, SharedUdpRegistration)> {
     let maybe_existing = registry().lock().get(&bind_addr).cloned();
     let port = if let Some(existing) = maybe_existing {
         existing
     } else {
-        let socket = UdpSocket::bind(bind_addr)
-            .await
-            .with_context(|| format!("bind shared UDP socket {bind_addr}"))?;
-        let socket = Arc::new(socket);
+        // std: bind a real mux socket; no_std (WP3): the embedder injects a
+        // Platform socket adapter — `acquire` is std-gated until then.
+        #[cfg(feature = "std")]
+        let socket: Arc<dyn UdpSocket> = {
+            let sock = tokio::net::UdpSocket::bind(bind_addr)
+                .await
+                .map_err(|e| {
+                    RtcError::Internal(format!("bind shared UDP socket {bind_addr}: {e}"))
+                })?;
+            Arc::new(tokio_impl::TokioUdpSocket::new(sock))
+        };
+        #[cfg(not(feature = "std"))]
+        let socket: Arc<dyn UdpSocket> = unimplemented!(
+            "no_std: pass an adapter implementing platform::net::UdpSocket (WP3)"
+        );
         let port = Arc::new(SharedUdpPort::new(socket));
         let mut reg = registry().lock();
         if let Some(existing) = reg.get(&bind_addr) {
@@ -313,12 +332,12 @@ pub(crate) async fn acquire(
     let local_addr = port
         .socket
         .local_addr()
-        .context("shared UDP socket local_addr")?;
+        .map_err(|e| RtcError::Internal(format!("{}: {e}", "shared UDP socket local_addr")))?;
 
     // Reject a duplicate ufrag registration on the same shared socket — each
     // PeerConnection must own a unique ufrag so demuxing is unambiguous.
     if port.sessions.lock().contains_key(&local_ufrag) {
-        bail!("ufrag {local_ufrag} already registered on shared UDP socket {bind_addr}");
+        return Err(RtcError::Internal(format!("ufrag {local_ufrag} already registered on shared UDP socket {bind_addr}")));
     }
 
     let (tx, rx) = mpsc::channel(SHARED_UDP_CHANNEL_CAPACITY);
@@ -329,7 +348,7 @@ pub(crate) async fn acquire(
 
     let handle = SharedUdpHandle {
         socket: port.socket.clone(),
-        rx: Arc::new(tokio::sync::Mutex::new(rx)),
+        rx: Arc::new(crate::platform::sync::AsyncMutex::new(rx)),
         peers: port.peers.clone(),
         ufrag: local_ufrag.clone(),
     };
@@ -372,4 +391,47 @@ pub(crate) fn ufrag_for_peer(bind_addr: SocketAddr, peer_addr: SocketAddr) -> Op
         .lock()
         .get(&peer_addr)
         .cloned()
+}
+
+pub(crate) fn peer_ufrag_from_binding_request(data: &[u8]) -> Option<String> {
+    // Cheap header classification (Binding method + Request class) instead of a
+    // full attribute decode — this runs on every STUN packet in the mux path.
+    if data.len() < 20 {
+        return None;
+    }
+    let msg_type = u16::from_be_bytes([data[0], data[1]]);
+    let is_binding = (msg_type & 0x3EEF) == 0x0001;
+    let is_request = (msg_type & 0x0110) == 0x0000;
+    if !is_binding || !is_request {
+        return None;
+    }
+    let username = username_from_stun_bytes(data)?;
+    let (peer, _own) = username.split_once(':')?;
+    Some(peer.to_string())
+}
+
+pub(crate) fn username_from_stun_bytes(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 20 {
+        return None;
+    }
+    let length = u16::from_be_bytes([bytes[2], bytes[3]]) as usize;
+    if length + 20 != bytes.len() {
+        return None;
+    }
+    let mut offset = 20;
+    while offset + 4 <= bytes.len() {
+        let typ = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
+        let len = u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]) as usize;
+        offset += 4;
+        if offset + len > bytes.len() {
+            break;
+        }
+        if typ == 0x0006 {
+            let value = &bytes[offset..offset + len];
+            return core::str::from_utf8(value).ok().map(str::to_string);
+        }
+        offset += len;
+        offset += (4 - (len % 4)) % 4;
+    }
+    None
 }

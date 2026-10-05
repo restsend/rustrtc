@@ -858,7 +858,7 @@ impl RtpTransport {
             if self.srtp_required {
                 return Err(anyhow::anyhow!("SRTP required but session not ready"));
             }
-            return self.transport.send(buf).await;
+            return self.transport.send(buf).await.map_err(anyhow::Error::from);
         };
 
         let protected = {
@@ -878,7 +878,7 @@ impl RtpTransport {
             srtp.protect_rtp(&packet, &mut protected)?;
             protected
         };
-        self.transport.send(&protected).await
+        self.transport.send(&protected).await.map_err(anyhow::Error::from)
     }
 
     /// Returns `Ok(0)` without sending while the direction stops this SSRC.
@@ -929,7 +929,7 @@ impl RtpTransport {
             }
         };
 
-        match self.transport.send(&protected).await {
+        match self.transport.send(&protected).await.map_err(anyhow::Error::from) {
             Ok(n) => {
                 if is_first {
                     self.transport.mark_first_outbound();
@@ -967,7 +967,7 @@ impl RtpTransport {
                 raw
             }
         };
-        self.transport.send_rtcp(&protected).await
+        self.transport.send_rtcp(&protected).await.map_err(anyhow::Error::from)
     }
 
     /// Synchronous best-effort RTCP send for the close path, where we must NOT

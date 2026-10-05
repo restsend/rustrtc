@@ -1,8 +1,19 @@
+use crate::prelude::*;
 use crate::media::depacketizer::{DefaultDepacketizerFactory, DepacketizerFactory};
+#[cfg(feature = "std")]
+#[cfg(feature = "std")]
 use crate::peer_connection::{RtpReceiverInterceptor, RtpSenderInterceptor};
+
+/// Spawn-pinning handle. std: tokio runtime handle; no_std: unused
+/// placeholder (embassy tasks are spawned by the embedder's executor).
+#[cfg(feature = "std")]
+pub type RuntimeHandle = tokio::runtime::Handle;
+#[cfg(not(feature = "std"))]
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeHandle;
 use serde::{Deserialize, Serialize};
-use std::fmt::{Debug, Formatter};
-use std::sync::Arc;
+use core::fmt::{Debug, Formatter};
+use alloc::sync::Arc;
 
 /// Describes how credentials are conveyed for a given ICE server.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -313,8 +324,8 @@ pub enum T38FaxRateManagement {
     LocalTCF,
 }
 
-impl std::fmt::Display for T38FaxRateManagement {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for T38FaxRateManagement {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::TransferredTCF => write!(f, "transferredTCF"),
             Self::LocalTCF => write!(f, "localTCF"),
@@ -331,8 +342,8 @@ pub enum T38UdpEC {
     T38UDPFEC,
 }
 
-impl std::fmt::Display for T38UdpEC {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for T38UdpEC {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::T38UDPRedundancy => write!(f, "t38UDPRedundancy"),
             Self::T38UDPFEC => write!(f, "t38UDPFEC"),
@@ -412,7 +423,7 @@ impl Default for DepacketizerStrategy {
 }
 
 impl Debug for DepacketizerStrategy {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         self.factory.fmt(f)
     }
 }
@@ -432,8 +443,8 @@ fn default_enable_gcc() -> bool {
 fn default_rtp_buffer_capacity() -> usize {    100
 }
 
-fn default_buffer_stats_log_interval() -> std::time::Duration {
-    std::time::Duration::from_secs(10)
+fn default_buffer_stats_log_interval() -> core::time::Duration {
+    core::time::Duration::from_secs(10)
 }
 
 /// Controls SDP generation compatibility for interoperability with legacy SIP endpoints.
@@ -456,12 +467,12 @@ fn default_upnp_lease_duration() -> u32 {
     3600
 }
 
-fn default_upnp_discovery_timeout() -> std::time::Duration {
-    std::time::Duration::from_secs(1)
+fn default_upnp_discovery_timeout() -> core::time::Duration {
+    core::time::Duration::from_secs(1)
 }
 
-fn default_upnp_refresh_interval() -> std::time::Duration {
-    std::time::Duration::from_secs(30)
+fn default_upnp_refresh_interval() -> core::time::Duration {
+    core::time::Duration::from_secs(30)
 }
 
 /// Primary configuration for a `PeerConnection`.
@@ -505,12 +516,12 @@ pub struct RtcConfiguration {
     pub bind_ip: Option<String>,
     pub disable_ipv6: bool,
     pub ssrc_start: u32,
-    pub stun_timeout: std::time::Duration,
+    pub stun_timeout: core::time::Duration,
     /// Timeout for the ICE nomination binding check (USE-CANDIDATE).
     /// This should be larger than `stun_timeout` to allow more retransmissions
     /// and reduce the probability of nomination failures under packet loss.
-    pub nomination_timeout: std::time::Duration,
-    pub ice_connection_timeout: std::time::Duration,
+    pub nomination_timeout: core::time::Duration,
+    pub ice_connection_timeout: core::time::Duration,
     /// How long without receiving any packet (STUN/DTLS/SCTP) before the ICE
     /// transport is demoted from `Connected` to `Disconnected`.
     ///
@@ -522,7 +533,7 @@ pub struct RtcConfiguration {
     /// Default: 30s. Raise it further (e.g. 120s) for long-lived
     /// tunnels (SSH/port-forwarding) over lossy links where brief blackouts are
     /// expected and must not even flap the SCTP association.
-    pub ice_disconnect_threshold: std::time::Duration,
+    pub ice_disconnect_threshold: core::time::Duration,
     /// How long to wait in `Disconnected` state before tearing down the
     /// PeerConnection (SCTP/DTLS). When ICE goes `Disconnected` the transport
     /// is given this long to recover before the connection is closed.
@@ -534,13 +545,13 @@ pub struct RtcConfiguration {
     ///
     /// Set to 0 to tear down immediately on ICE Disconnected.
     /// Default: 60s
-    pub ice_disconnect_grace: std::time::Duration,
-    pub sctp_rto_initial: std::time::Duration,
-    pub sctp_rto_min: std::time::Duration,
-    pub sctp_rto_max: std::time::Duration,
+    pub ice_disconnect_grace: core::time::Duration,
+    pub sctp_rto_initial: core::time::Duration,
+    pub sctp_rto_min: core::time::Duration,
+    pub sctp_rto_max: core::time::Duration,
     pub sctp_max_association_retransmits: u32,
     pub sctp_receive_window: usize,
-    pub sctp_heartbeat_interval: std::time::Duration,
+    pub sctp_heartbeat_interval: core::time::Duration,
     pub sctp_max_heartbeat_failures: u32,
     pub sctp_max_tsn_retransmits: u32,
     pub sctp_max_burst: usize,
@@ -592,13 +603,13 @@ pub struct RtcConfiguration {
     pub upnp_lease_duration: u32,
     /// UPnP gateway discovery timeout
     #[serde(default = "default_upnp_discovery_timeout")]
-    pub upnp_discovery_timeout: std::time::Duration,
+    pub upnp_discovery_timeout: core::time::Duration,
     /// How often to refresh UPnP port mappings before the router lease expires.
     /// Re-issuing AddPortMapping with the same external port renews the lease on
     /// most IGDs without deleting the mapping, so long-lived sessions survive
     /// the default lease (3600s) without inbound path loss.
     #[serde(default = "default_upnp_refresh_interval")]
-    pub upnp_refresh_interval: std::time::Duration,
+    pub upnp_refresh_interval: core::time::Duration,
     #[serde(skip, default)]
     pub depacketizer_strategy: DepacketizerStrategy,
     #[serde(default = "default_rtp_buffer_capacity")]
@@ -606,7 +617,7 @@ pub struct RtcConfiguration {
     #[serde(default)]
     pub buffer_drop_strategy: BufferDropStrategy,
     #[serde(default = "default_buffer_stats_log_interval")]
-    pub buffer_stats_log_interval: std::time::Duration,
+    pub buffer_stats_log_interval: core::time::Duration,
     /// Controls ICE TCP candidate support (RFC 6544).
     /// Default: Disabled — only UDP candidates are gathered and used.
     #[serde(default)]
@@ -638,7 +649,7 @@ pub struct RtcConfiguration {
     /// pinning media tasks to a dedicated runtime instead of the caller's.
     /// Falls back to `Handle::current()` when `None` (backward-compatible).
     #[serde(skip, default)]
-    pub runtime_handle: Option<tokio::runtime::Handle>,
+    pub runtime_handle: Option<RuntimeHandle>,
     /// Recording / tapping interceptors installed on every transceiver
     /// created by this PC. Receiver interceptors fire on incoming RTP
     /// (pre-depacketize); sender interceptors fire on outgoing RTP
@@ -730,17 +741,17 @@ impl Default for RtcConfiguration {
             bind_ip: None,
             disable_ipv6: false,
             ssrc_start: 10000,
-            stun_timeout: std::time::Duration::from_secs(5),
-            nomination_timeout: std::time::Duration::from_secs(10),
-            ice_connection_timeout: std::time::Duration::from_secs(120),
-            ice_disconnect_threshold: std::time::Duration::from_secs(30),
-            ice_disconnect_grace: std::time::Duration::from_secs(60),
-            sctp_rto_initial: std::time::Duration::from_secs(3),
-            sctp_rto_min: std::time::Duration::from_millis(200),
-            sctp_rto_max: std::time::Duration::from_secs(60),
+            stun_timeout: core::time::Duration::from_secs(5),
+            nomination_timeout: core::time::Duration::from_secs(10),
+            ice_connection_timeout: core::time::Duration::from_secs(120),
+            ice_disconnect_threshold: core::time::Duration::from_secs(30),
+            ice_disconnect_grace: core::time::Duration::from_secs(60),
+            sctp_rto_initial: core::time::Duration::from_secs(3),
+            sctp_rto_min: core::time::Duration::from_millis(200),
+            sctp_rto_max: core::time::Duration::from_secs(60),
             sctp_max_association_retransmits: 20,
             sctp_receive_window: 128 * 1024, // 128KB - reduced for lower memory footprint
-            sctp_heartbeat_interval: std::time::Duration::from_secs(15),
+            sctp_heartbeat_interval: core::time::Duration::from_secs(15),
             sctp_max_heartbeat_failures: 4,
             sctp_max_tsn_retransmits: 8,
             sctp_max_burst: 0,                    // 0 = use default heuristic
@@ -793,22 +804,40 @@ impl Default for RtcConfigurationBuilder {
 /// are opaque and only compared by count.
 #[derive(Clone, Default)]
 pub struct RecorderInterceptors {
+    #[cfg(feature = "std")]
     pub receivers: Vec<Arc<dyn RtpReceiverInterceptor>>,
+    #[cfg(feature = "std")]
     pub senders: Vec<Arc<dyn RtpSenderInterceptor>>,
 }
 
 impl Debug for RecorderInterceptors {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RecorderInterceptors")
-            .field("receivers_len", &self.receivers.len())
-            .field("senders_len", &self.senders.len())
-            .finish()
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        #[cfg(feature = "std")]
+        {
+            return f
+                .debug_struct("RecorderInterceptors")
+                .field("receivers_len", &self.receivers.len())
+                .field("senders_len", &self.senders.len())
+                .finish();
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            f.debug_struct("RecorderInterceptors").finish()
+        }
     }
 }
 
 impl PartialEq for RecorderInterceptors {
     fn eq(&self, other: &Self) -> bool {
-        self.receivers.len() == other.receivers.len() && self.senders.len() == other.senders.len()
+        #[cfg(feature = "std")]
+        {
+            self.receivers.len() == other.receivers.len()
+                && self.senders.len() == other.senders.len()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            true
+        }
     }
 }
 
@@ -861,13 +890,13 @@ impl RtcConfigurationBuilder {
         self
     }
 
-    pub fn upnp_discovery_timeout(mut self, timeout: std::time::Duration) -> Self {
+    pub fn upnp_discovery_timeout(mut self, timeout: core::time::Duration) -> Self {
         self.inner.upnp_discovery_timeout = timeout;
         self
     }
 
     /// Set how often UPnP port mappings are refreshed to keep the router lease alive.
-    pub fn upnp_refresh_interval(mut self, interval: std::time::Duration) -> Self {
+    pub fn upnp_refresh_interval(mut self, interval: core::time::Duration) -> Self {
         self.inner.upnp_refresh_interval = interval;
         self
     }
@@ -937,12 +966,12 @@ impl RtcConfigurationBuilder {
         self
     }
 
-    pub fn stun_timeout(mut self, timeout: std::time::Duration) -> Self {
+    pub fn stun_timeout(mut self, timeout: core::time::Duration) -> Self {
         self.inner.stun_timeout = timeout;
         self
     }
 
-    pub fn nomination_timeout(mut self, timeout: std::time::Duration) -> Self {
+    pub fn nomination_timeout(mut self, timeout: core::time::Duration) -> Self {
         self.inner.nomination_timeout = timeout;
         self
     }
@@ -976,17 +1005,17 @@ impl RtcConfigurationBuilder {
         self
     }
 
-    pub fn sctp_rto_initial(mut self, duration: std::time::Duration) -> Self {
+    pub fn sctp_rto_initial(mut self, duration: core::time::Duration) -> Self {
         self.inner.sctp_rto_initial = duration;
         self
     }
 
-    pub fn sctp_rto_min(mut self, duration: std::time::Duration) -> Self {
+    pub fn sctp_rto_min(mut self, duration: core::time::Duration) -> Self {
         self.inner.sctp_rto_min = duration;
         self
     }
 
-    pub fn sctp_rto_max(mut self, duration: std::time::Duration) -> Self {
+    pub fn sctp_rto_max(mut self, duration: core::time::Duration) -> Self {
         self.inner.sctp_rto_max = duration;
         self
     }
@@ -1001,7 +1030,7 @@ impl RtcConfigurationBuilder {
         self
     }
 
-    pub fn sctp_heartbeat_interval(mut self, duration: std::time::Duration) -> Self {
+    pub fn sctp_heartbeat_interval(mut self, duration: core::time::Duration) -> Self {
         self.inner.sctp_heartbeat_interval = duration;
         self
     }
@@ -1037,17 +1066,17 @@ impl RtcConfigurationBuilder {
         self
     }
 
-    pub fn ice_connection_timeout(mut self, timeout: std::time::Duration) -> Self {
+    pub fn ice_connection_timeout(mut self, timeout: core::time::Duration) -> Self {
         self.inner.ice_connection_timeout = timeout;
         self
     }
 
-    pub fn ice_disconnect_threshold(mut self, threshold: std::time::Duration) -> Self {
+    pub fn ice_disconnect_threshold(mut self, threshold: core::time::Duration) -> Self {
         self.inner.ice_disconnect_threshold = threshold;
         self
     }
 
-    pub fn ice_disconnect_grace(mut self, grace: std::time::Duration) -> Self {
+    pub fn ice_disconnect_grace(mut self, grace: core::time::Duration) -> Self {
         self.inner.ice_disconnect_grace = grace;
         self
     }
@@ -1062,7 +1091,7 @@ impl RtcConfigurationBuilder {
         self
     }
 
-    pub fn buffer_stats_log_interval(mut self, interval: std::time::Duration) -> Self {
+    pub fn buffer_stats_log_interval(mut self, interval: core::time::Duration) -> Self {
         self.inner.buffer_stats_log_interval = interval;
         self
     }
@@ -1097,6 +1126,7 @@ impl RtcConfigurationBuilder {
 
     /// Append a receiver interceptor (fires on every incoming RTP packet,
     /// pre-depacketize).
+    #[cfg(feature = "std")]
     pub fn receiver_interceptor(mut self, interceptor: Arc<dyn RtpReceiverInterceptor>) -> Self {
         self.inner.recorder_interceptors.receivers.push(interceptor);
         self
@@ -1104,6 +1134,7 @@ impl RtcConfigurationBuilder {
 
     /// Append a sender interceptor (fires on every outgoing RTP packet,
     /// post seq/timestamp rewrite).
+    #[cfg(feature = "std")]
     pub fn sender_interceptor(mut self, interceptor: Arc<dyn RtpSenderInterceptor>) -> Self {
         self.inner.recorder_interceptors.senders.push(interceptor);
         self
@@ -1112,7 +1143,7 @@ impl RtcConfigurationBuilder {
     /// Set the runtime handle for spawning internal tasks (ICE runner, DTLS,
     /// RTCP loops, etc.). When set, all rustrtc-internal tokio::spawn calls
     /// go through this runtime instead of the ambient tokio runtime.
-    pub fn runtime_handle(mut self, handle: tokio::runtime::Handle) -> Self {
+    pub fn runtime_handle(mut self, handle: RuntimeHandle) -> Self {
         self.inner.runtime_handle = Some(handle);
         self
     }
@@ -1131,7 +1162,7 @@ impl From<RtcConfigurationBuilder> for RtcConfiguration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use core::time::Duration;
 
     #[test]
     fn test_rtc_configuration_defaults() {

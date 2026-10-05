@@ -1,37 +1,175 @@
 pub mod conn;
+#[cfg(feature = "std")] // mDNS is excluded from the embedded target
 pub mod mdns;
+#[cfg(feature = "std")] // ICE-TCP is excluded from the embedded target
 pub mod shared_tcp;
+
+/// Placeholder registration (ICE-TCP excluded; never constructed).
+#[cfg(not(feature = "std"))]
+#[derive(Debug, Clone)]
+pub struct SharedTcpRegistration;
 pub mod shared_udp;
 pub mod stun;
 #[cfg(test)]
 mod tests;
 pub mod turn;
+#[cfg(feature = "std")] // UPnP is excluded from the embedded target
 pub mod upnp;
 
 // Re-export UPnP types
+#[cfg(feature = "std")]
 pub use upnp::{
     DEFAULT_LEASE_DURATION, DEFAULT_UPNP_DISCOVERY_TIMEOUT, MAX_LEASE_DURATION, MIN_LEASE_DURATION,
     UpnpPortMapper,
 };
 
+use crate::prelude::*;
 use crate::config::{BufferDropStrategy, IceServer, IceTransportPolicy, RtcConfiguration};
 use crate::transports::ice::turn::{TurnClient, TurnCredentials};
 use crate::transports::{PacketReceiver, get_local_ip};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
-use std::collections::{HashMap, VecDeque};
+use alloc::collections::{BTreeMap, VecDeque};
+#[cfg(feature = "std")]
+#[cfg(feature = "std")]
+#[cfg(feature = "std")]
 use std::io::ErrorKind;
-use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::net::{IpAddr, SocketAddr};
+use alloc::sync::Arc;
+use crate::platform::atomic64::AtomicU64;
+use core::sync::atomic::AtomicU32;
+use core::sync::atomic::Ordering;
 
-use std::time::{Duration, Instant};
+use core::time::Duration;
+#[cfg(feature = "std")]
+use std::time::Instant;
+#[cfg(not(feature = "std"))]
+use crate::platform::time::Instant;
 
-use anyhow::{Context, Result, anyhow, bail};
-use tokio::net::{TcpListener, TcpStream, UdpSocket, lookup_host};
-use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
-use tokio::time::timeout;
+use crate::errors::{RtcError, RtcResult};
+#[cfg(feature = "std")]
+use tokio::net::{TcpListener, TcpStream};
+#[cfg(feature = "std")]
+use crate::platform::net::UdpSocket as NetUdpSocket;
+#[cfg(feature = "std")]
+use tokio::net::UdpSocket;
+#[cfg(not(feature = "std"))]
+/// Placeholder standing in for the tokio UDP socket on embedded targets:
+/// direct-UDP gathering is a std-only path (the target uses Platform
+/// sockets via the embedder's adapter). Never constructed.
+#[derive(Debug, Clone)]
+pub struct UdpSocket;
+
+#[cfg(not(feature = "std"))]
+impl UdpSocket {
+    pub async fn bind(_addr: SocketAddr) -> RtcResult<Self> {
+        unimplemented!("direct UDP sockets are std-only; use Platform sockets (WP3)")
+    }
+    pub fn local_addr(&self) -> RtcResult<SocketAddr> {
+        unimplemented!("direct UDP sockets are std-only")
+    }
+    pub async fn send_to(&self, _: &[u8], _: SocketAddr) -> RtcResult<usize> {
+        unimplemented!("direct UDP sockets are std-only")
+    }
+    pub async fn recv_from(&self, _: &mut [u8]) -> RtcResult<(usize, SocketAddr)> {
+        unimplemented!("direct UDP sockets are std-only")
+    }
+    pub fn try_send_to(&self, _: &[u8], _: SocketAddr) -> RtcResult<usize> {
+        unimplemented!("direct UDP sockets are std-only")
+    }
+    pub async fn writable(&self) -> RtcResult<()> {
+        unimplemented!("direct UDP sockets are std-only")
+    }
+    pub fn diag(&self) -> SocketAddr {
+        unimplemented!("direct UDP sockets are std-only")
+    }
+}
+
+/// Placeholder for the tokio TcpStream on embedded targets: ICE-TCP is
+/// excluded there. Never constructed.
+#[cfg(not(feature = "std"))]
+#[derive(Debug, Clone)]
+pub struct TcpStream;
+
+#[cfg(not(feature = "std"))]
+impl TcpStream {
+    pub async fn connect(_addr: SocketAddr) -> RtcResult<Self> {
+        unimplemented!("ICE-TCP is excluded from the embedded target")
+    }
+    pub fn local_addr(&self) -> RtcResult<SocketAddr> {
+        unimplemented!("ICE-TCP is excluded from the embedded target")
+    }
+    pub fn set_nodelay(&self, _: bool) -> RtcResult<()> {
+        Ok(())
+    }
+    pub async fn write_all(&self, _: &[u8]) -> RtcResult<()> {
+        unimplemented!("ICE-TCP is excluded from the embedded target")
+    }
+    pub async fn read_exact(&self, _: &mut [u8]) -> RtcResult<()> {
+        unimplemented!("ICE-TCP is excluded from the embedded target")
+    }
+    pub fn into_split(self) -> (TcpReadHalf, TcpWriteHalf) {
+        unimplemented!("ICE-TCP is excluded from the embedded target")
+    }
+}
+
+/// Placeholder for the tokio TcpListener on embedded targets.
+#[cfg(not(feature = "std"))]
+#[derive(Debug, Clone)]
+pub struct TcpListener;
+
+#[cfg(not(feature = "std"))]
+impl TcpListener {
+    pub async fn bind(_addr: SocketAddr) -> RtcResult<Self> {
+        unimplemented!("ICE-TCP is excluded from the embedded target")
+    }
+    pub fn local_addr(&self) -> RtcResult<SocketAddr> {
+        unimplemented!("ICE-TCP is excluded from the embedded target")
+    }
+}
+
+/// Placeholder halves (ICE-TCP excluded).
+#[cfg(not(feature = "std"))]
+pub type TcpReadHalf = TcpStream;
+#[cfg(not(feature = "std"))]
+pub type TcpWriteHalf = TcpStream;
+
+/// Placeholder for the UPnP port mapper (UPnP excluded from the embedded
+/// target). Never constructed.
+#[cfg(not(feature = "std"))]
+#[derive(Debug, Clone)]
+pub struct UpnpPortMapper;
+
+#[cfg(not(feature = "std"))]
+impl UpnpPortMapper {
+    pub fn with_lease_duration(_local_addr: SocketAddr, _lease: u32) -> Self {
+        unimplemented!("UPnP is excluded from the embedded target")
+    }
+    pub async fn discover(&mut self) -> RtcResult<()> {
+        unimplemented!("UPnP is excluded from the embedded target")
+    }
+    pub async fn add_mapping(&mut self, _port: u16) -> RtcResult<SocketAddr> {
+        unimplemented!("UPnP is excluded from the embedded target")
+    }
+    pub async fn renew_all_stale(&self) -> RtcResult<()> {
+        unimplemented!("UPnP is excluded from the embedded target")
+    }
+    pub async fn discover_with_timeout(&mut self, _: core::time::Duration) -> RtcResult<()> {
+        unimplemented!("UPnP is excluded from the embedded target")
+    }
+    pub async fn add_mapping_random_port(&mut self, _: u16) -> RtcResult<u16> {
+        unimplemented!("UPnP is excluded from the embedded target")
+    }
+    pub async fn cleanup(&self) -> RtcResult<()> {
+        Ok(())
+    }
+    pub async fn get_external_ip(&self) -> RtcResult<core::net::Ipv4Addr> {
+        unimplemented!("UPnP is excluded from the embedded target")
+    }
+}
+use crate::platform::sync::{broadcast, mpsc, AsyncMutex as Mutex, oneshot, watch};
+use crate::platform::time::with_timeout;
 use tracing::{debug, error, instrument, trace, warn};
 
 #[cfg(any(test, feature = "simulator"))]
@@ -92,16 +230,25 @@ async fn simulate_stun_respond_delay(sender: &IceSocketWrapper) {
     if ms == 0 {
         return;
     }
-    if matches!(
-        sender,
-        IceSocketWrapper::Turn(_, _)
-            | IceSocketWrapper::TcpListener(_)
-            | IceSocketWrapper::TcpStream(_, _, _)
-    ) {
+    let is_relayed_or_tcp = matches!(sender, IceSocketWrapper::Turn(_, _))
+        || {
+            #[cfg(feature = "std")]
+            {
+                matches!(
+                    sender,
+                    IceSocketWrapper::TcpListener(_) | IceSocketWrapper::TcpStream(_, _, _)
+                )
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                false
+            }
+        };
+    if is_relayed_or_tcp {
         return;
     }
     trace!("SIMULATOR: delaying STUN response by {}ms", ms);
-    tokio::time::sleep(Duration::from_millis(ms)).await;
+    crate::platform::task::sleep(Duration::from_millis(ms)).await;
 }
 
 /// Statistics for monitoring buffer behavior
@@ -111,7 +258,7 @@ struct BufferStats {
     pub packets_dropped: AtomicU64,
     pub current_size: AtomicU32,
     pub peak_size: AtomicU32,
-    pub last_log_time: parking_lot::Mutex<Instant>,
+    pub last_log_time: crate::platform::sync::Mutex<Instant>,
 }
 
 impl Default for BufferStats {
@@ -121,7 +268,7 @@ impl Default for BufferStats {
             packets_dropped: AtomicU64::new(0),
             current_size: AtomicU32::new(0),
             peak_size: AtomicU32::new(0),
-            last_log_time: parking_lot::Mutex::new(Instant::now()),
+            last_log_time: crate::platform::sync::Mutex::new(Instant::now()),
         }
     }
 }
@@ -148,20 +295,20 @@ pub(crate) struct IceTransportInner {
     /// other watch channel in this struct holds a keeper receiver for exactly
     /// this reason.
     _gathering_state_rx_keeper: watch::Receiver<IceGathererState>,
-    role: parking_lot::Mutex<IceRole>,
-    selected_pair: parking_lot::Mutex<Option<IceCandidatePair>>,
+    role: crate::platform::sync::Mutex<IceRole>,
+    selected_pair: crate::platform::sync::Mutex<Option<IceCandidatePair>>,
     local_candidates: Mutex<Vec<IceCandidate>>,
-    remote_candidates: parking_lot::Mutex<Vec<IceCandidate>>,
-    gather_state: parking_lot::Mutex<IceGathererState>,
+    remote_candidates: crate::platform::sync::Mutex<Vec<IceCandidate>>,
+    gather_state: crate::platform::sync::Mutex<IceGathererState>,
     config: RtcConfiguration,
     gatherer: IceGatherer,
-    local_parameters: parking_lot::Mutex<IceParameters>,
-    remote_parameters: parking_lot::Mutex<Option<IceParameters>>,
-    pending_transactions: parking_lot::Mutex<HashMap<[u8; 12], oneshot::Sender<StunDecoded>>>,
-    data_receiver: parking_lot::Mutex<Option<Arc<dyn PacketReceiver>>>,
+    local_parameters: crate::platform::sync::Mutex<IceParameters>,
+    remote_parameters: crate::platform::sync::Mutex<Option<IceParameters>>,
+    pending_transactions: crate::platform::sync::Mutex<BTreeMap<[u8; 12], oneshot::Sender<StunDecoded>>>,
+    data_receiver: crate::platform::sync::Mutex<Option<Arc<dyn PacketReceiver>>>,
     /// Ring buffer for packets when no receiver is registered yet.
     /// Uses VecDeque for efficient pop_front removal.
-    buffered_packets: parking_lot::Mutex<VecDeque<(Vec<u8>, SocketAddr)>>,
+    buffered_packets: crate::platform::sync::Mutex<VecDeque<(Vec<u8>, SocketAddr)>>,
     /// Statistics for monitoring buffer behavior
     buffer_stats: Arc<BufferStats>,
     selected_socket: watch::Sender<Option<IceSocketWrapper>>,
@@ -178,7 +325,7 @@ pub(crate) struct IceTransportInner {
     last_received_nanos: AtomicU64,
     candidate_tx: broadcast::Sender<IceCandidate>,
     cmd_tx: mpsc::UnboundedSender<IceCommand>,
-    checking_pairs: Mutex<std::collections::HashSet<(SocketAddr, SocketAddr)>>,
+    checking_pairs: Mutex<alloc::collections::BTreeSet<(SocketAddr, SocketAddr)>>,
     /// Signals when the controlling-side nomination is complete.
     /// `true` = nomination succeeded, `false` = nomination failed (but ICE is still connected).
     /// Controlled side immediately sends `true` (no nomination to do).
@@ -188,26 +335,27 @@ pub(crate) struct IceTransportInner {
     /// `restart()` and the next `start()` with the peer's answer). Prevents a
     /// changed remote ufrag/pwd in that answer from being misread as a
     /// remote-initiated restart (which would reset ICE a second time).
-    restart_requested: std::sync::atomic::AtomicBool,
+    restart_requested: core::sync::atomic::AtomicBool,
     /// Monotonic counter bumped for every new controlled-side nomination and on
     /// every ICE restart. A deferred path-verification task only commits its
     /// pair while its captured generation is still current, so a stale
     /// nomination whose verification finishes late cannot switch media back to
     /// a superseded path (RFC 8445 §8.1.1).
-    nomination_generation: AtomicU64,
+    /// no_std: backed by the 32-bit atomic64 shim.
+    nomination_generation: crate::platform::atomic64::AtomicU64,
     /// mDNS hostname advertising our host candidates (`enable_mdns`).
     mdns_hostname: Option<String>,
     /// Guards against overlapping `run_turn_refresh` invocations: the refresh
     /// timer tick skips when a previous refresh is still in flight instead of
     /// cancelling it (which used to orphan pending transactions).
-    turn_refresh_in_progress: std::sync::atomic::AtomicBool,
+    turn_refresh_in_progress: core::sync::atomic::AtomicBool,
     /// Guards against overlapping UPnP mapping refreshes (same skip-on-in-flight
     /// pattern as `turn_refresh_in_progress`).
-    upnp_refresh_in_progress: std::sync::atomic::AtomicBool,
+    upnp_refresh_in_progress: core::sync::atomic::AtomicBool,
 }
 
-impl std::fmt::Debug for IceTransportInner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for IceTransportInner {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("IceTransportInner")
             .field("state", &self.state)
             .field("role", &self.role)
@@ -235,16 +383,18 @@ impl std::fmt::Debug for IceTransportInner {
 
 /// Collect the local addresses to advertise in mDNS answers and start a
 /// responder for the transport's obfuscated hostname.
+#[cfg(feature = "std")]
 fn start_mdns_responder(
     inner: &Arc<IceTransportInner>,
-) -> Result<crate::transports::ice::mdns::MdnsResponder> {
-    let mut addresses: Vec<std::net::IpAddr> = Vec::new();
+) -> anyhow::Result<crate::transports::ice::mdns::MdnsResponder> {
+    let mut addresses: Vec<core::net::IpAddr> = Vec::new();
     if let Some(bind) = &inner.config.bind_ip
-        && let Ok(ip) = bind.parse::<std::net::IpAddr>()
+        && let Ok(ip) = bind.parse::<core::net::IpAddr>()
     {
         addresses.push(ip);
     }
-    use local_ip_address::list_afinet_netifas;
+    #[cfg(feature = "std")]
+use local_ip_address::list_afinet_netifas;
     if let Ok(interfaces) = list_afinet_netifas() {
         for (_name, addr) in interfaces {
             if !addr.is_loopback() && !addresses.contains(&addr) {
@@ -271,6 +421,7 @@ impl IceTransportRunner {
     async fn run(mut self) {
         // mDNS responder lifetime: started when `enable_mdns` is set, stopped
         // when the runner loop exits (the guard's Drop signals the task).
+        #[cfg(feature = "std")]
         let _mdns: Option<crate::transports::ice::mdns::MdnsResponder> =
             if self.inner.config.enable_mdns {
                 match start_mdns_responder(&self.inner) {
@@ -286,10 +437,8 @@ impl IceTransportRunner {
             } else {
                 None
             };
-        let mut interval = tokio::time::interval_at(
-            tokio::time::Instant::now() + Duration::from_secs(1),
-            Duration::from_secs(1),
-        );
+        let mut interval =
+            crate::platform::task::interval_after(Duration::from_secs(1), Duration::from_secs(1));
         // TURN refresh interval. Kept well under both the 300 s permission
         // timeout AND typical UDP NAT mapping idle timeouts (~30 s on many
         // carrier/CGNAT deployments): each Refresh is bidirectional traffic
@@ -297,15 +446,13 @@ impl IceTransportRunner {
         // mapping warm for relays that are gathered but not selected (and
         // therefore carry no media ChannelData). 25 s is safely under all
         // those budgets while staying cheap (tiny authenticated packets).
-        let mut turn_refresh_interval = tokio::time::interval_at(
-            tokio::time::Instant::now() + Duration::from_secs(25),
-            Duration::from_secs(25),
-        );
+        let mut turn_refresh_interval =
+            crate::platform::task::interval_after(Duration::from_secs(25), Duration::from_secs(25));
         // UPnP mapping refresh interval. Long-lived sessions (> 1 hour) outlive
         // the default router lease (3600s); re-issuing AddPortMapping keeps the
         // mapping alive so inbound P2P traffic isn't lost mid-call.
-        let mut upnp_refresh_interval = tokio::time::interval_at(
-            tokio::time::Instant::now() + self.inner.config.upnp_refresh_interval,
+        let mut upnp_refresh_interval = crate::platform::task::interval_after(
+            self.inner.config.upnp_refresh_interval,
             self.inner.config.upnp_refresh_interval,
         );
         let mut read_futures: FuturesUnordered<BoxFuture<'static, ()>> = FuturesUnordered::new();
@@ -314,8 +461,92 @@ impl IceTransportRunner {
         let mut upnp_refresh_future: BoxFuture<'static, ()> = Box::pin(futures::future::pending());
 
         loop {
-            tokio::select! {
-                res = self.state_rx.changed() => {
+            // Backend-agnostic 11-arm race (replaces `tokio::select!`):
+            // every arm is polled once per wake in a fixed order; the first
+            // `Ready` wins. `Some(x) = rx.recv()` arms keep tokio's
+            // disabled-branch semantics through `*_open` flags — a closed
+            // channel stops polling that arm instead of spinning.
+            enum GatherArm {
+                State(Result<(), watch::RecvError>),
+                Socket(IceSocketWrapper),
+                Candidate(Result<(), broadcast::RecvError>),
+                Cmd(IceCommand),
+                Keepalive,
+                TurnRefreshTick,
+                TurnRefreshDone,
+                UpnpTick,
+                UpnpDone,
+                ReadLoopDone,
+                GatheringDone,
+            }
+            let mut socket_rx_open = true;
+            let mut cmd_rx_open = true;
+            let arm = core::future::poll_fn(|cx| {
+                use core::task::Poll;
+                let mut state_fut = core::pin::pin!(self.state_rx.changed());
+                let mut socket_fut = core::pin::pin!(self.socket_rx.recv());
+                let mut cand_fut = core::pin::pin!(self.candidate_rx.recv());
+                let mut cmd_fut = core::pin::pin!(self.cmd_rx.recv());
+                let mut ka_fut = core::pin::pin!(interval.tick());
+                let mut turn_tick_fut = core::pin::pin!(turn_refresh_interval.tick());
+                let mut upnp_tick_fut = core::pin::pin!(upnp_refresh_interval.tick());
+                let mut read_next_fut = core::pin::pin!(read_futures.next());
+                loop {
+                    if let Poll::Ready(res) = state_fut.as_mut().poll(cx) {
+                        return Poll::Ready(GatherArm::State(res));
+                    }
+                    if socket_rx_open
+                        && let Poll::Ready(v) = socket_fut.as_mut().poll(cx)
+                    {
+                        match v {
+                            Some(socket) => return Poll::Ready(GatherArm::Socket(socket)),
+                            None => socket_rx_open = false,
+                        }
+                    }
+                    if let Poll::Ready(res) = cand_fut.as_mut().poll(cx) {
+                        return Poll::Ready(GatherArm::Candidate(res.map(|_| ())));
+                    }
+                    if cmd_rx_open
+                        && let Poll::Ready(v) = cmd_fut.as_mut().poll(cx)
+                    {
+                        match v {
+                            Some(cmd) => return Poll::Ready(GatherArm::Cmd(cmd)),
+                            None => cmd_rx_open = false,
+                        }
+                    }
+                    if ka_fut.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(GatherArm::Keepalive);
+                    }
+                    if turn_tick_fut.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(GatherArm::TurnRefreshTick);
+                    }
+                    if core::pin::Pin::new(&mut turn_refresh_future)
+                        .poll(cx)
+                        .is_ready()
+                    {
+                        return Poll::Ready(GatherArm::TurnRefreshDone);
+                    }
+                    if upnp_tick_fut.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(GatherArm::UpnpTick);
+                    }
+                    if core::pin::Pin::new(&mut upnp_refresh_future)
+                        .poll(cx)
+                        .is_ready()
+                    {
+                        return Poll::Ready(GatherArm::UpnpDone);
+                    }
+                    if let Poll::Ready(Some(_)) = read_next_fut.as_mut().poll(cx) {
+                        return Poll::Ready(GatherArm::ReadLoopDone);
+                    }
+                    if core::pin::Pin::new(&mut gathering_future).poll(cx).is_ready() {
+                        return Poll::Ready(GatherArm::GatheringDone);
+                    }
+                    return Poll::Pending;
+                }
+            })
+            .await;
+            match arm {
+                GatherArm::State(res) => {
                     if res.is_err() {
                         break;
                     }
@@ -323,17 +554,31 @@ impl IceTransportRunner {
                         break;
                     }
                 }
-                Some(socket) = self.socket_rx.recv() => {
+                GatherArm::Socket(socket) => {
                     match socket {
                         IceSocketWrapper::Udp(s) => {
-                            read_futures.push(Box::pin(Self::run_udp_read_loop(s, self.inner.clone())));
+                            // std: the tokio socket's dedicated read loop;
+                            // no_std: Udp is a placeholder, never constructed.
+                            #[cfg(feature = "std")]
+                            {
+                                read_futures.push(Box::pin(Self::run_udp_read_loop(
+                                    s,
+                                    self.inner.clone(),
+                                )));
+                            }
+                            #[cfg(not(feature = "std"))]
+                            {
+                                let _ = s;
+                            }
                         }
                         IceSocketWrapper::SharedUdp(handle) => {
                             read_futures.push(Box::pin(Self::run_shared_udp_read_loop(handle, self.inner.clone())));
                         }
+                        #[cfg(feature = "std")]
                         IceSocketWrapper::TcpListener(l) => {
                             read_futures.push(Box::pin(Self::run_tcp_listen_loop(l, self.inner.clone())));
                         }
+                        #[cfg(feature = "std")]
                         IceSocketWrapper::TcpStream(read, write, peer) => {
                             read_futures.push(Box::pin(Self::run_tcp_read_loop(
                                 read,
@@ -342,12 +587,15 @@ impl IceTransportRunner {
                                 self.inner.clone(),
                             )));
                         }
+                        IceSocketWrapper::Platform(s) => {
+                            read_futures.push(Box::pin(Self::run_platform_read_loop(s, self.inner.clone())));
+                        }
                         IceSocketWrapper::Turn(c, addr) => {
                             read_futures.push(Box::pin(Self::run_turn_read_loop(c, addr, self.inner.clone())));
                         }
                     }
                 }
-                res = self.candidate_rx.recv() => {
+                GatherArm::Candidate(res) => {
                     match res {
                         Ok(_) => {
                             let inner = self.inner.clone();
@@ -355,11 +603,11 @@ impl IceTransportRunner {
                                 perform_connectivity_checks_async(inner).await;
                             }));
                         }
-                        Err(broadcast::error::RecvError::Closed) => break,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::RecvError::Closed) => break,
+                        Err(broadcast::RecvError::Lagged(_)) => continue,
                     }
                 }
-                Some(cmd) = self.cmd_rx.recv() => {
+                GatherArm::Cmd(cmd) => {
                     trace!("Runner received command: {:?}", cmd);
                     match cmd {
                         IceCommand::StartGathering => {
@@ -394,12 +642,12 @@ impl IceTransportRunner {
                         }
                     }
                 }
-                _ = interval.tick() => {
+                GatherArm::Keepalive => {
                     if let Some(f) = Self::run_keepalive_tick(&self.inner).await {
                         read_futures.push(f);
                     }
                 }
-                _ = turn_refresh_interval.tick() => {
+                GatherArm::TurnRefreshTick => {
                     // Only start a new refresh if the previous one has
                     // completed. If still running (e.g. server slow), skip
                     // this tick rather than reassigning the future, which
@@ -409,7 +657,7 @@ impl IceTransportRunner {
                     if !self
                         .inner
                         .turn_refresh_in_progress
-                        .load(std::sync::atomic::Ordering::SeqCst)
+                        .load(core::sync::atomic::Ordering::SeqCst)
                     {
                         let inner = self.inner.clone();
                         turn_refresh_future = Box::pin(async move {
@@ -417,10 +665,10 @@ impl IceTransportRunner {
                         });
                     }
                 }
-                _ = &mut turn_refresh_future => {
+                GatherArm::TurnRefreshDone => {
                     turn_refresh_future = Box::pin(futures::future::pending());
                 }
-                _ = upnp_refresh_interval.tick() => {
+                GatherArm::UpnpTick => {
                     // UPnP SOAP calls can be slow (hundreds of ms). Run them in
                     // a detached future so the runner's 1s keepalive tick is
                     // never blocked. Guard with an in-progress flag so slow
@@ -428,30 +676,36 @@ impl IceTransportRunner {
                     if !self
                         .inner
                         .upnp_refresh_in_progress
-                        .swap(true, std::sync::atomic::Ordering::SeqCst)
+                        .swap(true, core::sync::atomic::Ordering::SeqCst)
                     {
                         let inner = self.inner.clone();
                         upnp_refresh_future = Box::pin(async move {
+                            #[cfg(feature = "std")]
                             inner.gatherer.renew_upnp_mappings().await;
+                            #[cfg(not(feature = "std"))]
+                            {
+                                let _ = &inner;
+                            }
                             inner
                                 .upnp_refresh_in_progress
-                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                                .store(false, core::sync::atomic::Ordering::SeqCst);
                         });
                     }
                 }
-                _ = &mut upnp_refresh_future => {
+                GatherArm::UpnpDone => {
                     upnp_refresh_future = Box::pin(futures::future::pending());
                 }
-                Some(_) = read_futures.next() => {
+                GatherArm::ReadLoopDone => {
                     // Read loop finished
                 }
-                _ = &mut gathering_future => {
+                GatherArm::GatheringDone => {
                     gathering_future = Box::pin(futures::future::pending());
                 }
             }
         }
     }
 
+    #[cfg(feature = "std")]
     async fn run_udp_read_loop(socket: Arc<UdpSocket>, inner: Arc<IceTransportInner>) {
         let mut buf = [0u8; 1500];
         let mut marshal_buf = Vec::with_capacity(1500);
@@ -459,8 +713,13 @@ impl IceTransportRunner {
         let sender = IceSocketWrapper::Udp(socket.clone());
         trace!("Read loop started for {:?}", socket.local_addr());
         loop {
-            tokio::select! {
-                res = socket.readable() => {
+            let which = {
+                let mut readable_fut = core::pin::pin!(socket.readable());
+                let mut state_fut = core::pin::pin!(state_rx.changed());
+                crate::platform::select::select2(&mut readable_fut, &mut state_fut).await
+            };
+            match which {
+                crate::platform::select::Either::A(res) => {
                     if let Err(e) = res {
                         debug!("Socket readable wait error: {}", e);
                         break;
@@ -502,13 +761,43 @@ impl IceTransportRunner {
                         }
                     }
                 }
-                res = state_rx.changed() => {
+                crate::platform::select::Either::B(res) => {
                     if res.is_err() || matches!(*state_rx.borrow(), IceTransportState::Closed | IceTransportState::Failed) {
                         // routine teardown; one line per read loop is noisy at debug
                         trace!("Read loop stopping (IceTransport Closed or Failed)");
                         break;
                     }
                 }
+            }
+        }
+    }
+
+    async fn run_platform_read_loop(
+        socket: Arc<dyn crate::platform::net::UdpSocket>,
+        inner: Arc<IceTransportInner>,
+    ) {
+        let mut buf = vec![0u8; 1500];
+        let mut marshal_buf = Vec::with_capacity(1500);
+        let sender = IceSocketWrapper::Platform(socket.clone());
+        loop {
+            let result =
+                crate::platform::time::with_timeout(core::time::Duration::from_secs(1), socket.recv_from(&mut buf))
+                    .await;
+            let (len, addr) = match result {
+                Err(_) => continue,
+                Ok(Err(_)) => break,
+                Ok(Ok(v)) => v,
+            };
+            let packet = &buf[..len];
+            if len > 0 {
+                handle_packet(
+                    packet,
+                    addr,
+                    inner.clone(),
+                    sender.clone(),
+                    &mut marshal_buf,
+                )
+                .await;
             }
         }
     }
@@ -525,9 +814,16 @@ impl IceTransportRunner {
         let sender = IceSocketWrapper::SharedUdp(handle.clone());
         trace!("Shared UDP read loop started");
         loop {
-            let packet_opt = tokio::select! {
-                biased;
-                res = state_rx.changed() => {
+            // state arm polled first each wake (matches the old `biased;`).
+            // The block scopes the pinned futures so `state_rx` is released
+            // before the arm bodies run.
+            let which = {
+                let mut state_fut = core::pin::pin!(state_rx.changed());
+                let mut recv_fut = core::pin::pin!(handle.recv());
+                crate::platform::select::select2(&mut state_fut, &mut recv_fut).await
+            };
+            let packet_opt = match which {
+                crate::platform::select::Either::A(res) => {
                     if res.is_err()
                         || matches!(
                             *state_rx.borrow(),
@@ -539,7 +835,7 @@ impl IceTransportRunner {
                     }
                     continue;
                 }
-                pkt = handle.recv() => pkt,
+                crate::platform::select::Either::B(pkt) => pkt,
             };
             match packet_opt {
                 Some((packet, addr)) => {
@@ -567,10 +863,13 @@ impl IceTransportRunner {
         let mut state_rx = inner.state.subscribe();
         trace!("Read loop started for TURN client {}", relayed_addr);
         loop {
-            let recv_future = async { client.recv(&mut buf).await };
-
-            tokio::select! {
-                result = recv_future => {
+            let which = {
+                let mut recv_fut = core::pin::pin!(async { client.recv(&mut buf).await });
+                let mut state_fut = core::pin::pin!(state_rx.changed());
+                crate::platform::select::select2(&mut recv_fut, &mut state_fut).await
+            };
+            match which {
+                crate::platform::select::Either::A(result) => {
                     match result {
                         Ok(len) => {
                             if len > 0 {
@@ -586,7 +885,7 @@ impl IceTransportRunner {
                         }
                     }
                 }
-                res = state_rx.changed() => {
+                crate::platform::select::Either::B(res) => {
                     if res.is_err() || matches!(*state_rx.borrow(), IceTransportState::Closed | IceTransportState::Failed) {
                         trace!("TURN Read loop stopping (IceTransport Closed or Failed)");
                         break;
@@ -596,6 +895,7 @@ impl IceTransportRunner {
         }
     }
 
+    #[cfg(feature = "std")]
     async fn run_tcp_listen_loop(listener: Arc<TcpListener>, inner: Arc<IceTransportInner>) {
         let mut state_rx = inner.state.subscribe();
         let local_addr = match listener.local_addr() {
@@ -607,8 +907,13 @@ impl IceTransportRunner {
         };
         trace!("TCP listen loop started for {:?}", local_addr);
         loop {
-            tokio::select! {
-                accept_res = listener.accept() => {
+            let which = {
+                let mut accept_fut = core::pin::pin!(listener.accept());
+                let mut state_fut = core::pin::pin!(state_rx.changed());
+                crate::platform::select::select2(&mut accept_fut, &mut state_fut).await
+            };
+            match which {
+                crate::platform::select::Either::A(accept_res) => {
                     match accept_res {
                         Ok((stream, peer_addr)) => {
                             trace!("TCP accepted connection from {}", peer_addr);
@@ -622,7 +927,7 @@ impl IceTransportRunner {
                         }
                     }
                 }
-                res = state_rx.changed() => {
+                crate::platform::select::Either::B(res) => {
                     if res.is_err() || matches!(*state_rx.borrow(), IceTransportState::Closed | IceTransportState::Failed) {
                         debug!("TCP listen loop stopping (IceTransport Closed or Failed)");
                         break;
@@ -632,6 +937,7 @@ impl IceTransportRunner {
         }
     }
 
+    #[cfg(feature = "std")]
     async fn run_tcp_read_loop(
         read: Arc<Mutex<TcpReadHalf>>,
         write: Arc<Mutex<TcpWriteHalf>>,
@@ -641,11 +947,17 @@ impl IceTransportRunner {
         let mut buf = [0u8; 65_535];
         let mut marshal_buf = Vec::with_capacity(1500);
         let mut state_rx = inner.state.subscribe();
+        #[cfg(feature = "std")]
         let sender = IceSocketWrapper::TcpStream(read, write, peer_addr);
         trace!("TCP read loop started for peer {}", peer_addr);
         loop {
-            tokio::select! {
-                result = sender.recv_from(&mut buf) => {
+            let which = {
+                let mut recv_fut = core::pin::pin!(sender.recv_from(&mut buf));
+                let mut state_fut = core::pin::pin!(state_rx.changed());
+                crate::platform::select::select2(&mut recv_fut, &mut state_fut).await
+            };
+            match which {
+                crate::platform::select::Either::A(result) => {
                     match result {
                         Ok((len, addr)) => {
                             if len > 0 {
@@ -665,7 +977,7 @@ impl IceTransportRunner {
                         }
                     }
                 }
-                res = state_rx.changed() => {
+                crate::platform::select::Either::B(res) => {
                     if res.is_err() || matches!(*state_rx.borrow(), IceTransportState::Closed | IceTransportState::Failed) {
                         debug!("TCP read loop stopping (IceTransport Closed or Failed)");
                         break;
@@ -743,7 +1055,7 @@ impl IceTransportRunner {
 
                             let inner_weak = Arc::downgrade(inner);
                             let cleanup: BoxFuture<'static, ()> = Box::pin(async move {
-                                let _ = timeout(Duration::from_secs(5), rx).await;
+                                let _ = with_timeout(Duration::from_secs(5), rx).await;
                                 if let Some(inner) = inner_weak.upgrade() {
                                     let mut map = inner.pending_transactions.lock();
                                     map.remove(&tx_id);
@@ -785,16 +1097,16 @@ impl IceTransportRunner {
         // two concurrent refreshes that could interleave nonce updates.
         if inner
             .turn_refresh_in_progress
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
+            .swap(true, core::sync::atomic::Ordering::SeqCst)
         {
             return;
         }
         // RAII: guarantees the flag is cleared on every exit path, including
         // early returns and panics, so the timer never deadlocks on refresh.
-        struct RefreshGuard<'a>(&'a std::sync::atomic::AtomicBool);
+        struct RefreshGuard<'a>(&'a core::sync::atomic::AtomicBool);
         impl Drop for RefreshGuard<'_> {
             fn drop(&mut self) {
-                self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+                self.0.store(false, core::sync::atomic::Ordering::SeqCst);
             }
         }
         let _guard = RefreshGuard(&inner.turn_refresh_in_progress);
@@ -842,7 +1154,7 @@ impl IceTransportRunner {
                 inner.pending_transactions.lock().remove(&tx_id);
                 return None;
             }
-            match timeout(Duration::from_secs(5), rx).await {
+            match with_timeout(Duration::from_secs(5), rx).await {
                 Ok(Ok(msg)) => Some(msg),
                 _ => {
                     inner.pending_transactions.lock().remove(&tx_id);
@@ -992,9 +1304,9 @@ impl IceTransportRunner {
 }
 
 impl IceTransport {
-    pub fn new(config: RtcConfiguration) -> (Self, impl std::future::Future<Output = ()> + Send) {
+    pub fn new(config: RtcConfiguration) -> (Self, impl core::future::Future<Output = ()> + Send) {
         let (candidate_tx, _) = broadcast::channel(100);
-        let (socket_tx, socket_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (socket_tx, socket_rx) = crate::platform::sync::mpsc::unbounded_channel();
         let gatherer = IceGatherer::new(config.clone(), candidate_tx.clone(), socket_tx);
         let (state_tx, state_rx) = watch::channel(IceTransportState::New);
         let runner_state_rx = state_tx.subscribe();
@@ -1010,18 +1322,18 @@ impl IceTransport {
             _state_rx_keeper: state_rx,
             gathering_state: gathering_state_tx,
             _gathering_state_rx_keeper: gathering_state_rx,
-            role: parking_lot::Mutex::new(IceRole::Controlled),
-            selected_pair: parking_lot::Mutex::new(None),
+            role: crate::platform::sync::Mutex::new(IceRole::Controlled),
+            selected_pair: crate::platform::sync::Mutex::new(None),
             local_candidates: Mutex::new(Vec::new()),
-            remote_candidates: parking_lot::Mutex::new(Vec::new()),
-            gather_state: parking_lot::Mutex::new(IceGathererState::New),
+            remote_candidates: crate::platform::sync::Mutex::new(Vec::new()),
+            gather_state: crate::platform::sync::Mutex::new(IceGathererState::New),
             config: config.clone(),
             gatherer,
-            local_parameters: parking_lot::Mutex::new(IceParameters::generate()),
-            remote_parameters: parking_lot::Mutex::new(None),
-            pending_transactions: parking_lot::Mutex::new(HashMap::new()),
-            data_receiver: parking_lot::Mutex::new(None),
-            buffered_packets: parking_lot::Mutex::new(VecDeque::new()),
+            local_parameters: crate::platform::sync::Mutex::new(IceParameters::generate()),
+            remote_parameters: crate::platform::sync::Mutex::new(None),
+            pending_transactions: crate::platform::sync::Mutex::new(BTreeMap::new()),
+            data_receiver: crate::platform::sync::Mutex::new(None),
+            buffered_packets: crate::platform::sync::Mutex::new(VecDeque::new()),
             selected_socket: selected_socket_tx,
             _socket_rx_keeper: selected_socket_rx,
             selected_rtcp_socket: selected_rtcp_socket_tx,
@@ -1032,16 +1344,25 @@ impl IceTransport {
             last_received_nanos: AtomicU64::new(0),
             candidate_tx: candidate_tx.clone(),
             cmd_tx,
-            checking_pairs: Mutex::new(std::collections::HashSet::new()),
+            checking_pairs: Mutex::new(alloc::collections::BTreeSet::new()),
             nomination_complete: nomination_complete_tx,
             _nomination_complete_rx: nomination_complete_rx,
-            restart_requested: std::sync::atomic::AtomicBool::new(false),
-            nomination_generation: AtomicU64::new(0),
-            mdns_hostname: config
-                .enable_mdns
-                .then(crate::transports::ice::mdns::MdnsResponder::generate_hostname),
-            turn_refresh_in_progress: std::sync::atomic::AtomicBool::new(false),
-            upnp_refresh_in_progress: std::sync::atomic::AtomicBool::new(false),
+            restart_requested: core::sync::atomic::AtomicBool::new(false),
+            nomination_generation: crate::platform::atomic64::AtomicU64::new(0),
+            mdns_hostname: {
+                #[cfg(feature = "std")]
+                {
+                    config
+                        .enable_mdns
+                        .then(crate::transports::ice::mdns::MdnsResponder::generate_hostname)
+                }
+                #[cfg(not(feature = "std"))]
+                {
+                    None
+                }
+            },
+            turn_refresh_in_progress: core::sync::atomic::AtomicBool::new(false),
+            upnp_refresh_in_progress: core::sync::atomic::AtomicBool::new(false),
             buffer_stats: Arc::new(BufferStats::default()),
         };
         let inner = Arc::new(inner);
@@ -1116,8 +1437,14 @@ impl IceTransport {
                 .cloned()
                 .collect();
             for wrapper in streams {
+                #[cfg(feature = "std")]
                 if let IceSocketWrapper::TcpStream(_, _, peer) = wrapper {
+                    #[cfg(feature = "std")]
                     complete_controlled_inbound_tcp_nomination(&wrapper, peer, inner).await;
+                    #[cfg(not(feature = "std"))]
+                    {
+                        let _ = (&wrapper, &peer, &inner);
+                    }
                     return;
                 }
             }
@@ -1171,7 +1498,7 @@ impl IceTransport {
     /// A remote-initiated restart (peer offers new ice-ufrag/ice-pwd) is
     /// detected in [`Self::start`], which runs the same reset via
     /// `restart_internal` *without* marking it as locally initiated.
-    pub async fn restart(&self) -> Result<()> {
+    pub async fn restart(&self) -> RtcResult<()> {
         // Mark this as locally initiated *before* rolling credentials, so the
         // peer's answer (which carries our new ufrag/pwd) is recognised as the
         // completion of our own restart rather than a fresh remote one. This
@@ -1180,14 +1507,14 @@ impl IceTransport {
         // like the completion of a local restart and skip it (issue #54).
         self.inner
             .restart_requested
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+            .store(true, core::sync::atomic::Ordering::SeqCst);
         self.restart_internal().await
     }
 
     /// Shared restart body used by both locally- and remotely-initiated
     /// restarts. Deliberately does not touch `restart_requested`; see
     /// [`Self::restart`] for why only the local path may set that flag.
-    async fn restart_internal(&self) -> Result<()> {
+    async fn restart_internal(&self) -> RtcResult<()> {
         // 1. Fresh credentials. A new tie_breaker also makes us win/lose role
         //    conflicts per RFC 8445 §5.1.1.1 semantics for the new session.
         *self.inner.local_parameters.lock() = IceParameters::generate();
@@ -1203,7 +1530,7 @@ impl IceTransport {
         // restart so it cannot re-select the old pair afterwards.
         self.inner
             .nomination_generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         let _ = self.inner.nomination_complete.send(None);
         let _ = self.inner.set_state(IceTransportState::Checking);
 
@@ -1222,7 +1549,7 @@ impl IceTransport {
 
     /// Re-register this transport on the shared UDP mux socket under the
     /// current (fresh) ufrag. No-op when mux is not in use.
-    async fn rebind_shared_udp_mux(&self) -> Result<()> {
+    async fn rebind_shared_udp_mux(&self) -> RtcResult<()> {
         let gatherer = &self.inner.gatherer;
         let listen_key = {
             let regs = gatherer.shared_udp_regs.lock();
@@ -1241,7 +1568,7 @@ impl IceTransport {
             shared_udp::acquire(listen_key, ufrag).await.map_err(|e| {
                 // Fall back to dropping the session entirely rather than
                 // leaving the mux registered under the stale ufrag.
-                anyhow::anyhow!("shared UDP mux rebind failed: {e:#}")
+                RtcError::Internal(format!("shared UDP mux rebind failed: {e:#}"))
             })?;
         gatherer.shared_udp_regs.lock().push(registration);
 
@@ -1256,7 +1583,7 @@ impl IceTransport {
         // Handled by runner
     }
 
-    pub fn start_gathering(&self) -> Result<()> {
+    pub fn start_gathering(&self) -> RtcResult<()> {
         {
             let mut state = self.inner.gather_state.lock();
             if *state == IceGathererState::Complete || *state == IceGathererState::Gathering {
@@ -1270,7 +1597,7 @@ impl IceTransport {
         Ok(())
     }
 
-    pub async fn start(&self, remote: IceParameters) -> Result<()> {
+    pub async fn start(&self, remote: IceParameters) -> RtcResult<()> {
         // Remote-initiated ICE restart detection (RFC 8445 §9): the peer
         // signals a restart by changing its ice-ufrag/ice-pwd after the
         // session was established. When we did NOT ask for a restart
@@ -1286,7 +1613,7 @@ impl IceTransport {
             if self
                 .inner
                 .restart_requested
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
+                .swap(false, core::sync::atomic::Ordering::SeqCst)
             {
                 debug!(
                     label = self.inner.config.label.as_deref().unwrap_or("-"),
@@ -1302,7 +1629,7 @@ impl IceTransport {
         } else {
             self.inner
                 .restart_requested
-                .store(false, std::sync::atomic::Ordering::SeqCst);
+                .store(false, core::sync::atomic::Ordering::SeqCst);
         }
 
         self.start_gathering()?;
@@ -1316,7 +1643,7 @@ impl IceTransport {
         Ok(())
     }
 
-    pub async fn start_direct(&self, remote_addr: SocketAddr) -> Result<()> {
+    pub async fn start_direct(&self, remote_addr: SocketAddr) -> RtcResult<()> {
         self.start_gathering()?;
         self.start_keepalive();
 
@@ -1356,7 +1683,7 @@ impl IceTransport {
                     break;
                 }
 
-                match timeout(remaining, rx.recv()).await {
+                match with_timeout(remaining, rx.recv()).await {
                     Ok(Ok(c)) => {
                         if is_suitable(&c) {
                             best_local = Some(c);
@@ -1374,7 +1701,7 @@ impl IceTransport {
         } else if let Some(first) = self.inner.gatherer.local_candidates().first() {
             first.clone()
         } else {
-            bail!("No local candidates gathered for direct connection");
+            return Err(RtcError::Internal(format!("No local candidates gathered for direct connection")));
         };
 
         let remote = IceCandidate::host(remote_addr, 1);
@@ -1393,7 +1720,7 @@ impl IceTransport {
     /// Set up a direct UDP socket for RTP mode without any ICE gathering,
     /// STUN lookups, or connectivity checks.
     /// Binds a single socket, registers it, and marks the transport as connected.
-    pub async fn setup_direct_rtp(&self, remote_addr: SocketAddr) -> Result<SocketAddr> {
+    pub async fn setup_direct_rtp(&self, remote_addr: SocketAddr) -> RtcResult<SocketAddr> {
         self.setup_direct_rtp_with_rtcp(remote_addr, false).await
     }
 
@@ -1401,15 +1728,15 @@ impl IceTransport {
         &self,
         remote_addr: SocketAddr,
         bind_rtcp: bool,
-    ) -> Result<SocketAddr> {
+    ) -> RtcResult<SocketAddr> {
         let bind_ip = if let Some(bind_ip_str) = &self.inner.config.bind_ip {
             bind_ip_str.parse::<IpAddr>().unwrap_or_else(|_| {
-                get_local_ip().unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+                get_local_ip().unwrap_or(IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED))
             })
         } else if let Ok(ip) = get_local_ip() {
             ip
         } else {
-            IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+            IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED)
         };
 
         let socket = self.inner.gatherer.bind_socket(bind_ip).await?;
@@ -1428,9 +1755,11 @@ impl IceTransport {
 
         // Build a local candidate for SDP generation
         let mut cand_addr = local_addr;
-        let mut upnp_external_addr = None;
+        let mut upnp_external_addr: Option<SocketAddr> = None;
 
-        // Try UPnP if enabled (for RTP mode behind NAT)
+        // Try UPnP if enabled (for RTP mode behind NAT) — std-only
+        // (UPnP is excluded from the embedded target)
+        #[cfg(feature = "std")]
         if self.inner.config.enable_upnp && !local_addr.ip().is_loopback() && !local_addr.is_ipv6()
         {
             let mut mapper = UpnpPortMapper::with_lease_duration(
@@ -1519,22 +1848,22 @@ impl IceTransport {
     /// Set up a direct UDP socket for RTP mode (offer side, no remote addr yet).
     /// Binds a socket and registers the local candidate, but does NOT set the
     /// selected pair or transition to Connected.
-    pub async fn setup_direct_rtp_offer(&self) -> Result<SocketAddr> {
+    pub async fn setup_direct_rtp_offer(&self) -> RtcResult<SocketAddr> {
         self.setup_direct_rtp_offer_with_rtcp(false).await
     }
 
     pub(crate) async fn setup_direct_rtp_offer_with_rtcp(
         &self,
         bind_rtcp: bool,
-    ) -> Result<SocketAddr> {
+    ) -> RtcResult<SocketAddr> {
         let bind_ip = if let Some(bind_ip_str) = &self.inner.config.bind_ip {
             bind_ip_str.parse::<IpAddr>().unwrap_or_else(|_| {
-                get_local_ip().unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+                get_local_ip().unwrap_or(IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED))
             })
         } else if let Ok(ip) = get_local_ip() {
             ip
         } else {
-            IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+            IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED)
         };
 
         let socket = self.inner.gatherer.bind_socket(bind_ip).await?;
@@ -1549,9 +1878,11 @@ impl IceTransport {
             .send(IceSocketWrapper::Udp(socket));
 
         let mut cand_addr = local_addr;
-        let mut upnp_external_addr = None;
+        let mut upnp_external_addr: Option<SocketAddr> = None;
 
-        // Try UPnP if enabled (for RTP mode behind NAT)
+        // Try UPnP if enabled (for RTP mode behind NAT) — std-only
+        // (UPnP is excluded from the embedded target)
+        #[cfg(feature = "std")]
         if self.inner.config.enable_upnp && !local_addr.ip().is_loopback() && !local_addr.is_ipv6()
         {
             let mut mapper = UpnpPortMapper::with_lease_duration(
@@ -1638,7 +1969,7 @@ impl IceTransport {
             .find(|candidate| candidate.component == 1)
             .unwrap_or_else(|| {
                 IceCandidate::host(
-                    SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+                    SocketAddr::new(IpAddr::V4(core::net::Ipv4Addr::LOCALHOST), 0),
                     1,
                 )
             });
@@ -1688,6 +2019,10 @@ impl IceTransport {
         // Best-effort UPnP port mapping cleanup. Guarded: only spawn when a
         // tokio runtime is alive (normal close). During runtime teardown
         // (Drop) this is skipped — port mapping leases expire on the router.
+        // Detached best-effort UPnP cleanup: only possible on a live tokio
+        // runtime (normal close). During runtime teardown the handle is
+        // unavailable and the mappings are abandoned (process is exiting).
+        #[cfg(feature = "std")]
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let upnp_clone = self.inner.gatherer.clone();
             handle.spawn(async move {
@@ -1869,7 +2204,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     // passive port range is configured. Synthesize active TCP locals so we open
     // outbound connections to remote passive TCP candidates (RFC 6544).
     if locals.is_empty() && role == IceRole::Controlling {
-        use std::net::{IpAddr, Ipv4Addr};
+        use core::net::{IpAddr, Ipv4Addr};
         for remote in &remotes {
             if remote.transport == "tcp" && remote.tcp_type == Some(TcpType::Passive) {
                 locals.push(IceCandidate::tcp(
@@ -1916,7 +2251,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     }
 
     // Sort by priority
-    pairs.sort_by_key(|p| std::cmp::Reverse(p.priority(role)));
+    pairs.sort_by_key(|p| core::cmp::Reverse(p.priority(role)));
 
     // If configured, demote host candidate pairs behind NAT so that srflx
     // pairs are checked first.  A host behind NAT may pass a single STUN
@@ -1925,10 +2260,10 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     // Only demote when the remote is NOT also a private host — same-LAN pairs
     // (e.g. 192.168.1.x ↔ 192.168.1.y) keep their high priority.
     if inner.config.prefer_srflx_over_natted_host {
-        let is_private_ip = |ip: std::net::IpAddr| -> bool {
+        let is_private_ip = |ip: core::net::IpAddr| -> bool {
             match ip {
-                std::net::IpAddr::V4(v4) => v4.is_private(),
-                std::net::IpAddr::V6(v6) => v6.is_unique_local(),
+                core::net::IpAddr::V4(v4) => v4.is_private(),
+                core::net::IpAddr::V6(v6) => v6.is_unique_local(),
             }
         };
         let is_behind_nat = |pair: &IceCandidatePair| -> bool {
@@ -1962,7 +2297,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     if pairs_to_check.is_empty() {
         return;
     }
-    let mut checks = futures::stream::FuturesUnordered::new();
+        let mut checks = futures::stream::FuturesUnordered::new();
 
     for pair in pairs_to_check {
         let inner = inner.clone();
@@ -2002,7 +2337,8 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         return;
     }
 
-    use futures::stream::StreamExt;
+    #[cfg(feature = "std")]
+use futures::stream::StreamExt;
     let mut successful_pairs: Vec<IceCandidatePair> = Vec::new();
 
     // Collect successful pairs. Once the first usable pair arrives, only wait a
@@ -2016,10 +2352,12 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         let next = if successful_pairs.is_empty() {
             checks.next().await
         } else {
-            tokio::select! {
-                biased;
-                res = checks.next() => res,
-                _ = tokio::time::sleep(NOMINATION_GRACE) => break,
+            // checks arm polled first each wake (matches the old `biased;`).
+            let mut checks_fut = core::pin::pin!(checks.next());
+            let mut grace_fut = core::pin::pin!(crate::platform::task::sleep(NOMINATION_GRACE));
+            match crate::platform::select::select2(&mut checks_fut, &mut grace_fut).await {
+                crate::platform::select::Either::A(res) => res,
+                crate::platform::select::Either::B(_) => break,
             }
         };
 
@@ -2049,7 +2387,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     }
 
     // Sort by priority: host > srflx > relay.  P2P first, relay last.
-    successful_pairs.sort_by_key(|p| std::cmp::Reverse(p.priority(role)));
+    successful_pairs.sort_by_key(|p| core::cmp::Reverse(p.priority(role)));
 
     for p in &successful_pairs {
         debug!(
@@ -2100,11 +2438,14 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         // phase to a single nomination_timeout so a lossy link cannot multiply
         // the latency by the candidate count (which previously stalled setup
         // for N × nomination_timeout under high packet loss).
-        let nomination_deadline = tokio::time::Instant::now() + inner.config.nomination_timeout;
+        let nomination_start = crate::platform::time::Instant::now();
         let mut nominated_pair: Option<IceCandidatePair> = None;
         for (idx, pair) in successful_pairs.iter().enumerate() {
             // Always attempt the best pair; only bound the fallbacks.
-            if idx > 0 && tokio::time::Instant::now() >= nomination_deadline {
+            if idx > 0
+                && crate::platform::time::Instant::now().duration_since(nomination_start)
+                    >= inner.config.nomination_timeout
+            {
                 debug!("Nomination deadline reached before trying all candidate pairs");
                 break;
             }
@@ -2207,6 +2548,7 @@ fn resolve_socket(inner: &IceTransportInner, pair: &IceCandidatePair) -> Option<
         // when multiple sessions share a passive port range.
         let streams = inner.gatherer.tcp_streams.lock();
         for wrapper in streams.values() {
+            #[cfg(feature = "std")]
             if let IceSocketWrapper::TcpStream(_, _, peer) = wrapper
                 && *peer == pair.remote.address
             {
@@ -2241,15 +2583,20 @@ fn publish_selected_socket(
     // Inbound TCP is authoritative for passive ICE-TCP: the controlling peer
     // connected to us on this stream and nominated it via USE-CANDIDATE.
     let socket = match inbound {
+        #[cfg(feature = "std")]
         Some(s @ IceSocketWrapper::TcpStream(_, _, _)) => Some(s.clone()),
         _ => resolve_socket(inner, pair),
     };
     if let Some(socket) = socket {
+        #[cfg(feature = "std")]
+        let inbound_tcp = matches!(inbound, Some(IceSocketWrapper::TcpStream(_, _, _)));
+        #[cfg(not(feature = "std"))]
+        let inbound_tcp = false;
         debug!(
             pair_local = %pair.local.address,
             pair_remote = %pair.remote.address,
             socket = %socket.diag(),
-            inbound_tcp = matches!(inbound, Some(IceSocketWrapper::TcpStream(_, _, _))),
+            inbound_tcp,
             "ICE: published selected socket"
         );
         let _ = inner.selected_socket.send(Some(socket.clone()));
@@ -2270,7 +2617,7 @@ fn commit_verified_nomination(
 ) -> bool {
     if inner
         .nomination_generation
-        .load(std::sync::atomic::Ordering::SeqCst)
+        .load(core::sync::atomic::Ordering::SeqCst)
         != generation
     {
         return false;
@@ -2281,6 +2628,7 @@ fn commit_verified_nomination(
     true
 }
 
+#[cfg(feature = "std")]
 async fn complete_controlled_inbound_tcp_nomination(
     sender: &IceSocketWrapper,
     addr: SocketAddr,
@@ -2289,6 +2637,7 @@ async fn complete_controlled_inbound_tcp_nomination(
     if *inner.role.lock() != IceRole::Controlled {
         return;
     }
+    #[cfg(feature = "std")]
     let IceSocketWrapper::TcpStream(read, _, _) = sender else {
         return;
     };
@@ -2331,7 +2680,7 @@ async fn complete_controlled_inbound_tcp_nomination(
         // A TCP nomination supersedes any pending UDP path verification.
         inner
             .nomination_generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         *inner.selected_pair.lock() = Some(pair.clone());
         let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
         publish_selected_socket(&inner, &pair, Some(sender));
@@ -2414,7 +2763,7 @@ async fn bind_direct_rtcp_socket(
     inner: &IceTransportInner,
     rtp_base: SocketAddr,
     advertised_ip: IpAddr,
-) -> Result<(Arc<UdpSocket>, IceCandidate)> {
+) -> RtcResult<(Arc<UdpSocket>, IceCandidate)> {
     let rtcp_bind_addr = rtp_base
         .port()
         .checked_add(1)
@@ -2629,7 +2978,7 @@ async fn verify_nominated_path(
         return false;
     }
 
-    let verified = timeout(inner.config.stun_timeout, rx)
+    let verified = with_timeout(inner.config.stun_timeout, rx)
         .await
         .map(|res| res.is_ok())
         .unwrap_or(false);
@@ -2656,25 +3005,9 @@ async fn handle_stun_request(
         match sender.send_to(&bytes, addr).await {
             Ok(_) => trace!("Sent STUN Response to {}", addr),
             Err(e) => {
-                if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-                    match io_err.kind() {
-                        std::io::ErrorKind::HostUnreachable
-                        | std::io::ErrorKind::NetworkUnreachable => {
-                            debug!("Failed to send STUN Response to {}: {}", addr, e);
-                        }
-                        _ => {
-                            if io_err.raw_os_error() == Some(65)
-                                || io_err.raw_os_error() == Some(49)
-                            {
-                                debug!("Failed to send STUN Response to {}: {}", addr, e);
-                            } else {
-                                debug!("Failed to send STUN Response to {}: {}", addr, e);
-                            }
-                        }
-                    }
-                } else {
-                    debug!("Failed to send STUN Response to {}: {}", addr, e);
-                }
+                // send failures (incl. unreachable/err65/49) are logged and
+                // tolerated — STUN retransmits recover
+                debug!("Failed to send STUN Response to {}: {}", addr, e);
             }
         }
     } else {
@@ -2696,7 +3029,8 @@ async fn handle_stun_request(
     if !known {
         debug!("Discovered peer reflexive candidate: {}", addr);
         let transport = match sender {
-            IceSocketWrapper::Udp(_) | IceSocketWrapper::SharedUdp(_) => "udp",
+            IceSocketWrapper::Platform(_) | IceSocketWrapper::Udp(_) | IceSocketWrapper::SharedUdp(_) => "udp",
+            #[cfg(feature = "std")]
             IceSocketWrapper::TcpListener(_) | IceSocketWrapper::TcpStream(_, _, _) => "tcp",
             IceSocketWrapper::Turn(_, _) => "udp",
         };
@@ -2746,13 +3080,21 @@ async fn handle_stun_request(
         }
     }
 
+    #[cfg(feature = "std")]
     complete_controlled_inbound_tcp_nomination(sender, addr, inner.clone()).await;
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = (sender, &addr, &inner);
+    }
 
     if msg.use_candidate {
         let role = *inner.role.lock();
         if role == IceRole::Controlled {
             // TCP passive nomination is handled above; UDP still uses USE-CANDIDATE below.
+            #[cfg(feature = "std")]
             if matches!(sender, IceSocketWrapper::TcpStream(_, _, _)) {
+                #[allow(unused_mut, unused_variables)]
+                let sender = &sender;
                 return;
             }
             // A newer USE-CANDIDATE supersedes any pending path verification:
@@ -2761,7 +3103,7 @@ async fn handle_stun_request(
             // has since been superseded and must not move media (issue #55).
             let use_candidate_generation = inner
                 .nomination_generation
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .fetch_add(1, core::sync::atomic::Ordering::SeqCst)
                 + 1;
             // The controlling agent is authoritative, but "authoritative"
             // does not mean media should be diverted onto an unproven path.
@@ -2785,15 +3127,20 @@ async fn handle_stun_request(
             // failovers answer checks on the new path and converge within one
             // RTT; dead paths never respond and are ignored.
             let local_addr: SocketAddr = match sender {
+                IceSocketWrapper::Platform(s) => s
+                    .local_addr()
+                    .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
                 IceSocketWrapper::Udp(s) => s
                     .local_addr()
                     .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
                 IceSocketWrapper::SharedUdp(h) => h
                     .local_addr()
                     .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
+                #[cfg(feature = "std")]
                 IceSocketWrapper::TcpListener(l) => l
                     .local_addr()
                     .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
+                #[cfg(feature = "std")]
                 IceSocketWrapper::TcpStream(read, _, _) => {
                     let s = read.lock().await;
                     s.local_addr()
@@ -2863,7 +3210,7 @@ async fn handle_stun_request(
                     let inner2 = inner.clone();
                     let sender2 = sender.clone();
                     let pair2 = pair.clone();
-                    tokio::spawn(async move {
+                    crate::platform::task::spawn(async move {
                         let verified =
                             verify_nominated_path(&sender2, addr, inner2.clone()).await;
                         if !verified {
@@ -2906,7 +3253,7 @@ async fn handle_stun_request(
 }
 
 struct TransactionGuard<'a> {
-    map: &'a parking_lot::Mutex<HashMap<[u8; 12], oneshot::Sender<StunDecoded>>>,
+    map: &'a crate::platform::sync::Mutex<BTreeMap<[u8; 12], oneshot::Sender<StunDecoded>>>,
     tx_id: [u8; 12],
 }
 
@@ -2924,10 +3271,15 @@ async fn perform_binding_check(
     inner: &Arc<IceTransportInner>,
     role: IceRole,
     nominated: bool,
-) -> Result<()> {
+) -> RtcResult<()> {
     // Handle TCP candidates separately — establish connection and perform STUN over TCP
+    #[cfg(feature = "std")]
     if local.transport == "tcp" && remote.transport == "tcp" {
         return perform_tcp_binding_check(local, remote, inner, role, nominated).await;
+    }
+    #[cfg(not(feature = "std"))]
+    if local.transport == "tcp" && remote.transport == "tcp" {
+        return Err(RtcError::Internal("ICE-TCP is excluded from the embedded target".into()));
     }
 
     // For Controlled role with TCP passive candidates, don't initiate outbound checks
@@ -2937,13 +3289,13 @@ async fn perform_binding_check(
 
     // For non-TCP candidates, transport must be UDP
     if remote.transport != "udp" {
-        bail!("only UDP connectivity checks are supported");
+        return Err(RtcError::Internal(format!("only UDP connectivity checks are supported")));
     }
 
     let local_params = inner.local_parameters.lock().clone();
     let remote_params = match inner.remote_parameters.lock().clone() {
         Some(p) => p,
-        None => bail!("no remote params"),
+        None => return Err(RtcError::Internal(format!("no remote params"))),
     };
 
     let tx_id = random_bytes::<12>();
@@ -2995,7 +3347,7 @@ async fn perform_binding_check(
     if local.typ == IceCandidateType::Relay {
         let client = turn_client
             .as_ref()
-            .ok_or_else(|| anyhow!("TURN client not found for relay candidate"))?;
+            .ok_or_else(|| RtcError::Internal(format!("TURN client not found for relay candidate")))?;
 
         let (perm_bytes, perm_tx_id) = client.create_permission_packet(remote.address).await?;
 
@@ -3011,10 +3363,10 @@ async fn perform_binding_check(
             return Err(e);
         }
 
-        match timeout(inner.config.stun_timeout, perm_rx).await {
+        match with_timeout(inner.config.stun_timeout, perm_rx).await {
             Ok(Ok(msg)) => {
                 if msg.class == StunClass::ErrorResponse {
-                    bail!("CreatePermission failed: {:?}", msg.error_code);
+                    return Err(RtcError::Internal(format!("CreatePermission failed: {:?}", msg.error_code)));
                 }
 
                 // Try ChannelBind if not already bound
@@ -3034,7 +3386,7 @@ async fn perform_binding_check(
                         let inner_weak = Arc::downgrade(inner);
                         let timeout_dur = inner.config.stun_timeout;
 
-                        match timeout(timeout_dur, bind_rx).await {
+                        match with_timeout(timeout_dur, bind_rx).await {
                             Ok(Ok(msg)) => {
                                 if msg.class == StunClass::SuccessResponse {
                                     client_clone.add_channel(remote_addr, channel_num).await;
@@ -3054,11 +3406,11 @@ async fn perform_binding_check(
             _ => {
                 let mut map = inner.pending_transactions.lock();
                 map.remove(&perm_tx_id);
-                bail!("CreatePermission timeout");
+                return Err(RtcError::Internal(format!("CreatePermission timeout")));
             }
         }
     } else if socket.is_none() {
-        bail!("no socket found for local candidate");
+        return Err(RtcError::Internal(format!("no socket found for local candidate")));
     }
 
     let start = Instant::now();
@@ -3093,7 +3445,8 @@ async fn perform_binding_check(
                     return Err(e.into());
                 }
             };
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            #[cfg(feature = "std")]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut tcp_stream = tcp_stream;
             let mut framed = Vec::with_capacity(2 + bytes.len());
             let flen = bytes.len() as u16;
@@ -3101,13 +3454,13 @@ async fn perform_binding_check(
             framed.extend_from_slice(&bytes);
             tcp_stream.write_all(&framed).await?;
             // Read STUN response with TCP framing
-            match timeout(inner.config.stun_timeout, async {
+            match with_timeout(inner.config.stun_timeout, async {
                 let mut len_buf = [0u8; 2];
                 tcp_stream.read_exact(&mut len_buf).await?;
                 let resp_len = u16::from_be_bytes(len_buf) as usize;
                 let mut resp_buf = vec![0u8; resp_len];
                 tcp_stream.read_exact(&mut resp_buf).await?;
-                StunMessage::decode(&resp_buf).map_err(|e| anyhow!(e))
+                StunMessage::decode(&resp_buf).map_err(|e| RtcError::Internal(format!("stun decode: {e}")))
             })
             .await
             {
@@ -3115,20 +3468,31 @@ async fn perform_binding_check(
                     if parsed.class == StunClass::SuccessResponse {
                         return Ok(());
                     }
-                    return Err(anyhow!("TCP binding check failed: unexpected response"));
+                    return Err(RtcError::Internal(format!("TCP binding check failed: unexpected response")));
                 }
                 Ok(Err(e)) => return Err(e),
-                Err(_) => return Err(anyhow!("TCP binding check timeout")),
+                Err(_) => return Err(RtcError::Internal(format!("TCP binding check timeout"))),
             }
         } else if let Some(socket) = &socket
             && let Err(e) = socket.send_to(&bytes, remote.address).await
         {
-            let is_fatal = matches!(
-                e.kind(),
-                std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::NotConnected
-            );
+            // std inspects io::ErrorKind; no_std treats everything as
+            // transient (the Platform socket reports errors as text).
+            let is_fatal = {
+                #[cfg(feature = "std")]
+                {
+                    matches!(
+                        e.kind(),
+                        std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::NotConnected
+                    )
+                }
+                #[cfg(not(feature = "std"))]
+                {
+                    false
+                }
+            };
             if is_fatal {
                 debug!(
                     "socket.send_to {} fatal error, aborting nomination: {}",
@@ -3140,36 +3504,38 @@ async fn perform_binding_check(
             // Treat as a dropped send — wait for next RTO and retry.
         }
 
-        let timeout_fut = tokio::time::sleep(max_timeout.saturating_sub(start.elapsed()));
-        let rto_fut = tokio::time::sleep(rto);
+        let timeout_fut = crate::platform::task::sleep(max_timeout.saturating_sub(start.elapsed()));
+        let rto_fut = crate::platform::task::sleep(rto);
 
-        tokio::select! {
-            res = &mut rx => {
+        let mut timeout_fut = core::pin::pin!(timeout_fut);
+        let mut rto_fut = core::pin::pin!(rto_fut);
+        match crate::platform::select::select3(&mut rx, &mut timeout_fut, &mut rto_fut).await {
+            crate::platform::select::Which3::A(res) => {
                 let parsed = match res {
                     Ok(msg) => msg,
-                    Err(_) => bail!("channel closed"),
+                    Err(_) => return Err(RtcError::Internal(format!("channel closed"))),
                 };
 
                 if parsed.transaction_id != tx_id {
-                    bail!("binding response transaction mismatch");
+                    return Err(RtcError::Internal(format!("binding response transaction mismatch")));
                 }
                 if parsed.method != StunMethod::Binding {
-                    bail!("unexpected STUN method in binding response");
+                    return Err(RtcError::Internal(format!("unexpected STUN method in binding response")));
                 }
                 if parsed.class != StunClass::SuccessResponse {
-                    bail!("binding request failed");
+                    return Err(RtcError::Internal(format!("binding request failed")));
                 }
                 return Ok(());
             }
-            _ = timeout_fut => {
-                bail!("timeout");
+            crate::platform::select::Which3::B(_) => {
+                return Err(RtcError::Internal(format!("timeout")));
             }
-            _ = rto_fut => {
+            crate::platform::select::Which3::C(_) => {
                 if start.elapsed() >= max_timeout {
                     continue;
                 }
                 trace!("Retransmitting STUN Request to {} tx={:?}", remote.address, tx_id);
-                rto = std::cmp::min(rto * 2, Duration::from_millis(1600));
+                rto = core::cmp::min(rto * 2, Duration::from_millis(1600));
             }
         }
     }
@@ -3184,6 +3550,7 @@ async fn perform_binding_check(
 /// 4. Store the stream for later media use
 ///
 /// RFC 4571 STUN/TCP framing used by WebRTC (length prefix + message).
+#[cfg(feature = "std")]
 fn frame_stun_for_tcp(data: &[u8]) -> Vec<u8> {
     let len = data.len() as u16;
     let mut framed = Vec::with_capacity(2 + data.len());
@@ -3192,14 +3559,18 @@ fn frame_stun_for_tcp(data: &[u8]) -> Vec<u8> {
     framed
 }
 
+#[cfg(feature = "std")]
 type TcpReadHalf = tokio::net::tcp::OwnedReadHalf;
+#[cfg(feature = "std")]
 type TcpWriteHalf = tokio::net::tcp::OwnedWriteHalf;
 
+#[cfg(feature = "std")]
 fn split_tcp_stream(stream: TcpStream, peer: SocketAddr) -> IceSocketWrapper {
     if let Err(e) = stream.set_nodelay(true) {
         debug!("TCP set_nodelay failed: {}", e);
     }
     let (read, write) = stream.into_split();
+    #[cfg(feature = "std")]
     IceSocketWrapper::TcpStream(
         Arc::new(Mutex::new(read)),
         Arc::new(Mutex::new(write)),
@@ -3207,6 +3578,7 @@ fn split_tcp_stream(stream: TcpStream, peer: SocketAddr) -> IceSocketWrapper {
     )
 }
 
+#[cfg(feature = "std")]
 pub(crate) async fn attach_demuxed_tcp_stream(
     inner: Arc<IceTransportInner>,
     stream: TcpStream,
@@ -3223,7 +3595,8 @@ pub(crate) async fn attach_demuxed_tcp_stream(
     handle_packet(&first_packet, peer_addr, inner, wrapper, &mut marshal_buf).await;
 }
 
-pub(crate) async fn tcp_write_all(write: &Arc<Mutex<TcpWriteHalf>>, data: &[u8]) -> Result<()> {
+#[cfg(feature = "std")]
+pub(crate) async fn tcp_write_all(write: &Arc<Mutex<TcpWriteHalf>>, data: &[u8]) -> RtcResult<()> {
     let mut offset = 0;
     while offset < data.len() {
         let guard = write.lock().await;
@@ -3235,20 +3608,21 @@ pub(crate) async fn tcp_write_all(write: &Arc<Mutex<TcpWriteHalf>>, data: &[u8])
                     break;
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => guard.writable().await?,
-                Err(e) => return Err(anyhow!("TCP write failed: {}", e)),
+                Err(e) => return Err(RtcError::Internal(format!("TCP write failed: {}", e))),
             }
         }
     }
     Ok(())
 }
 
+#[cfg(feature = "std")]
 async fn perform_tcp_binding_check(
     local: &IceCandidate,
     remote: &IceCandidate,
     inner: &Arc<IceTransportInner>,
     role: IceRole,
     nominated: bool,
-) -> Result<()> {
+) -> RtcResult<()> {
     debug!(
         "perform_tcp_binding_check: {} -> {}",
         local.address, remote.address
@@ -3256,7 +3630,7 @@ async fn perform_tcp_binding_check(
     let local_params = inner.local_parameters.lock().clone();
     let remote_params = match inner.remote_parameters.lock().clone() {
         Some(p) => p,
-        None => bail!("no remote params"),
+        None => return Err(RtcError::Internal(format!("no remote params"))),
     };
 
     let tx_id = random_bytes::<12>();
@@ -3283,16 +3657,17 @@ async fn perform_tcp_binding_check(
 
     // Establish TCP connection to the remote peer
     let connect_timeout = inner.config.stun_timeout;
-    let stream = timeout(connect_timeout, TcpStream::connect(remote.address))
+    let stream = with_timeout(connect_timeout, TcpStream::connect(remote.address))
         .await
-        .map_err(|_| anyhow!("TCP connect timeout to {}", remote.address))?
-        .map_err(|e| anyhow!("TCP connect to {} failed: {}", remote.address, e))?;
+        .map_err(|_| RtcError::Internal(format!("TCP connect timeout to {}", remote.address)))?
+        .map_err(|e| RtcError::Internal(format!("TCP connect to {} failed: {}", remote.address, e)))?;
 
     let local_addr = stream.local_addr()?;
     let wrapper = split_tcp_stream(stream, remote.address);
     let write = match &wrapper {
+        #[cfg(feature = "std")]
         IceSocketWrapper::TcpStream(_, write, _) => write.clone(),
-        _ => bail!("split_tcp_stream invariant"),
+        _ => return Err(RtcError::Internal(format!("split_tcp_stream invariant"))),
     };
 
     // Register the TCP stream with the runner so its read loop handles incoming STUN responses
@@ -3313,6 +3688,7 @@ async fn perform_tcp_binding_check(
     // Send STUN binding request over TCP (RFC 4571 framed)
     {
         let framed = frame_stun_for_tcp(&bytes);
+        #[cfg(feature = "std")]
         tcp_write_all(&write, &framed).await?;
     }
 
@@ -3326,37 +3702,40 @@ async fn perform_tcp_binding_check(
     };
 
     loop {
-        let timeout_fut = tokio::time::sleep(max_timeout.saturating_sub(start.elapsed()));
-        let rto_fut = tokio::time::sleep(rto);
+        let timeout_fut = crate::platform::task::sleep(max_timeout.saturating_sub(start.elapsed()));
+        let rto_fut = crate::platform::task::sleep(rto);
 
-        tokio::select! {
-            res = &mut rx => {
+        let mut timeout_fut = core::pin::pin!(timeout_fut);
+        let mut rto_fut = core::pin::pin!(rto_fut);
+        match crate::platform::select::select3(&mut rx, &mut timeout_fut, &mut rto_fut).await {
+            crate::platform::select::Which3::A(res) => {
                 let parsed = match res {
                     Ok(msg) => msg,
-                    Err(_) => bail!("channel closed"),
+                    Err(_) => return Err(RtcError::Internal(format!("channel closed"))),
                 };
                 if parsed.transaction_id != tx_id {
-                    bail!("binding response transaction mismatch");
+                    return Err(RtcError::Internal(format!("binding response transaction mismatch")));
                 }
                 if parsed.method != StunMethod::Binding {
-                    bail!("unexpected STUN method in binding response");
+                    return Err(RtcError::Internal(format!("unexpected STUN method in binding response")));
                 }
                 if parsed.class != StunClass::SuccessResponse {
-                    bail!("binding request failed");
+                    return Err(RtcError::Internal(format!("binding request failed")));
                 }
                 return Ok(());
             }
-            _ = timeout_fut => {
-                bail!("timeout");
+            crate::platform::select::Which3::B(_) => {
+                return Err(RtcError::Internal(format!("timeout")));
             }
-            _ = rto_fut => {
+            crate::platform::select::Which3::C(_) => {
                 if start.elapsed() >= max_timeout {
                     continue;
                 }
                 trace!("TCP Retransmitting STUN Request to {} tx={:?}", remote.address, tx_id);
-                rto = std::cmp::min(rto * 2, Duration::from_millis(1600));
+                rto = core::cmp::min(rto * 2, Duration::from_millis(1600));
                 let framed = frame_stun_for_tcp(&bytes);
-                let _ = tcp_write_all(&write, &framed).await;
+                #[cfg(feature = "std")]
+        let _ = tcp_write_all(&write, &framed).await;
             }
         }
     }
@@ -3473,14 +3852,31 @@ pub struct IceCandidate {
 
 impl IceCandidate {
     fn compute_foundation(typ: IceCandidateType, base_addr: SocketAddr, transport: &str) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        typ.hash(&mut hasher);
-        base_addr.ip().hash(&mut hasher);
-        transport.hash(&mut hasher);
-        format!("{:x}", hasher.finish())
+        // FNV-1a 64-bit: deterministic across platforms (std's DefaultHasher
+        // is randomly seeded per process — wrong for a session-persistent
+        // candidate foundation anyway) and available under no_std.
+        fn fnv1a(parts: &[&[u8]]) -> u64 {
+            let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+            for part in parts {
+                for b in *part {
+                    hash ^= u64::from(*b);
+                    hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+                }
+                hash ^= 0xff; // part separator
+                hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+            }
+            hash
+        }
+        let typ_label = alloc::format!("{typ:?}");
+        let ip_label = base_addr.ip().to_string();
+        format!(
+            "{:x}",
+            fnv1a(&[
+                typ_label.as_bytes(),
+                ip_label.as_bytes(),
+                transport.as_bytes(),
+            ])
+        )
     }
 
     /// Set the TCP type on this candidate (for peer-reflexive discovery over TCP).
@@ -3640,10 +4036,10 @@ impl IceCandidate {
         parts.join(" ")
     }
 
-    pub fn from_sdp(sdp: &str) -> Result<Self> {
+    pub fn from_sdp(sdp: &str) -> RtcResult<Self> {
         let parts: Vec<&str> = sdp.split_whitespace().collect();
         if parts.len() < 8 {
-            bail!("invalid candidate");
+            return Err(RtcError::Internal(format!("invalid candidate")));
         }
         // Handle "candidate:" prefix if present (though usually it's the attribute key)
         let start_idx = 0;
@@ -3670,7 +4066,7 @@ impl IceCandidate {
             "srflx" => IceCandidateType::ServerReflexive,
             "prflx" => IceCandidateType::PeerReflexive,
             "relay" => IceCandidateType::Relay,
-            _ => bail!("unknown type"),
+            _ => return Err(RtcError::Internal(format!("unknown type"))),
         };
 
         // Parse optional tcptype attribute (RFC 6544)
@@ -3750,7 +4146,7 @@ impl IceCandidatePair {
             IceRole::Controlling => (g, d),
             IceRole::Controlled => (d, g),
         };
-        (1u64 << 32) * std::cmp::min(g, d) + 2 * std::cmp::max(g, d) + if g > d { 1 } else { 0 }
+        (1u64 << 32) * core::cmp::min(g, d) + 2 * core::cmp::max(g, d) + if g > d { 1 } else { 0 }
     }
 }
 
@@ -3810,7 +4206,7 @@ impl IceTransportBuilder {
         self
     }
 
-    pub fn build(self) -> (IceTransport, impl std::future::Future<Output = ()> + Send) {
+    pub fn build(self) -> (IceTransport, impl core::future::Future<Output = ()> + Send) {
         let mut config = self.config.clone();
         config.ice_servers.extend(self.servers);
         let (transport, runner) = IceTransport::new(config);
@@ -3824,49 +4220,53 @@ impl IceTransportBuilder {
 
 #[derive(Debug, Clone)]
 struct IceGatherer {
-    state: Arc<parking_lot::Mutex<IceGathererState>>,
-    local_candidates: Arc<parking_lot::Mutex<Vec<IceCandidate>>>,
-    sockets: Arc<parking_lot::Mutex<Vec<Arc<UdpSocket>>>>,
-    tcp_listeners: Arc<parking_lot::Mutex<Vec<Arc<TcpListener>>>>,
-    tcp_streams: Arc<parking_lot::Mutex<HashMap<SocketAddr, IceSocketWrapper>>>,
-    shared_tcp_regs: Arc<parking_lot::Mutex<Vec<shared_tcp::SharedTcpRegistration>>>,
-    shared_udp_regs: Arc<parking_lot::Mutex<Vec<shared_udp::SharedUdpRegistration>>>,
+    state: Arc<crate::platform::sync::Mutex<IceGathererState>>,
+    local_candidates: Arc<crate::platform::sync::Mutex<Vec<IceCandidate>>>,
+    sockets: Arc<crate::platform::sync::Mutex<Vec<Arc<UdpSocket>>>>,
+        #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    tcp_listeners: Arc<crate::platform::sync::Mutex<Vec<Arc<TcpListener>>>>,
+    tcp_streams: Arc<crate::platform::sync::Mutex<BTreeMap<SocketAddr, IceSocketWrapper>>>,
+    #[cfg(feature = "std")]
+    shared_tcp_regs: Arc<crate::platform::sync::Mutex<Vec<shared_tcp::SharedTcpRegistration>>>,
+    #[cfg(not(feature = "std"))]
+    shared_tcp_regs: Arc<crate::platform::sync::Mutex<Vec<SharedTcpRegistration>>>,
+    shared_udp_regs: Arc<crate::platform::sync::Mutex<Vec<shared_udp::SharedUdpRegistration>>>,
     /// The shared UDP mux socket wrapper (when `ice_udp_mux` is enabled).
     /// Stored so `resolve_socket` can return it for sending.
-    shared_udp_socket: Arc<parking_lot::Mutex<Option<IceSocketWrapper>>>,
-    transport_inner: Arc<parking_lot::Mutex<Option<std::sync::Weak<IceTransportInner>>>>,
-    turn_clients: Arc<parking_lot::Mutex<HashMap<SocketAddr, Arc<TurnClient>>>>,
-    upnp_mappers: Arc<parking_lot::Mutex<Vec<UpnpPortMapper>>>,
+    shared_udp_socket: Arc<crate::platform::sync::Mutex<Option<IceSocketWrapper>>>,
+    transport_inner: Arc<crate::platform::sync::Mutex<Option<alloc::sync::Weak<IceTransportInner>>>>,
+    turn_clients: Arc<crate::platform::sync::Mutex<BTreeMap<SocketAddr, Arc<TurnClient>>>>,
+        upnp_mappers: Arc<crate::platform::sync::Mutex<Vec<UpnpPortMapper>>>,
     config: RtcConfiguration,
     candidate_tx: broadcast::Sender<IceCandidate>,
-    socket_tx: tokio::sync::mpsc::UnboundedSender<IceSocketWrapper>,
+    socket_tx: crate::platform::sync::mpsc::UnboundedSender<IceSocketWrapper>,
 }
 
 impl IceGatherer {
     fn new(
         config: RtcConfiguration,
         candidate_tx: broadcast::Sender<IceCandidate>,
-        socket_tx: tokio::sync::mpsc::UnboundedSender<IceSocketWrapper>,
+        socket_tx: crate::platform::sync::mpsc::UnboundedSender<IceSocketWrapper>,
     ) -> Self {
         Self {
-            state: Arc::new(parking_lot::Mutex::new(IceGathererState::New)),
-            local_candidates: Arc::new(parking_lot::Mutex::new(Vec::new())),
-            sockets: Arc::new(parking_lot::Mutex::new(Vec::new())),
-            tcp_listeners: Arc::new(parking_lot::Mutex::new(Vec::new())),
-            tcp_streams: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            shared_tcp_regs: Arc::new(parking_lot::Mutex::new(Vec::new())),
-            shared_udp_regs: Arc::new(parking_lot::Mutex::new(Vec::new())),
-            shared_udp_socket: Arc::new(parking_lot::Mutex::new(None)),
-            transport_inner: Arc::new(parking_lot::Mutex::new(None)),
-            turn_clients: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            upnp_mappers: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            state: Arc::new(crate::platform::sync::Mutex::new(IceGathererState::New)),
+            local_candidates: Arc::new(crate::platform::sync::Mutex::new(Vec::new())),
+            sockets: Arc::new(crate::platform::sync::Mutex::new(Vec::new())),
+            tcp_listeners: Arc::new(crate::platform::sync::Mutex::new(Vec::new())),
+            tcp_streams: Arc::new(crate::platform::sync::Mutex::new(BTreeMap::new())),
+            shared_tcp_regs: Arc::new(crate::platform::sync::Mutex::new(Vec::new())),
+            shared_udp_regs: Arc::new(crate::platform::sync::Mutex::new(Vec::new())),
+            shared_udp_socket: Arc::new(crate::platform::sync::Mutex::new(None)),
+            transport_inner: Arc::new(crate::platform::sync::Mutex::new(None)),
+            turn_clients: Arc::new(crate::platform::sync::Mutex::new(BTreeMap::new())),
+            upnp_mappers: Arc::new(crate::platform::sync::Mutex::new(Vec::new())),
             config,
             candidate_tx,
             socket_tx,
         }
     }
 
-    fn set_transport(&self, inner: std::sync::Weak<IceTransportInner>) {
+    fn set_transport(&self, inner: alloc::sync::Weak<IceTransportInner>) {
         *self.transport_inner.lock() = Some(inner);
     }
 
@@ -3963,7 +4363,8 @@ impl IceGatherer {
 
     /// Get the UPnP mappers for manual cleanup
     #[allow(dead_code)]
-    pub fn upnp_mappers(&self) -> Arc<parking_lot::Mutex<Vec<UpnpPortMapper>>> {
+    #[cfg(feature = "std")]
+    pub fn upnp_mappers(&self) -> Arc<crate::platform::sync::Mutex<Vec<UpnpPortMapper>>> {
         self.upnp_mappers.clone()
     }
 
@@ -3984,6 +4385,7 @@ impl IceGatherer {
     /// Called periodically by the ICE runner so long-lived sessions keep their
     /// router leases alive. Each mapper renews its own stale mappings and a
     /// single failure does not abort the rest.
+    #[cfg(feature = "std")]
     pub async fn renew_upnp_mappings(&self) {
         let mappers = self.upnp_mappers.lock().clone();
         for mapper in mappers {
@@ -4001,13 +4403,13 @@ impl IceGatherer {
         self.local_candidates.lock().clone()
     }
 
-    async fn bind_socket(&self, ip: IpAddr) -> Result<UdpSocket> {
+    async fn bind_socket(&self, ip: IpAddr) -> RtcResult<UdpSocket> {
         if let (Some(start), Some(end)) = (self.config.rtp_start_port, self.config.rtp_end_port) {
             let start = start.saturating_add(start % 2);
             let end = end - (end % 2);
 
             if start > end {
-                bail!("No usable even RTP ports in range {}..={}", start, end);
+                return Err(RtcError::Internal(format!("No usable even RTP ports in range {}..={}", start, end)));
             }
 
             let port_count = (((end - start) / 2) + 1) as u64;
@@ -4023,7 +4425,7 @@ impl IceGatherer {
                         // not assigned to a local interface, permissions, ...)
                         // fails for every port in the range and must not be
                         // misreported as port exhaustion below.
-                        if e.kind() != std::io::ErrorKind::AddrInUse {
+                        if !e.to_string().contains("address in use") {
                             error!(
                                 label = self.config.label.as_deref().unwrap_or("-"),
                                 "binding RTP port {} on {} failed: {}",
@@ -4031,7 +4433,7 @@ impl IceGatherer {
                                 ip,
                                 e
                             );
-                            bail!("binding RTP port {} on {} failed: {}", port, ip, e);
+                            return Err(RtcError::Internal(format!("binding RTP port {} on {} failed: {}", port, ip, e)));
                         }
                         port = port.saturating_add(2);
                         if port > end {
@@ -4040,11 +4442,16 @@ impl IceGatherer {
                     }
                 }
             }
-            bail!("No available even RTP ports in range {}..={} (label={})", start, end, self.config.label.as_deref().unwrap_or("-"))
+            return Err(RtcError::Internal(format!(
+                "No available even RTP ports in range {}..={} (label={label})",
+                start,
+                end,
+                label = self.config.label.as_deref().unwrap_or("-")
+            )))
         } else {
             UdpSocket::bind(SocketAddr::new(ip, 0))
                 .await
-                .map_err(|e| anyhow!(e))
+                .map_err(|e| RtcError::Internal(format!("udp bind: {e}")))
         }
     }
 
@@ -4068,7 +4475,7 @@ impl IceGatherer {
             && let Ok(local) = handle.local_addr()
             && (local == addr || (local.ip().is_unspecified() && local.port() == addr.port()))
         {
-            return Some(handle.socket().clone());
+            return None; // mux socket is not a tokio-UdpSocket (Platform path owns it)
         }
         // Avoid unwrap in logging to prevent panic hiding
         let available: Vec<String> = self
@@ -4112,7 +4519,7 @@ impl IceGatherer {
     }
 
     #[instrument(skip(self))]
-    async fn gather(&self) -> Result<()> {
+    async fn gather(&self) -> RtcResult<()> {
         {
             let mut state = self.state.lock();
             if *state == IceGathererState::Complete {
@@ -4152,7 +4559,16 @@ impl IceGatherer {
 
         // TCP host candidate gathering
         if (self.config.tcp_port_range_start.is_some() || self.config.tcp_port_range_end.is_some())
-            && let Err(e) = self.gather_tcp_host_candidates().await
+            && let Err(e) = {
+                #[cfg(feature = "std")]
+                {
+                    self.gather_tcp_host_candidates().await
+                }
+                #[cfg(not(feature = "std"))]
+                {
+                    Ok::<(), RtcError>(())
+                }
+            }
         {
             debug!("TCP host gathering failed: {}", e);
         }
@@ -4163,7 +4579,7 @@ impl IceGatherer {
         // can never stall the whole gather — UPnP still runs and the
         // gather completes with whatever candidates arrived in time.
         let stun_public_ip = if self.config.enable_upnp {
-            timeout(
+            with_timeout(
                 Duration::from_secs(5),
                 self.gather_servers_and_get_public_ip(),
             )
@@ -4197,24 +4613,24 @@ impl IceGatherer {
     /// (single-port multiplexing). All PeerConnections sharing the same
     /// `ice_udp_mux_port` register their ufrag on the same socket; incoming
     /// packets are demuxed by ufrag / source address in `shared_udp`.
-    async fn gather_shared_udp_host_candidate(&self) -> Result<()> {
+    async fn gather_shared_udp_host_candidate(&self) -> RtcResult<()> {
         let port = self
             .config
             .ice_udp_mux_port
-            .ok_or_else(|| anyhow!("ice_udp_mux is enabled but ice_udp_mux_port is not set"))?;
+            .ok_or_else(|| RtcError::Internal(format!("ice_udp_mux is enabled but ice_udp_mux_port is not set")))?;
 
         let bind_ip = if let Some(bind_ip_str) = &self.config.bind_ip {
             bind_ip_str
                 .parse::<IpAddr>()
-                .with_context(|| format!("invalid bind_ip {}", bind_ip_str))?
+                .map_err(|e| RtcError::Internal(format!("invalid bind_ip {bind_ip_str}: {e}")))?
         } else {
             // Bind on the wildcard so the shared socket accepts on every
             // interface; the advertised candidate IP is rewritten below.
-            IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+            IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED)
         };
 
         if self.config.disable_ipv6 && bind_ip.is_ipv6() {
-            bail!("disable_ipv6 is set but bind_ip is IPv6");
+            return Err(RtcError::Internal(format!("disable_ipv6 is set but bind_ip is IPv6")));
         }
 
         let bind_addr = SocketAddr::new(bind_ip, port);
@@ -4224,10 +4640,14 @@ impl IceGatherer {
             .lock()
             .as_ref()
             .and_then(|weak| weak.upgrade())
-            .context("ICE transport unavailable during shared UDP gather")?;
+            .ok_or_else(|| {
+                RtcError::Internal("ICE transport unavailable during shared UDP gather".into())
+            })?;
         let ufrag = inner.local_parameters.lock().username_fragment.clone();
 
-        let (local_addr, handle, registration) = shared_udp::acquire(bind_addr, ufrag).await?;
+        let (local_addr, handle, registration) = shared_udp::acquire(bind_addr, ufrag)
+            .await
+            .map_err(|e| RtcError::Internal(format!("shared udp acquire: {e}")))?;
 
         self.shared_udp_regs.lock().push(registration);
 
@@ -4260,7 +4680,7 @@ impl IceGatherer {
         Ok(())
     }
 
-    async fn gather_host_candidates(&self) -> Result<()> {
+    async fn gather_host_candidates(&self) -> RtcResult<()> {
         let mut bind_ips = Vec::new();
 
         if let Some(bind_ip_str) = &self.config.bind_ip {
@@ -4274,17 +4694,19 @@ impl IceGatherer {
             if let Ok(ip) = get_local_ip() {
                 bind_ips.push(ip);
             } else {
-                bind_ips.push(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                bind_ips.push(IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED));
             }
         } else {
             // Default: bind to all LAN IPs. Loopback is only added on explicit
             // opt-in (`ice_include_loopback_candidates`) — advertising 127.0.0.1
             // to remote peers is useless and wastes their permissions/checks.
             if self.config.ice_include_loopback_candidates {
-                bind_ips.push(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+                bind_ips.push(IpAddr::V4(core::net::Ipv4Addr::LOCALHOST));
             }
 
+            #[cfg(feature = "std")]
             use local_ip_address::list_afinet_netifas;
+            #[cfg(feature = "std")]
             if let Ok(interfaces) = list_afinet_netifas() {
                 for (name, addr) in interfaces {
                     if let IpAddr::V4(ip) = addr
@@ -4374,7 +4796,9 @@ impl IceGatherer {
             }
         }
 
-        // Gather TCP host candidates if TCP is enabled
+        // Gather TCP host candidates if TCP is enabled (std-only:
+        // ICE-TCP is excluded from the embedded target)
+        #[cfg(feature = "std")]
         if self.config.ice_tcp_policy != crate::config::IceTcpPolicy::Disabled {
             for ip in &bind_ips {
                 let ip = *ip;
@@ -4383,6 +4807,7 @@ impl IceGatherer {
                         if let Ok(addr) = listener.local_addr() {
                             let listener = Arc::new(listener);
                             self.tcp_listeners.lock().push(listener.clone());
+                            #[cfg(feature = "std")]
                             let _ = self.socket_tx.send(IceSocketWrapper::TcpListener(listener));
 
                             let tcp_type = TcpType::Passive;
@@ -4415,8 +4840,8 @@ impl IceGatherer {
     /// Advertise ICE-TCP active host candidates for controlling clients (no UDP gather).
     ///
     /// RFC 6544 uses port 9 in SDP for active candidates (not 0 — browsers reject port 0).
-    async fn gather_tcp_active_candidates(&self) -> Result<()> {
-        use std::net::{IpAddr, Ipv4Addr};
+    async fn gather_tcp_active_candidates(&self) -> RtcResult<()> {
+        use core::net::{IpAddr, Ipv4Addr};
 
         const ACTIVE_PLACEHOLDER_PORT: u16 = 9;
 
@@ -4445,7 +4870,8 @@ impl IceGatherer {
         Ok(())
     }
 
-    async fn gather_tcp_host_candidates(&self) -> Result<()> {
+    #[cfg(feature = "std")]
+    async fn gather_tcp_host_candidates(&self) -> RtcResult<()> {
         let start = self.config.tcp_port_range_start.unwrap_or(0);
         let end = self.config.tcp_port_range_end.unwrap_or(0);
 
@@ -4462,9 +4888,11 @@ impl IceGatherer {
         } else {
             let mut ips = Vec::new();
             if self.config.ice_include_loopback_candidates {
-                ips.push(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+                ips.push(IpAddr::V4(core::net::Ipv4Addr::LOCALHOST));
             }
+            #[cfg(feature = "std")]
             use local_ip_address::list_afinet_netifas;
+            #[cfg(feature = "std")]
             if let Ok(interfaces) = list_afinet_netifas() {
                 for (name, addr) in interfaces {
                     if let IpAddr::V4(ip) = addr
@@ -4499,7 +4927,7 @@ impl IceGatherer {
                     .lock()
                     .as_ref()
                     .and_then(|weak| weak.upgrade())
-                    .context("ICE transport unavailable during TCP gather")?;
+                    .ok_or_else(|| RtcError::Internal("ICE transport unavailable during TCP gather".into()))?;
                 let ufrag = inner.local_parameters.lock().username_fragment.clone();
                 match shared_tcp::acquire(addr, ufrag, Arc::downgrade(&inner)).await {
                     Ok((local_addr, registration)) => {
@@ -4524,6 +4952,7 @@ impl IceGatherer {
                         };
                         let listener = Arc::new(listener);
                         self.tcp_listeners.lock().push(listener.clone());
+                        #[cfg(feature = "std")]
                         let _ = self.socket_tx.send(IceSocketWrapper::TcpListener(listener));
 
                         self.push_tcp_passive_candidate(local_addr, ip);
@@ -4537,7 +4966,7 @@ impl IceGatherer {
         Ok(())
     }
 
-    async fn gather_upnp_candidates(&self, stun_public_ip: Option<IpAddr>) -> Result<()> {
+    async fn gather_upnp_candidates(&self, stun_public_ip: Option<IpAddr>) -> RtcResult<()> {
         let sockets = self.sockets.lock().clone();
         let timeout = self.config.upnp_discovery_timeout;
         let mut tasks = FuturesUnordered::new();
@@ -4627,7 +5056,7 @@ impl IceGatherer {
         Ok(())
     }
 
-    async fn gather_servers(&self) -> Result<()> {
+    async fn gather_servers(&self) -> RtcResult<()> {
         let mut tasks = FuturesUnordered::new();
 
         for server in &self.config.ice_servers {
@@ -4683,8 +5112,8 @@ impl IceGatherer {
     /// This is used to detect and fix double-NAT scenarios for UPnP.
     async fn gather_servers_and_get_public_ip(&self) -> Option<IpAddr> {
         let mut tasks = FuturesUnordered::new();
-        let public_ip: Arc<parking_lot::Mutex<Option<IpAddr>>> =
-            Arc::new(parking_lot::Mutex::new(None));
+        let public_ip: Arc<crate::platform::sync::Mutex<Option<IpAddr>>> =
+            Arc::new(crate::platform::sync::Mutex::new(None));
 
         for server in &self.config.ice_servers {
             for url in &server.urls {
@@ -4751,7 +5180,7 @@ impl IceGatherer {
         ip
     }
 
-    async fn probe_stun(&self, uri: &IceServerUri) -> Result<Option<IceCandidate>> {
+    async fn probe_stun(&self, uri: &IceServerUri) -> RtcResult<Option<IceCandidate>> {
         let addr = uri.resolve(self.config.disable_ipv6).await?;
 
         // Find a suitable host address to bind to (prefer non-loopback IPv4).
@@ -4773,9 +5202,9 @@ impl IceGatherer {
             }
         };
         let fallback = if addr.is_ipv6() {
-            IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+            IpAddr::V6(core::net::Ipv6Addr::UNSPECIFIED)
         } else {
-            IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))
+            IpAddr::V4(core::net::Ipv4Addr::new(0, 0, 0, 0))
         };
         let bind_ip = self
             .local_candidates
@@ -4796,7 +5225,9 @@ impl IceGatherer {
         let bytes = message.encode(None, true)?;
         socket.send_to(&bytes, addr).await?;
         let mut buf = [0u8; MAX_STUN_MESSAGE];
-        let (len, from) = timeout(self.config.stun_timeout, socket.recv_from(&mut buf)).await??;
+        let (len, from) = with_timeout(self.config.stun_timeout, socket.recv_from(&mut buf))
+            .await
+            .map_err(|_| RtcError::Internal("stun recv timeout".into()))??;
         if from.ip() != addr.ip() {
             return Ok(None);
         }
@@ -4814,7 +5245,7 @@ impl IceGatherer {
         &self,
         uri: &IceServerUri,
         server: &IceServer,
-    ) -> Result<Option<IceCandidate>> {
+    ) -> RtcResult<Option<IceCandidate>> {
         let credentials = TurnCredentials::from_server(server)?;
         let client = TurnClient::connect(uri, self.config.disable_ipv6).await?;
         let allocation = client.allocate(credentials).await?;
@@ -4880,16 +5311,16 @@ pub(crate) struct IceServerUri {
 }
 
 impl IceServerUri {
-    fn parse(input: &str) -> Result<Self> {
+    fn parse(input: &str) -> RtcResult<Self> {
         let (scheme, rest) = input
             .split_once(':')
-            .ok_or_else(|| anyhow!("missing scheme"))?;
+            .ok_or_else(|| RtcError::Internal(format!("missing scheme")))?;
         let (host_part, query) = match rest.split_once('?') {
             Some(parts) => parts,
             None => (rest, ""),
         };
         let (host, port) = if let Some((h, p)) = host_part.rsplit_once(':') {
-            let port = p.parse::<u16>().context("invalid port")?;
+            let port = p.parse::<u16>().map_err(|e| RtcError::Internal(format!("invalid port: {e}")))?;
             (h.to_string(), port)
         } else {
             (host_part.to_string(), default_port_for_scheme(scheme)?)
@@ -4903,18 +5334,18 @@ impl IceServerUri {
                     transport = match v.to_ascii_lowercase().as_str() {
                         "udp" => IceTransportProtocol::Udp,
                         "tcp" => IceTransportProtocol::Tcp,
-                        other => bail!("unsupported transport {}", other),
+                        other => return Err(RtcError::Internal(format!("unsupported transport {}", other))),
                     };
                 }
             }
         }
         if scheme.starts_with("stun") && query.contains("transport") {
-            bail!("stun URI must not include transport parameter");
+            return Err(RtcError::Internal(format!("stun URI must not include transport parameter")));
         }
         let kind = match scheme {
             "stun" | "stuns" => IceUriKind::Stun,
             "turn" | "turns" => IceUriKind::Turn,
-            other => bail!("unsupported scheme {}", other),
+            other => return Err(RtcError::Internal(format!("unsupported scheme {}", other))),
         };
         Ok(Self {
             kind,
@@ -4924,11 +5355,14 @@ impl IceServerUri {
         })
     }
 
-    async fn resolve(&self, disable_ipv6: bool) -> Result<SocketAddr> {
+    async fn resolve(&self, disable_ipv6: bool) -> RtcResult<SocketAddr> {
         let target = format!("{}:{}", self.host, self.port);
-        let addrs = timeout(Duration::from_secs(5), lookup_host(&target))
-            .await
-            .map_err(|_| anyhow!("DNS lookup timed out for {}", target))??;
+        let addrs = with_timeout(
+            Duration::from_secs(5),
+            crate::platform::dns::lookup_host(&target),
+        )
+        .await
+        .map_err(|_| RtcError::Internal(format!("DNS lookup timed out for {}", target)))??;
 
         for addr in addrs {
             if disable_ipv6 && addr.is_ipv6() {
@@ -4936,11 +5370,10 @@ impl IceServerUri {
             }
             return Ok(addr);
         }
-        Err(anyhow!(
-            "{} unresolved (disable_ipv6={})",
+        Err(RtcError::Internal(format!("{} unresolved (disable_ipv6={})",
             self.host,
             disable_ipv6
-        ))
+        )))
     }
 }
 
@@ -4965,19 +5398,19 @@ impl IceTransportProtocol {
     }
 }
 
-fn default_port_for_scheme(scheme: &str) -> Result<u16> {
+fn default_port_for_scheme(scheme: &str) -> RtcResult<u16> {
     Ok(match scheme {
         "stun" | "turn" => 3478,
         "stuns" | "turns" => 5349,
-        other => bail!("unsupported scheme {}", other),
+        other => return Err(RtcError::Internal(format!("unsupported scheme {}", other))),
     })
 }
 
-fn default_transport_for_scheme(scheme: &str) -> Result<IceTransportProtocol> {
+fn default_transport_for_scheme(scheme: &str) -> RtcResult<IceTransportProtocol> {
     Ok(match scheme {
         "stun" | "turn" => IceTransportProtocol::Udp,
         "stuns" | "turns" => IceTransportProtocol::Tcp,
-        other => bail!("unsupported scheme {}", other),
+        other => return Err(RtcError::Internal(format!("unsupported scheme {}", other))),
     })
 }
 
@@ -5003,7 +5436,7 @@ fn is_private_ip(ip: &IpAddr) -> bool {
                 // IPv6 link-local fe80::/10
                 || ipv6.segments()[0] & 0xffc0 == 0xfe80
                 // IPv6 loopback ::1
-                || *ipv6 == std::net::Ipv6Addr::LOCALHOST
+                || *ipv6 == core::net::Ipv6Addr::LOCALHOST
         }
     }
 }
@@ -5018,14 +5451,19 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum IceSocketWrapper {
+    Platform(Arc<dyn crate::platform::net::UdpSocket>),
+    /// std: the tokio UDP socket; no_std: never constructed (the placeholder
+    /// type keeps the enum shape).
     Udp(Arc<UdpSocket>),
     /// Shared (muxed) UDP socket. Incoming packets arrive via the handle's
     /// receiver (fed by the shared demux loop); outbound packets go out through
     /// the handle, which also records the destination for reverse routing.
     SharedUdp(Arc<shared_udp::SharedUdpHandle>),
+    #[cfg(feature = "std")]
     TcpListener(Arc<TcpListener>),
+    #[cfg(feature = "std")]
     TcpStream(
         Arc<Mutex<TcpReadHalf>>,
         Arc<Mutex<TcpWriteHalf>>,
@@ -5034,10 +5472,22 @@ pub enum IceSocketWrapper {
     Turn(Arc<TurnClient>, SocketAddr),
 }
 
+impl core::fmt::Debug for IceSocketWrapper {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.diag())
+    }
+}
+
 impl IceSocketWrapper {
     /// Short description for diagnostic logs (no async I/O).
     pub fn diag(&self) -> String {
         match self {
+            IceSocketWrapper::Platform(s) => format!(
+                "platform-udp:{}",
+                s.local_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|_| "?".into())
+            ),
             IceSocketWrapper::Udp(s) => format!(
                 "udp:{}",
                 s.local_addr()
@@ -5050,12 +5500,14 @@ impl IceSocketWrapper {
                     .map(|a| a.to_string())
                     .unwrap_or_else(|_| "?".into())
             ),
+            #[cfg(feature = "std")]
             IceSocketWrapper::TcpListener(l) => format!(
                 "tcp-listen:{}",
                 l.local_addr()
                     .map(|a| a.to_string())
                     .unwrap_or_else(|_| "?".into())
             ),
+            #[cfg(feature = "std")]
             IceSocketWrapper::TcpStream(_, _, peer) => format!("tcp-stream:peer={peer}"),
             IceSocketWrapper::Turn(_, addr) => format!("turn:{addr}"),
         }
@@ -5064,7 +5516,7 @@ impl IceSocketWrapper {
     /// Non-blocking variant of `send_to`: calls `try_send_to` once and returns
     /// immediately on `WouldBlock` / `ENOBUFS` instead of parking on
     /// `writable()`. Used by the RTP bridge fast-path.
-    pub fn try_send_to(&self, data: &[u8], addr: SocketAddr) -> Result<usize> {
+    pub fn try_send_to(&self, data: &[u8], addr: SocketAddr) -> RtcResult<usize> {
         match self {
             IceSocketWrapper::Udp(s) => match s.try_send_to(data, addr) {
                 Ok(len) => Ok(len),
@@ -5073,35 +5525,42 @@ impl IceSocketWrapper {
                         Ok(local) => format!("UDP {} -> {} failed: {}", local, addr, e),
                         Err(_) => format!("UDP -> {} failed: {}", addr, e),
                     };
-                    Err(anyhow!(reason))
+                    Err(RtcError::Internal(reason))
                 }
             },
+            #[cfg(not(feature = "std"))]
+            IceSocketWrapper::Udp(_) => {
+                unimplemented!("direct UDP sockets are std-only")
+            }
             IceSocketWrapper::SharedUdp(h) => {
                 // Shared (muxed) UDP is still a synchronous datagram socket:
                 // record the peer for reverse routing, then write without
                 // parking (same contract as the `Udp` arm above).
                 h.register_peer(addr);
-                match h.socket().try_send_to(data, addr) {
+                match <dyn crate::platform::net::UdpSocket>::try_send_to(h.socket().as_ref(), data, addr) {
                     Ok(len) => Ok(len),
                     Err(e) => {
                         let reason = match h.local_addr() {
                             Ok(local) => format!("shared UDP {} -> {} failed: {}", local, addr, e),
                             Err(_) => format!("shared UDP -> {} failed: {}", addr, e),
                         };
-                        Err(anyhow!(reason))
+                        Err(RtcError::Internal(reason))
                     }
                 }
             }
             // TURN / TCP / TLS have no synchronous send: callers must use the
             // async `send_to` (the bridge fast-path queues via `IceConn`).
-            _ => Err(anyhow::anyhow!(
-                "IceSocketWrapper::try_send_to not supported for this transport variant"
-            )),
+            _ => Err(RtcError::Internal(format!("IceSocketWrapper::try_send_to not supported for this transport variant"))),
         }
     }
 
-    pub async fn send_to(&self, data: &[u8], addr: SocketAddr) -> Result<usize> {
+    pub async fn send_to(&self, data: &[u8], addr: SocketAddr) -> RtcResult<usize> {
         match self {
+            IceSocketWrapper::Platform(s) => s
+                .send_to(data, addr)
+                .await
+                .map_err(|e| RtcError::Internal(format!("platform send_to: {e}"))),
+            #[cfg(feature = "std")]
             IceSocketWrapper::Udp(s) => loop {
                 match s.try_send_to(data, addr) {
                     Ok(len) => return Ok(len),
@@ -5116,22 +5575,28 @@ impl IceSocketWrapper {
                             s.writable().await?;
                             continue;
                         }
-                        let reason = anyhow!("UDP {} -> {} failed: {}", s.local_addr()?, addr, e);
+                        let reason = RtcError::Internal(format!("UDP {} -> {} failed: {}", s.local_addr()?, addr, e));
                         return Err(reason);
                     }
                 }
             },
+            #[cfg(not(feature = "std"))]
+            IceSocketWrapper::Udp(_) => {
+                unimplemented!("direct UDP sockets are std-only")
+            }
             IceSocketWrapper::SharedUdp(h) => {
                 let dest = addr;
-                h.send_to(data, dest).await.map_err(anyhow::Error::from)
+                h.send_to(data, dest).await.map_err(RtcError::from)
             }
+            #[cfg(feature = "std")]
             IceSocketWrapper::TcpListener(_) => {
-                bail!("send_to not supported on TcpListener")
+                return Err(RtcError::Internal(format!("send_to not supported on TcpListener")))
             }
+            #[cfg(feature = "std")]
             IceSocketWrapper::TcpStream(_, write, _) => {
                 let len = data.len();
                 if len > 0xFFFF {
-                    bail!("STUN message too large for TCP framing");
+                    return Err(RtcError::Internal(format!("STUN message too large for TCP framing")));
                 }
                 let header = (len as u16).to_be_bytes();
                 let mut framed = Vec::with_capacity(2 + len);
@@ -5151,46 +5616,45 @@ impl IceSocketWrapper {
         }
     }
 
-    pub async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+    pub async fn recv_from(&self, buf: &mut [u8]) -> RtcResult<(usize, SocketAddr)> {
         match self {
+            IceSocketWrapper::Platform(s) => s.recv_from(buf).await.map_err(|e| e.into()),
             IceSocketWrapper::Udp(s) => s.recv_from(buf).await.map_err(|e| e.into()),
             IceSocketWrapper::SharedUdp(h) => match h.recv().await {
                 Some((data, addr)) => {
                     if data.len() > buf.len() {
-                        return Err(anyhow::anyhow!(
+                        return Err(RtcError::Internal(format!(
                             "shared UDP packet too large: {} > {}",
                             data.len(),
                             buf.len()
-                        ));
+                        )));
                     }
                     let len = data.len();
                     buf[..len].copy_from_slice(&data);
                     Ok((len, addr))
                 }
-                None => Err(anyhow::anyhow!("shared UDP channel closed")),
+                None => Err(RtcError::Internal(format!("shared UDP channel closed"))),
             },
+            #[cfg(feature = "std")]
             IceSocketWrapper::TcpStream(read, _, peer) => {
-                use tokio::io::AsyncReadExt;
+                #[cfg(feature = "std")]
+use tokio::io::AsyncReadExt;
                 let mut stream = read.lock().await;
                 let mut len_buf = [0u8; 2];
                 stream.read_exact(&mut len_buf).await?;
                 let len = u16::from_be_bytes(len_buf) as usize;
                 if len > buf.len() {
-                    return Err(anyhow::anyhow!(
-                        "TCP STUN message too large: {} > {}",
+                    return Err(RtcError::Internal(format!("TCP STUN message too large: {} > {}",
                         len,
-                        buf.len()
+                        buf.len())
                     ));
                 }
                 stream.read_exact(&mut buf[..len]).await?;
                 Ok((len, *peer))
             }
-            IceSocketWrapper::TcpListener(_) => Err(anyhow::anyhow!(
-                "recv_from not supported on TcpListener wrapper directly"
-            )),
-            IceSocketWrapper::Turn(_, _) => Err(anyhow::anyhow!(
-                "recv_from not supported on TURN wrapper directly"
-            )),
+            #[cfg(feature = "std")]
+            IceSocketWrapper::TcpListener(_) => Err(RtcError::Internal(format!("recv_from not supported on TcpListener wrapper directly"))),
+            IceSocketWrapper::Turn(_, _) => Err(RtcError::Internal(format!("recv_from not supported on TURN wrapper directly"))),
         }
     }
 }

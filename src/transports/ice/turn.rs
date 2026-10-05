@@ -1,21 +1,25 @@
-use anyhow::{Result, anyhow, bail};
+use crate::prelude::*;
+use crate::errors::{RtcError, RtcResult};
 use md5::{Digest as Md5Digest, Md5};
-use parking_lot::Mutex as SyncMutex;
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use crate::platform::sync::Mutex as SyncMutex;
+use alloc::collections::BTreeMap;
+use core::net::SocketAddr;
+use alloc::sync::Arc;
+#[cfg(feature = "std")] // TURN-TCP mode is excluded from the embedded target
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(feature = "std")]
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::Mutex;
-use tokio::time::timeout;
+#[cfg(feature = "std")]
+use tokio::net::TcpStream;
+use crate::platform::sync::AsyncMutex as Mutex;
+use crate::platform::time::with_timeout as timeout;
 
 use super::stun::{StunAttribute, StunClass, StunMessage, StunMethod, random_bytes};
 use super::{IceServerUri, IceTransportProtocol, MAX_STUN_MESSAGE};
 use crate::{IceCredentialType, IceServer};
 
 pub const DEFAULT_TURN_LIFETIME: u32 = 600;
-pub const DEFAULT_STUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+pub const DEFAULT_STUN_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(3);
 
 #[derive(Debug, Clone)]
 pub(crate) struct TurnCredentials {
@@ -24,18 +28,18 @@ pub(crate) struct TurnCredentials {
 }
 
 impl TurnCredentials {
-    pub fn from_server(server: &IceServer) -> Result<Self> {
+    pub fn from_server(server: &IceServer) -> RtcResult<Self> {
         if server.credential_type != IceCredentialType::Password {
-            bail!("only password credentials supported for TURN");
+            return Err(RtcError::Internal(format!("only password credentials supported for TURN")));
         }
         let username = server
             .username
             .clone()
-            .ok_or_else(|| anyhow!("TURN server missing username"))?;
+            .ok_or_else(|| RtcError::Internal(format!("TURN server missing username")))?;
         let password = server
             .credential
             .clone()
-            .ok_or_else(|| anyhow!("TURN server missing credential"))?;
+            .ok_or_else(|| RtcError::Internal(format!("TURN server missing credential")))?;
         Ok(Self { username, password })
     }
 }
@@ -44,8 +48,8 @@ impl TurnCredentials {
 pub struct TurnClient {
     transport: TurnTransport,
     auth: SyncMutex<Option<TurnAuthState>>,
-    channels: Mutex<HashMap<SocketAddr, u16>>,
-    channel_map: Mutex<HashMap<u16, SocketAddr>>,
+    channels: Mutex<BTreeMap<SocketAddr, u16>>,
+    channel_map: Mutex<BTreeMap<u16, SocketAddr>>,
     next_channel: Mutex<u16>,
 }
 
@@ -86,46 +90,60 @@ impl TurnAuthState {
 }
 
 impl TurnClient {
-    pub(crate) async fn connect(uri: &IceServerUri, disable_ipv6: bool) -> Result<Self> {
+    pub(crate) async fn connect(uri: &IceServerUri, disable_ipv6: bool) -> RtcResult<Self> {
         let addr = timeout(DEFAULT_STUN_TIMEOUT, uri.resolve(disable_ipv6))
             .await
-            .map_err(|_| anyhow::anyhow!("TURN server DNS resolution timed out"))??;
+            .map_err(|_| RtcError::Internal(format!("TURN server DNS resolution timed out")))??;
         let transport = match uri.transport {
             IceTransportProtocol::Udp => {
-                let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+                #[cfg(feature = "std")]
+                let socket: Arc<dyn crate::platform::net::UdpSocket> = {
+                    let sock = tokio::net::UdpSocket::bind("0.0.0.0:0")
+                        .await
+                        .map_err(|e| RtcError::Internal(format!("turn bind: {e}")))?;
+                    Arc::new(crate::platform::net::tokio_impl::TokioUdpSocket::new(sock))
+                };
+                #[cfg(not(feature = "std"))]
+                let socket: Arc<dyn crate::platform::net::UdpSocket> =
+                    unimplemented!("no_std TURN socket injection (WP3)");
                 TurnTransport::Udp {
                     socket,
                     server: addr,
                 }
             }
+            #[cfg(feature = "std")]
             IceTransportProtocol::Tcp => {
                 let stream = timeout(DEFAULT_STUN_TIMEOUT, TcpStream::connect(addr))
                     .await
-                    .map_err(|_| anyhow::anyhow!("TURN TCP connect to {} timed out", addr))??;
+                    .map_err(|_| RtcError::Internal(format!("TURN TCP connect to {} timed out", addr)))??;
                 let (read, write) = stream.into_split();
                 TurnTransport::Tcp {
                     read: Arc::new(Mutex::new(read)),
                     write: Arc::new(Mutex::new(write)),
                 }
             }
+            #[cfg(not(feature = "std"))]
+            IceTransportProtocol::Tcp => {
+                unimplemented!("TURN-TCP is excluded from the embedded target")
+            }
         };
         Ok(Self {
             transport,
             auth: SyncMutex::new(None),
-            channels: Mutex::new(HashMap::new()),
-            channel_map: Mutex::new(HashMap::new()),
+            channels: Mutex::new(BTreeMap::new()),
+            channel_map: Mutex::new(BTreeMap::new()),
             next_channel: Mutex::new(0x4000),
         })
     }
 
-    pub(crate) async fn allocate(&self, creds: TurnCredentials) -> Result<TurnAllocation> {
+    pub(crate) async fn allocate(&self, creds: TurnCredentials) -> RtcResult<TurnAllocation> {
         *self.auth.lock() = None;
         let mut nonce_info: Option<TurnNonce> = None;
         let mut attempt = 0;
         loop {
             attempt += 1;
             if attempt > 3 {
-                bail!("TURN allocation failed after retries");
+                return Err(RtcError::Internal(format!("TURN allocation failed after retries")));
             }
             let tx_id = random_bytes::<12>();
             let attrs = vec![
@@ -153,7 +171,7 @@ impl TurnClient {
                 continue;
             }
             if parsed.method != StunMethod::Allocate {
-                bail!("unexpected STUN method in allocate response");
+                return Err(RtcError::Internal(format!("unexpected STUN method in allocate response")));
             }
             match parsed.class {
                 StunClass::SuccessResponse => {
@@ -177,30 +195,30 @@ impl TurnClient {
                             lifetime_secs: granted_lifetime,
                         });
                     }
-                    bail!("TURN success without relayed address");
+                    return Err(RtcError::Internal(format!("TURN success without relayed address")));
                 }
                 StunClass::ErrorResponse => {
                     if parsed.error_code == Some(401) || parsed.error_code == Some(438) {
                         let realm = parsed
                             .realm
                             .clone()
-                            .ok_or_else(|| anyhow!("TURN error missing realm"))?;
+                            .ok_or_else(|| RtcError::Internal(format!("TURN error missing realm")))?;
                         let nonce = parsed
                             .nonce
                             .clone()
-                            .ok_or_else(|| anyhow!("TURN error missing nonce"))?;
+                            .ok_or_else(|| RtcError::Internal(format!("TURN error missing nonce")))?;
                         nonce_info = Some(TurnNonce { realm, nonce });
                         continue;
                     }
-                    bail!("TURN allocate error {}", parsed.error_code.unwrap_or(0));
+                    return Err(RtcError::Internal(format!("TURN allocate error {}", parsed.error_code.unwrap_or(0))));
                 }
-                _ => bail!("unexpected TURN response class"),
+                _ => return Err(RtcError::Internal(format!("unexpected TURN response class"))),
             }
         }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) async fn create_permission(&self, peer: SocketAddr) -> Result<()> {
+    pub(crate) async fn create_permission(&self, peer: SocketAddr) -> RtcResult<()> {
         const MAX_ATTEMPTS: usize = 3;
         for _ in 0..MAX_ATTEMPTS {
             let tx_id = random_bytes::<12>();
@@ -208,7 +226,7 @@ impl TurnClient {
                 let auth_guard = self.auth.lock();
                 let auth = auth_guard
                     .as_ref()
-                    .ok_or_else(|| anyhow!("TURN allocation missing auth context"))?;
+                    .ok_or_else(|| RtcError::Internal(format!("TURN allocation missing auth context")))?;
                 let mut attributes = vec![StunAttribute::Username(auth.username.clone())];
                 attributes.push(StunAttribute::Realm(auth.realm.clone()));
                 attributes.push(StunAttribute::Nonce(auth.nonce.clone()));
@@ -229,7 +247,7 @@ impl TurnClient {
                 continue;
             }
             if parsed.method != StunMethod::CreatePermission {
-                bail!("unexpected STUN method in create-permission response");
+                return Err(RtcError::Internal(format!("unexpected STUN method in create-permission response")));
             }
             match parsed.class {
                 StunClass::SuccessResponse => return Ok(()),
@@ -238,33 +256,31 @@ impl TurnClient {
                         let realm = parsed
                             .realm
                             .clone()
-                            .ok_or_else(|| anyhow!("TURN error missing realm"))?;
+                            .ok_or_else(|| RtcError::Internal(format!("TURN error missing realm")))?;
                         let nonce = parsed
                             .nonce
                             .clone()
-                            .ok_or_else(|| anyhow!("TURN error missing nonce"))?;
+                            .ok_or_else(|| RtcError::Internal(format!("TURN error missing nonce")))?;
                         if let Some(state) = self.auth.lock().as_mut() {
                             state.update_nonce(realm, nonce);
                         }
                         continue;
                     }
-                    bail!(
-                        "TURN create-permission error {}",
-                        parsed.error_code.unwrap_or(0)
+                    return Err(RtcError::Internal(format!("TURN create-permission error {}", parsed.error_code.unwrap_or(0)))
                     );
                 }
-                _ => bail!("unexpected TURN response class"),
+                _ => return Err(RtcError::Internal(format!("unexpected TURN response class"))),
             }
         }
-        bail!("TURN create-permission failed after retries");
+        return Err(RtcError::Internal(format!("TURN create-permission failed after retries")));
     }
 
-    pub(crate) async fn create_refresh_packet(&self) -> Result<(Vec<u8>, [u8; 12])> {
+    pub(crate) async fn create_refresh_packet(&self) -> RtcResult<(Vec<u8>, [u8; 12])> {
         let tx_id = random_bytes::<12>();
         let auth_guard = self.auth.lock();
         let auth = auth_guard
             .as_ref()
-            .ok_or_else(|| anyhow!("TURN refresh: no auth context"))?;
+            .ok_or_else(|| RtcError::Internal(format!("TURN refresh: no auth context")))?;
 
         let attributes = vec![
             StunAttribute::Lifetime(DEFAULT_TURN_LIFETIME),
@@ -287,15 +303,15 @@ impl TurnClient {
     /// allocation (RFC 5766 §7.4 "Destroying an Allocation"). The server
     /// releases the allocation upon receipt of the request; the success
     /// response (which carries LIFETIME=0) is purely informational.
-    pub(crate) fn create_destroy_packet_sync(&self) -> Result<(Vec<u8>, [u8; 12])> {
+    pub(crate) fn create_destroy_packet_sync(&self) -> RtcResult<(Vec<u8>, [u8; 12])> {
         let tx_id = random_bytes::<12>();
         let guard = self
             .auth
             .try_lock()
-            .ok_or_else(|| anyhow!("TURN destroy: auth mutex busy"))?;
+            .ok_or_else(|| RtcError::Internal(format!("TURN destroy: auth mutex busy")))?;
         let auth = guard
             .as_ref()
-            .ok_or_else(|| anyhow!("TURN destroy: no auth context"))?;
+            .ok_or_else(|| RtcError::Internal(format!("TURN destroy: no auth context")))?;
 
         let attributes = vec![
             StunAttribute::Lifetime(0),
@@ -326,11 +342,12 @@ impl TurnClient {
         self.channels.lock().await.keys().cloned().collect()
     }
 
-    pub(crate) async fn send(&self, data: &[u8]) -> Result<()> {
+    pub(crate) async fn send(&self, data: &[u8]) -> RtcResult<()> {
         match &self.transport {
             TurnTransport::Udp { socket, server } => {
                 socket.send_to(data, *server).await?;
             }
+            #[cfg(feature = "std")]
             TurnTransport::Tcp { write, .. } => {
                 let mut frame = Vec::with_capacity(2 + data.len());
                 frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
@@ -350,16 +367,23 @@ impl TurnClient {
                 let _ = socket.try_send_to(data, *server);
                 true
             }
+            #[cfg(feature = "std")]
             TurnTransport::Tcp { .. } => false,
+            #[cfg(not(feature = "std"))]
+            _ => false,
         }
     }
 
-    pub(crate) async fn recv(&self, buf: &mut [u8]) -> Result<usize> {
+    pub(crate) async fn recv(&self, buf: &mut [u8]) -> RtcResult<usize> {
         match &self.transport {
             TurnTransport::Udp { socket, .. } => {
-                let (len, _) = timeout(DEFAULT_STUN_TIMEOUT, socket.recv_from(buf)).await??;
+                let (len, _) = timeout(DEFAULT_STUN_TIMEOUT, socket.recv_from(buf))
+                .await
+                .map_err(|_| RtcError::Internal("timeout".into()))?
+                .map_err(RtcError::from)?;
                 Ok(len)
             }
+            #[cfg(feature = "std")]
             TurnTransport::Tcp { read, .. } => {
                 let mut header = [0u8; 2];
                 let mut stream = read.lock().await;
@@ -369,7 +393,7 @@ impl TurnClient {
                 while offset < len {
                     let read = stream.read(&mut buf[offset..len]).await?;
                     if read == 0 {
-                        bail!("TURN TCP stream closed");
+                        return Err(RtcError::Internal(format!("TURN TCP stream closed")));
                     }
                     offset += read;
                 }
@@ -378,7 +402,7 @@ impl TurnClient {
         }
     }
 
-    pub(crate) async fn send_indication(&self, peer: SocketAddr, data: &[u8]) -> Result<()> {
+    pub(crate) async fn send_indication(&self, peer: SocketAddr, data: &[u8]) -> RtcResult<()> {
         let tx_id = random_bytes::<12>();
         let mut attributes = vec![StunAttribute::XorPeerAddress(peer)];
         attributes.push(StunAttribute::Data(data.to_vec()));
@@ -415,10 +439,10 @@ impl TurnClient {
     pub(crate) async fn create_permission_packet(
         &self,
         peer: SocketAddr,
-    ) -> Result<(Vec<u8>, [u8; 12])> {
+    ) -> RtcResult<(Vec<u8>, [u8; 12])> {
         let tx_id = random_bytes::<12>();
         let auth_guard = self.auth.lock();
-        let auth = auth_guard.as_ref().ok_or_else(|| anyhow!("no auth"))?;
+        let auth = auth_guard.as_ref().ok_or_else(|| RtcError::Internal(format!("no auth")))?;
 
         let mut attributes = vec![StunAttribute::Username(auth.username.clone())];
         attributes.push(StunAttribute::Realm(auth.realm.clone()));
@@ -438,7 +462,7 @@ impl TurnClient {
     pub(crate) async fn create_channel_bind_packet(
         &self,
         peer: SocketAddr,
-    ) -> Result<(Vec<u8>, [u8; 12], u16)> {
+    ) -> RtcResult<(Vec<u8>, [u8; 12], u16)> {
         // Allocate new channel number
         let channel_number = {
             let mut next = self.next_channel.lock().await;
@@ -453,7 +477,7 @@ impl TurnClient {
 
         let tx_id = random_bytes::<12>();
         let auth_guard = self.auth.lock();
-        let auth = auth_guard.as_ref().ok_or_else(|| anyhow!("no auth"))?;
+        let auth = auth_guard.as_ref().ok_or_else(|| RtcError::Internal(format!("no auth")))?;
 
         let attributes = vec![
             StunAttribute::ChannelNumber(channel_number),
@@ -477,10 +501,10 @@ impl TurnClient {
         &self,
         peer: SocketAddr,
         channel_number: u16,
-    ) -> Result<(Vec<u8>, [u8; 12])> {
+    ) -> RtcResult<(Vec<u8>, [u8; 12])> {
         let tx_id = random_bytes::<12>();
         let auth_guard = self.auth.lock();
-        let auth = auth_guard.as_ref().ok_or_else(|| anyhow!("no auth"))?;
+        let auth = auth_guard.as_ref().ok_or_else(|| RtcError::Internal(format!("no auth")))?;
 
         let attributes = vec![
             StunAttribute::ChannelNumber(channel_number),
@@ -517,7 +541,7 @@ impl TurnClient {
         channel_map.get(&channel).copied()
     }
 
-    pub(crate) async fn send_channel_data(&self, channel: u16, data: &[u8]) -> Result<()> {
+    pub(crate) async fn send_channel_data(&self, channel: u16, data: &[u8]) -> RtcResult<()> {
         // ChannelData:
         // 0-1: Channel Number
         // 2-3: Length
@@ -555,17 +579,20 @@ impl TurnTransport {
     fn protocol(&self) -> IceTransportProtocol {
         match self {
             TurnTransport::Udp { .. } => IceTransportProtocol::Udp,
+            #[cfg(feature = "std")]
             TurnTransport::Tcp { .. } => IceTransportProtocol::Tcp,
+            #[cfg(not(feature = "std"))]
+            _ => IceTransportProtocol::Udp,
         }
     }
 }
 
-#[derive(Debug, Clone)]
 enum TurnTransport {
     Udp {
-        socket: Arc<UdpSocket>,
+        socket: Arc<dyn crate::platform::net::UdpSocket>,
         server: SocketAddr,
     },
+    #[cfg(feature = "std")]
     Tcp {
         read: Arc<Mutex<OwnedReadHalf>>,
         write: Arc<Mutex<OwnedWriteHalf>>,
@@ -584,4 +611,32 @@ fn md5_digest(input: &[u8]) -> [u8; 16] {
     let mut out = [0u8; 16];
     out.copy_from_slice(&result);
     out
+}
+
+impl core::fmt::Debug for TurnTransport {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            TurnTransport::Udp { server, .. } => {
+                f.debug_struct("TurnTransport::Udp").field("server", server).finish()
+            }
+            #[cfg(feature = "std")]
+            TurnTransport::Tcp { .. } => f.write_str("TurnTransport::Tcp"),
+        }
+    }
+}
+
+impl Clone for TurnTransport {
+    fn clone(&self) -> Self {
+        match self {
+            TurnTransport::Udp { socket, server } => TurnTransport::Udp {
+                socket: socket.clone(),
+                server: server.clone(),
+            },
+            #[cfg(feature = "std")]
+            TurnTransport::Tcp { read, write } => TurnTransport::Tcp {
+                read: read.clone(),
+                write: write.clone(),
+            },
+        }
+    }
 }

@@ -169,7 +169,7 @@ async fn read_tcp_framed_packet(stream: &mut TcpStream) -> Result<Vec<u8>> {
         .context("read TCP STUN frame length")?;
     let len = u16::from_be_bytes(len_buf) as usize;
     if len == 0 || len > MAX_STUN_MESSAGE {
-        bail!("invalid TCP STUN frame length {len}");
+        return Err(anyhow!("invalid TCP STUN frame length {len}"));
     }
     let mut buf = vec![0u8; len];
     stream
@@ -181,23 +181,8 @@ async fn read_tcp_framed_packet(stream: &mut TcpStream) -> Result<Vec<u8>> {
 
 /// USERNAME on an inbound Binding request is `peer-ufrag:own-ufrag` from the sender.
 /// For a browser connecting to our passive listener, peer-ufrag is our local ufrag.
-pub(crate) fn peer_ufrag_from_binding_request(data: &[u8]) -> Option<String> {
-    // Cheap header classification (Binding method + Request class) instead of a
-    // full attribute decode — this runs on every STUN packet in the mux path.
-    if data.len() < 20 {
-        return None;
-    }
-    let msg_type = u16::from_be_bytes([data[0], data[1]]);
-    let is_binding = (msg_type & 0x3EEF) == 0x0001;
-    let is_request = (msg_type & 0x0110) == 0x0000;
-    if !is_binding || !is_request {
-        return None;
-    }
-    let username = username_from_stun_bytes(data)?;
-    let (peer, _own) = username.split_once(':')?;
-    Some(peer.to_string())
-}
-
+// NOTE: duplicated from shared_udp (which is no_std-graduated; this
+// module is std-gated). Pure parsing helpers — keep in sync.
 pub(crate) fn username_from_stun_bytes(bytes: &[u8]) -> Option<String> {
     if bytes.len() < 20 {
         return None;
@@ -222,6 +207,23 @@ pub(crate) fn username_from_stun_bytes(bytes: &[u8]) -> Option<String> {
         offset += (4 - (len % 4)) % 4;
     }
     None
+}
+
+pub(crate) fn peer_ufrag_from_binding_request(data: &[u8]) -> Option<String> {
+    // Cheap header classification (Binding method + Request class) instead of a
+    // full attribute decode — this runs on every STUN packet in the mux path.
+    if data.len() < 20 {
+        return None;
+    }
+    let msg_type = u16::from_be_bytes([data[0], data[1]]);
+    let is_binding = (msg_type & 0x3EEF) == 0x0001;
+    let is_request = (msg_type & 0x0110) == 0x0000;
+    if !is_binding || !is_request {
+        return None;
+    }
+    let username = username_from_stun_bytes(data)?;
+    let (peer, _own) = username.split_once(':')?;
+    Some(peer.to_string())
 }
 
 #[cfg(test)]

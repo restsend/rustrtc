@@ -1,10 +1,11 @@
+use crate::prelude::*;
+#[cfg(feature = "std")]
+#[cfg(feature = "std")]
 use crate::config::RtcConfiguration;
 use crate::errors::{SdpError, SdpResult};
 use serde::{Deserialize, Serialize};
-use std::{
-    fmt::{self, Write},
-    str::FromStr,
-};
+use core::fmt::{self, Write};
+use core::str::FromStr;
 
 pub const ABS_SEND_TIME_URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time";
 pub const SDES_MID_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
@@ -269,6 +270,7 @@ impl SessionDescription {
     }
 
     /// Extracts all video capabilities from all video media sections.
+    #[cfg(feature = "std")]
     pub fn to_video_capabilities(&self) -> Vec<crate::config::VideoCapability> {
         self.video_sections()
             .flat_map(|s| s.to_video_capabilities())
@@ -276,6 +278,7 @@ impl SessionDescription {
     }
 
     /// Extracts all audio capabilities from all audio media sections.
+    #[cfg(feature = "std")]
     pub fn to_audio_capabilities(&self) -> Vec<crate::config::AudioCapability> {
         self.audio_sections()
             .flat_map(|s| s.to_audio_capabilities())
@@ -283,6 +286,7 @@ impl SessionDescription {
     }
 
     /// Extracts all T.38 fax capabilities from all image media sections.
+    #[cfg(feature = "std")]
     pub fn to_image_capabilities(&self) -> Vec<crate::config::T38Capability> {
         self.image_sections()
             .flat_map(|s| s.to_image_capabilities())
@@ -814,6 +818,7 @@ impl MediaSection {
         None
     }
 
+    #[cfg(feature = "std")]
     pub fn to_video_capabilities(&self) -> Vec<crate::config::VideoCapability> {
         if self.kind != MediaKind::Video {
             return Vec::new();
@@ -933,6 +938,7 @@ impl MediaSection {
         capabilities
     }
 
+    #[cfg(feature = "std")]
     pub fn to_audio_capabilities(&self) -> Vec<crate::config::AudioCapability> {
         if self.kind != MediaKind::Audio {
             return Vec::new();
@@ -1035,6 +1041,7 @@ impl MediaSection {
         capabilities
     }
 
+    #[cfg(feature = "std")]
     pub fn apply_config(&mut self, config: &RtcConfiguration) {
         match self.kind {
             MediaKind::Audio => self.apply_audio_config(config),
@@ -1044,6 +1051,7 @@ impl MediaSection {
         }
     }
 
+    #[cfg(feature = "std")]
     fn apply_audio_config(&mut self, config: &RtcConfiguration) {
         let default_caps = crate::config::AudioCapability::default();
         let caps = if let Some(c) = &config.media_capabilities {
@@ -1092,6 +1100,7 @@ impl MediaSection {
         }
     }
 
+    #[cfg(feature = "std")]
     fn apply_video_config(&mut self, config: &RtcConfiguration) {
         let default_caps = crate::config::VideoCapability::default();
         let caps = if let Some(c) = &config.media_capabilities {
@@ -1142,6 +1151,7 @@ impl MediaSection {
         }
     }
 
+    #[cfg(feature = "std")]
     fn apply_application_config(&mut self, config: &RtcConfiguration) {
         let default_caps = crate::config::ApplicationCapability::default();
         let port = if let Some(caps) = &config.media_capabilities {
@@ -1160,6 +1170,7 @@ impl MediaSection {
             .push(Attribute::new("sctp-port", Some(port.to_string())));
     }
 
+    #[cfg(feature = "std")]
     pub fn to_image_capabilities(&self) -> Vec<crate::config::T38Capability> {
         if self.kind != MediaKind::Image {
             return Vec::new();
@@ -1232,6 +1243,7 @@ impl MediaSection {
         capabilities
     }
 
+    #[cfg(feature = "std")]
     fn apply_image_config(&mut self, config: &RtcConfiguration) {
         let default_caps = crate::config::T38Capability::default();
         let caps = if let Some(c) = &config.media_capabilities {

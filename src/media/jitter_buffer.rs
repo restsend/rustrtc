@@ -1,6 +1,9 @@
+#[cfg_attr(feature = "std", allow(unused_imports))]
+use crate::prelude::*;
 use crate::media::frame::MediaSample;
-use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use alloc::collections::BTreeMap;
+use core::time::Duration;
+use crate::platform::time::Instant;
 
 #[derive(Debug)]
 struct BufferedSample {
@@ -332,7 +335,7 @@ mod tests {
     use crate::media::frame::AudioFrame;
     use crate::rtp::{RtpHeader, RtpPacket};
     use bytes::Bytes;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     fn make_sample(seq: u16) -> MediaSample {
         MediaSample::Audio(AudioFrame {

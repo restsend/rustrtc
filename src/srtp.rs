@@ -1,5 +1,7 @@
+use crate::prelude::*;
 use crate::{
     errors::{SrtpError, SrtpResult},
+    platform::time::Instant,
     rtp::{RtpHeader, RtpPacket},
 };
 use aes::Aes128;
@@ -11,9 +13,8 @@ use bytes::BytesMut;
 use ctr::cipher::{InnerIvInit, StreamCipher};
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
-use std::fmt;
+use alloc::collections::btree_map::Entry;
+use core::fmt;
 
 type Aes128Ctr = ctr::Ctr128BE<Aes128>;
 type HmacSha1 = Hmac<Sha1>;
@@ -145,8 +146,8 @@ pub struct SrtpSession {
     profile: SrtpProfile,
     tx_keying: SrtpKeyingMaterial,
     rx_keying: SrtpKeyingMaterial,
-    tx_contexts: HashMap<u32, SrtpContext>,
-    rx_contexts: HashMap<u32, SrtpContext>,
+    tx_contexts: BTreeMap<u32, SrtpContext>,
+    rx_contexts: BTreeMap<u32, SrtpContext>,
     /// MKI negotiated from the SDES `a=crypto` attributes.
     mki: MkiParams,
     /// Adaptive inbound MKI mode for SRTCP (session-wide: one RTCP remote per
@@ -162,7 +163,7 @@ const SSRC_CONTEXT_HIGH_WATERMARK: usize = 32;
 /// Inactivity threshold after which an SRTP context is considered stale and
 /// eligible for eviction. A real media SSRC silent this long has almost
 /// certainly ended (or rotated), so dropping its ROC state is safe.
-const SSRC_INACTIVITY_EVICT: std::time::Duration = std::time::Duration::from_secs(60);
+const SSRC_INACTIVITY_EVICT: core::time::Duration = core::time::Duration::from_secs(60);
 
 impl SrtpSession {
     pub fn new(
@@ -174,8 +175,8 @@ impl SrtpSession {
             profile,
             tx_keying,
             rx_keying,
-            tx_contexts: HashMap::new(),
-            rx_contexts: HashMap::new(),
+            tx_contexts: BTreeMap::new(),
+            rx_contexts: BTreeMap::new(),
             mki: MkiParams::default(),
             rtcp_rx_mki_active: None,
         })
@@ -244,7 +245,7 @@ impl SrtpSession {
                 e.insert(ctx)
             }
         };
-        ctx.last_used = std::time::Instant::now();
+        ctx.last_used = Instant::now();
         ctx.protect(packet, output)
     }
 
@@ -265,7 +266,7 @@ impl SrtpSession {
                 e.insert(ctx)
             }
         };
-        ctx.last_used = std::time::Instant::now();
+        ctx.last_used = Instant::now();
         ctx.unprotect(packet)
     }
 
@@ -290,7 +291,7 @@ impl SrtpSession {
                 e.insert(ctx)
             }
         };
-        ctx.last_used = std::time::Instant::now();
+        ctx.last_used = Instant::now();
         ctx.protect_rtcp(packet)
     }
 
@@ -316,7 +317,7 @@ impl SrtpSession {
                 e.insert(ctx)
             }
         };
-        ctx.last_used = std::time::Instant::now();
+        ctx.last_used = Instant::now();
 
         // Adaptive inbound MKI, mirroring the RTP path: some deployed stacks
         // advertise `|...|1:1` in SDP but never send the MKI field, so try the
@@ -367,7 +368,7 @@ impl SrtpSession {
         if self.tx_contexts.len() <= SSRC_CONTEXT_HIGH_WATERMARK {
             return;
         }
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         self.tx_contexts.retain(|s, c| {
             *s == keep_ssrc || now.duration_since(c.last_used) < SSRC_INACTIVITY_EVICT
         });
@@ -378,7 +379,7 @@ impl SrtpSession {
         if self.rx_contexts.len() <= SSRC_CONTEXT_HIGH_WATERMARK {
             return;
         }
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         self.rx_contexts.retain(|s, c| {
             *s == keep_ssrc || now.duration_since(c.last_used) < SSRC_INACTIVITY_EVICT
         });
@@ -418,7 +419,7 @@ pub struct SrtpContext {
     /// Wall-clock time of the most recent protect/unprotect call, used to evict
     /// contexts for SSRCs that have gone away (prevents unbounded growth as
     /// SSRCs churn across a long call / relay).
-    last_used: std::time::Instant,
+    last_used: Instant,
     /// Negotiated MKI handling (RFC 4568/RFC 3711): outbound MKI bytes are
     /// appended on protect; inbound packets are expected to carry an MKI of
     /// `mki.rx_len()` octets before the auth tag.
@@ -514,7 +515,7 @@ impl SrtpContext {
             last_sequence: None,
             rtcp_index: 0,
             auth_scratch: Vec::new(),
-            last_used: std::time::Instant::now(),
+            last_used: Instant::now(),
             mki: MkiParams::default(),
             rx_mki_active: None,
         })

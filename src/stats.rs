@@ -1,10 +1,15 @@
+use crate::prelude::*;
+#[cfg(feature = "std")]
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::BTreeMap, sync::Arc, time::SystemTime};
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
+use crate::platform::time::Instant;
 
 use crate::errors::RtcResult;
 
+#[cfg(feature = "std")]
 pub type DynProvider = dyn StatsProvider + Send + Sync + 'static;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -30,11 +35,11 @@ pub enum StatsKind {
     Custom(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct StatsEntry {
     pub id: StatsId,
     pub kind: StatsKind,
-    pub timestamp: SystemTime,
+    pub timestamp: Instant,
     pub values: BTreeMap<String, Value>,
 }
 
@@ -43,7 +48,7 @@ impl StatsEntry {
         Self {
             id,
             kind,
-            timestamp: SystemTime::now(),
+            timestamp: Instant::now(),
             values: BTreeMap::new(),
         }
     }
@@ -54,8 +59,8 @@ impl StatsEntry {
     }
 }
 
-impl std::fmt::Display for StatsEntry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for StatsEntry {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "[{:?}/{}]", self.kind, self.id.0)?;
         for (k, v) in &self.values {
             // Attempt to display strings without quotes for cleaner logs, fallback to standard display
@@ -69,16 +74,16 @@ impl std::fmt::Display for StatsEntry {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct StatsReport {
-    pub collected_at: SystemTime,
+    pub collected_at: Instant,
     pub entries: Vec<StatsEntry>,
 }
 
 impl StatsReport {
     pub fn new(entries: Vec<StatsEntry>) -> Self {
         Self {
-            collected_at: SystemTime::now(),
+            collected_at: Instant::now(),
             entries,
         }
     }
@@ -90,8 +95,8 @@ impl StatsReport {
     }
 }
 
-impl std::fmt::Display for StatsReport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for StatsReport {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "StatsReport(len={})", self.entries.len())?;
         for entry in &self.entries {
             write!(f, " {}", entry)?;
@@ -100,11 +105,16 @@ impl std::fmt::Display for StatsReport {
     }
 }
 
+// The provider trait lives behind `std`: async_trait pulls a std crate and
+// its implementors (IceConn, StatsCollector) are std-side anyway. The plain
+// stats structs above stay available to the no_std data plane.
+#[cfg(feature = "std")]
 #[async_trait]
 pub trait StatsProvider: Send + Sync {
     async fn collect(&self) -> RtcResult<Vec<StatsEntry>>;
 }
 
+#[cfg(feature = "std")]
 pub async fn gather_once(providers: &[Arc<DynProvider>]) -> RtcResult<StatsReport> {
     let mut entries = Vec::new();
     for provider in providers {

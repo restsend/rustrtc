@@ -452,24 +452,12 @@ impl DtlsInner {
         if let Some(records) = &ctx.last_flight_records
             && let Err(e) = self.conn.send_dtls_record_batch(records).await
         {
-            let msg = format!("{:?}", e);
+            let msg = e.to_string();
             if msg.contains("No selected socket") || msg.contains("Remote address not set") {
                 debug!("Retransmission skipped — ICE socket unavailable");
-            } else if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-                match io_err.kind() {
-                    std::io::ErrorKind::HostUnreachable
-                    | std::io::ErrorKind::NetworkUnreachable => {
-                        debug!("Retransmission failed: {}", e);
-                    }
-                    _ => {
-                        if io_err.raw_os_error() == Some(65) {
-                            debug!("Retransmission failed: {}", e);
-                        } else {
-                            debug!("Retransmission failed: {}", e);
-                        }
-                    }
-                }
             } else {
+                // all remaining failures (incl. unreachable/err65) are
+                // retransmit-tolerant: log and keep the handshake alive
                 debug!("Retransmission failed: {}", e);
             }
         }
@@ -932,23 +920,8 @@ impl DtlsInner {
             if let Some(records) = &ctx.last_flight_records
                 && let Err(e) = self.conn.send_dtls_record_batch(records).await
             {
-                if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-                    match io_err.kind() {
-                        std::io::ErrorKind::HostUnreachable
-                        | std::io::ErrorKind::NetworkUnreachable => {
-                            debug!("Failed to retransmit flight: {}", e);
-                        }
-                        _ => {
-                            if io_err.raw_os_error() == Some(65) {
-                                debug!("Failed to retransmit flight: {}", e);
-                            } else {
-                                warn!("Failed to retransmit flight: {}", e);
-                            }
-                        }
-                    }
-                } else {
-                    warn!("Failed to retransmit flight: {}", e);
-                }
+                // retransmit-tolerant: all failures (incl. unreachable/err65)
+                debug!("Failed to retransmit flight: {}", e);
             }
             return Ok(());
         }
@@ -2050,24 +2023,19 @@ impl DtlsInner {
         let buf =
             self.build_handshake_record(msg, epoch, sequence_number, session_keys, is_client)?;
         if let Err(e) = self.conn.send(&buf).await {
-            if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-                match io_err.kind() {
-                    std::io::ErrorKind::HostUnreachable
-                    | std::io::ErrorKind::NetworkUnreachable => {
-                        debug!("Failed to send DTLS record: {}", e);
-                    }
-                    _ => {
-                        if io_err.raw_os_error() == Some(65) {
-                            debug!("Failed to send DTLS record: {}", e);
-                        } else {
-                            warn!("Failed to send DTLS record: {}", e);
-                        }
-                    }
-                }
+            // IceConn::send now returns RtcError (no_std-graduated); the
+            // io::ErrorKind distinction is preserved textually for the
+            // transient/unreachable cases (macOS err65 included).
+            let text = e.to_string();
+            if text.contains("unreachable")
+                || text.contains("No selected socket")
+                || text.contains("Remote address not set")
+            {
+                debug!("Failed to send DTLS record: {}", e);
             } else {
                 warn!("Failed to send DTLS record: {}", e);
             }
-            return Err(e);
+            return Err(anyhow::Error::from(e));
         }
 
         Ok(buf.to_vec())

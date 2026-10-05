@@ -1,7 +1,8 @@
-use std::cell::UnsafeCell;
-use std::mem::MaybeUninit;
-use std::ops::Deref;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use crate::prelude::*;
+use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
+use core::ops::Deref;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Pad a value to fill a full cache line (64 bytes on x86_64/aarch64).
 ///
@@ -158,7 +159,7 @@ mod tests {
     #[test]
     fn head_and_tail_are_cache_line_separated() {
         use super::CachePadded;
-        use std::sync::atomic::AtomicUsize;
+        use core::sync::atomic::AtomicUsize;
         // Each padded atomic must occupy exactly one 64-byte cache line so the
         // producer's `tail` and consumer's `head` cannot false-share.
         assert_eq!(std::mem::size_of::<CachePadded<AtomicUsize>>(), 64);

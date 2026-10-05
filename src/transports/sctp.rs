@@ -5919,7 +5919,7 @@ mod tests {
         );
     }
 
-    /// Test RTO backoff is capped at 4s (FIX验证)
+    /// Test RTO backoff is capped at 4s (fix verification)
     #[tokio::test]
     async fn test_rto_backoff_capped_at_10s() {
         let (socket_tx, _) = tokio::sync::watch::channel(None);
@@ -5986,7 +5986,7 @@ mod tests {
             let rto = sctp.inner.rto_state.lock().rto;
             println!("✓ Iteration {}: RTO = {:.1}s", i + 1, rto);
 
-            // FIX验证: After several backoffs, RTO should be capped at 4s
+            // fix verification: after several backoffs, RTO should be capped at 4s
             if i >= 3 {
                 assert!(rto <= 4.1, "RTO should be capped at 4s but got {:.1}s", rto);
             }
@@ -6003,7 +6003,7 @@ mod tests {
         println!("✅ FIX VERIFIED: RTO backoff properly capped at 4s");
     }
 
-    /// Test peer_rwnd=0 doesn't increment error_count (FIX验证)
+    /// Test peer_rwnd=0 doesn't increment error_count (fix verification)
     #[tokio::test]
     async fn test_peer_rwnd_zero_doesnt_increment_error_count() {
         let (socket_tx, _) = tokio::sync::watch::channel(None);
@@ -6076,7 +6076,7 @@ mod tests {
 
         let final_error_count = sctp.inner.association_error_count.load(Ordering::SeqCst);
 
-        // FIX验证: Error count should NOT have increased because peer_rwnd=0
+        // fix verification: error count should NOT have increased because peer_rwnd=0
         assert_eq!(
             final_error_count, 5,
             "Error count should remain at 5 when peer_rwnd=0, got {}",
@@ -6086,7 +6086,7 @@ mod tests {
         println!("✅ FIX VERIFIED: peer_rwnd=0 doesn't increment error_count");
     }
 
-    /// Test Gap ACK error_count reduction works correctly (FIX验证)
+    /// Test Gap ACK error_count reduction works correctly (fix verification)
     #[tokio::test]
     async fn test_gap_ack_reduces_error_count_correctly() {
         let (socket_tx, _) = tokio::sync::watch::channel(None);

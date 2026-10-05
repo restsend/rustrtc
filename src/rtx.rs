@@ -4,9 +4,10 @@
 //! followed by the original RTP payload. RTX uses a dedicated SSRC and payload type
 //! associated with the primary codec via `a=fmtp:<rtx-pt> apt=<primary-pt>`.
 
+use crate::prelude::*;
 use crate::rtp::{RtpHeader, RtpPacket};
 use bytes::{BufMut, BytesMut};
-use std::collections::HashMap;
+
 
 /// Sender-side RTX parameters negotiated for a primary media stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,7 +17,7 @@ pub struct RtxSenderConfig {
 }
 
 /// Association parsed from SDP: RTX payload type → primary (associated) payload type.
-pub type RtxAptMap = HashMap<u8, u8>;
+pub type RtxAptMap = BTreeMap<u8, u8>;
 
 /// Wrap a primary media packet into an RFC 4588 RTX retransmission packet.
 pub fn wrap_rtx_packet(
@@ -112,6 +113,7 @@ pub fn extract_rtx_apt_map(attributes: &[(String, Option<String>)]) -> RtxAptMap
 }
 
 /// Convenience over SDP `Attribute` list.
+#[cfg(feature = "std")]
 pub fn extract_rtx_apt_map_from_attrs(attrs: &[crate::sdp::Attribute]) -> RtxAptMap {
     let pairs: Vec<(String, Option<String>)> = attrs
         .iter()
@@ -126,6 +128,7 @@ pub fn allocate_rtx_payload_type(used: &[u8]) -> Option<u8> {
 }
 
 /// Append RTX rtpmap/fmtp lines and the PT to `formats` for a primary codec.
+#[cfg(feature = "std")]
 pub fn append_rtx_to_section(
     formats: &mut Vec<String>,
     attributes: &mut Vec<crate::sdp::Attribute>,

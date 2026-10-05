@@ -1,10 +1,12 @@
+use crate::prelude::*;
 use crate::media::MediaResult;
 use crate::media::frame::{MediaKind, MediaSample, VideoFrame, VideoPixelFormat};
 use crate::rtp::RtpPacket;
 use bytes::Bytes;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use core::net::SocketAddr;
+
+use crate::platform::atomic64::AtomicU64;
+use core::sync::atomic::Ordering;
 
 pub trait Depacketizer: Send + Sync {
     fn push(
@@ -244,7 +246,7 @@ impl Depacketizer for H264Depacketizer {
     }
 }
 
-pub trait DepacketizerFactory: std::fmt::Debug + Send + Sync {
+pub trait DepacketizerFactory: core::fmt::Debug + Send + Sync {
     fn create(&self, kind: MediaKind) -> Box<dyn Depacketizer>;
 }
 

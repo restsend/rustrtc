@@ -1,9 +1,17 @@
+use crate::prelude::*;
 use thiserror::Error;
 
 pub type RtcResult<T> = Result<T, RtcError>;
 pub type SdpResult<T> = Result<T, SdpError>;
 pub type RtpResult<T> = Result<T, RtpError>;
 pub type SrtpResult<T> = Result<T, SrtpError>;
+
+#[cfg(feature = "std")]
+impl From<std::io::Error> for RtcError {
+    fn from(e: std::io::Error) -> Self {
+        RtcError::Transport(alloc::format!("io: {e}"))
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum RtcError {
@@ -60,5 +68,23 @@ pub enum SrtpError {
 impl From<RtpError> for SrtpError {
     fn from(value: RtpError) -> Self {
         SrtpError::Internal(value.to_string())
+    }
+}
+
+impl From<crate::platform::net::NetError> for RtcError {
+    fn from(e: crate::platform::net::NetError) -> Self {
+        RtcError::Transport(alloc::format!("net: {e}"))
+    }
+}
+
+impl From<core::num::ParseIntError> for RtcError {
+    fn from(e: core::num::ParseIntError) -> Self {
+        RtcError::Internal(alloc::format!("int parse: {e}"))
+    }
+}
+
+impl From<core::net::AddrParseError> for RtcError {
+    fn from(e: core::net::AddrParseError) -> Self {
+        RtcError::Internal(alloc::format!("addr parse: {e}"))
     }
 }

@@ -1,16 +1,20 @@
+use crate::prelude::*;
 use super::{IceSocketWrapper, should_drop_packet};
-use crate::errors::RtcResult;
+use crate::errors::{RtcError, RtcResult};
+#[cfg(feature = "std")]
 use crate::stats::{StatsEntry, StatsId, StatsKind, StatsProvider};
 use crate::transports::PacketReceiver;
-use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
-use parking_lot::{Mutex, RwLock};
+use crate::platform::sync::{Mutex, RwLock};
 use serde_json::json;
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
-use tokio::sync::{mpsc, watch};
+use core::net::SocketAddr;
+use crate::platform::atomic64::AtomicU64;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use crate::platform::sync::OnceLock;
+use alloc::sync::{Arc, Weak};
+use crate::platform::sync::{mpsc, watch};
+use crate::platform::task;
 use tracing::{debug, trace, warn};
 
 /// Per-source-address state tracked during the latching probation period.
@@ -298,7 +302,7 @@ impl IceConn {
     /// Non-blocking variant of `send`. Skips the `writable().await` parking
     /// and simply returns `Err` when the kernel socket buffer is full. Used by
     /// the RTP bridge fast-path so the receive loop never suspends on send.
-    pub fn try_send(&self, buf: &[u8]) -> Result<usize> {
+    pub fn try_send(&self, buf: &[u8]) -> RtcResult<usize> {
         if should_drop_packet() {
             return Ok(buf.len());
         }
@@ -309,17 +313,17 @@ impl IceConn {
             let socket = socket_rx.borrow_and_update().clone();
             let Some(socket) = socket else {
                 tracing::trace!("IceConn: try_send failed - no selected socket");
-                return Err(anyhow::anyhow!("No selected socket"));
+                return Err(RtcError::Internal(format!("No selected socket")));
             };
             return self.do_try_send(socket, buf);
         };
         self.do_try_send(socket, buf)
     }
 
-    fn do_try_send(&self, socket: IceSocketWrapper, buf: &[u8]) -> Result<usize> {
+    fn do_try_send(&self, socket: IceSocketWrapper, buf: &[u8]) -> RtcResult<usize> {
         let remote = *self.remote_addr.read();
         if remote.port() == 0 {
-            return Err(anyhow::anyhow!("Remote address not set"));
+            return Err(RtcError::Internal(format!("Remote address not set")));
         }
         match &socket {
             IceSocketWrapper::Udp(_) | IceSocketWrapper::SharedUdp(_) => {
@@ -345,7 +349,7 @@ impl IceConn {
     fn defer_async_send(&self, socket: IceSocketWrapper, buf: &[u8], addr: SocketAddr) {
         let tx = self.deferred_send_tx.get_or_init(|| {
             let (tx, mut rx) = mpsc::unbounded_channel::<(IceSocketWrapper, Vec<u8>, SocketAddr)>();
-            tokio::spawn(async move {
+            task::spawn(async move {
                 while let Some((socket, buf, addr)) = rx.recv().await {
                     if let Err(e) = socket.send_to(&buf, addr).await {
                         debug!(
@@ -362,7 +366,7 @@ impl IceConn {
         }
     }
 
-    pub async fn send(&self, buf: &[u8]) -> Result<usize> {
+    pub async fn send(&self, buf: &[u8]) -> RtcResult<usize> {
         if should_drop_packet() {
             return Ok(buf.len());
         }
@@ -372,7 +376,7 @@ impl IceConn {
         if let Some(socket) = socket_opt {
             let remote = *self.remote_addr.read();
             if remote.port() == 0 {
-                return Err(anyhow::anyhow!("Remote address not set"));
+                return Err(RtcError::Internal(format!("Remote address not set")));
             }
             let n = socket.send_to(buf, remote).await?;
             self.tx_packets.fetch_add(1, Ordering::Relaxed);
@@ -385,7 +389,7 @@ impl IceConn {
             if let Some(socket) = socket_opt {
                 let remote = *self.remote_addr.read();
                 if remote.port() == 0 {
-                    return Err(anyhow::anyhow!("Remote address not set"));
+                    return Err(RtcError::Internal(format!("Remote address not set")));
                 }
                 let n = socket.send_to(buf, remote).await?;
                 self.tx_packets.fetch_add(1, Ordering::Relaxed);
@@ -393,14 +397,14 @@ impl IceConn {
                 Ok(n)
             } else {
                 tracing::trace!("IceConn: send failed - no selected socket");
-                Err(anyhow::anyhow!("No selected socket"))
+                Err(RtcError::Internal(format!("No selected socket")))
             }
         }
     }
 
     /// Send multiple DTLS records. On TCP, each record is RFC 4571-framed and all
     /// frames are written in one syscall (avoids Chrome seeing a partial flight).
-    pub async fn send_dtls_record_batch(&self, records: &[Vec<u8>]) -> Result<usize> {
+    pub async fn send_dtls_record_batch(&self, records: &[Vec<u8>]) -> RtcResult<usize> {
         if records.is_empty() {
             return Ok(0);
         }
@@ -410,7 +414,7 @@ impl IceConn {
 
         let remote = *self.remote_addr.read();
         if remote.port() == 0 {
-            return Err(anyhow::anyhow!("Remote address not set"));
+            return Err(RtcError::Internal(format!("Remote address not set")));
         }
 
         let socket_rx = self.socket_rx.clone();
@@ -422,7 +426,7 @@ impl IceConn {
 
         let Some(socket) = socket_opt else {
             tracing::trace!("IceConn: send_dtls_record_batch failed - no selected socket");
-            return Err(anyhow::anyhow!("No selected socket"));
+            return Err(RtcError::Internal(format!("No selected socket")));
         };
 
         let total_payload: usize = records.iter().map(|r| r.len()).sum();
@@ -430,11 +434,12 @@ impl IceConn {
             .fetch_add(records.len() as u64, Ordering::Relaxed);
 
         match &socket {
+            #[cfg(feature = "std")]
             IceSocketWrapper::TcpStream(_, write, _) => {
                 let mut framed = Vec::new();
                 for record in records {
                     if record.len() > 0xFFFF {
-                        return Err(anyhow::anyhow!("DTLS record too large for TCP framing"));
+                        return Err(RtcError::Internal(format!("DTLS record too large for TCP framing")));
                     }
                     framed.extend_from_slice(&(record.len() as u16).to_be_bytes());
                     framed.extend_from_slice(record);
@@ -454,7 +459,7 @@ impl IceConn {
         }
     }
 
-    pub async fn send_rtcp(&self, buf: &[u8]) -> Result<usize> {
+    pub async fn send_rtcp(&self, buf: &[u8]) -> RtcResult<usize> {
         let rtcp_addr = *self.remote_rtcp_addr.read();
         let remote = if let Some(rtcp_addr) = rtcp_addr {
             rtcp_addr
@@ -463,7 +468,7 @@ impl IceConn {
         };
 
         if remote.port() == 0 {
-            return Err(anyhow::anyhow!("Remote address not set"));
+            return Err(RtcError::Internal(format!("Remote address not set")));
         }
 
         let mut socket_rx = if rtcp_addr.is_some() {
@@ -491,7 +496,7 @@ impl IceConn {
             Ok(n)
         } else {
             tracing::trace!("IceConn: send_rtcp failed - no selected socket");
-            Err(anyhow::anyhow!("No selected socket"))
+            Err(RtcError::Internal(format!("No selected socket")))
         }
     }
 }
@@ -516,10 +521,17 @@ impl PacketReceiver for IceConn {
         // accepted stream so DTLS/RTP replies use the correct destination.
         let socket_is_inbound_tcp = {
             let socket_rx = self.socket_rx.clone();
-            matches!(
-                socket_rx.borrow().as_ref(),
-                Some(IceSocketWrapper::TcpStream(_, _, _))
-            )
+            #[cfg(feature = "std")]
+            {
+                matches!(
+                    socket_rx.borrow().as_ref(),
+                    Some(IceSocketWrapper::TcpStream(_, _, _))
+                )
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                false
+            }
         };
         if current_remote.port() == 0 || (socket_is_inbound_tcp && current_remote != addr) {
             *self.remote_addr.write() = addr;
@@ -749,6 +761,7 @@ impl PacketReceiver for IceConn {
 }
 
 #[async_trait]
+#[cfg(feature = "std")]
 impl StatsProvider for IceConn {
     async fn collect(&self) -> RtcResult<Vec<StatsEntry>> {
         let rx_packets = self.rx_packets.load(Ordering::Relaxed);
@@ -771,7 +784,7 @@ impl StatsProvider for IceConn {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use std::net::{IpAddr, Ipv4Addr};
+    use core::net::{IpAddr, Ipv4Addr};
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     use tokio::net::UdpSocket;
@@ -822,13 +835,15 @@ mod tests {
         let receiver_addr = receiver.local_addr().unwrap();
         let conn = IceConn::new(rx, receiver_addr, None);
 
-        shared_socket.writable().await.unwrap();
+        // (trait sockets have no `writable()`; the tokio socket behind the
+        // test mux is immediately writable after bind)
+        tokio::time::sleep(core::time::Duration::from_millis(50)).await;
         conn.try_send(b"relayed")
             .expect("fast-path send must not fail on shared UDP");
 
         let mut buf = [0u8; 32];
         let (len, _) = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
+            core::time::Duration::from_millis(500),
             receiver.recv_from(&mut buf),
         )
         .await
@@ -863,7 +878,7 @@ mod tests {
         // The async drain task writes a 2-byte big-endian length prefix + data.
         let mut header = [0u8; 2];
         tokio::time::timeout(
-            std::time::Duration::from_millis(500),
+            core::time::Duration::from_millis(500),
             tokio::io::AsyncReadExt::read_exact(&mut client, &mut header),
         )
         .await
@@ -935,7 +950,7 @@ mod tests {
         conn.send(b"retargeted").await.unwrap();
         let mut buf = [0u8; 32];
         let (len, _) = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
+            core::time::Duration::from_millis(100),
             new_receiver.recv_from(&mut buf),
         )
         .await
@@ -944,7 +959,7 @@ mod tests {
         assert_eq!(&buf[..len], b"retargeted");
         assert!(
             tokio::time::timeout(
-                std::time::Duration::from_millis(20),
+                core::time::Duration::from_millis(20),
                 old_receiver.recv_from(&mut buf),
             )
             .await

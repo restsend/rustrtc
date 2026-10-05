@@ -1,7 +1,10 @@
+use crate::prelude::*;
 use crate::errors::{RtpError, RtpResult};
 use bytes::{Buf, BufMut, Bytes};
+#[cfg_attr(feature = "std", allow(unused_imports))]
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use core::net::SocketAddr;
+#[cfg(feature = "std")]
 use std::time::SystemTime;
 use tracing::debug;
 
@@ -22,7 +25,8 @@ pub const RTCP_PSFB_PLI: u8 = 1;
 pub const RTCP_PSFB_FIR: u8 = 4;
 pub const RTCP_PSFB_APP: u8 = 15; // REMB lives under APP-format payload feedback
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RtpHeaderExtension {
     pub profile: u16,
     pub data: Bytes,
@@ -387,6 +391,7 @@ impl RtpPacket {
     }
 }
 
+#[cfg(feature = "std")]
 pub fn calculate_abs_send_time(time: SystemTime) -> u32 {
     let duration = time
         .duration_since(std::time::UNIX_EPOCH)
