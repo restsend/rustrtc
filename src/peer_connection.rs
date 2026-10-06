@@ -5299,9 +5299,16 @@ impl PeerConnectionInner {
                 section
                     .attributes
                     .push(Attribute::new("ice-pwd", Some(ice_password.clone())));
-                section
-                    .attributes
-                    .push(Attribute::new("ice-options", Some("trickle".into())));
+                // Advertise trickle ICE only while gathering is still in
+                // progress. A complete offer (all candidates + the
+                // a=end-of-candidates line below) is vanilla ICE: advertising
+                // trickle there is wrong and makes one-shot-SDP peers
+                // (SIP INVITE, WHEP) wait for candidates that never arrive.
+                if !gather_complete {
+                    section
+                        .attributes
+                        .push(Attribute::new("ice-options", Some("trickle".into())));
+                }
                 for candidate in &candidate_lines {
                     section
                         .attributes
@@ -5571,13 +5578,9 @@ impl PeerConnectionInner {
         mode: &TransportMode,
         rtx_ssrc: Option<u32>,
     ) {
-        if *mode == TransportMode::WebRtc {
-            section.attributes.push(Attribute::new(
-                "msid",
-                Some(format!("{} {}", stream_id, track_id)),
-            ));
-        }
-
+        // MSID is signalled exactly once, via the a=ssrc msid: attribute below
+        // (Chrome unified-plan style). Emitting an additional media-section
+        // level a=msid would describe the same stream/track pair twice.
         if let Some(rtx) = rtx_ssrc {
             section.attributes.push(Attribute::new(
                 "ssrc-group",
@@ -8799,12 +8802,21 @@ mod tests {
                 .any(|a| a.key == "msid-semantic")
         );
 
-        // Should have msid in media section
-        assert!(attrs.iter().any(|a| a.key == "msid"));
+        // msid must appear exactly once, carried by the a=ssrc msid:
+        // attribute (Chrome unified-plan style); never as a media-section
+        // level a=msid on top of it.
+        assert!(attrs.iter().all(|a| a.key != "msid"));
+        assert!(
+            attrs.iter().any(|a| a.key == "ssrc"
+                && a.value.as_deref().is_some_and(|v| v.contains(" msid:"))),
+            "ssrc msid attribute must be present"
+        );
 
         // Should have ssrc in media section
         assert!(attrs.iter().any(|a| a.key == "ssrc"));
-        assert!(attrs.iter().any(|attr| attr.key == "ice-options"));
+        // This offer carries end-of-candidates (gathering completed), so it
+        // must not advertise trickle ICE.
+        assert!(attrs.iter().all(|attr| attr.key != "ice-options"));
         assert!(attrs.iter().any(|attr| attr.key == "end-of-candidates"));
         assert!(attrs.iter().filter(|attr| attr.key == "candidate").count() >= 1);
         assert!(attrs.iter().any(|attr| {

@@ -117,8 +117,8 @@ async fn test_ssrc_negotiation_without_track() -> Result<()> {
     );
     assert!(sdp.contains("a=sendonly"), "SDP should contain a=sendonly");
     assert!(
-        sdp.contains("a=msid:"),
-        "SDP should contain a=msid in WebRTC mode"
+        sdp.contains(" msid:"),
+        "SDP should contain an a=ssrc msid: attribute in WebRTC mode"
     );
 
     Ok(())
