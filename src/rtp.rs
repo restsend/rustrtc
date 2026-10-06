@@ -1,9 +1,9 @@
-use crate::prelude::*;
 use crate::errors::{RtpError, RtpResult};
+use crate::prelude::*;
 use bytes::{Buf, BufMut, Bytes};
+use core::net::SocketAddr;
 #[cfg_attr(feature = "std", allow(unused_imports))]
 use serde::{Deserialize, Serialize};
-use core::net::SocketAddr;
 #[cfg(feature = "std")]
 use std::time::SystemTime;
 use tracing::debug;

@@ -878,7 +878,10 @@ impl RtpTransport {
             srtp.protect_rtp(&packet, &mut protected)?;
             protected
         };
-        self.transport.send(&protected).await.map_err(anyhow::Error::from)
+        self.transport
+            .send(&protected)
+            .await
+            .map_err(anyhow::Error::from)
     }
 
     /// Returns `Ok(0)` without sending while the direction stops this SSRC.
@@ -929,7 +932,12 @@ impl RtpTransport {
             }
         };
 
-        match self.transport.send(&protected).await.map_err(anyhow::Error::from) {
+        match self
+            .transport
+            .send(&protected)
+            .await
+            .map_err(anyhow::Error::from)
+        {
             Ok(n) => {
                 if is_first {
                     self.transport.mark_first_outbound();
@@ -967,7 +975,10 @@ impl RtpTransport {
                 raw
             }
         };
-        self.transport.send_rtcp(&protected).await.map_err(anyhow::Error::from)
+        self.transport
+            .send_rtcp(&protected)
+            .await
+            .map_err(anyhow::Error::from)
     }
 
     /// Synchronous best-effort RTCP send for the close path, where we must NOT
@@ -1129,7 +1140,11 @@ impl PacketReceiver for RtpTransport {
                         match srtp.unprotect_rtcp(&mut buf) {
                             Ok(()) => {
                                 if std::env::var("RUSTRTC_RTCP_TRACE").is_ok() {
-                                    debug!("RTCP unprotected: {} bytes head={:02x?}", buf.len(), &buf[..buf.len().min(8)]);
+                                    debug!(
+                                        "RTCP unprotected: {} bytes head={:02x?}",
+                                        buf.len(),
+                                        &buf[..buf.len().min(8)]
+                                    );
                                 }
                                 Bytes::from(buf)
                             }

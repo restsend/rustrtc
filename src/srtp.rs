@@ -9,12 +9,12 @@ use aes_gcm::{
     Aes128Gcm, Nonce,
     aead::{Aead, AeadInPlace, KeyInit, Payload},
 };
+use alloc::collections::btree_map::Entry;
 use bytes::BytesMut;
+use core::fmt;
 use ctr::cipher::{InnerIvInit, StreamCipher};
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
-use alloc::collections::btree_map::Entry;
-use core::fmt;
 
 type Aes128Ctr = ctr::Ctr128BE<Aes128>;
 type HmacSha1 = Hmac<Sha1>;

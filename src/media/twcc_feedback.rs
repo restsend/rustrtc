@@ -14,7 +14,7 @@
 
 use crate::prelude::*;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 use parking_lot::Mutex;
@@ -127,10 +127,7 @@ impl TwccFeedbackGenerator {
         if queue.back().map(|r| r.seq) == Some(seq) {
             return;
         }
-        queue.push_back(PendingRecord {
-            seq,
-            arrival_us,
-        });
+        queue.push_back(PendingRecord { seq, arrival_us });
     }
 
     fn pending_count(&self) -> usize {
@@ -152,7 +149,9 @@ impl TwccFeedbackGenerator {
             for chunk in owned.chunks(MAX_STATUSES_PER_REPORT) {
                 match self.build_feedback(media_ssrc, feedback_ssrc, chunk) {
                     Some(feedback) => {
-                        if transport.send_rtcp(&[RtcpPacket::TransportWideCc(feedback)]).await
+                        if transport
+                            .send_rtcp(&[RtcpPacket::TransportWideCc(feedback)])
+                            .await
                             .is_ok()
                         {
                             sent += 1;
@@ -225,9 +224,7 @@ impl TwccFeedbackGenerator {
             let sym = symbol_bits(&statuses[idx]);
             // Length of the run of identical symbols starting here.
             let mut run = 1usize;
-            while idx + run < statuses.len()
-                && symbol_bits(&statuses[idx + run]) == sym
-            {
+            while idx + run < statuses.len() && symbol_bits(&statuses[idx + run]) == sym {
                 run += 1;
             }
             if run >= 3 {
@@ -282,7 +279,10 @@ impl TwccFeedbackGenerator {
     }
 
     /// Periodic flush loop; spawn per receiver transport.
-    pub async fn run_flush_loop(self: std::sync::Arc<Self>, transport: std::sync::Arc<RtpTransport>) {
+    pub async fn run_flush_loop(
+        self: std::sync::Arc<Self>,
+        transport: std::sync::Arc<RtpTransport>,
+    ) {
         let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -307,7 +307,8 @@ fn symbol_bits(s: &DeltaSize) -> u16 {
     }
 }
 
-fn delta_size(delta_us: i64) -> DeltaSize {    let units = delta_us / 250;
+fn delta_size(delta_us: i64) -> DeltaSize {
+    let units = delta_us / 250;
     if (0..=255).contains(&units) {
         DeltaSize::Small(delta_us)
     } else if (-32768..=32767).contains(&units) {
@@ -323,8 +324,8 @@ fn rand_u16() -> u16 {
     (crate::transports::ice::stun::random_u32() & 0xffff) as u16
 }
 
-use async_trait::async_trait;
 use crate::peer_connection::RtpReceiverInterceptor;
+use async_trait::async_trait;
 
 #[async_trait]
 impl RtpReceiverInterceptor for TwccFeedbackGenerator {
@@ -360,7 +361,9 @@ mod tests {
                 arrival_us: t0 + i as u64 * 40_000,
             });
         }
-        let fb = generator.build_feedback(0xAA_BB_CC_DD, 0x1234_5678, &records).unwrap();
+        let fb = generator
+            .build_feedback(0xAA_BB_CC_DD, 0x1234_5678, &records)
+            .unwrap();
         assert_eq!(fb.media_ssrc, 0xAA_BB_CC_DD);
         assert_eq!(fb.base_sequence, 100);
         assert_eq!(fb.packet_status_count, 15);
@@ -392,9 +395,18 @@ mod tests {
         generator.set_ext_id(1);
         // seq 10, then 12 (11 lost), then 13.
         let records = vec![
-            PendingRecord { seq: 10, arrival_us: 0 },
-            PendingRecord { seq: 12, arrival_us: 1_000 },
-            PendingRecord { seq: 13, arrival_us: 2_000 },
+            PendingRecord {
+                seq: 10,
+                arrival_us: 0,
+            },
+            PendingRecord {
+                seq: 12,
+                arrival_us: 1_000,
+            },
+            PendingRecord {
+                seq: 13,
+                arrival_us: 2_000,
+            },
         ];
         let fb = generator.build_feedback(1, 2, &records).unwrap();
         assert_eq!(fb.packet_status_count, 4); // 10, 11(lost), 12, 13

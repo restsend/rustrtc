@@ -1,11 +1,11 @@
-use crate::prelude::*;
 #[cfg(feature = "std")]
 #[cfg(feature = "std")]
 use crate::config::RtcConfiguration;
 use crate::errors::{SdpError, SdpResult};
-use serde::{Deserialize, Serialize};
+use crate::prelude::*;
 use core::fmt::{self, Write};
 use core::str::FromStr;
+use serde::{Deserialize, Serialize};
 
 pub const ABS_SEND_TIME_URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time";
 pub const SDES_MID_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";

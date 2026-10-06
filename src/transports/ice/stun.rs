@@ -1,9 +1,9 @@
-use crate::prelude::*;
 use crate::errors::{RtcError, RtcResult};
+use crate::prelude::*;
+use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use crc32fast::Hasher;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
-use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const MAGIC_COOKIE: u32 = 0x2112A442;
 const FINGERPRINT_XOR: u32 = 0x5354_554e;

@@ -1,19 +1,19 @@
-use crate::prelude::*;
 use super::{IceSocketWrapper, should_drop_packet};
 use crate::errors::{RtcError, RtcResult};
-use crate::stats::{StatsEntry, StatsId, StatsKind, StatsProvider};
-use crate::transports::PacketReceiver;
-use async_trait::async_trait;
-use bytes::Bytes;
-use crate::platform::sync::{Mutex, RwLock};
-use serde_json::json;
-use core::net::SocketAddr;
 use crate::platform::atomic64::AtomicU64;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use crate::platform::sync::OnceLock;
-use alloc::sync::{Arc, Weak};
+use crate::platform::sync::{Mutex, RwLock};
 use crate::platform::sync::{mpsc, watch};
 use crate::platform::task;
+use crate::prelude::*;
+use crate::stats::{StatsEntry, StatsId, StatsKind, StatsProvider};
+use crate::transports::PacketReceiver;
+use alloc::sync::{Arc, Weak};
+use async_trait::async_trait;
+use bytes::Bytes;
+use core::net::SocketAddr;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use serde_json::json;
 use tracing::{debug, trace, warn};
 
 /// Per-source-address state tracked during the latching probation period.
@@ -438,7 +438,9 @@ impl IceConn {
                 let mut framed = Vec::new();
                 for record in records {
                     if record.len() > 0xFFFF {
-                        return Err(RtcError::Internal(format!("DTLS record too large for TCP framing")));
+                        return Err(RtcError::Internal(format!(
+                            "DTLS record too large for TCP framing"
+                        )));
                     }
                     framed.extend_from_slice(&(record.len() as u16).to_be_bytes());
                     framed.extend_from_slice(record);

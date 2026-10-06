@@ -16,13 +16,13 @@
 
 use crate::prelude::*;
 
+use crate::platform::atomic64::AtomicU64;
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
-use alloc::collections::VecDeque;
 use core::future::Future;
 use core::pin::Pin;
-use crate::platform::atomic64::AtomicU64;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 
@@ -366,7 +366,12 @@ pub mod watch {
             version: crate::platform::atomic64::AtomicU64::new(0),
             seen: crate::platform::atomic64::AtomicU64::new(0),
         });
-        (Sender { inner: inner.clone() }, Receiver { inner })
+        (
+            Sender {
+                inner: inner.clone(),
+            },
+            Receiver { inner },
+        )
     }
 }
 
@@ -492,11 +497,11 @@ pub struct oneshot_Receiver<T> {
 pub struct oneshot_Canceled;
 
 pub mod oneshot {
-    use crate::prelude::*;
-    use alloc::sync::Arc;
     pub use super::{
         oneshot_Canceled as Canceled, oneshot_Receiver as Receiver, oneshot_Sender as Sender,
     };
+    use crate::prelude::*;
+    use alloc::sync::Arc;
 
     pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
         let inner = Arc::new(super::Mutex::new(super::OneshotState {
@@ -504,7 +509,12 @@ pub mod oneshot {
             wakers: Vec::new(),
             sender_gone: false,
         }));
-        (Sender { inner: inner.clone() }, Receiver { inner })
+        (
+            Sender {
+                inner: inner.clone(),
+            },
+            Receiver { inner },
+        )
     }
 }
 
@@ -601,12 +611,12 @@ pub mod mpsc {
     use alloc::collections::VecDeque;
     use alloc::sync::Arc;
 
+    pub use super::mpsc_bounded::channel;
+    pub use super::mpsc_bounded::{Receiver, Sender, TrySendError};
     pub use super::{
         mpsc_SendError as SendError, mpsc_UnboundedReceiver as UnboundedReceiver,
         mpsc_UnboundedSender as UnboundedSender,
     };
-    pub use super::mpsc_bounded::{Receiver, Sender, TrySendError};
-    pub use super::mpsc_bounded::channel;
 
     pub fn unbounded_channel<T>() -> (UnboundedSender<T>, UnboundedReceiver<T>) {
         let inner = Arc::new(super::Mutex::new(super::MpscState {
@@ -614,7 +624,12 @@ pub mod mpsc {
             wakers: Vec::new(),
             sender_gone: false,
         }));
-        (UnboundedSender { inner: inner.clone() }, UnboundedReceiver { inner })
+        (
+            UnboundedSender {
+                inner: inner.clone(),
+            },
+            UnboundedReceiver { inner },
+        )
     }
 }
 
@@ -724,14 +739,14 @@ pub enum broadcast_RecvError {
 pub struct broadcast_SendError;
 
 pub mod broadcast {
-    use crate::prelude::*;
     use crate::platform::atomic64::AtomicU64;
+    use crate::prelude::*;
     use alloc::collections::VecDeque;
     use alloc::sync::Arc;
 
     pub use super::{
-        broadcast_RecvError as RecvError, broadcast_SendError as SendError,
-        broadcast_Receiver as Receiver, broadcast_Sender as Sender,
+        broadcast_Receiver as Receiver, broadcast_RecvError as RecvError,
+        broadcast_SendError as SendError, broadcast_Sender as Sender,
     };
 
     /// `capacity` is accepted for API parity; history is fixed at
@@ -744,7 +759,9 @@ pub mod broadcast {
             sender_gone: false,
         }));
         (
-            Sender { inner: inner.clone() },
+            Sender {
+                inner: inner.clone(),
+            },
             Receiver {
                 inner,
                 next_seq: AtomicU64::new(0),
@@ -870,9 +887,7 @@ impl<T> OnceLock<T> {
         // SAFETY: once `Some`, the value is never mutated or moved (OnceLock
         // semantics), so the reference outlives the dropped guard and
         // borrows `self`.
-        unsafe {
-            core::mem::transmute::<Option<&T>, Option<&T>>(guard.value.as_ref())
-        }
+        unsafe { core::mem::transmute::<Option<&T>, Option<&T>>(guard.value.as_ref()) }
     }
 
     /// Initialises with `f` if empty; returns the stored value.
@@ -888,8 +903,7 @@ impl<T> OnceLock<T> {
                 state.value = Some(value);
             }
             // SAFETY: see `get`.
-            unsafe { core::mem::transmute::<Option<&T>, Option<&T>>(state.value.as_ref()) }
-                .unwrap()
+            unsafe { core::mem::transmute::<Option<&T>, Option<&T>>(state.value.as_ref()) }.unwrap()
         }
     }
 }
@@ -948,7 +962,12 @@ pub mod mpsc_bounded {
             wakers: Vec::new(),
             receiver_gone: false,
         }));
-        (Sender { inner: inner.clone() }, Receiver { inner })
+        (
+            Sender {
+                inner: inner.clone(),
+            },
+            Receiver { inner },
+        )
     }
 }
 
@@ -1071,7 +1090,8 @@ impl<T> core::fmt::Debug for broadcast_Sender<T> {
 
 impl<T> core::fmt::Debug for mpsc_UnboundedSender<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("mpsc_UnboundedSender").finish_non_exhaustive()
+        f.debug_struct("mpsc_UnboundedSender")
+            .finish_non_exhaustive()
     }
 }
 

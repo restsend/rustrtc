@@ -93,11 +93,7 @@ fn bind_mdns_socket() -> Result<tokio::net::UdpSocket> {
     #[cfg(unix)]
     let _ = socket.set_reuse_port(true);
     socket.set_multicast_loop_v4(true)?;
-    socket.bind(&SocketAddr::V4(SocketAddrV4::new(
-        Ipv4Addr::UNSPECIFIED,
-        MDNS_PORT,
-    ))
-    .into())?;
+    socket.bind(&SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MDNS_PORT)).into())?;
     // Join the group on the wildcard plus every local IPv4 interface — the
     // kernel only delivers multicast to sockets that joined on the interface
     // the packet arrived on (mDNS daemons do the same).
@@ -231,12 +227,7 @@ fn handle_mdns_packet(packet: &[u8], hostname: &str, addresses: &[IpAddr]) -> Op
 
 /// Build an mDNS response: echo the question, then one answer record per
 /// address (name compressed to offset 12 via pointer 0xC00C).
-fn build_response(
-    query: &[u8],
-    question_end: usize,
-    qtype: u16,
-    addresses: &[&IpAddr],
-) -> Vec<u8> {
+fn build_response(query: &[u8], question_end: usize, qtype: u16, addresses: &[&IpAddr]) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + (question_end - 12) + 16 * addresses.len());
     // Header: ID=0 (mDNS), QR|AA, zero counts except QD/AN.
     out.extend_from_slice(&query[..2]); // echo transaction ID (legacy query)
@@ -309,9 +300,7 @@ mod tests {
         assert!(handle_mdns_packet(&a_query("other123456789.local"), hostname, &addrs).is_none());
 
         // Case-insensitive match still answers.
-        assert!(
-            handle_mdns_packet(&a_query("ABC12345DEF67890.LOCAL"), hostname, &addrs).is_some()
-        );
+        assert!(handle_mdns_packet(&a_query("ABC12345DEF67890.LOCAL"), hostname, &addrs).is_some());
 
         // PTR query (type 12) is not answered.
         let mut q = a_query(hostname);

@@ -16,7 +16,10 @@ pub mod track;
 #[cfg(feature = "std")]
 pub mod twcc_feedback;
 
-pub use depacketizer::{Depacketizer, H264Depacketizer, PassThroughDepacketizer, Vp9Depacketizer, parse_vp9_descriptor, Vp9Descriptor};
+pub use depacketizer::{
+    Depacketizer, H264Depacketizer, PassThroughDepacketizer, Vp9Depacketizer, Vp9Descriptor,
+    parse_vp9_descriptor,
+};
 pub use error::{MediaError, MediaResult};
 pub use frame::{AudioFrame, MediaKind, MediaSample, VideoFrame, VideoPixelFormat};
 #[cfg(feature = "std")]

@@ -17,12 +17,12 @@ use crate::prelude::*;
 use async_trait::async_trait;
 #[cfg_attr(feature = "std", allow(unused_imports))]
 use bytes::Bytes;
+use core::net::{IpAddr, SocketAddr};
+use core::time::Duration;
 #[cfg(feature = "std")]
 use parking_lot::Mutex;
-use core::net::{IpAddr, SocketAddr};
 #[cfg(feature = "std")]
 use std::sync::OnceLock;
-use core::time::Duration;
 #[cfg(feature = "std")]
 use std::time::Instant;
 

@@ -5,10 +5,10 @@
 // consumes it and moves `target_bitrate` off its start value.
 #![allow(clippy::field_reassign_with_default)]
 use anyhow::Result;
-use rustrtc::media::MediaSample;
 use rustrtc::MediaKind;
+use rustrtc::media::MediaSample;
 use rustrtc::transports::ice::IceGathererState;
-use rustrtc::{PeerConnection, RtpCodecParameters, RtcConfiguration};
+use rustrtc::{PeerConnection, RtcConfiguration, RtpCodecParameters};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -44,7 +44,8 @@ async fn gcc_loop_runs_over_loopback() -> Result<()> {
     });
 
     // PC1: sender with a live video source.
-    let (source, track, _) = rustrtc::media::track::sample_track(rustrtc::media::MediaKind::Video, 100);
+    let (source, track, _) =
+        rustrtc::media::track::sample_track(rustrtc::media::MediaKind::Video, 100);
     let sender = pc1.add_track(track.clone(), video_params())?;
 
     // PC2: receive-only video.
@@ -142,7 +143,8 @@ async fn gcc_disabled_skips_transport_cc_extmap() -> Result<()> {
     });
     let pc2 = PeerConnection::new(RtcConfiguration::default());
 
-    let (_source, track, _) = rustrtc::media::track::sample_track(rustrtc::media::MediaKind::Video, 10);
+    let (_source, track, _) =
+        rustrtc::media::track::sample_track(rustrtc::media::MediaKind::Video, 10);
     let _sender = pc1.add_track(track, video_params())?;
     pc2.add_transceiver(MediaKind::Video, rustrtc::TransceiverDirection::RecvOnly);
 

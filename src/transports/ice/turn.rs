@@ -1,18 +1,18 @@
-use crate::prelude::*;
 use crate::errors::{RtcError, RtcResult};
-use md5::{Digest as Md5Digest, Md5};
+use crate::platform::sync::AsyncMutex as Mutex;
 use crate::platform::sync::Mutex as SyncMutex;
+use crate::platform::time::with_timeout as timeout;
+use crate::prelude::*;
 use alloc::collections::BTreeMap;
-use core::net::SocketAddr;
 use alloc::sync::Arc;
+use core::net::SocketAddr;
+use md5::{Digest as Md5Digest, Md5};
 #[cfg(feature = "std")] // TURN-TCP mode is excluded from the embedded target
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(feature = "std")]
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-#[cfg(feature = "std")]
 use tokio::net::TcpStream;
-use crate::platform::sync::AsyncMutex as Mutex;
-use crate::platform::time::with_timeout as timeout;
+#[cfg(feature = "std")]
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 use super::stun::{StunAttribute, StunClass, StunMessage, StunMethod, random_bytes};
 use super::{IceServerUri, IceTransportProtocol, MAX_STUN_MESSAGE};
@@ -30,7 +30,9 @@ pub(crate) struct TurnCredentials {
 impl TurnCredentials {
     pub fn from_server(server: &IceServer) -> RtcResult<Self> {
         if server.credential_type != IceCredentialType::Password {
-            return Err(RtcError::Internal(format!("only password credentials supported for TURN")));
+            return Err(RtcError::Internal(format!(
+                "only password credentials supported for TURN"
+            )));
         }
         let username = server
             .username
@@ -115,7 +117,9 @@ impl TurnClient {
             IceTransportProtocol::Tcp => {
                 let stream = timeout(DEFAULT_STUN_TIMEOUT, TcpStream::connect(addr))
                     .await
-                    .map_err(|_| RtcError::Internal(format!("TURN TCP connect to {} timed out", addr)))??;
+                    .map_err(|_| {
+                        RtcError::Internal(format!("TURN TCP connect to {} timed out", addr))
+                    })??;
                 let (read, write) = stream.into_split();
                 TurnTransport::Tcp {
                     read: Arc::new(Mutex::new(read)),
@@ -143,7 +147,9 @@ impl TurnClient {
         loop {
             attempt += 1;
             if attempt > 3 {
-                return Err(RtcError::Internal(format!("TURN allocation failed after retries")));
+                return Err(RtcError::Internal(format!(
+                    "TURN allocation failed after retries"
+                )));
             }
             let tx_id = random_bytes::<12>();
             let attrs = vec![
@@ -171,7 +177,9 @@ impl TurnClient {
                 continue;
             }
             if parsed.method != StunMethod::Allocate {
-                return Err(RtcError::Internal(format!("unexpected STUN method in allocate response")));
+                return Err(RtcError::Internal(format!(
+                    "unexpected STUN method in allocate response"
+                )));
             }
             match parsed.class {
                 StunClass::SuccessResponse => {
@@ -195,24 +203,31 @@ impl TurnClient {
                             lifetime_secs: granted_lifetime,
                         });
                     }
-                    return Err(RtcError::Internal(format!("TURN success without relayed address")));
+                    return Err(RtcError::Internal(format!(
+                        "TURN success without relayed address"
+                    )));
                 }
                 StunClass::ErrorResponse => {
                     if parsed.error_code == Some(401) || parsed.error_code == Some(438) {
-                        let realm = parsed
-                            .realm
-                            .clone()
-                            .ok_or_else(|| RtcError::Internal(format!("TURN error missing realm")))?;
-                        let nonce = parsed
-                            .nonce
-                            .clone()
-                            .ok_or_else(|| RtcError::Internal(format!("TURN error missing nonce")))?;
+                        let realm = parsed.realm.clone().ok_or_else(|| {
+                            RtcError::Internal(format!("TURN error missing realm"))
+                        })?;
+                        let nonce = parsed.nonce.clone().ok_or_else(|| {
+                            RtcError::Internal(format!("TURN error missing nonce"))
+                        })?;
                         nonce_info = Some(TurnNonce { realm, nonce });
                         continue;
                     }
-                    return Err(RtcError::Internal(format!("TURN allocate error {}", parsed.error_code.unwrap_or(0))));
+                    return Err(RtcError::Internal(format!(
+                        "TURN allocate error {}",
+                        parsed.error_code.unwrap_or(0)
+                    )));
                 }
-                _ => return Err(RtcError::Internal(format!("unexpected TURN response class"))),
+                _ => {
+                    return Err(RtcError::Internal(format!(
+                        "unexpected TURN response class"
+                    )));
+                }
             }
         }
     }
@@ -224,9 +239,9 @@ impl TurnClient {
             let tx_id = random_bytes::<12>();
             let bytes = {
                 let auth_guard = self.auth.lock();
-                let auth = auth_guard
-                    .as_ref()
-                    .ok_or_else(|| RtcError::Internal(format!("TURN allocation missing auth context")))?;
+                let auth = auth_guard.as_ref().ok_or_else(|| {
+                    RtcError::Internal(format!("TURN allocation missing auth context"))
+                })?;
                 let mut attributes = vec![StunAttribute::Username(auth.username.clone())];
                 attributes.push(StunAttribute::Realm(auth.realm.clone()));
                 attributes.push(StunAttribute::Nonce(auth.nonce.clone()));
@@ -247,32 +262,40 @@ impl TurnClient {
                 continue;
             }
             if parsed.method != StunMethod::CreatePermission {
-                return Err(RtcError::Internal(format!("unexpected STUN method in create-permission response")));
+                return Err(RtcError::Internal(format!(
+                    "unexpected STUN method in create-permission response"
+                )));
             }
             match parsed.class {
                 StunClass::SuccessResponse => return Ok(()),
                 StunClass::ErrorResponse => {
                     if parsed.error_code == Some(401) || parsed.error_code == Some(438) {
-                        let realm = parsed
-                            .realm
-                            .clone()
-                            .ok_or_else(|| RtcError::Internal(format!("TURN error missing realm")))?;
-                        let nonce = parsed
-                            .nonce
-                            .clone()
-                            .ok_or_else(|| RtcError::Internal(format!("TURN error missing nonce")))?;
+                        let realm = parsed.realm.clone().ok_or_else(|| {
+                            RtcError::Internal(format!("TURN error missing realm"))
+                        })?;
+                        let nonce = parsed.nonce.clone().ok_or_else(|| {
+                            RtcError::Internal(format!("TURN error missing nonce"))
+                        })?;
                         if let Some(state) = self.auth.lock().as_mut() {
                             state.update_nonce(realm, nonce);
                         }
                         continue;
                     }
-                    return Err(RtcError::Internal(format!("TURN create-permission error {}", parsed.error_code.unwrap_or(0)))
-                    );
+                    return Err(RtcError::Internal(format!(
+                        "TURN create-permission error {}",
+                        parsed.error_code.unwrap_or(0)
+                    )));
                 }
-                _ => return Err(RtcError::Internal(format!("unexpected TURN response class"))),
+                _ => {
+                    return Err(RtcError::Internal(format!(
+                        "unexpected TURN response class"
+                    )));
+                }
             }
         }
-        return Err(RtcError::Internal(format!("TURN create-permission failed after retries")));
+        return Err(RtcError::Internal(format!(
+            "TURN create-permission failed after retries"
+        )));
     }
 
     pub(crate) async fn create_refresh_packet(&self) -> RtcResult<(Vec<u8>, [u8; 12])> {
@@ -378,9 +401,9 @@ impl TurnClient {
         match &self.transport {
             TurnTransport::Udp { socket, .. } => {
                 let (len, _) = timeout(DEFAULT_STUN_TIMEOUT, socket.recv_from(buf))
-                .await
-                .map_err(|_| RtcError::Internal("timeout".into()))?
-                .map_err(RtcError::from)?;
+                    .await
+                    .map_err(|_| RtcError::Internal("timeout".into()))?
+                    .map_err(RtcError::from)?;
                 Ok(len)
             }
             #[cfg(feature = "std")]
@@ -442,7 +465,9 @@ impl TurnClient {
     ) -> RtcResult<(Vec<u8>, [u8; 12])> {
         let tx_id = random_bytes::<12>();
         let auth_guard = self.auth.lock();
-        let auth = auth_guard.as_ref().ok_or_else(|| RtcError::Internal(format!("no auth")))?;
+        let auth = auth_guard
+            .as_ref()
+            .ok_or_else(|| RtcError::Internal(format!("no auth")))?;
 
         let mut attributes = vec![StunAttribute::Username(auth.username.clone())];
         attributes.push(StunAttribute::Realm(auth.realm.clone()));
@@ -477,7 +502,9 @@ impl TurnClient {
 
         let tx_id = random_bytes::<12>();
         let auth_guard = self.auth.lock();
-        let auth = auth_guard.as_ref().ok_or_else(|| RtcError::Internal(format!("no auth")))?;
+        let auth = auth_guard
+            .as_ref()
+            .ok_or_else(|| RtcError::Internal(format!("no auth")))?;
 
         let attributes = vec![
             StunAttribute::ChannelNumber(channel_number),
@@ -504,7 +531,9 @@ impl TurnClient {
     ) -> RtcResult<(Vec<u8>, [u8; 12])> {
         let tx_id = random_bytes::<12>();
         let auth_guard = self.auth.lock();
-        let auth = auth_guard.as_ref().ok_or_else(|| RtcError::Internal(format!("no auth")))?;
+        let auth = auth_guard
+            .as_ref()
+            .ok_or_else(|| RtcError::Internal(format!("no auth")))?;
 
         let attributes = vec![
             StunAttribute::ChannelNumber(channel_number),
@@ -616,9 +645,10 @@ fn md5_digest(input: &[u8]) -> [u8; 16] {
 impl core::fmt::Debug for TurnTransport {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            TurnTransport::Udp { server, .. } => {
-                f.debug_struct("TurnTransport::Udp").field("server", server).finish()
-            }
+            TurnTransport::Udp { server, .. } => f
+                .debug_struct("TurnTransport::Udp")
+                .field("server", server)
+                .finish(),
             #[cfg(feature = "std")]
             TurnTransport::Tcp { .. } => f.write_str("TurnTransport::Tcp"),
         }

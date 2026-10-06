@@ -609,9 +609,7 @@ fn apply_sack_to_sent_queue(
                 outcome.bytes_acked_by_gap += len;
                 // The payload is freed below; account the per-stream buffered
                 // bytes here (the later cumulative removal sees len 0).
-                outcome
-                    .bytes_acked_per_stream
-                    .push((record.stream_id, len));
+                outcome.bytes_acked_per_stream.push((record.stream_id, len));
 
                 // Always reduce flight_size when a packet is acknowledged,
                 // regardless of whether it was retransmitted

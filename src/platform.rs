@@ -64,9 +64,9 @@ pub mod dns {
     /// no_std placeholder (WP3 wires the embedder's resolver).
     #[cfg(not(feature = "std"))]
     pub async fn lookup_host(_host: &str) -> RtcResult<Vec<SocketAddr>> {
-        Err(crate::errors::RtcError::Internal(alloc::string::String::from(
-            "dns: no resolver wired (WP3)",
-        )))
+        Err(crate::errors::RtcError::Internal(
+            alloc::string::String::from("dns: no resolver wired (WP3)"),
+        ))
     }
 }
 
@@ -404,36 +404,36 @@ pub mod task {
 #[cfg(feature = "std")]
 pub mod sync {
     pub mod watch {
-        pub use tokio::sync::watch::{channel, error::RecvError, Receiver, Sender};
+        pub use tokio::sync::watch::{Receiver, Sender, channel, error::RecvError};
     }
     pub mod mpsc {
-        pub use tokio::sync::mpsc::{
-            channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender,
-        };
         pub use tokio::sync::mpsc::error::TrySendError;
+        pub use tokio::sync::mpsc::{
+            Receiver, Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel,
+        };
     }
     pub mod oneshot {
-        pub use tokio::sync::oneshot::{channel, Receiver, Sender};
+        pub use tokio::sync::oneshot::{Receiver, Sender, channel};
     }
     pub mod broadcast {
-        pub use tokio::sync::broadcast::{channel, error::RecvError, Receiver, Sender};
+        pub use tokio::sync::broadcast::{Receiver, Sender, channel, error::RecvError};
     }
     /// Lock primitives. std: parking_lot (non-poisoning, matches the
     /// guard API used across the codebase). no_std (WP3): critical-section
     /// mutex + embassy RwLock.
     pub use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+    pub use std::sync::OnceLock;
     /// Async mutex (held across `.await`). std: tokio. no_std (WP3): embassy.
     pub use tokio::sync::Mutex as AsyncMutex;
-    pub use std::sync::OnceLock;
 }
 
 #[cfg(not(feature = "std"))]
 pub mod sync {
+    pub use crate::platform::sync_embedded::OnceLock;
+    pub use crate::platform::sync_embedded::broadcast;
     pub use crate::platform::sync_embedded::mpsc;
     pub use crate::platform::sync_embedded::oneshot;
     pub use crate::platform::sync_embedded::watch;
-    pub use crate::platform::sync_embedded::broadcast;
     pub use crate::platform::sync_embedded::{AsyncMutex, Mutex, MutexGuard};
     pub use crate::platform::sync_embedded::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-    pub use crate::platform::sync_embedded::OnceLock;
 }

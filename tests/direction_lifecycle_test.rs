@@ -11,7 +11,9 @@
 //!   answer, `set_direction` re-arms our intent for the next offer);
 //! - `restart_ice` does not disturb the negotiated direction intent.
 #![allow(clippy::field_reassign_with_default)]
-use rustrtc::sdp::{Attribute, Direction, MediaSection, SessionDescription, SessionSection, SdpType};
+use rustrtc::sdp::{
+    Attribute, Direction, MediaSection, SdpType, SessionDescription, SessionSection,
+};
 use rustrtc::{MediaKind, PeerConnection, RtcConfiguration, TransceiverDirection, TransportMode};
 
 fn dir_str(direction: Direction) -> &'static str {
@@ -43,10 +45,9 @@ fn minimal_sdp(sdp_type: SdpType, mid: &str, direction: Direction) -> SessionDes
         "rtpmap",
         Some("111 opus/48000/2".to_string()),
     ));
-    section.attributes.push(Attribute::new(
-        "ssrc",
-        Some("12345 cname:test".to_string()),
-    ));
+    section
+        .attributes
+        .push(Attribute::new("ssrc", Some("12345 cname:test".to_string())));
 
     desc.media_sections.push(section);
     desc
@@ -100,7 +101,10 @@ async fn hold_resume_lifecycle_we_initiate() {
     pc.set_local_description(offer.clone()).unwrap();
     let answer = minimal_sdp(SdpType::Answer, "0", Direction::SendRecv);
     pc.set_remote_description(answer).await.unwrap();
-    assert_eq!(pc.get_transceivers()[0].direction(), as_trans(Direction::SendRecv));
+    assert_eq!(
+        pc.get_transceivers()[0].direction(),
+        as_trans(Direction::SendRecv)
+    );
 
     // 2. WE hold: set_direction(SendOnly) → our offer must be sendonly.
     pc.get_transceivers()[0].set_direction(TransceiverDirection::SendOnly);
@@ -136,7 +140,10 @@ async fn hold_resume_lifecycle_we_initiate() {
     pc.set_local_description(resume_offer).unwrap();
     let resume_answer = minimal_sdp(SdpType::Answer, "0", Direction::SendRecv);
     pc.set_remote_description(resume_answer).await.unwrap();
-    assert_eq!(pc.get_transceivers()[0].direction(), as_trans(Direction::SendRecv));
+    assert_eq!(
+        pc.get_transceivers()[0].direction(),
+        as_trans(Direction::SendRecv)
+    );
 }
 
 /// #45 ∘ #44 composition through the real parse path: a session-level
@@ -158,7 +165,8 @@ async fn session_level_hold_intersects_with_local_intent() {
             SessionDescription::parse(SdpType::Offer, &session_level_sdp(Direction::SendOnly))
                 .unwrap();
         assert_eq!(
-            offer.media_sections[0].direction, Direction::SendOnly,
+            offer.media_sections[0].direction,
+            Direction::SendOnly,
             "session-level a=sendonly must apply to the media section"
         );
         pc.set_remote_description(offer).await.unwrap();
@@ -192,21 +200,23 @@ async fn reoffer_after_session_level_hold_carries_local_direction() {
     // sendonly (that would tell the remote that WE hold IT).
     let reoffer = pc.create_offer().await.unwrap();
     assert_eq!(
-        reoffer.media_sections[0].direction, Direction::SendRecv,
+        reoffer.media_sections[0].direction,
+        Direction::SendRecv,
         "re-offer must carry our own sendrecv intent, not the remote's sendonly"
     );
     // And the serialized offer states the direction at media level, so the
     // session-level attribute of the remote's old offer cannot leak back.
     let serialized = reoffer.to_sdp_string();
-    let media_section_has_direction = serialized
-        .lines()
-        .skip_while(|l| !l.starts_with("m="))
-        .any(|l| {
-            l.starts_with("a=sendonly")
-                || l.starts_with("a=recvonly")
-                || l.starts_with("a=sendrecv")
-                || l.starts_with("a=inactive")
-        });
+    let media_section_has_direction =
+        serialized
+            .lines()
+            .skip_while(|l| !l.starts_with("m="))
+            .any(|l| {
+                l.starts_with("a=sendonly")
+                    || l.starts_with("a=recvonly")
+                    || l.starts_with("a=sendrecv")
+                    || l.starts_with("a=inactive")
+            });
     assert!(
         media_section_has_direction,
         "serialized offer must state direction at media level:\n{serialized}"
@@ -240,12 +250,11 @@ async fn restart_ice_preserves_direction_intent() {
         .session
         .attributes
         .push(Attribute::new("ice-ufrag", Some("answerufrag".to_string())));
-    answer
-        .session
-        .attributes
-        .push(Attribute::new("ice-pwd", Some("answerpwdanswerpwdanswerpwd".to_string())));
-    answer
-        .media_sections[0]
+    answer.session.attributes.push(Attribute::new(
+        "ice-pwd",
+        Some("answerpwdanswerpwdanswerpwd".to_string()),
+    ));
+    answer.media_sections[0]
         .attributes
         .push(Attribute::new("setup", Some("active".to_string())));
     pc.set_remote_description(answer).await.unwrap();
@@ -285,7 +294,8 @@ async fn restart_ice_preserves_direction_intent() {
         .unwrap();
     assert_ne!(ufrag_before, ufrag_after, "restart must rotate ice-ufrag");
     assert_eq!(
-        restart_offer.media_sections[0].direction, Direction::SendRecv,
+        restart_offer.media_sections[0].direction,
+        Direction::SendRecv,
         "restart offer must preserve the negotiated direction"
     );
 }

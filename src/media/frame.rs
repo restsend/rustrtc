@@ -1,8 +1,8 @@
 use crate::prelude::*;
 use bytes::Bytes;
+use core::net::SocketAddr;
 #[cfg_attr(feature = "std", allow(unused_imports))]
 use serde::{Deserialize, Serialize};
-use core::net::SocketAddr;
 
 use crate::rtp::{RtpHeader, RtpHeaderExtension, RtpPacket};
 

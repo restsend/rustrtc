@@ -1,8 +1,8 @@
-use crate::prelude::*;
 use crate::media::depacketizer::{DefaultDepacketizerFactory, DepacketizerFactory};
 #[cfg(feature = "std")]
 #[cfg(feature = "std")]
 use crate::peer_connection::{RtpReceiverInterceptor, RtpSenderInterceptor};
+use crate::prelude::*;
 
 /// Spawn-pinning handle. std: tokio runtime handle; no_std: unused
 /// placeholder (embassy tasks are spawned by the embedder's executor).
@@ -11,9 +11,9 @@ pub type RuntimeHandle = tokio::runtime::Handle;
 #[cfg(not(feature = "std"))]
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeHandle;
-use serde::{Deserialize, Serialize};
-use core::fmt::{Debug, Formatter};
 use alloc::sync::Arc;
+use core::fmt::{Debug, Formatter};
+use serde::{Deserialize, Serialize};
 
 /// Describes how credentials are conveyed for a given ICE server.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -440,7 +440,8 @@ fn default_enable_gcc() -> bool {
     true
 }
 
-fn default_rtp_buffer_capacity() -> usize {    100
+fn default_rtp_buffer_capacity() -> usize {
+    100
 }
 
 fn default_buffer_stats_log_interval() -> core::time::Duration {

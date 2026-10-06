@@ -209,8 +209,8 @@ mod vp9_tests {
     use super::*;
     use crate::media::Depacketizer;
     use crate::media::depacketizer::{Vp9Depacketizer, parse_vp9_descriptor};
-    use crate::rtp::{RtpHeader, RtpPacket};
     use crate::media::frame::MediaKind;
+    use crate::rtp::{RtpHeader, RtpPacket};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     fn dummy_addr() -> SocketAddr {
@@ -238,7 +238,9 @@ mod vp9_tests {
 
         let mut dep = Vp9Depacketizer::new();
         let pkt = vp9_packet(payloads[0].to_vec(), 100, 9000, true);
-        let samples = dep.push(pkt, 90000, dummy_addr(), MediaKind::Video).unwrap();
+        let samples = dep
+            .push(pkt, 90000, dummy_addr(), MediaKind::Video)
+            .unwrap();
         assert_eq!(samples.len(), 1);
         match &samples[0] {
             crate::media::MediaSample::Video(f) => {
@@ -272,7 +274,10 @@ mod vp9_tests {
         let mut samples = Vec::new();
         for (i, pl) in payloads.iter().enumerate() {
             let pkt = vp9_packet(pl.to_vec(), 200 + i as u16, 9000, i == 2);
-            samples.extend(dep.push(pkt, 90000, dummy_addr(), MediaKind::Video).unwrap());
+            samples.extend(
+                dep.push(pkt, 90000, dummy_addr(), MediaKind::Video)
+                    .unwrap(),
+            );
         }
         assert_eq!(samples.len(), 1);
         match &samples[0] {

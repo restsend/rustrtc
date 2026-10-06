@@ -8,7 +8,6 @@ use crate::prelude::*;
 use crate::rtp::{RtpHeader, RtpPacket};
 use bytes::{BufMut, BytesMut};
 
-
 /// Sender-side RTX parameters negotiated for a primary media stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RtxSenderConfig {

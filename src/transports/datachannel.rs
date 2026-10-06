@@ -194,9 +194,7 @@ impl DataChannel {
             reassembly_buffer: Mutex::new(BytesMut::new()),
             send_lock: TokioMutex::new(()),
             buffered_amount: AtomicUsize::new(0),
-            buffered_amount_low_threshold: AtomicUsize::new(
-                config.buffered_amount_low_threshold,
-            ),
+            buffered_amount_low_threshold: AtomicUsize::new(config.buffered_amount_low_threshold),
             above_low_threshold: AtomicBool::new(false),
         }
     }

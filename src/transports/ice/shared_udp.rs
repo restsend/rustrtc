@@ -15,20 +15,20 @@
 //!
 //! This mirrors [`super::shared_tcp`] for the UDP case.
 
-use crate::prelude::*;
 use crate::errors::{RtcError, RtcResult};
-use crate::platform::sync::Mutex;
-use alloc::collections::BTreeMap;
-use core::net::SocketAddr;
 use crate::platform::atomic64::AtomicU64;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use crate::platform::sync::OnceLock;
-use alloc::sync::Arc;
-use core::time::Duration;
+use crate::platform::net::UdpSocket;
 #[cfg(feature = "std")]
 use crate::platform::net::tokio_impl;
-use crate::platform::net::UdpSocket;
+use crate::platform::sync::Mutex;
+use crate::platform::sync::OnceLock;
 use crate::platform::sync::mpsc;
+use crate::prelude::*;
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
+use core::net::SocketAddr;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::time::Duration;
 use tracing::{debug, trace};
 
 /// Per-session incoming packet (bytes + source address).
@@ -95,23 +95,21 @@ impl SharedUdpPort {
                 };
                 match which {
                     crate::platform::select::Either::A(()) => break,
-                    crate::platform::select::Either::B(res) => {
-                        match res {
-                            Ok((len, peer_addr)) => {
-                                if len == 0 {
-                                    continue;
-                                }
-                                port.dispatch(&buf[..len], peer_addr);
+                    crate::platform::select::Either::B(res) => match res {
+                        Ok((len, peer_addr)) => {
+                            if len == 0 {
+                                continue;
                             }
-                            Err(e) => {
-                                if port.shutting_down.load(Ordering::Relaxed) {
-                                    break;
-                                }
-                                debug!("shared UDP recv error: {}", e);
-                                crate::platform::task::sleep(Duration::from_millis(50)).await;
-                            }
+                            port.dispatch(&buf[..len], peer_addr);
                         }
-                    }
+                        Err(e) => {
+                            if port.shutting_down.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            debug!("shared UDP recv error: {}", e);
+                            crate::platform::task::sleep(Duration::from_millis(50)).await;
+                        }
+                    },
                 }
             }
             debug!("shared UDP recv loop exited");
@@ -226,7 +224,9 @@ impl core::fmt::Debug for SharedUdpHandle {
 
 impl SharedUdpHandle {
     pub fn local_addr(&self) -> RtcResult<SocketAddr> {
-        self.socket.local_addr().map_err(|e| RtcError::Internal(alloc::format!("{e}")))
+        self.socket
+            .local_addr()
+            .map_err(|e| RtcError::Internal(alloc::format!("{e}")))
     }
 
     pub fn socket(&self) -> &Arc<dyn UdpSocket> {
@@ -243,7 +243,10 @@ impl SharedUdpHandle {
     /// Record `dest` as a peer belonging to this session, then send.
     pub async fn send_to(&self, data: &[u8], dest: SocketAddr) -> RtcResult<usize> {
         self.register_peer(dest);
-        self.socket.send_to(data, dest).await.map_err(RtcError::from)
+        self.socket
+            .send_to(data, dest)
+            .await
+            .map_err(RtcError::from)
     }
 
     /// Receive the next demuxed packet for this session.
@@ -307,17 +310,14 @@ pub(crate) async fn acquire(
         // Platform socket adapter — `acquire` is std-gated until then.
         #[cfg(feature = "std")]
         let socket: Arc<dyn UdpSocket> = {
-            let sock = tokio::net::UdpSocket::bind(bind_addr)
-                .await
-                .map_err(|e| {
-                    RtcError::Internal(format!("bind shared UDP socket {bind_addr}: {e}"))
-                })?;
+            let sock = tokio::net::UdpSocket::bind(bind_addr).await.map_err(|e| {
+                RtcError::Internal(format!("bind shared UDP socket {bind_addr}: {e}"))
+            })?;
             Arc::new(tokio_impl::TokioUdpSocket::new(sock))
         };
         #[cfg(not(feature = "std"))]
-        let socket: Arc<dyn UdpSocket> = unimplemented!(
-            "no_std: pass an adapter implementing platform::net::UdpSocket (WP3)"
-        );
+        let socket: Arc<dyn UdpSocket> =
+            unimplemented!("no_std: pass an adapter implementing platform::net::UdpSocket (WP3)");
         let port = Arc::new(SharedUdpPort::new(socket));
         let mut reg = registry().lock();
         if let Some(existing) = reg.get(&bind_addr) {
@@ -337,7 +337,9 @@ pub(crate) async fn acquire(
     // Reject a duplicate ufrag registration on the same shared socket — each
     // PeerConnection must own a unique ufrag so demuxing is unambiguous.
     if port.sessions.lock().contains_key(&local_ufrag) {
-        return Err(RtcError::Internal(format!("ufrag {local_ufrag} already registered on shared UDP socket {bind_addr}")));
+        return Err(RtcError::Internal(format!(
+            "ufrag {local_ufrag} already registered on shared UDP socket {bind_addr}"
+        )));
     }
 
     let (tx, rx) = mpsc::channel(SHARED_UDP_CHANNEL_CAPACITY);

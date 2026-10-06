@@ -4791,7 +4791,11 @@ async fn silent_remote_relay_candidate_still_gets_probed_and_connects() -> Resul
     };
     let remotes = [
         mk(dead_host.local_addr()?, IceCandidateType::Host, 21_000_000),
-        mk(dead_srflx.local_addr()?, IceCandidateType::ServerReflexive, 16_000_000),
+        mk(
+            dead_srflx.local_addr()?,
+            IceCandidateType::ServerReflexive,
+            16_000_000,
+        ),
         mk(fake_relay_addr, IceCandidateType::Relay, 4_000_000),
     ];
     for c in &remotes {
@@ -4815,10 +4819,7 @@ async fn silent_remote_relay_candidate_still_gets_probed_and_connects() -> Resul
         crate::transports::ice::stun::StunMethod::Binding,
         "packet sent to the remote relay candidate must be a STUN binding request"
     );
-    assert_eq!(
-        msg.class,
-        crate::transports::ice::stun::StunClass::Request
-    );
+    assert_eq!(msg.class, crate::transports::ice::stun::StunClass::Request);
 
     // 2. Answer like a browser would (miuturn delivers the request into the
     //    allocation; the browser's ICE answers it on the network thread even
@@ -4865,13 +4866,12 @@ async fn silent_remote_relay_candidate_still_gets_probed_and_connects() -> Resul
 #[tokio::test]
 #[serial]
 async fn second_nomination_requires_path_verification() -> Result<()> {
-    let (controlling, controlled) = setup_host_pair(
-        RtcConfiguration::default(),
-        RtcConfiguration::default(),
-    )
-    .await;
+    let (controlling, controlled) =
+        setup_host_pair(RtcConfiguration::default(), RtcConfiguration::default()).await;
     wait_for_selected_pair(&controlled, Duration::from_secs(5)).await?;
-    let initial = controlled.get_selected_pair().expect("initial selected pair");
+    let initial = controlled
+        .get_selected_pair()
+        .expect("initial selected pair");
 
     let agent_addr = controlled
         .local_candidates()
@@ -4888,16 +4888,21 @@ async fn second_nomination_requires_path_verification() -> Result<()> {
 
     let use_candidate_request = || -> Result<Vec<u8>> {
         let mut msg = StunMessage::binding_request(random_bytes::<12>(), Some("test"));
-        msg.attributes.push(StunAttribute::Username(username.clone()));
+        msg.attributes
+            .push(StunAttribute::Username(username.clone()));
         msg.attributes.push(StunAttribute::UseCandidate);
         Ok(msg.encode(Some(pwd.as_bytes()), true)?)
     };
 
     // ── Case 1: silent path ──────────────────────────────────────────────
     let silent = UdpSocket::bind("127.0.0.1:0").await?;
-    silent.send_to(&use_candidate_request()?, agent_addr).await?;
+    silent
+        .send_to(&use_candidate_request()?, agent_addr)
+        .await?;
     tokio::time::sleep(Duration::from_millis(800)).await;
-    let sel = controlled.get_selected_pair().expect("selected pair after silent nomination");
+    let sel = controlled
+        .get_selected_pair()
+        .expect("selected pair after silent nomination");
     assert_ne!(
         sel.remote.address,
         silent.local_addr()?,
@@ -4925,7 +4930,8 @@ async fn second_nomination_requires_path_verification() -> Result<()> {
         }
     };
     let resp = StunMessage::binding_success_response(vreq.transaction_id, from);
-    good.send_to(&resp.encode(Some(pwd.as_bytes()), true)?, from).await?;
+    good.send_to(&resp.encode(Some(pwd.as_bytes()), true)?, from)
+        .await?;
 
     let switched = timeout(Duration::from_secs(3), async {
         loop {
@@ -4995,11 +5001,8 @@ async fn second_remote_ice_restart_still_restarts() -> Result<()> {
 #[tokio::test]
 #[serial]
 async fn superseded_nomination_does_not_override_newer() -> Result<()> {
-    let (controlling, controlled) = setup_host_pair(
-        RtcConfiguration::default(),
-        RtcConfiguration::default(),
-    )
-    .await;
+    let (controlling, controlled) =
+        setup_host_pair(RtcConfiguration::default(), RtcConfiguration::default()).await;
     wait_for_selected_pair(&controlled, Duration::from_secs(5)).await?;
 
     let agent_addr = controlled
@@ -5016,7 +5019,8 @@ async fn superseded_nomination_does_not_override_newer() -> Result<()> {
     );
     let use_candidate_request = || -> Result<Vec<u8>> {
         let mut msg = StunMessage::binding_request(random_bytes::<12>(), Some("test"));
-        msg.attributes.push(StunAttribute::Username(username.clone()));
+        msg.attributes
+            .push(StunAttribute::Username(username.clone()));
         msg.attributes.push(StunAttribute::UseCandidate);
         Ok(msg.encode(Some(pwd.as_bytes()), true)?)
     };

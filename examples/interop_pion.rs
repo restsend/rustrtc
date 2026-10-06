@@ -292,14 +292,12 @@ fn extract_attr(desc: &SessionDescription, key: &str) -> String {
         .find(|a| a.key == key)
         .and_then(|a| a.value.clone())
         .or_else(|| {
-            desc.media_sections
-                .iter()
-                .find_map(|m| {
-                    m.attributes
-                        .iter()
-                        .find(|a| a.key == key)
-                        .and_then(|a| a.value.clone())
-                })
+            desc.media_sections.iter().find_map(|m| {
+                m.attributes
+                    .iter()
+                    .find(|a| a.key == key)
+                    .and_then(|a| a.value.clone())
+            })
         })
         .unwrap_or_default()
 }

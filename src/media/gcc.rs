@@ -23,7 +23,7 @@ use std::time::Instant;
 
 use parking_lot::Mutex;
 
-use crate::rtp::{decode_twcc_feedback, RtcpPacket};
+use crate::rtp::{RtcpPacket, decode_twcc_feedback};
 
 /// Initial estimate (Chrome's default start).
 pub const START_BITRATE_BPS: u64 = 1_000_000;
@@ -112,9 +112,7 @@ impl GccBandwidthEstimator {
                     None => lost += 1,
                     Some(recv_delta_us) => {
                         acked += 1;
-                        samples.push_back(TrendSample {
-                            recv_delta_us,
-                        });
+                        samples.push_back(TrendSample { recv_delta_us });
                     }
                 }
             }
@@ -178,8 +176,11 @@ impl GccBandwidthEstimator {
         // x = sample index, y = recv delta in ms.
         let n_f = n as f64;
         let mean_x = (n_f - 1.0) / 2.0;
-        let mean_y: f64 =
-            samples.iter().map(|s| s.recv_delta_us as f64 / 1000.0).sum::<f64>() / n_f;
+        let mean_y: f64 = samples
+            .iter()
+            .map(|s| s.recv_delta_us as f64 / 1000.0)
+            .sum::<f64>()
+            / n_f;
         let mut num = 0.0;
         let mut den = 0.0;
         for (i, s) in samples.iter().enumerate() {
@@ -194,7 +195,6 @@ impl GccBandwidthEstimator {
         num / den
     }
 
-
     pub fn decrease_count(&self) -> u64 {
         self.decreases.load(Ordering::Relaxed)
     }
@@ -204,21 +204,23 @@ impl GccBandwidthEstimator {
     }
 }
 
-use async_trait::async_trait;
 use crate::peer_connection::RtpSenderInterceptor;
 use crate::transports::rtp::RtpTransport;
+use async_trait::async_trait;
 
 #[async_trait]
 impl RtpSenderInterceptor for GccBandwidthEstimator {
-    async fn on_rtcp_received(&self, packet: &RtcpPacket, _transport: std::sync::Arc<RtpTransport>) {
+    async fn on_rtcp_received(
+        &self,
+        packet: &RtcpPacket,
+        _transport: std::sync::Arc<RtpTransport>,
+    ) {
         if let RtcpPacket::TransportWideCc(feedback) = packet {
             self.on_twcc_feedback(feedback);
         }
     }
 
-    fn as_gcc_stats(
-        self: std::sync::Arc<Self>,
-    ) -> Option<std::sync::Arc<GccBandwidthEstimator>> {
+    fn as_gcc_stats(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<GccBandwidthEstimator>> {
         Some(self)
     }
 }
@@ -279,9 +281,7 @@ mod tests {
 
         // Steady small deltas → additive growth.
         let fb = feedback(
-            &(0..10)
-                .map(|i| (i as u16, Some(1000)))
-                .collect::<Vec<_>>(),
+            &(0..10).map(|i| (i as u16, Some(1000))).collect::<Vec<_>>(),
             0,
         );
         est.on_twcc_feedback(&fb);

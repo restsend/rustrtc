@@ -125,7 +125,10 @@ async fn buffered_amount_low_fires_once_after_drain() -> Result<()> {
 
     // The edge is one-shot: no second event until we exceed again.
     let second = timeout(Duration::from_millis(1500), low_rx.recv()).await;
-    assert!(second.is_err(), "BufferedAmountLow must not re-fire without re-arming");
+    assert!(
+        second.is_err(),
+        "BufferedAmountLow must not re-fire without re-arming"
+    );
 
     // After full drain the buffered amount is zero.
     for _ in 0..50 {
@@ -205,6 +208,9 @@ async fn buffered_amount_zero_threshold_never_fires() -> Result<()> {
         pc_a.send_data(dc_a.id, &burst).await?;
     }
     let fired = timeout(Duration::from_millis(1500), low_rx.recv()).await;
-    assert!(fired.is_err(), "threshold 0 must never fire BufferedAmountLow");
+    assert!(
+        fired.is_err(),
+        "threshold 0 must never fire BufferedAmountLow"
+    );
     Ok(())
 }

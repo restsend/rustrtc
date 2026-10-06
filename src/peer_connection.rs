@@ -177,9 +177,7 @@ pub trait RtpSenderInterceptor: Send + Sync {
         None
     }
     /// Downcast hook for the GCC bandwidth estimator (GCC loop).
-    fn as_gcc_stats(
-        self: Arc<Self>,
-    ) -> Option<Arc<crate::media::gcc::GccBandwidthEstimator>> {
+    fn as_gcc_stats(self: Arc<Self>) -> Option<Arc<crate::media::gcc::GccBandwidthEstimator>> {
         None
     }
 }
@@ -6950,12 +6948,12 @@ impl RtpSender {
     /// Subscribe to GCC target-bitrate changes (bps). Returns `None` when no
     /// estimator is installed. Applications driving an encoder should spawn a
     /// task on this receiver and adapt the encoder bitrate.
-    pub fn subscribe_target_bitrate(
-        &self,
-    ) -> Option<tokio::sync::watch::Receiver<u64>> {
-        self.interceptors
-            .iter()
-            .find_map(|i| i.clone().as_gcc_stats().map(|g| g.subscribe_target_bitrate()))
+    pub fn subscribe_target_bitrate(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.interceptors.iter().find_map(|i| {
+            i.clone()
+                .as_gcc_stats()
+                .map(|g| g.subscribe_target_bitrate())
+        })
     }
 
     /// Next sequence number the paced send loop will put on the wire.

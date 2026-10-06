@@ -64,10 +64,7 @@ async fn mdns_candidates_obfuscate_sdp_but_still_connect() -> Result<()> {
     // Host candidates must be advertised as `.local` hostnames.
     let cands = candidate_lines(&offer_sdp);
     assert!(!cands.is_empty(), "offer must carry candidates");
-    let host_cands: Vec<&String> = cands
-        .iter()
-        .filter(|c| c.contains(" typ host"))
-        .collect();
+    let host_cands: Vec<&String> = cands.iter().filter(|c| c.contains(" typ host")).collect();
     assert!(
         !host_cands.is_empty(),
         "offer must carry host candidates, got: {cands:?}"
@@ -107,7 +104,8 @@ async fn mdns_candidates_obfuscate_sdp_but_still_connect() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     // DataChannel flows across the mDNS-obfuscated offer.
-    pc_a.send_data(dc_a.id, b"mdns-ping".to_vec().as_slice()).await?;
+    pc_a.send_data(dc_a.id, b"mdns-ping".to_vec().as_slice())
+        .await?;
     let got = timeout(Duration::from_secs(5), async {
         loop {
             if let Some(DataChannelEvent::Message(b)) = dc_b.recv().await {

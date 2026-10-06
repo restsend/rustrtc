@@ -76,10 +76,7 @@ pub mod tokio_impl {
     #[async_trait::async_trait]
     impl UdpSocket for TokioUdpSocket {
         async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr), NetError> {
-            self.0
-                .recv_from(buf)
-                .await
-                .map_err(|_| NetError::Other)
+            self.0.recv_from(buf).await.map_err(|_| NetError::Other)
         }
 
         async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> Result<usize, NetError> {
@@ -109,9 +106,7 @@ pub mod tokio_impl {
                 let mut fut = self.0.writable();
                 let _ = core::pin::pin!(fut).poll(&mut cx);
             }
-            self.0
-                .try_send_to(buf, addr)
-                .map_err(|_| NetError::Other)
+            self.0.try_send_to(buf, addr).map_err(|_| NetError::Other)
         }
     }
 }
