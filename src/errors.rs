@@ -77,6 +77,18 @@ impl From<crate::platform::net::NetError> for RtcError {
     }
 }
 
+impl From<RtpError> for RtcError {
+    fn from(e: RtpError) -> Self {
+        RtcError::Protocol(alloc::format!("rtp: {e}"))
+    }
+}
+
+impl From<SrtpError> for RtcError {
+    fn from(e: SrtpError) -> Self {
+        RtcError::Protocol(alloc::format!("srtp: {e}"))
+    }
+}
+
 impl From<core::num::ParseIntError> for RtcError {
     fn from(e: core::num::ParseIntError) -> Self {
         RtcError::Internal(alloc::format!("int parse: {e}"))

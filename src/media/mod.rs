@@ -11,7 +11,6 @@ pub mod packetizer;
 #[cfg(feature = "std")]
 pub mod pipeline;
 pub mod spsc;
-#[cfg(feature = "std")]
 pub mod track;
 #[cfg(feature = "std")]
 pub mod twcc_feedback;
@@ -32,7 +31,6 @@ pub use pipeline::{
     TrackMediaSink, TrackMediaSource, spawn_media_pump, track_from_source,
 };
 pub use spsc::SpscRing;
-#[cfg(feature = "std")]
 pub use track::{
     AudioStreamTrack, MediaRelay, MediaStreamTrack, RelayStreamTrack, SampleStreamSource,
     SampleStreamTrack, TrackState, VideoStreamTrack, sample_track,

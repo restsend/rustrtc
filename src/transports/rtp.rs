@@ -1,19 +1,18 @@
+use crate::errors::{RtcError, RtcResult};
 use crate::peer_connection::{RtpObserver, RtpReceiver};
+use crate::platform::atomic64::AtomicU64;
+use crate::platform::sync::{Mutex, RwLock, mpsc};
+use crate::prelude::*;
 use crate::rtp::{RtcpPacket, RtpPacket, is_rtcp, marshal_rtcp_packets, parse_rtcp_packets};
 use crate::srtp::{SrtpPacket, SrtpSession};
 use crate::transports::PacketReceiver;
 use crate::transports::ice::conn::IceConn;
 use crate::transports::ice::stun::random_u32;
-use anyhow::Result;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use parking_lot::{Mutex, RwLock};
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
-use tokio::sync::mpsc;
+use core::cell::RefCell;
+use core::net::SocketAddr;
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use tracing::{debug, trace};
 
 const EXT_ID_NONE: u8 = 0;
@@ -31,18 +30,15 @@ fn decode_ext_id(raw: u8) -> Option<u8> {
 async fn try_send_with_fallback<T>(
     tx: &mpsc::Sender<T>,
     value: T,
-) -> Result<(), mpsc::error::SendError<T>> {
+) -> Result<(), mpsc::SendError<T>> {
     match tx.try_send(value) {
         Ok(()) => Ok(()),
-        Err(mpsc::error::TrySendError::Full(value)) => tx.send(value).await,
-        Err(mpsc::error::TrySendError::Closed(value)) => Err(mpsc::error::SendError(value)),
+        Err(mpsc::TrySendError::Full(value)) => tx.send(value).await,
+        Err(mpsc::TrySendError::Closed(value)) => Err(mpsc::SendError(value)),
     }
 }
 
-fn try_send_dropping<T>(
-    tx: &mpsc::Sender<T>,
-    value: T,
-) -> Result<(), mpsc::error::TrySendError<T>> {
+fn try_send_dropping<T>(tx: &mpsc::Sender<T>, value: T) -> Result<(), mpsc::TrySendError<T>> {
     tx.try_send(value)
 }
 
@@ -197,10 +193,10 @@ struct OutTimeline {
 struct RewriteBridge {
     target: Arc<RtpTransport>,
     video_target: Option<Arc<RtpTransport>>,
-    video_payload_types: HashSet<u8>,
+    video_payload_types: BTreeSet<u8>,
     options: RtpRewriteBridgeOptions,
     rules: Vec<RtpRewriteRule>,
-    streams: RefCell<HashMap<u32, StreamRewriteState>>,
+    streams: RefCell<BTreeMap<u32, StreamRewriteState>>,
     /// Outgoing timeline per destination SSRC (see [`OutTimeline`]).
     ///
     /// A re-used sequence number on an outgoing SSRC looks like a stale
@@ -210,14 +206,14 @@ struct RewriteBridge {
     /// it still owns the destination timeline (nothing else was assigned
     /// after its last packet); otherwise it re-anchors past the high-water
     /// mark.
-    timelines: RefCell<HashMap<u32, OutTimeline>>,
+    timelines: RefCell<BTreeMap<u32, OutTimeline>>,
 }
 
 impl RewriteBridge {
     fn new(
         target: Arc<RtpTransport>,
         video_target: Option<Arc<RtpTransport>>,
-        video_payload_types: HashSet<u8>,
+        video_payload_types: BTreeSet<u8>,
         options: RtpRewriteBridgeOptions,
         rules: Vec<RtpRewriteRule>,
     ) -> Self {
@@ -227,8 +223,8 @@ impl RewriteBridge {
             video_payload_types,
             options,
             rules,
-            streams: RefCell::new(HashMap::new()),
-            timelines: RefCell::new(HashMap::new()),
+            streams: RefCell::new(BTreeMap::new()),
+            timelines: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -405,9 +401,9 @@ impl RewriteBridge {
 
 #[derive(Default)]
 struct ListenerRegistry {
-    by_ssrc: HashMap<u32, mpsc::Sender<(RtpPacket, SocketAddr)>>,
-    by_rid: HashMap<String, mpsc::Sender<(RtpPacket, SocketAddr)>>,
-    by_mid: HashMap<String, mpsc::Sender<(RtpPacket, SocketAddr)>>,
+    by_ssrc: BTreeMap<u32, mpsc::Sender<(RtpPacket, SocketAddr)>>,
+    by_rid: BTreeMap<String, mpsc::Sender<(RtpPacket, SocketAddr)>>,
+    by_mid: BTreeMap<String, mpsc::Sender<(RtpPacket, SocketAddr)>>,
     routes: Vec<ListenerRoute>,
 }
 
@@ -721,13 +717,13 @@ impl RtpTransport {
 
     /// Returns the remote peer's socket address (the nominated ICE candidate
     /// or the configured RTP destination).
-    pub fn remote_addr(&self) -> std::net::SocketAddr {
+    pub fn remote_addr(&self) -> SocketAddr {
         *self.transport.remote_addr.read()
     }
 
     /// Returns the local socket address (the ICE socket's bind address).
     /// Returns `0.0.0.0:0` when the socket is not yet available.
-    pub fn local_addr(&self) -> std::net::SocketAddr {
+    pub fn local_addr(&self) -> SocketAddr {
         self.transport.local_addr()
     }
 
@@ -753,7 +749,7 @@ impl RtpTransport {
         options: RtpRewriteBridgeOptions,
         rules: Vec<RtpRewriteRule>,
     ) {
-        self.bridge_rewrite_rules_to_with_video(dst, None, HashSet::new(), options, rules);
+        self.bridge_rewrite_rules_to_with_video(dst, None, BTreeSet::new(), options, rules);
     }
 
     /// Install a payload-type-aware rewrite bridge with an optional video
@@ -766,7 +762,7 @@ impl RtpTransport {
         &self,
         dst: Arc<RtpTransport>,
         video_dst: Option<Arc<RtpTransport>>,
-        video_payload_types: HashSet<u8>,
+        video_payload_types: BTreeSet<u8>,
         options: RtpRewriteBridgeOptions,
         rules: Vec<RtpRewriteRule>,
     ) {
@@ -845,7 +841,7 @@ impl RtpTransport {
     }
 
     /// Returns `Ok(0)` without sending while the direction stops this SSRC.
-    pub async fn send(&self, buf: &[u8]) -> Result<usize> {
+    pub async fn send(&self, buf: &[u8]) -> RtcResult<usize> {
         let ssrc = buf
             .get(8..12)
             .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
@@ -856,15 +852,21 @@ impl RtpTransport {
         let session = self.srtp_session.lock().as_ref().cloned();
         let Some(session) = session else {
             if self.srtp_required {
-                return Err(anyhow::anyhow!("SRTP required but session not ready"));
+                return Err(RtcError::InvalidState(
+                    "SRTP required but session not ready".into(),
+                ));
             }
-            return self.transport.send(buf).await.map_err(anyhow::Error::from);
+            return self.transport.send(buf).await;
         };
 
         let protected = {
             let mut packet = RtpPacket::parse(buf)?;
 
             // Inject abs-send-time if enabled.
+            // abs-send-time carries NTP wall-clock timestamps: inject only
+            // where a wall clock exists. no_std targets without one simply
+            // omit the extension (receivers treat it as absent).
+            #[cfg(feature = "std")]
             if let Some(id) = decode_ext_id(self.abs_send_time_extension_id.load(Ordering::Relaxed))
             {
                 let abs_send_time =
@@ -878,14 +880,11 @@ impl RtpTransport {
             srtp.protect_rtp(&packet, &mut protected)?;
             protected
         };
-        self.transport
-            .send(&protected)
-            .await
-            .map_err(anyhow::Error::from)
+        self.transport.send(&protected).await
     }
 
     /// Returns `Ok(0)` without sending while the direction stops this SSRC.
-    pub async fn send_rtp(&self, mut packet: RtpPacket) -> Result<usize> {
+    pub async fn send_rtp(&self, mut packet: RtpPacket) -> RtcResult<usize> {
         if !self.rtp_send_allowed_for(packet.header.ssrc) {
             return Ok(0);
         }
@@ -901,6 +900,8 @@ impl RtpTransport {
         }
 
         // Inject abs-send-time if enabled (non-fatal: header may lack room on small payloads).
+        // Wall-clock NTP timestamps: std only (see send() above).
+        #[cfg(feature = "std")]
         if let Some(id) = decode_ext_id(self.abs_send_time_extension_id.load(Ordering::Relaxed)) {
             let abs_send_time = crate::rtp::calculate_abs_send_time(std::time::SystemTime::now());
             let data = abs_send_time.to_be_bytes();
@@ -925,19 +926,16 @@ impl RtpTransport {
                         debug!(
                             "RtpTransport: SRTP required but session not ready, dropping RTP send"
                         );
-                        return Err(anyhow::anyhow!("SRTP required but session not ready"));
+                        return Err(RtcError::InvalidState(
+                            "SRTP required but session not ready".into(),
+                        ));
                     }
                     packet.marshal()?
                 }
             }
         };
 
-        match self
-            .transport
-            .send(&protected)
-            .await
-            .map_err(anyhow::Error::from)
-        {
+        match self.transport.send(&protected).await {
             Ok(n) => {
                 if is_first {
                     self.transport.mark_first_outbound();
@@ -959,7 +957,7 @@ impl RtpTransport {
         }
     }
 
-    pub async fn send_rtcp(&self, packets: &[RtcpPacket]) -> Result<usize> {
+    pub async fn send_rtcp(&self, packets: &[RtcpPacket]) -> RtcResult<usize> {
         let mut raw = marshal_rtcp_packets(packets)?;
         let protected = {
             let session_guard = self.srtp_session.lock();
@@ -970,15 +968,14 @@ impl RtpTransport {
             } else {
                 if self.srtp_required {
                     debug!("Failed to send PLI: SRTP required but session not ready");
-                    return Err(anyhow::anyhow!("SRTP required but session not ready"));
+                    return Err(RtcError::InvalidState(
+                        "SRTP required but session not ready".into(),
+                    ));
                 }
                 raw
             }
         };
-        self.transport
-            .send_rtcp(&protected)
-            .await
-            .map_err(anyhow::Error::from)
+        self.transport.send_rtcp(&protected).await
     }
 
     /// Synchronous best-effort RTCP send for the close path, where we must NOT
@@ -1139,7 +1136,11 @@ impl PacketReceiver for RtpTransport {
                         let mut srtp = session.lock();
                         match srtp.unprotect_rtcp(&mut buf) {
                             Ok(()) => {
-                                if std::env::var("RUSTRTC_RTCP_TRACE").is_ok() {
+                                #[cfg(feature = "std")]
+                                let rtcp_trace = std::env::var("RUSTRTC_RTCP_TRACE").is_ok();
+                                #[cfg(not(feature = "std"))]
+                                let rtcp_trace = false;
+                                if rtcp_trace {
                                     debug!(
                                         "RTCP unprotected: {} bytes head={:02x?}",
                                         buf.len(),
@@ -1280,7 +1281,7 @@ impl PacketReceiver for RtpTransport {
                 let mut bind_ssrc = false;
 
                 if let Some(rid) = &rid_bytes
-                    && let Ok(rid_str) = std::str::from_utf8(rid)
+                    && let Ok(rid_str) = core::str::from_utf8(rid)
                 {
                     selected = listeners.by_rid.get(rid_str).cloned();
                     bind_ssrc = selected.is_some();
@@ -1288,7 +1289,7 @@ impl PacketReceiver for RtpTransport {
 
                 if selected.is_none()
                     && let Some(mid) = &mid_bytes
-                    && let Ok(mid_str) = std::str::from_utf8(mid)
+                    && let Ok(mid_str) = core::str::from_utf8(mid)
                 {
                     selected = listeners.by_mid(mid_str);
                     bind_ssrc = selected.is_some();
@@ -1340,8 +1341,8 @@ impl PacketReceiver for RtpTransport {
             if let Some(tx) = listener {
                 match try_send_dropping(&tx, (rtp_packet, addr)) {
                     Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {}
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                    Err(mpsc::TrySendError::Full(_)) => {}
+                    Err(mpsc::TrySendError::Closed(_)) => {
                         let mut listeners = self.listeners.lock();
                         listeners.by_ssrc.remove(&ssrc);
                         listeners.remove_sender(&tx);
@@ -1357,7 +1358,7 @@ impl PacketReceiver for RtpTransport {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
     use crate::transports::ice::conn::IceConn;
@@ -2190,7 +2191,7 @@ mod tests {
         src_transport.bridge_rewrite_rules_to_with_video(
             dst_transport.clone(),
             Some(video_dst_transport.clone()),
-            HashSet::from([98, 99]),
+            BTreeSet::from([98, 99]),
             Default::default(),
             rules,
         );
@@ -2589,27 +2590,27 @@ mod tests {
 
     /// A counting observer that records ingress and egress separately.
     struct CountingObserver {
-        ingress: std::sync::atomic::AtomicU32,
-        egress: std::sync::atomic::AtomicU32,
-        last_pt: std::sync::atomic::AtomicU8,
+        ingress: core::sync::atomic::AtomicU32,
+        egress: core::sync::atomic::AtomicU32,
+        last_pt: core::sync::atomic::AtomicU8,
     }
 
     impl crate::peer_connection::RtpObserver for CountingObserver {
         fn on_ingress(&self, packet: &RtpPacket, _src_addr: SocketAddr) {
             self.ingress
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             self.last_pt.store(
                 packet.header.payload_type,
-                std::sync::atomic::Ordering::Relaxed,
+                core::sync::atomic::Ordering::Relaxed,
             );
         }
 
         fn on_egress(&self, packet: &RtpPacket, _dst_addr: SocketAddr) {
             self.egress
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             self.last_pt.store(
                 packet.header.payload_type,
-                std::sync::atomic::Ordering::Relaxed,
+                core::sync::atomic::Ordering::Relaxed,
             );
         }
     }
@@ -2625,9 +2626,9 @@ mod tests {
         let connection = IceConn::new(socket_rx, "127.0.0.1:9".parse().unwrap(), None);
         let transport = RtpTransport::new(connection, false);
         let observer: Arc<dyn crate::peer_connection::RtpObserver> = Arc::new(CountingObserver {
-            ingress: std::sync::atomic::AtomicU32::new(0),
-            egress: std::sync::atomic::AtomicU32::new(0),
-            last_pt: std::sync::atomic::AtomicU8::new(0),
+            ingress: core::sync::atomic::AtomicU32::new(0),
+            egress: core::sync::atomic::AtomicU32::new(0),
+            last_pt: core::sync::atomic::AtomicU8::new(0),
         });
 
         transport.add_observer(observer.clone());
@@ -2672,9 +2673,9 @@ mod tests {
 
         // Observe INGRESS on the source transport.
         let tap = Arc::new(CountingObserver {
-            ingress: std::sync::atomic::AtomicU32::new(0),
-            egress: std::sync::atomic::AtomicU32::new(0),
-            last_pt: std::sync::atomic::AtomicU8::new(0),
+            ingress: core::sync::atomic::AtomicU32::new(0),
+            egress: core::sync::atomic::AtomicU32::new(0),
+            last_pt: core::sync::atomic::AtomicU8::new(0),
         });
         src_transport.add_observer(tap.clone());
 
@@ -2694,12 +2695,12 @@ mod tests {
         }
 
         assert_eq!(
-            tap.ingress.load(std::sync::atomic::Ordering::Relaxed),
+            tap.ingress.load(core::sync::atomic::Ordering::Relaxed),
             3,
             "ingress observer must fire on the relay fast-path"
         );
         assert_eq!(
-            tap.last_pt.load(std::sync::atomic::Ordering::Relaxed),
+            tap.last_pt.load(core::sync::atomic::Ordering::Relaxed),
             8,
             "ingress observer observed the packet's payload type"
         );
@@ -2741,9 +2742,9 @@ mod tests {
         // Observe EGRESS on the DESTINATION (relay pushes to dst's IceConn,
         // firing dst's egress observer on the plaintext rewritten packet).
         let tap = Arc::new(CountingObserver {
-            ingress: std::sync::atomic::AtomicU32::new(0),
-            egress: std::sync::atomic::AtomicU32::new(0),
-            last_pt: std::sync::atomic::AtomicU8::new(0),
+            ingress: core::sync::atomic::AtomicU32::new(0),
+            egress: core::sync::atomic::AtomicU32::new(0),
+            last_pt: core::sync::atomic::AtomicU8::new(0),
         });
         dst_transport.add_observer(tap.clone());
 
@@ -2763,17 +2764,17 @@ mod tests {
         }
 
         assert_eq!(
-            tap.egress.load(std::sync::atomic::Ordering::Relaxed),
+            tap.egress.load(core::sync::atomic::Ordering::Relaxed),
             3,
             "egress observer on destination must fire for relayed packets"
         );
         assert_eq!(
-            tap.last_pt.load(std::sync::atomic::Ordering::Relaxed),
+            tap.last_pt.load(core::sync::atomic::Ordering::Relaxed),
             96,
             "egress observer saw the rewritten payload type"
         );
         assert_eq!(
-            tap.ingress.load(std::sync::atomic::Ordering::Relaxed),
+            tap.ingress.load(core::sync::atomic::Ordering::Relaxed),
             0,
             "ingress on destination must NOT fire (relay bypasses dst receive)"
         );
@@ -2793,9 +2794,9 @@ mod tests {
         let transport = Arc::new(RtpTransport::new(conn, false));
 
         let tap = Arc::new(CountingObserver {
-            ingress: std::sync::atomic::AtomicU32::new(0),
-            egress: std::sync::atomic::AtomicU32::new(0),
-            last_pt: std::sync::atomic::AtomicU8::new(0),
+            ingress: core::sync::atomic::AtomicU32::new(0),
+            egress: core::sync::atomic::AtomicU32::new(0),
+            last_pt: core::sync::atomic::AtomicU8::new(0),
         });
         transport.add_observer(tap.clone());
 
@@ -2806,12 +2807,12 @@ mod tests {
         }
 
         assert_eq!(
-            tap.egress.load(std::sync::atomic::Ordering::Relaxed),
+            tap.egress.load(core::sync::atomic::Ordering::Relaxed),
             2,
             "egress observer must fire on normal send_rtp"
         );
         assert_eq!(
-            tap.last_pt.load(std::sync::atomic::Ordering::Relaxed),
+            tap.last_pt.load(core::sync::atomic::Ordering::Relaxed),
             0,
             "egress observer saw the sent payload type"
         );
@@ -2852,7 +2853,7 @@ mod tests {
         assert!(
             !src_transport
                 .has_observers
-                .load(std::sync::atomic::Ordering::SeqCst),
+                .load(core::sync::atomic::Ordering::SeqCst),
             "flag must be false when no observer registered"
         );
 

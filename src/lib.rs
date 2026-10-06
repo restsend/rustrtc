@@ -33,7 +33,6 @@ pub mod prelude {
 pub mod config;
 pub mod errors;
 pub mod media;
-#[cfg(feature = "std")]
 pub mod peer_connection;
 pub mod platform;
 pub mod rtp;
@@ -41,7 +40,6 @@ pub mod rtx;
 pub mod sdp;
 pub mod srtp;
 pub mod stats;
-#[cfg(feature = "std")]
 pub mod stats_collector;
 #[cfg(feature = "t38")]
 pub mod t38;

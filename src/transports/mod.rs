@@ -3,7 +3,6 @@ pub mod datachannel;
 #[cfg(feature = "std")]
 pub mod dtls;
 pub mod ice;
-#[cfg(feature = "std")]
 pub mod rtp;
 #[cfg(feature = "std")]
 pub mod sctp;

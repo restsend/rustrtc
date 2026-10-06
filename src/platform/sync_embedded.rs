@@ -78,6 +78,12 @@ impl<T> core::ops::DerefMut for MutexGuard<'_, T> {
     }
 }
 
+impl<T: Default> Default for Mutex<T> {
+    fn default() -> Self {
+        Mutex::new(T::default())
+    }
+}
+
 impl<T: core::fmt::Debug> core::fmt::Debug for Mutex<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let guard = self.lock();
@@ -302,6 +308,103 @@ impl<T> AsyncMutex<T> {
     }
 }
 
+// ── Notify ───────────────────────────────────────────────────────────────
+
+/// Tokio-style async notification primitive.
+///
+/// Semantics mirror `tokio::sync::Notify` for the surface the crate uses:
+/// - [`notify_one`](Notify::notify_one) wakes one registered waiter, or
+///   stores a **permit** (at most one) so the wake is never lost across
+///   await points — the permit is consumed by the next `notified()` poll;
+/// - [`notify_waiters`](Notify::notify_waiters) wakes every currently
+///   registered waiter and stores **no** permit (`notified()` futures that
+///   have not been polled yet do not observe it);
+/// - [`notified`](Notify::notified) resolves immediately when a permit is
+///   pending, otherwise registers the waker and pends.
+///
+/// WP3 note: the embassy backend can build the same semantics on
+/// `embassy_sync::signal` + a permit flag.
+pub struct Notify {
+    state: Mutex<NotifyState>,
+}
+
+struct NotifyState {
+    permit: bool,
+    waiters: Vec<Waker>,
+}
+
+impl Notify {
+    pub const fn new() -> Self {
+        Self {
+            state: Mutex::new(NotifyState {
+                permit: false,
+                waiters: Vec::new(),
+            }),
+        }
+    }
+
+    /// Wakes one registered waiter; with no waiter pending, stores a single
+    /// permit for the next `notified()`.
+    pub fn notify_one(&self) {
+        let woken;
+        {
+            let mut state = self.state.lock();
+            if state.waiters.is_empty() {
+                state.permit = true;
+                return;
+            }
+            woken = Some(state.waiters.remove(0));
+        }
+        woken.unwrap().wake();
+    }
+
+    /// Wakes every currently registered waiter. Stores no permit.
+    pub fn notify_waiters(&self) {
+        let woken = core::mem::take(&mut self.state.lock().waiters);
+        for w in woken {
+            w.wake();
+        }
+    }
+
+    /// Future resolving on the next wake (or immediately with a stored
+    /// permit). Registration happens on first poll, matching tokio.
+    pub fn notified(&self) -> NotifyNotified<'_> {
+        NotifyNotified { notify: self }
+    }
+}
+
+impl Default for Notify {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Future returned by [`Notify::notified`].
+pub struct NotifyNotified<'a> {
+    notify: &'a Notify,
+}
+
+impl Future for NotifyNotified<'_> {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut state = self.notify.state.lock();
+        if state.permit {
+            state.permit = false;
+            drop(state);
+            return Poll::Ready(());
+        }
+        // Re-poll replaces the stored waker (same task, same future) so a
+        // long-lived loop does not accumulate stale entries; a different
+        // waker means a genuinely distinct waiter and is appended.
+        match state.waiters.iter_mut().find(|w| w.will_wake(cx.waker())) {
+            Some(slot) => *slot = cx.waker().clone(),
+            None => state.waiters.push(cx.waker().clone()),
+        }
+        drop(state);
+        Poll::Pending
+    }
+}
+
 // ── watch ────────────────────────────────────────────────────────────────
 
 struct WatchState<T> {
@@ -318,6 +421,14 @@ struct WatchInner<T> {
 
 pub struct watch_Sender<T> {
     inner: Arc<WatchInner<T>>,
+}
+
+impl<T> Clone for watch_Sender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 pub struct watch_Receiver<T> {
@@ -406,6 +517,23 @@ impl<T> watch_Sender<T> {
     pub fn borrow(&self) -> watch_Ref<'_, T> {
         watch_Ref {
             guard: self.inner.state.lock(),
+        }
+    }
+
+    /// Stores `f(value)` when the mutation reports a change; wakes all
+    /// receivers only then (tokio parity).
+    pub fn send_if_modified(&self, f: impl FnOnce(&mut T) -> bool) {
+        let woken;
+        {
+            let mut state = self.inner.state.lock();
+            if !f(&mut state.value) {
+                return;
+            }
+            self.inner.version.fetch_add(1, Ordering::AcqRel);
+            woken = core::mem::take(&mut state.wakers);
+        }
+        for w in woken {
+            w.wake();
         }
     }
 }
@@ -713,19 +841,31 @@ struct BroadcastState<T> {
 
 pub struct broadcast_Sender<T> {
     inner: Arc<Mutex<BroadcastState<T>>>,
+    /// Live receiver count (tokio `receiver_count` parity). Senders share
+    /// the counter; only receiver creation/drop changes it.
+    receivers: Arc<AtomicUsize>,
 }
 
 pub struct broadcast_Receiver<T> {
     inner: Arc<Mutex<BroadcastState<T>>>,
     next_seq: AtomicU64,
+    receivers: Arc<AtomicUsize>,
 }
 
 impl<T> Clone for broadcast_Receiver<T> {
     fn clone(&self) -> Self {
+        self.receivers.fetch_add(1, Ordering::AcqRel);
         Self {
             inner: self.inner.clone(),
             next_seq: AtomicU64::new(self.next_seq.load(Ordering::Acquire)),
+            receivers: self.receivers.clone(),
         }
+    }
+}
+
+impl<T> Drop for broadcast_Receiver<T> {
+    fn drop(&mut self) {
+        self.receivers.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -733,6 +873,15 @@ impl<T> Clone for broadcast_Receiver<T> {
 pub enum broadcast_RecvError {
     Closed,
     Lagged(u64),
+}
+
+/// Non-blocking receive outcome (tokio `broadcast::error::TryRecvError`
+/// parity).
+#[derive(Debug, PartialEq, Eq)]
+pub enum broadcast_TryRecvError {
+    Empty,
+    Lagged(u64),
+    Closed,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -743,10 +892,12 @@ pub mod broadcast {
     use crate::prelude::*;
     use alloc::collections::VecDeque;
     use alloc::sync::Arc;
+    use core::sync::atomic::AtomicUsize;
 
     pub use super::{
         broadcast_Receiver as Receiver, broadcast_RecvError as RecvError,
         broadcast_SendError as SendError, broadcast_Sender as Sender,
+        broadcast_TryRecvError as TryRecvError,
     };
 
     /// `capacity` is accepted for API parity; history is fixed at
@@ -758,13 +909,16 @@ pub mod broadcast {
             wakers: Vec::new(),
             sender_gone: false,
         }));
+        let receivers = Arc::new(AtomicUsize::new(1));
         (
             Sender {
                 inner: inner.clone(),
+                receivers: receivers.clone(),
             },
             Receiver {
                 inner,
                 next_seq: AtomicU64::new(0),
+                receivers,
             },
         )
     }
@@ -774,6 +928,7 @@ impl<T> Clone for broadcast_Sender<T> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            receivers: self.receivers.clone(),
         }
     }
 }
@@ -805,10 +960,17 @@ impl<T: Clone> broadcast_Sender<T> {
     /// New receiver (sees only values sent after this point).
     pub fn subscribe(&self) -> broadcast_Receiver<T> {
         let next = self.inner.lock().next_seq;
+        self.receivers.fetch_add(1, Ordering::AcqRel);
         broadcast_Receiver {
             inner: self.inner.clone(),
             next_seq: AtomicU64::new(next),
+            receivers: self.receivers.clone(),
         }
+    }
+
+    /// Number of live receivers (tokio parity).
+    pub fn receiver_count(&self) -> usize {
+        self.receivers.load(Ordering::Acquire)
     }
 }
 
@@ -816,6 +978,31 @@ impl<T: Clone> broadcast_Receiver<T> {
     /// Async receive of the next undelivered value.
     pub fn recv(&mut self) -> BroadcastRecvFuture<'_, T> {
         BroadcastRecvFuture { rx: self }
+    }
+
+    /// Non-blocking receive (tokio parity): the next undelivered value,
+    /// `Empty` when nothing new, `Lagged` (with the skipped count) when the
+    /// receiver fell behind the history, `Closed` once the sender is gone
+    /// and the history is drained. Advances `next_seq` on `Ok`/`Lagged`,
+    /// matching tokio.
+    pub fn try_recv(&self) -> Result<T, broadcast_TryRecvError> {
+        let mut state = self.inner.lock();
+        let want = self.next_seq.load(Ordering::Acquire);
+        if let Some(&(oldest, _)) = state.history.front()
+            && want < oldest
+        {
+            self.next_seq.store(oldest, Ordering::Release);
+            return Err(broadcast_TryRecvError::Lagged(oldest - want));
+        }
+        if let Some(pos) = state.history.iter().position(|(s, _)| *s == want) {
+            let v = state.history[pos].1.clone();
+            self.next_seq.store(want + 1, Ordering::Release);
+            return Ok(v);
+        }
+        if state.sender_gone {
+            return Err(broadcast_TryRecvError::Closed);
+        }
+        Err(broadcast_TryRecvError::Empty)
     }
 }
 
@@ -993,7 +1180,18 @@ impl<T> mpsc_BoundedSender<T> {
         Ok(())
     }
 
-    /// Async send: waits for room.
+    /// `true` once the receiver half has been dropped.
+    pub fn is_closed(&self) -> bool {
+        self.inner.lock().receiver_gone
+    }
+
+    /// `true` when both handles point at the same channel.
+    pub fn same_channel(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Async send: waits for room. Fails with `SendError` once the
+    /// receiver is gone (tokio `Sender::send` parity).
     pub fn send(&self, value: T) -> BoundedSendFuture<'_, T> {
         BoundedSendFuture {
             sender: self,
@@ -1008,7 +1206,7 @@ pub struct BoundedSendFuture<'a, T> {
 }
 
 impl<'a, T> Future for BoundedSendFuture<'a, T> {
-    type Output = Result<(), mpsc_TrySendError<T>>;
+    type Output = Result<(), mpsc_SendError<T>>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // Projection is safe: no structural pinning (value moved out via
         // Option::take, sender reference is fixed).
@@ -1016,7 +1214,7 @@ impl<'a, T> Future for BoundedSendFuture<'a, T> {
         let mut state = this.sender.inner.lock();
         if state.receiver_gone {
             let v = this.value.take().unwrap();
-            return Poll::Ready(Err(mpsc_TrySendError::Closed(v)));
+            return Poll::Ready(Err(mpsc_SendError(v)));
         }
         if state.queue.len() >= state.capacity {
             state.wakers.push(cx.waker().clone());

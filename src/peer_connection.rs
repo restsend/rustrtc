@@ -1,8 +1,31 @@
+use crate::errors::{RtcError, RtcResult};
 use crate::media::depacketizer::{Depacketizer, DepacketizerFactory};
 use crate::media::track::{MediaStreamTrack, SampleStreamSource, SampleStreamTrack, sample_track};
+use crate::platform::join::{join2, join3};
+use crate::platform::sync::{self, Mutex, Notify, RwLock, broadcast, mpsc, watch};
+use crate::platform::time::Instant;
+use crate::prelude::*;
 use crate::rtp::{
     FirRequest, FullIntraRequest, GenericNack, PictureLossIndication, RtcpPacket, RtpPacket,
     SenderReport,
+};
+// sdp types straight from the module: the crate-root re-exports are
+// std-gated, the items themselves are not.
+#[cfg(feature = "std")]
+use crate::media::gcc::GccBandwidthEstimator;
+#[cfg(feature = "std")]
+use crate::media::twcc_feedback::TwccFeedbackGenerator;
+#[cfg(not(feature = "std"))]
+use crate::peer_connection::std_gated::dtls;
+#[cfg(not(feature = "std"))]
+use crate::peer_connection::std_gated::gcc::GccBandwidthEstimator;
+#[cfg(not(feature = "std"))]
+use crate::peer_connection::std_gated::twcc_feedback::TwccFeedbackGenerator;
+#[cfg(not(feature = "std"))]
+use crate::peer_connection::std_gated::{DataChannel, DtlsTransport, SctpTransport, UdtlTransport};
+use crate::platform::atomic64::AtomicU64;
+use crate::sdp::{
+    Attribute, Direction, MediaKind, MediaSection, Origin, SdpType, SessionDescription,
 };
 use crate::stats::{StatsReport, gather_once};
 use crate::stats_collector::StatsCollector;
@@ -10,38 +33,156 @@ use crate::stats_collector::StatsCollector;
 use crate::t38::endpoint::FaxEndpoint;
 #[cfg(feature = "t38")]
 use crate::t38::t30::{T30FaxConfig, T30Role, T30Session};
+#[cfg(feature = "std")]
 use crate::transports::dtls::{self, DtlsTransport};
 use crate::transports::get_local_ip;
+use crate::transports::ice::conn::IceConn;
 use crate::transports::ice::stun::random_u32;
-use crate::transports::ice::{IceCandidate, IceGathererState, IceTransport, conn::IceConn};
+use crate::transports::ice::{IceCandidate, IceGathererState, IceTransport};
 use crate::transports::rtp::{
     RtpRewriteBridgeOptions, RtpRewriteBridgeParams, RtpRewriteRule, RtpTransport,
 };
-use crate::transports::sctp::{SctpLinkStats, SctpTransport};
+#[cfg(feature = "std")]
+use crate::transports::sctp::{DataChannel, DataChannelConfig, SctpLinkStats, SctpTransport};
+#[cfg(feature = "std")]
 use crate::transports::udptl::UdtlTransport;
-use crate::{
-    Attribute, AudioCapability, Direction, MediaKind, MediaSection, Origin, RtcConfiguration,
-    RtcError, RtcResult, SdpType, SessionDescription, TransportMode, VideoCapability,
-};
+use crate::{AudioCapability, RtcConfiguration, TransportMode, VideoCapability};
+use alloc::collections::VecDeque;
+use async_trait::async_trait;
 use base64::prelude::*;
-use parking_lot::{Mutex, RwLock};
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::IpAddr;
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering},
-    },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
-use tokio::sync::{Notify, broadcast, mpsc, watch};
+use core::future::Future;
+use core::net::IpAddr;
+use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, Ordering};
+use core::time::Duration;
+use futures::stream::{FuturesUnordered, StreamExt};
+#[cfg_attr(not(feature = "std"), allow(unused_imports))]
 use tracing::{Instrument, debug, debug_span, trace, warn};
 
-use async_trait::async_trait;
-use futures::stream::{FuturesUnordered, StreamExt};
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Weak;
+/// no_std stand-ins for the std-gated transports (plan D6: DTLS/SCTP/
+/// T.38/GCC-TWCC stay server-side; the embedded delivery surface is
+/// rtp/srtp). Shared code paths meet these types behind `Option`s that
+/// stay `None` in rtp/srtp mode, or through inert stub methods; the
+/// WebRtc-only code paths are `#[cfg(feature = "std")]` and fail fast
+/// with `RtcError::NotImplemented` on no_std.
+#[cfg(not(feature = "std"))]
+pub(crate) mod std_gated {
+    use crate::prelude::*;
+
+    pub mod dtls {
+        use crate::prelude::*;
+
+        /// Placeholder certificate: rtp/srtp mode carries no DTLS
+        /// fingerprint, so nothing ever reads its key material.
+        #[derive(Debug, Default, Clone)]
+        pub struct Certificate;
+
+        /// Only reachable if a no_std peer configures WebRtc mode; the
+        /// transport setup fails fast afterwards.
+        pub fn generate_certificate() -> crate::errors::RtcResult<Certificate> {
+            Ok(Certificate)
+        }
+
+        /// Empty fingerprint: rtp/srtp SDP carries no `a=fingerprint`.
+        pub fn fingerprint(_cert: &Certificate) -> String {
+            String::new()
+        }
+
+        #[derive(Debug)]
+        pub struct DtlsTransport;
+
+        impl DtlsTransport {
+            pub fn close(&self) {}
+
+            /// Inert: no DTLS transport exists, so there is no state stream.
+            pub fn subscribe_state(
+                &self,
+            ) -> Option<crate::platform::sync::watch::Receiver<DtlsState>> {
+                None
+            }
+        }
+
+        /// State names shared with the std DTLS transport so flavor-shared
+        /// monitors compile; the stub never emits any of them.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub enum DtlsState {
+            New,
+            Handshaking,
+            Connected,
+            Failed,
+            Closed,
+        }
+    }
+
+    pub use dtls::DtlsTransport;
+
+    #[derive(Debug)]
+    pub struct SctpTransport;
+
+    impl SctpTransport {
+        /// Shared close path: no SCTP transport → no close reason.
+        pub fn close_reason(&self) -> Option<String> {
+            None
+        }
+
+        /// Shared close path: nothing to close.
+        pub fn close(&self) {}
+
+        /// Shared diagnostics: nothing to report.
+        pub fn diagnostic_info(&self) -> String {
+            String::new()
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct DataChannel;
+
+    /// Inert stand-in: T.38/UDPTL is server-side (plan D6); the field is
+    /// always `None` on no_std because the only setters live in
+    /// std-gated fax paths.
+    #[derive(Debug)]
+    pub struct UdtlTransport;
+
+    /// Inert stand-in for the datachannel setup API (std only).
+    #[derive(Debug, Default)]
+    pub struct DataChannelConfig;
+
+    pub mod twcc_feedback {
+        /// Inert stand-in: `enable_gcc` requires WebRtc mode (std only),
+        /// so the runtime gates never install it on no_std.
+        #[derive(Debug)]
+        pub struct TwccFeedbackGenerator;
+
+        impl TwccFeedbackGenerator {
+            pub fn new() -> Self {
+                TwccFeedbackGenerator
+            }
+
+            pub fn set_ext_id(&self, _id: u8) {}
+
+            pub fn set_feedback_ssrc(&self, _ssrc: u32) {}
+
+            pub async fn run_flush_loop<T>(&self, _transport: T) {}
+        }
+
+        impl crate::peer_connection::RtpSenderInterceptor for TwccFeedbackGenerator {}
+        impl crate::peer_connection::RtpReceiverInterceptor for TwccFeedbackGenerator {}
+    }
+
+    pub mod gcc {
+        /// Inert stand-in: see [`super::twcc_feedback::TwccFeedbackGenerator`].
+        #[derive(Debug)]
+        pub struct GccBandwidthEstimator;
+
+        impl GccBandwidthEstimator {
+            pub fn new() -> Self {
+                GccBandwidthEstimator
+            }
+        }
+
+        impl crate::peer_connection::RtpSenderInterceptor for GccBandwidthEstimator {}
+    }
+}
 
 fn section_has_rtx(section: &MediaSection) -> bool {
     !crate::rtx::extract_rtx_apt_map_from_attrs(&section.attributes).is_empty()
@@ -133,7 +274,9 @@ impl Drop for TransportLoopDone {
 /// aborted on `Drop`) hard-cancels every remaining loop — replicating the old
 /// "drop the combined `select!` future" semantics without needing a
 /// cancellation token or a per-task `select!` branch.
+#[cfg(feature = "std")]
 struct LoopsGuard(Vec<tokio::task::JoinHandle<()>>);
+#[cfg(feature = "std")]
 impl Drop for LoopsGuard {
     fn drop(&mut self) {
         for handle in self.0.drain(..) {
@@ -141,6 +284,11 @@ impl Drop for LoopsGuard {
         }
     }
 }
+
+/// no_std counterpart: the injected spawner returns no handle; loops shut
+/// down cooperatively via their tokens/Notify guards.
+#[cfg(not(feature = "std"))]
+struct LoopsGuard;
 
 /// NACK / retransmission / RTCP-feedback hook for the SENDER side.
 ///
@@ -157,8 +305,8 @@ pub trait RtpSenderInterceptor: Send + Sync {
     async fn on_packet_sent(
         &self,
         _packet: &RtpPacket,
-        _dst_addr: std::net::SocketAddr,
-        _local_addr: std::net::SocketAddr,
+        _dst_addr: core::net::SocketAddr,
+        _local_addr: core::net::SocketAddr,
     ) {
     }
     /// Fires after a Sender Report (RTCP SR) has been built and sent.
@@ -177,7 +325,8 @@ pub trait RtpSenderInterceptor: Send + Sync {
         None
     }
     /// Downcast hook for the GCC bandwidth estimator (GCC loop).
-    fn as_gcc_stats(self: Arc<Self>) -> Option<Arc<crate::media::gcc::GccBandwidthEstimator>> {
+    #[cfg(feature = "std")]
+    fn as_gcc_stats(self: Arc<Self>) -> Option<Arc<GccBandwidthEstimator>> {
         None
     }
 }
@@ -199,8 +348,8 @@ pub trait RtpReceiverInterceptor: Send + Sync {
     async fn on_packet_received(
         &self,
         _packet: &RtpPacket,
-        _src_addr: std::net::SocketAddr,
-        _local_addr: std::net::SocketAddr,
+        _src_addr: core::net::SocketAddr,
+        _local_addr: core::net::SocketAddr,
     ) -> Option<RtcpPacket> {
         None
     }
@@ -227,12 +376,12 @@ pub trait RtpReceiverInterceptor: Send + Sync {
 pub trait RtpObserver: Send + Sync {
     /// Inbound packet, AFTER SRTP unprotect, BEFORE relay/demux. Fires for
     /// every accepted inbound RTP packet (relay and depacketize paths alike).
-    fn on_ingress(&self, _packet: &RtpPacket, _src_addr: std::net::SocketAddr) {}
+    fn on_ingress(&self, _packet: &RtpPacket, _src_addr: core::net::SocketAddr) {}
 
     /// Outbound packet, BEFORE SRTP protect (normal send) or BEFORE the relay
     /// push. Plaintext in both cases. Fires for every packet this transport
     /// emits on the wire.
-    fn on_egress(&self, _packet: &RtpPacket, _dst_addr: std::net::SocketAddr) {}
+    fn on_egress(&self, _packet: &RtpPacket, _dst_addr: core::net::SocketAddr) {}
 }
 
 const RTP_RECEIVER_SAMPLE_CAPACITY: usize = 64;
@@ -261,14 +410,14 @@ pub trait NackStats: Send + Sync {
 /// Bounded retransmission store: FIFO eviction + O(1) seq lookup.
 struct NackSendBuffer {
     order: VecDeque<u16>,
-    packets: HashMap<u16, RtpPacket>,
+    packets: BTreeMap<u16, RtpPacket>,
 }
 
 impl NackSendBuffer {
     fn with_capacity(max_size: usize) -> Self {
         Self {
             order: VecDeque::with_capacity(max_size),
-            packets: HashMap::with_capacity(max_size),
+            packets: BTreeMap::new(),
         }
     }
 
@@ -299,7 +448,7 @@ impl NackSendBuffer {
 pub struct DefaultRtpSenderNackHandler {
     buffer: Mutex<NackSendBuffer>,
     /// Last time we accepted a retransmit for a given primary sequence.
-    recent_resends: Mutex<HashMap<u16, Instant>>,
+    recent_resends: Mutex<BTreeMap<u16, Instant>>,
     max_size: usize,
     pub nack_recv_count: AtomicU64,
     /// Retransmits skipped because the same seq was resent within the cooldown.
@@ -342,7 +491,7 @@ impl DefaultRtpSenderNackHandler {
         let max_size = max_size.max(1);
         Self {
             buffer: Mutex::new(NackSendBuffer::with_capacity(max_size)),
-            recent_resends: Mutex::new(HashMap::with_capacity(max_size)),
+            recent_resends: Mutex::new(BTreeMap::new()),
             max_size,
             nack_recv_count: AtomicU64::new(0),
             retransmit_suppressed_count: AtomicU64::new(0),
@@ -379,7 +528,7 @@ impl DefaultRtpSenderNackHandler {
         let buffer = self.buffer.lock();
         let mut recent = self.recent_resends.lock();
         let mut out = Vec::new();
-        let mut seen = HashSet::with_capacity(seqs.len());
+        let mut seen = BTreeSet::new();
 
         for &seq in seqs {
             if !seen.insert(seq) {
@@ -414,8 +563,8 @@ impl RtpSenderInterceptor for DefaultRtpSenderNackHandler {
     async fn on_packet_sent(
         &self,
         packet: &RtpPacket,
-        _dst_addr: std::net::SocketAddr,
-        _local_addr: std::net::SocketAddr,
+        _dst_addr: core::net::SocketAddr,
+        _local_addr: core::net::SocketAddr,
     ) {
         // Do not buffer RTX retransmissions. They are sent directly through the
         // transport (not the interceptor chain), but guard in case a future
@@ -481,9 +630,9 @@ impl NackStats for DefaultRtpSenderNackHandler {
 pub struct DefaultRtpReceiverNackHandler {
     last_seq: AtomicU16,
     last_ssrc: AtomicU32,
-    initialized: std::sync::atomic::AtomicBool,
+    initialized: core::sync::atomic::AtomicBool,
     /// Sequences we have already requested via NACK; used for safer recovery accounting.
-    pending_nacks: Mutex<HashSet<u16>>,
+    pending_nacks: Mutex<BTreeSet<u16>>,
     pub nack_sent_count: AtomicU64,
     pub nack_recovered_count: AtomicU64,
 }
@@ -499,8 +648,8 @@ impl DefaultRtpReceiverNackHandler {
         Self {
             last_seq: AtomicU16::new(0),
             last_ssrc: AtomicU32::new(0),
-            initialized: std::sync::atomic::AtomicBool::new(false),
-            pending_nacks: Mutex::new(HashSet::new()),
+            initialized: core::sync::atomic::AtomicBool::new(false),
+            pending_nacks: Mutex::new(BTreeSet::new()),
             nack_sent_count: AtomicU64::new(0),
             nack_recovered_count: AtomicU64::new(0),
         }
@@ -516,8 +665,8 @@ impl RtpReceiverInterceptor for DefaultRtpReceiverNackHandler {
     async fn on_packet_received(
         &self,
         packet: &RtpPacket,
-        _src_addr: std::net::SocketAddr,
-        _local_addr: std::net::SocketAddr,
+        _src_addr: core::net::SocketAddr,
+        _local_addr: core::net::SocketAddr,
     ) -> Option<RtcpPacket> {
         let seq = packet.header.sequence_number;
         let ssrc = packet.header.ssrc;
@@ -624,19 +773,18 @@ impl NackStats for DefaultRtpReceiverNackHandler {
 enum ReceiverCommand {
     AddTrack {
         rid: Option<String>,
-        packet_rx: mpsc::Receiver<(crate::rtp::RtpPacket, std::net::SocketAddr)>,
-        feedback_rx:
-            std::sync::Arc<tokio::sync::Mutex<mpsc::Receiver<crate::media::track::FeedbackEvent>>>,
-        source: std::sync::Arc<crate::media::track::SampleStreamSource>,
-        simulcast_ssrc: std::sync::Arc<Mutex<Option<u32>>>,
+        packet_rx: mpsc::Receiver<(crate::rtp::RtpPacket, core::net::SocketAddr)>,
+        feedback_rx: Arc<sync::AsyncMutex<mpsc::Receiver<crate::media::track::FeedbackEvent>>>,
+        source: Arc<crate::media::track::SampleStreamSource>,
+        simulcast_ssrc: Arc<Mutex<Option<u32>>>,
     },
 }
 
 enum LoopEvent {
     Packet(
-        Option<(crate::rtp::RtpPacket, std::net::SocketAddr)>,
+        Option<(crate::rtp::RtpPacket, core::net::SocketAddr)>,
         Option<String>,
-        mpsc::Receiver<(crate::rtp::RtpPacket, std::net::SocketAddr)>,
+        mpsc::Receiver<(crate::rtp::RtpPacket, core::net::SocketAddr)>,
         Box<dyn Depacketizer>,
     ),
     Feedback(Option<crate::media::track::FeedbackEvent>, Option<String>),
@@ -644,7 +792,7 @@ enum LoopEvent {
 
 #[derive(Clone)]
 pub enum PeerConnectionEvent {
-    DataChannel(Arc<crate::transports::sctp::DataChannel>),
+    DataChannel(Arc<DataChannel>),
     Track(Arc<RtpTransceiver>),
 }
 
@@ -680,12 +828,12 @@ struct PeerConnectionInner {
     /// first inbound packets (e.g. RFC 4733 telephone-event / DTMF) until a
     /// caller-side poll attached them. New transports re-attach this list.
     rtp_observers: Mutex<Vec<Arc<dyn RtpObserver>>>,
-    rtp_media_ice_transports: Mutex<HashMap<u64, IceTransport>>,
-    rtp_media_transports: Mutex<HashMap<u64, Arc<RtpTransport>>>,
+    rtp_media_ice_transports: Mutex<BTreeMap<u64, IceTransport>>,
+    rtp_media_transports: Mutex<BTreeMap<u64, Arc<RtpTransport>>>,
     sctp_transport: Mutex<Option<Arc<SctpTransport>>>,
-    data_channels: Arc<Mutex<Vec<std::sync::Weak<crate::transports::sctp::DataChannel>>>>,
+    data_channels: Arc<Mutex<Vec<Weak<DataChannel>>>>,
     event_tx: mpsc::UnboundedSender<PeerConnectionEvent>,
-    event_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<PeerConnectionEvent>>,
+    event_rx: sync::AsyncMutex<mpsc::UnboundedReceiver<PeerConnectionEvent>>,
     dtls_role: watch::Sender<Option<bool>>,
     _dtls_role_rx: watch::Receiver<Option<bool>>,
     stats_collector: Arc<StatsCollector>,
@@ -697,7 +845,10 @@ struct PeerConnectionInner {
     /// `close_with_reason` / `Drop` abort any that survived cooperative
     /// shutdown so they cannot outlive the connection and leak the Arcs they
     /// captured (tracks, transports, etc.).
+    #[cfg(feature = "std")]
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    #[cfg(not(feature = "std"))]
+    tasks: Mutex<()>,
     /// Root span for this PeerConnection. Carries the configured `label` (set
     /// by the application, e.g. rustpbx's `{session_id}-{leg}`) and is
     /// instrumented onto every internal runner task so all ICE/DTLS/RTP logs
@@ -707,7 +858,7 @@ struct PeerConnectionInner {
 
 pub(crate) fn generate_sdes_key_params(profile: crate::srtp::SrtpProfile) -> String {
     let mut key_salt = vec![0u8; profile.key_len() + profile.salt_len()];
-    rand::fill(key_salt.as_mut_slice());
+    crate::platform::rng::fill(key_salt.as_mut_slice());
     let encoded = BASE64_STANDARD.encode(key_salt);
     format!("inline:{}", encoded)
 }
@@ -894,19 +1045,28 @@ impl PeerConnection {
             dtls_transport: Mutex::new(None),
             rtp_transport: Mutex::new(None),
             rtp_observers: Mutex::new(Vec::new()),
-            rtp_media_ice_transports: Mutex::new(HashMap::new()),
-            rtp_media_transports: Mutex::new(HashMap::new()),
+            rtp_media_ice_transports: Mutex::new(BTreeMap::new()),
+            rtp_media_transports: Mutex::new(BTreeMap::new()),
             sctp_transport: Mutex::new(None),
             data_channels: Arc::new(Mutex::new(Vec::new())),
             event_tx,
-            event_rx: tokio::sync::Mutex::new(event_rx),
+            event_rx: sync::AsyncMutex::new(event_rx),
             dtls_role: dtls_role_tx,
             _dtls_role_rx: dtls_role_rx.clone(),
             stats_collector: Arc::new(StatsCollector::new()),
             ssrc_generator,
             disconnect_reason: disconnect_reason_tx,
             _disconnect_reason_rx: disconnect_reason_rx,
-            tasks: Mutex::new(Vec::new()),
+            tasks: Mutex::new({
+                #[cfg(feature = "std")]
+                {
+                    Vec::new()
+                }
+                #[cfg(not(feature = "std"))]
+                {
+                    ()
+                }
+            }),
             pc_span,
         };
         let pc = Self {
@@ -927,7 +1087,9 @@ impl PeerConnection {
                 async move {
                     let rtp_ice_loop =
                         run_rtp_direct_loop(ice_transport, ice_connection_state_tx, inner_weak);
-                    tokio::join!(rtp_ice_loop, ice_runner);
+                    // seam join2 takes Unpin futures; async fn bodies are !Unpin
+                    let ice_runner = core::pin::pin!(ice_runner);
+                    join2(core::pin::pin!(rtp_ice_loop), ice_runner).await;
                 },
             );
             pc.inner.track_task(h);
@@ -944,12 +1106,14 @@ impl PeerConnection {
                 pc.inner.config.runtime_handle.as_ref(),
                 pc.inner.pc_span.clone(),
                 async move {
+                    #[cfg(feature = "std")]
                     let gathering_loop = run_gathering_loop(
                         ice_transport_gathering,
                         ice_gathering_state_tx,
                         inner_weak_gathering,
                     );
 
+                    #[cfg(feature = "std")]
                     let dtls_loop = run_ice_dtls_loop(
                         ice_transport,
                         ice_connection_state_tx,
@@ -957,7 +1121,28 @@ impl PeerConnection {
                         inner_weak,
                     );
 
-                    tokio::join!(gathering_loop, dtls_loop, ice_runner);
+                    #[cfg(feature = "std")]
+                    {
+                        let gathering_loop = core::pin::pin!(gathering_loop);
+                        let dtls_loop = core::pin::pin!(dtls_loop);
+                        let ice_runner = core::pin::pin!(ice_runner);
+                        join3(gathering_loop, dtls_loop, ice_runner).await;
+                    }
+                    #[cfg(not(feature = "std"))]
+                    {
+                        // WebRtc transport loops do not exist on no_std (D6);
+                        // keep the socket read loop alive.
+                        let _ = (
+                            &inner_weak_gathering,
+                            &ice_gathering_state_tx,
+                            &ice_transport_gathering,
+                            &dtls_role_rx,
+                            &ice_connection_state_tx,
+                            &inner_weak,
+                            &ice_transport,
+                        );
+                        ice_runner.await;
+                    }
                 },
             );
             pc.inner.track_task(h);
@@ -1128,14 +1313,14 @@ impl PeerConnection {
 
     pub async fn wait_for_rtp_transport_ready(
         &self,
-        timeout: std::time::Duration,
+        timeout: core::time::Duration,
     ) -> RtcResult<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        while tokio::time::Instant::now() < deadline {
+        let deadline = crate::platform::time::Instant::now() + timeout;
+        while crate::platform::time::Instant::now() < deadline {
             if self.inner.rtp_transport.lock().is_some() {
                 return Ok(());
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            crate::platform::task::sleep(core::time::Duration::from_millis(10)).await;
         }
 
         Err(RtcError::InvalidState(
@@ -1200,6 +1385,7 @@ impl PeerConnection {
             .runtime_handle(self.inner.config.runtime_handle.clone())
             .reception_stats(self.inner.stats_collector.clone())
             .depacketizer_factory(self.inner.config.depacketizer_strategy.factory.clone());
+        #[cfg(feature = "std")]
         for i in &self.inner.config.recorder_interceptors.receivers {
             builder = builder.interceptor(i.clone());
         }
@@ -1225,9 +1411,7 @@ impl PeerConnection {
         }
         if self.inner.config.enable_gcc && self.inner.config.transport_mode == TransportMode::WebRtc
         {
-            builder = builder.twcc_feedback(Arc::new(
-                crate::media::twcc_feedback::TwccFeedbackGenerator::new(),
-            ));
+            builder = builder.twcc_feedback(Arc::new(TwccFeedbackGenerator::new()));
         }
         let receiver = builder.build();
         if direction.sends() {
@@ -1307,6 +1491,7 @@ impl PeerConnection {
             .pc_span(self.inner.pc_span.clone())
             .runtime_handle(self.inner.config.runtime_handle.clone())
             .interceptor(self.inner.stats_collector.clone());
+        #[cfg(feature = "std")]
         for i in &self.inner.config.recorder_interceptors.senders {
             builder = builder.interceptor(i.clone());
         }
@@ -1336,9 +1521,7 @@ impl PeerConnection {
             if self.inner.config.enable_gcc {
                 // GCC bandwidth estimator replaces the log-only REMB handler:
                 // it consumes TWCC feedback and publishes target_bitrate.
-                builder = builder.interceptor(std::sync::Arc::new(
-                    crate::media::gcc::GccBandwidthEstimator::new(),
-                ));
+                builder = builder.interceptor(Arc::new(GccBandwidthEstimator::new()));
             } else {
                 builder = builder.bitrate_controller();
             }
@@ -1818,9 +2001,9 @@ impl PeerConnection {
                     if parts.len() >= 3
                         && parts[0] == "IN"
                         && parts[1] == "IP4"
-                        && let Ok(ip) = parts[2].parse::<std::net::IpAddr>()
+                        && let Ok(ip) = parts[2].parse::<core::net::IpAddr>()
                     {
-                        remote_addr = Some(std::net::SocketAddr::new(ip, section.port));
+                        remote_addr = Some(core::net::SocketAddr::new(ip, section.port));
                     }
                 }
             }
@@ -1872,7 +2055,7 @@ impl PeerConnection {
         // Create transceivers for new media sections in Offer
         if desc.sdp_type == SdpType::Offer {
             let mut transceivers = self.inner.transceivers.lock();
-            let mut used_indices = std::collections::HashSet::new();
+            let mut used_indices = alloc::collections::BTreeSet::new();
             for section in &desc.media_sections {
                 let mid = &section.mid;
                 let mut found_transceiver: Option<(usize, Arc<RtpTransceiver>)> = None;
@@ -2095,9 +2278,7 @@ impl PeerConnection {
                     if self.inner.config.enable_gcc
                         && self.inner.config.transport_mode == TransportMode::WebRtc
                     {
-                        builder = builder.twcc_feedback(Arc::new(
-                            crate::media::twcc_feedback::TwccFeedbackGenerator::new(),
-                        ));
+                        builder = builder.twcc_feedback(Arc::new(TwccFeedbackGenerator::new()));
                     }
                     let receiver = builder.build();
                     if let Some(rtx) = rtx_ssrc {
@@ -2273,34 +2454,53 @@ impl PeerConnection {
         loops: Vec<Pin<Box<dyn Future<Output = ()> + Send>>>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let done = Arc::new(Notify::new());
-        let mut handles = Vec::with_capacity(loops.len());
-
-        for fut in loops {
-            let done = done.clone();
-            let handle = crate::spawn_rtc(
-                self.inner.config.runtime_handle.as_ref(),
-                self.inner.pc_span.clone(),
-                async move {
-                    let _done = TransportLoopDone(done);
-                    fut.await;
-                },
-            );
-            handles.push(handle);
+        #[cfg(feature = "std")]
+        {
+            let mut handles = Vec::with_capacity(loops.len());
+            for fut in loops {
+                let done = done.clone();
+                let handle = crate::spawn_rtc(
+                    self.inner.config.runtime_handle.as_ref(),
+                    self.inner.pc_span.clone(),
+                    async move {
+                        let _done = TransportLoopDone(done);
+                        fut.await;
+                    },
+                );
+                handles.push(handle);
+            }
+            Box::pin(async move {
+                let _guard = LoopsGuard(handles);
+                done.notified().await;
+            })
         }
-
-        Box::pin(async move {
-            let _guard = LoopsGuard(handles);
-            done.notified().await;
-        })
+        #[cfg(not(feature = "std"))]
+        {
+            for fut in loops {
+                let done = done.clone();
+                crate::spawn_rtc(
+                    self.inner.config.runtime_handle.as_ref(),
+                    self.inner.pc_span.clone(),
+                    async move {
+                        let _done = TransportLoopDone(done);
+                        fut.await;
+                    },
+                );
+            }
+            Box::pin(async move {
+                let _guard = LoopsGuard;
+                done.notified().await;
+            })
+        }
     }
 
     /// Block until both the local and remote descriptions carry `a=crypto`
     /// attributes (SDES negotiation complete), or the timeout expires.
     async fn wait_for_sdes_attributes(
-        inner: &std::sync::Arc<PeerConnectionInner>,
-        timeout: std::time::Duration,
+        inner: &Arc<PeerConnectionInner>,
+        timeout: core::time::Duration,
     ) -> RtcResult<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = crate::platform::time::Instant::now() + timeout;
         loop {
             {
                 let remote = inner.remote_description.lock();
@@ -2325,19 +2525,19 @@ impl PeerConnection {
                     return Ok(());
                 }
             }
-            if tokio::time::Instant::now() >= deadline {
+            if crate::platform::time::Instant::now() >= deadline {
                 return Err(RtcError::Internal(
                     "Timed out waiting for SDES crypto attributes".into(),
                 ));
             }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            crate::platform::task::sleep(core::time::Duration::from_millis(25)).await;
         }
     }
 
     pub(crate) async fn start_dtls(
         &self,
         is_client: bool,
-    ) -> RtcResult<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> {
+    ) -> RtcResult<core::pin::Pin<Box<dyn core::future::Future<Output = ()> + Send>>> {
         self.inner
             .pc_span
             .in_scope(|| debug!("start_dtls: starting with is_client={}", is_client));
@@ -2401,8 +2601,8 @@ impl PeerConnection {
         ));
         {
             let mut rx = ice_conn.rtp_receiver.write();
-            *rx = Some(Arc::downgrade(&rtp_transport)
-                as std::sync::Weak<dyn crate::transports::PacketReceiver>);
+            *rx =
+                Some(Arc::downgrade(&rtp_transport) as Weak<dyn crate::transports::PacketReceiver>);
         }
         *self.inner.rtp_transport.lock() = Some(rtp_transport.clone());
         self.attach_registered_observers(&rtp_transport);
@@ -2438,7 +2638,8 @@ impl PeerConnection {
             // crypto attributes" and leave the leg permanently without SRTP
             // (rustpbx issue #281 e2e flake). Wait for the negotiation to
             // complete instead of failing the transport start.
-            Self::wait_for_sdes_attributes(&self.inner, std::time::Duration::from_secs(10)).await?;
+            Self::wait_for_sdes_attributes(&self.inner, core::time::Duration::from_secs(10))
+                .await?;
             self.setup_sdes(&rtp_transport)?;
             let rtcp_loop = Self::create_rtcp_loop(
                 rtp_transport.clone(),
@@ -2479,189 +2680,203 @@ impl PeerConnection {
             );
         }
 
-        let remote_dtls_fingerprint = self.inner.remote_dtls_fingerprint.lock().clone();
-        let ice_conn_for_data = ice_conn.clone();
-        let (dtls, incoming_data_rx, dtls_runner) = DtlsTransport::new(
-            ice_conn,
-            self.inner.certificate.as_ref().clone(),
-            is_client,
-            self.config().dtls_buffer_size,
-            remote_dtls_fingerprint,
-        )
-        .await
-        .map_err(|e| RtcError::Internal(format!("DTLS failed: {}", e)))?;
+        // ── WebRtc (DTLS/SCTP) transport path — server-side only (plan D6). ──
+        // The rtp and srtp transport modes returned above; on no_std this
+        // mode fails fast instead of half-starting a DTLS setup.
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = ice_conn;
+            return Err(RtcError::NotImplemented(
+                "WebRtc (DTLS/SCTP) transport mode requires the std feature \
+                 (D6 embedded scope: rtp/srtp only)",
+            ));
+        }
+        #[cfg(feature = "std")]
+        {
+            let remote_dtls_fingerprint = self.inner.remote_dtls_fingerprint.lock().clone();
+            let ice_conn_for_data = ice_conn.clone();
+            let (dtls, incoming_data_rx, dtls_runner) = DtlsTransport::new(
+                ice_conn,
+                self.inner.certificate.as_ref().clone(),
+                is_client,
+                self.config().dtls_buffer_size,
+                remote_dtls_fingerprint,
+            )
+            .await
+            .map_err(|e| RtcError::Internal(format!("DTLS failed: {}", e)))?;
 
-        // Start the handshake loop before flushing buffered packets so inbound
-        // DTLS records are not dropped on the try_send race.
-        let mut dtls_runner_task = crate::spawn_rtc(
-            self.inner.config.runtime_handle.as_ref(),
-            self.inner.pc_span.clone(),
-            dtls_runner,
-        );
-        // Once the runner task completes we must not poll its JoinHandle again
-        // (tokio panics with "JoinHandle polled after completion"). This flag
-        // guards the select! branch below so the handle is only ever polled once.
-        let mut dtls_runner_done = false;
+            // Start the handshake loop before flushing buffered packets so inbound
+            // DTLS records are not dropped on the try_send race.
+            let mut dtls_runner_task = crate::spawn_rtc(
+                self.inner.config.runtime_handle.as_ref(),
+                self.inner.pc_span.clone(),
+                dtls_runner,
+            );
+            // Once the runner task completes we must not poll its JoinHandle again
+            // (tokio panics with "JoinHandle polled after completion"). This flag
+            // guards the select! branch below so the handle is only ever polled once.
+            let mut dtls_runner_done = false;
 
-        // DTLS receiver is now registered (inside DtlsTransport::new),
-        // safe to set data receiver and flush buffered packets.
-        self.inner
-            .ice_transport
-            .set_data_receiver(ice_conn_for_data)
-            .await;
+            // DTLS receiver is now registered (inside DtlsTransport::new),
+            // safe to set data receiver and flush buffered packets.
+            self.inner
+                .ice_transport
+                .set_data_receiver(ice_conn_for_data)
+                .await;
 
-        let sctp_port = if let Some(caps) = &self.config().media_capabilities {
-            if let Some(app) = &caps.application {
-                app.sctp_port
+            let sctp_port = if let Some(caps) = &self.config().media_capabilities {
+                if let Some(app) = &caps.application {
+                    app.sctp_port
+                } else {
+                    5000
+                }
             } else {
                 5000
-            }
-        } else {
-            5000
-        };
+            };
 
-        let sctp_needed = {
-            let remote = self.inner.remote_description.lock();
-            if let Some(desc) = &*remote {
-                desc.media_sections
-                    .iter()
-                    .any(|m| m.kind == MediaKind::Application)
-            } else {
-                false
-            }
-        };
-
-        let (dc_tx, mut dc_rx) = mpsc::unbounded_channel();
-
-        let mut sctp_runner: Pin<Box<dyn Future<Output = ()> + Send>>;
-
-        if sctp_needed {
-            let (sctp, runner) = SctpTransport::new(
-                dtls.clone(),
-                incoming_data_rx,
-                self.inner.data_channels.clone(),
-                sctp_port,
-                sctp_port,
-                Some(dc_tx),
-                is_client,
-                self.config(),
-            );
-            *self.inner.sctp_transport.lock() = Some(sctp);
-            sctp_runner = Box::pin(runner);
-        } else {
-            drop(incoming_data_rx);
-            sctp_runner = Box::pin(std::future::pending());
-        }
-
-        // Close any previous DTLS transport so its background handshake/packet
-        // task stops instead of being orphaned (which caused a memory leak and
-        // the “no selected socket” retransmit log spam every second).
-        if let Some(old_dtls) = self.inner.dtls_transport.lock().take() {
-            debug!("Closing previous DTLS transport before creating a new one");
-            old_dtls.close();
-        }
-
-        *self.inner.dtls_transport.lock() = Some(dtls.clone());
-
-        let dtls_clone = dtls.clone();
-        let rtp_transport_clone = rtp_transport.clone();
-        let inner_weak = Arc::downgrade(&self.inner);
-        let stats_collector = self.inner.stats_collector.clone();
-
-        let inner_weak_dc = inner_weak.clone();
-        let dc_listener = async move {
-            while let Some(dc) = dc_rx.recv().await {
-                if let Some(inner) = inner_weak_dc.upgrade() {
-                    let _ = inner.event_tx.send(PeerConnectionEvent::DataChannel(dc));
+            let sctp_needed = {
+                let remote = self.inner.remote_description.lock();
+                if let Some(desc) = &*remote {
+                    desc.media_sections
+                        .iter()
+                        .any(|m| m.kind == MediaKind::Application)
                 } else {
-                    break;
+                    false
                 }
-            }
-        };
-        let mut dc_listener: Pin<Box<dyn Future<Output = ()> + Send>> = if sctp_needed {
-            Box::pin(dc_listener)
-        } else {
-            Box::pin(std::future::pending())
-        };
+            };
 
-        let mut state_rx = dtls_clone.subscribe_state();
-        loop {
-            let state = state_rx.borrow().clone();
-            match state {
-                crate::transports::dtls::DtlsState::Connected(_, profile_opt) => {
-                    self.setup_srtp(&dtls_clone, is_client, profile_opt, &rtp_transport_clone);
+            let (dc_tx, mut dc_rx) = mpsc::unbounded_channel();
 
-                    let rtcp_loop = Self::create_rtcp_loop(
-                        rtp_transport_clone.clone(),
-                        inner_weak.clone(),
-                        stats_collector.clone(),
-                    );
+            let mut sctp_runner: Pin<Box<dyn Future<Output = ()> + Send>>;
 
-                    let pair_monitor =
-                        Self::create_pair_monitor(pair_rx.clone(), ice_conn_monitor.clone());
-
-                    return Ok(self.spawn_transport_loops(vec![
-                        Box::pin(rtcp_loop),
-                        sctp_runner,
-                        dc_listener,
-                        Box::pin(pair_monitor),
-                    ]));
-                }
-                crate::transports::dtls::DtlsState::Failed => {
-                    return Err(RtcError::Internal("DTLS handshake failed".into()));
-                }
-                crate::transports::dtls::DtlsState::Closed => {
-                    return Err(RtcError::Internal(
-                        "DTLS transport closed before completing handshake".into(),
-                    ));
-                }
-                _ => {}
+            if sctp_needed {
+                let (sctp, runner) = SctpTransport::new(
+                    dtls.clone(),
+                    incoming_data_rx,
+                    self.inner.data_channels.clone(),
+                    sctp_port,
+                    sctp_port,
+                    Some(dc_tx),
+                    is_client,
+                    self.config(),
+                );
+                *self.inner.sctp_transport.lock() = Some(sctp);
+                sctp_runner = Box::pin(runner);
+            } else {
+                drop(incoming_data_rx);
+                sctp_runner = Box::pin(core::future::pending());
             }
 
-            // The runner task has finished but the watch state wasn't
-            // Connected/Failed/Closed yet (the handshake can return Ok after
-            // setting Closed, or exit via feeder/close without a final state).
-            // Wait for a state transition instead of re-polling the completed
-            // JoinHandle, which would panic.
-            if dtls_runner_done {
-                if state_rx.changed().await.is_err() {
-                    break;
-                }
-                continue;
+            // Close any previous DTLS transport so its background handshake/packet
+            // task stops instead of being orphaned (which caused a memory leak and
+            // the “no selected socket” retransmit log spam every second).
+            if let Some(old_dtls) = self.inner.dtls_transport.lock().take() {
+                debug!("Closing previous DTLS transport before creating a new one");
+                old_dtls.close();
             }
 
-            tokio::select! {
-                res = &mut dtls_runner_task => {
-                    if let Err(e) = res {
-                        return Err(RtcError::Internal(format!("DTLS runner panicked: {e}")));
+            *self.inner.dtls_transport.lock() = Some(dtls.clone());
+
+            let dtls_clone = dtls.clone();
+            let rtp_transport_clone = rtp_transport.clone();
+            let inner_weak = Arc::downgrade(&self.inner);
+            let stats_collector = self.inner.stats_collector.clone();
+
+            let inner_weak_dc = inner_weak.clone();
+            let dc_listener = async move {
+                while let Some(dc) = dc_rx.recv().await {
+                    if let Some(inner) = inner_weak_dc.upgrade() {
+                        let _ = inner.event_tx.send(PeerConnectionEvent::DataChannel(dc));
+                    } else {
+                        break;
                     }
-                    dtls_runner_done = true;
-                    // Loop back: the top-of-loop state check will return/err
-                    // based on the final DtlsState set by the handshake.
                 }
-                _ = &mut sctp_runner => {
-                     return Err(RtcError::Internal("SCTP runner stopped unexpectedly".into()));
+            };
+            let mut dc_listener: Pin<Box<dyn Future<Output = ()> + Send>> = if sctp_needed {
+                Box::pin(dc_listener)
+            } else {
+                Box::pin(core::future::pending())
+            };
+
+            let mut state_rx = dtls_clone.subscribe_state();
+            loop {
+                let state = state_rx.borrow().clone();
+                match state {
+                    dtls::DtlsState::Connected(_, profile_opt) => {
+                        self.setup_srtp(&dtls_clone, is_client, profile_opt, &rtp_transport_clone);
+
+                        let rtcp_loop = Self::create_rtcp_loop(
+                            rtp_transport_clone.clone(),
+                            inner_weak.clone(),
+                            stats_collector.clone(),
+                        );
+
+                        let pair_monitor =
+                            Self::create_pair_monitor(pair_rx.clone(), ice_conn_monitor.clone());
+
+                        return Ok(self.spawn_transport_loops(vec![
+                            Box::pin(rtcp_loop),
+                            sctp_runner,
+                            dc_listener,
+                            Box::pin(pair_monitor),
+                        ]));
+                    }
+                    dtls::DtlsState::Failed => {
+                        return Err(RtcError::Internal("DTLS handshake failed".into()));
+                    }
+                    dtls::DtlsState::Closed => {
+                        return Err(RtcError::Internal(
+                            "DTLS transport closed before completing handshake".into(),
+                        ));
+                    }
+                    _ => {}
                 }
-                _ = &mut dc_listener => {
-                     debug!("DataChannel listener stopped unexpectedly");
-                     return Err(RtcError::Internal("DataChannel listener stopped unexpectedly".into()));
+
+                // The runner task has finished but the watch state wasn't
+                // Connected/Failed/Closed yet (the handshake can return Ok after
+                // setting Closed, or exit via feeder/close without a final state).
+                // Wait for a state transition instead of re-polling the completed
+                // JoinHandle, which would panic.
+                if dtls_runner_done {
+                    if state_rx.changed().await.is_err() {
+                        break;
+                    }
+                    continue;
                 }
-                res = state_rx.changed() => {
-                    if res.is_err() { break; }
-                }
-                res = pair_rx.changed() => {
-                    if res.is_ok()
-                        && let Some(pair) = pair_rx.borrow().clone() {
-                            ice_conn_monitor.set_remote_addr_from_selected_pair(
-                                pair.remote.address,
-                                "dtls pair monitor update",
-                            );
+
+                tokio::select! {
+                    res = &mut dtls_runner_task => {
+                        if let Err(e) = res {
+                            return Err(RtcError::Internal(format!("DTLS runner panicked: {e}")));
                         }
+                        dtls_runner_done = true;
+                        // Loop back: the top-of-loop state check will return/err
+                        // based on the final DtlsState set by the handshake.
+                    }
+                    _ = &mut sctp_runner => {
+                         return Err(RtcError::Internal("SCTP runner stopped unexpectedly".into()));
+                    }
+                    _ = &mut dc_listener => {
+                         debug!("DataChannel listener stopped unexpectedly");
+                         return Err(RtcError::Internal("DataChannel listener stopped unexpectedly".into()));
+                    }
+                    res = state_rx.changed() => {
+                        if res.is_err() { break; }
+                    }
+                    res = pair_rx.changed() => {
+                        if res.is_ok()
+                            && let Some(pair) = pair_rx.borrow().clone() {
+                                ice_conn_monitor.set_remote_addr_from_selected_pair(
+                                    pair.remote.address,
+                                    "dtls pair monitor update",
+                                );
+                            }
+                    }
                 }
             }
-        }
 
-        Ok(Box::pin(async {}) as Pin<Box<dyn Future<Output = ()> + Send>>)
+            Ok(Box::pin(async {}) as Pin<Box<dyn Future<Output = ()> + Send>>)
+        }
     }
 
     fn setup_sdes(&self, rtp_transport: &Arc<RtpTransport>) -> RtcResult<()> {
@@ -2766,6 +2981,7 @@ impl PeerConnection {
         Ok(())
     }
 
+    #[cfg(feature = "std")]
     fn setup_srtp(
         &self,
         dtls: &DtlsTransport,
@@ -2892,7 +3108,7 @@ impl PeerConnection {
     fn remote_rtp_addr_from_section(
         desc: &SessionDescription,
         section: &MediaSection,
-    ) -> Option<std::net::SocketAddr> {
+    ) -> Option<core::net::SocketAddr> {
         let conn = section
             .connection
             .as_ref()
@@ -2901,9 +3117,9 @@ impl PeerConnection {
         if parts.len() >= 3
             && parts[0] == "IN"
             && matches!(parts[1], "IP4" | "IP6")
-            && let Ok(ip) = parts[2].parse::<std::net::IpAddr>()
+            && let Ok(ip) = parts[2].parse::<core::net::IpAddr>()
         {
-            return Some(std::net::SocketAddr::new(ip, section.port));
+            return Some(core::net::SocketAddr::new(ip, section.port));
         }
         None
     }
@@ -2913,7 +3129,7 @@ impl PeerConnection {
         desc: &SessionDescription,
     ) -> Vec<(Arc<RtpTransceiver>, usize)> {
         let transceivers = self.inner.transceivers.lock().clone();
-        let mut used_indices = std::collections::HashSet::new();
+        let mut used_indices = alloc::collections::BTreeSet::new();
         let mut matched = Vec::new();
 
         for (section_idx, section) in desc.media_sections.iter().enumerate() {
@@ -2958,22 +3174,17 @@ impl PeerConnection {
     }
 
     fn stop_extra_rtp_media_transports(&self) {
-        let extra_transports = self
-            .inner
-            .rtp_media_transports
-            .lock()
-            .drain()
+        // BTreeMap::drain is unstable; swap the map out and drain the owner.
+        let extra_transports = core::mem::take(&mut *self.inner.rtp_media_transports.lock())
+            .into_iter()
             .map(|(_, transport)| transport)
             .collect::<Vec<_>>();
         for transport in extra_transports {
             transport.clear_listeners();
         }
 
-        let extra_ice = self
-            .inner
-            .rtp_media_ice_transports
-            .lock()
-            .drain()
+        let extra_ice = core::mem::take(&mut *self.inner.rtp_media_ice_transports.lock())
+            .into_iter()
             .map(|(_, transport)| transport)
             .collect::<Vec<_>>();
         for transport in extra_ice {
@@ -3053,7 +3264,7 @@ impl PeerConnection {
         transceiver: &Arc<RtpTransceiver>,
         section: &MediaSection,
         primary: bool,
-        remote_addr: std::net::SocketAddr,
+        remote_addr: core::net::SocketAddr,
         ufrag: Option<&String>,
         pwd: Option<&String>,
         remote_candidates: &[IceCandidate],
@@ -3124,7 +3335,7 @@ impl PeerConnection {
         transceiver: &Arc<RtpTransceiver>,
         ice_transport: &IceTransport,
         section: Option<&MediaSection>,
-        remote_addr: Option<std::net::SocketAddr>,
+        remote_addr: Option<core::net::SocketAddr>,
     ) -> Arc<RtpTransport> {
         if let Some(transport) = self
             .inner
@@ -3152,7 +3363,7 @@ impl PeerConnection {
         let socket_rx = ice_transport.subscribe_selected_socket();
         let rtcp_socket_rx = ice_transport.subscribe_selected_rtcp_socket();
         let remote_addr = remote_addr.unwrap_or_else(|| {
-            std::net::SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
+            core::net::SocketAddr::new(IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED), 0)
         });
         let ice_conn = IceConn::new_with_rtcp(
             socket_rx,
@@ -3198,9 +3409,11 @@ impl PeerConnection {
             self.inner.config.runtime_handle.as_ref(),
             self.inner.pc_span.clone(),
             async move {
-                tokio::select! {
-                    _ = rtcp_loop => {},
-                    _ = pair_monitor => {},
+                let __s0 = core::pin::pin!(rtcp_loop);
+                let __s1 = core::pin::pin!(pair_monitor);
+                match crate::platform::select::select2(__s0, __s1).await {
+                    crate::platform::select::Either::A(_) => {}
+                    crate::platform::select::Either::B(_) => {}
                 }
             },
         );
@@ -3265,8 +3478,8 @@ impl PeerConnection {
 
     fn remote_rtcp_addr_from_sdp(
         desc: &SessionDescription,
-        remote_rtp_addr: std::net::SocketAddr,
-    ) -> Option<std::net::SocketAddr> {
+        remote_rtp_addr: core::net::SocketAddr,
+    ) -> Option<core::net::SocketAddr> {
         let section = Self::bundle_tag_mid(desc)
             .as_ref()
             .and_then(|mid| {
@@ -3280,8 +3493,8 @@ impl PeerConnection {
 
     fn remote_rtcp_addr_from_media_section(
         section: &MediaSection,
-        remote_rtp_addr: std::net::SocketAddr,
-    ) -> Option<std::net::SocketAddr> {
+        remote_rtp_addr: core::net::SocketAddr,
+    ) -> Option<core::net::SocketAddr> {
         if section.attributes.iter().any(|attr| attr.key == "rtcp-mux") {
             return None;
         }
@@ -3300,7 +3513,10 @@ impl PeerConnection {
         Some(addr)
     }
 
-    fn parse_rtcp_attribute(attr: &Attribute, fallback_ip: IpAddr) -> Option<std::net::SocketAddr> {
+    fn parse_rtcp_attribute(
+        attr: &Attribute,
+        fallback_ip: IpAddr,
+    ) -> Option<core::net::SocketAddr> {
         let value = attr.value.as_deref()?;
         let mut parts = value.split_whitespace();
         let port = parts.next()?.parse::<u16>().ok()?;
@@ -3308,7 +3524,7 @@ impl PeerConnection {
             (Some("IN"), Some("IP4" | "IP6"), Some(host)) => host.parse().ok()?,
             _ => fallback_ip,
         };
-        Some(std::net::SocketAddr::new(ip, port))
+        Some(core::net::SocketAddr::new(ip, port))
     }
 
     /// Whether an incoming RTCP packet should be delivered to a sender whose
@@ -3497,6 +3713,7 @@ impl PeerConnection {
     /// The UDPTL transport is also stored on the Image transceiver and can be
     /// retrieved via `transceiver.udtl_transport()`.
     #[cfg(feature = "t38")]
+    #[cfg(feature = "std")]
     pub async fn init_t38_fax(&self) -> RtcResult<FaxEndpoint> {
         self.init_t38_fax_with(T30FaxConfig::default(), T30Role::Caller)
             .await
@@ -3505,6 +3722,7 @@ impl PeerConnection {
     /// Like [`PeerConnection::init_t38_fax`] but with explicit T.30 session
     /// configuration and fax role (Caller originates the call, Callee answers).
     #[cfg(feature = "t38")]
+    #[cfg(feature = "std")]
     pub async fn init_t38_fax_with(
         &self,
         config: T30FaxConfig,
@@ -3512,15 +3730,16 @@ impl PeerConnection {
     ) -> RtcResult<FaxEndpoint> {
         use crate::config::T38UdpEC;
         use crate::transports::udptl::UdtlConfig;
-        use std::net::IpAddr;
+        use core::net::IpAddr;
 
-        let parse_connection = |conn: Option<&String>, port: u16| -> Option<std::net::SocketAddr> {
-            let ip: IpAddr = conn?.strip_prefix("IN IP4 ").map_or_else(
-                || conn?.strip_prefix("IN IP6 ")?.parse().ok(),
-                |s| s.parse().ok(),
-            )?;
-            Some(std::net::SocketAddr::new(ip, port))
-        };
+        let parse_connection =
+            |conn: Option<&String>, port: u16| -> Option<core::net::SocketAddr> {
+                let ip: IpAddr = conn?.strip_prefix("IN IP4 ").map_or_else(
+                    || conn?.strip_prefix("IN IP6 ")?.parse().ok(),
+                    |s| s.parse().ok(),
+                )?;
+                Some(core::net::SocketAddr::new(ip, port))
+            };
 
         let transceiver = {
             let transceivers = self.inner.transceivers.lock();
@@ -3597,8 +3816,8 @@ impl PeerConnection {
                         let bind_addr = local_addr
                             .filter(|a| a.port() != 0 && a.port() != 9)
                             .unwrap_or_else(|| {
-                                std::net::SocketAddr::new(
-                                    IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                                core::net::SocketAddr::new(
+                                    IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED),
                                     0,
                                 )
                             });
@@ -3617,11 +3836,12 @@ impl PeerConnection {
         Ok(FaxEndpoint::new(transport, session))
     }
 
+    #[cfg(feature = "std")]
     pub fn create_data_channel(
         &self,
         label: &str,
-        config: Option<crate::transports::sctp::DataChannelConfig>,
-    ) -> RtcResult<Arc<crate::transports::sctp::DataChannel>> {
+        config: Option<DataChannelConfig>,
+    ) -> RtcResult<Arc<DataChannel>> {
         // Ensure we have an application transceiver for negotiation
         let has_app_transceiver = {
             let transceivers = self.inner.transceivers.lock();
@@ -3663,10 +3883,7 @@ impl PeerConnection {
             id
         };
 
-        let dc = Arc::new(crate::transports::sctp::DataChannel::new(
-            id,
-            config.clone(),
-        ));
+        let dc = Arc::new(DataChannel::new(id, config.clone()));
 
         self.inner.data_channels.lock().push(Arc::downgrade(&dc));
 
@@ -3690,6 +3907,7 @@ impl PeerConnection {
         Ok(dc)
     }
 
+    #[cfg(feature = "std")]
     pub async fn send_data(&self, channel_id: u16, data: &[u8]) -> RtcResult<()> {
         let transport = self.inner.sctp_transport.lock().clone();
         if let Some(transport) = transport {
@@ -3702,6 +3920,7 @@ impl PeerConnection {
         }
     }
 
+    #[cfg(feature = "std")]
     pub async fn send_text(&self, channel_id: u16, data: impl AsRef<str>) -> RtcResult<()> {
         let transport = self.inner.sctp_transport.lock().clone();
         if let Some(transport) = transport {
@@ -3714,6 +3933,7 @@ impl PeerConnection {
         }
     }
 
+    #[cfg(feature = "std")]
     pub fn sctp_buffered_amount(&self) -> usize {
         let transport = self.inner.sctp_transport.lock().clone();
         if let Some(transport) = transport {
@@ -3727,6 +3947,7 @@ impl PeerConnection {
     /// has been established. Covers duration, rto (RTT estimate), sent/recv
     /// bytes, retransmits, heartbeat failures and association error count.
     /// Returns `None` when there is no SCTP transport (e.g. RTP-only sessions).
+    #[cfg(feature = "std")]
     pub fn sctp_diagnostic_info(&self) -> Option<String> {
         self.inner
             .sctp_transport
@@ -3738,6 +3959,7 @@ impl PeerConnection {
     /// Returns a snapshot of the SCTP transport's key link statistics, if an
     /// SCTP association has been established. Useful for structured periodic
     /// logging of bytes sent/received and round-trip time.
+    #[cfg(feature = "std")]
     pub fn sctp_link_stats(&self) -> Option<SctpLinkStats> {
         self.inner
             .sctp_transport
@@ -3918,9 +4140,9 @@ impl PeerConnection {
                     if parts.len() >= 3
                         && parts[0] == "IN"
                         && parts[1] == "IP4"
-                        && let Ok(ip) = parts[2].parse::<std::net::IpAddr>()
+                        && let Ok(ip) = parts[2].parse::<core::net::IpAddr>()
                     {
-                        let remote_addr = std::net::SocketAddr::new(ip, section.port);
+                        let remote_addr = core::net::SocketAddr::new(ip, section.port);
                         if self.config().transport_mode == TransportMode::Rtp {
                             self.inner.ice_transport.complete_direct_rtp(remote_addr);
                             debug!("Updated RTP remote address to {}", remote_addr);
@@ -3957,7 +4179,7 @@ impl PeerConnection {
         // SDP containing only empty MIDs incorrectly removes every per-media
         // transport. Reuse the one-to-one MID-or-kind matching used when
         // configuring RTP transports and retain each matched transceiver.
-        let live_transceiver_ids: std::collections::HashSet<u64> = self
+        let live_transceiver_ids: alloc::collections::BTreeSet<u64> = self
             .matched_rtp_media_sections(new_desc)
             .into_iter()
             .map(|(transceiver, _)| transceiver.id())
@@ -4009,8 +4231,8 @@ impl PeerConnection {
     /// (RFC 4588 retransmission) — are skipped in every pass; they must never
     /// become the sender's primary media payload type.
     fn pick_sender_codec_params(
-        section: &crate::MediaSection,
-        payload_map: &HashMap<u8, RtpCodecParameters>,
+        section: &crate::sdp::MediaSection,
+        payload_map: &BTreeMap<u8, RtpCodecParameters>,
         cur: &RtpCodecParameters,
     ) -> Option<RtpCodecParameters> {
         /// True for payloads that can never be a sender's primary media codec.
@@ -4061,8 +4283,8 @@ impl PeerConnection {
     }
 
     /// Extract payload type to codec parameters mapping from media section
-    fn extract_payload_map(section: &crate::MediaSection) -> HashMap<u8, RtpCodecParameters> {
-        let mut payload_map = HashMap::new();
+    fn extract_payload_map(section: &crate::sdp::MediaSection) -> BTreeMap<u8, RtpCodecParameters> {
+        let mut payload_map = BTreeMap::new();
         // Parse rtpmap attributes: "96 opus/48000/2"
         for attr in &section.attributes {
             if attr.key == "rtpmap"
@@ -4141,8 +4363,8 @@ impl PeerConnection {
     }
 
     /// Extract extension header mapping from media section
-    fn extract_extmap(section: &crate::MediaSection) -> HashMap<u8, String> {
-        let mut extmap = HashMap::new();
+    fn extract_extmap(section: &crate::sdp::MediaSection) -> BTreeMap<u8, String> {
+        let mut extmap = BTreeMap::new();
 
         // Parse extmap attributes: "1 urn:ietf:params:rtp-hdrext:ssrc-audio-level"
         for attr in &section.attributes {
@@ -4162,7 +4384,7 @@ impl PeerConnection {
     }
 
     /// Extract SSRC from media section
-    fn extract_ssrc_from_section(section: &crate::MediaSection) -> Option<u32> {
+    fn extract_ssrc_from_section(section: &crate::sdp::MediaSection) -> Option<u32> {
         // Parse a=ssrc:<ssrc> <attribute>:<value>
         for attr in &section.attributes {
             if attr.key == "ssrc"
@@ -4271,7 +4493,7 @@ fn update_local_description_on_gather(
 async fn run_gathering_loop(
     ice_transport: IceTransport,
     ice_gathering_state_tx: watch::Sender<IceGatheringState>,
-    inner_weak: std::sync::Weak<PeerConnectionInner>,
+    inner_weak: Weak<PeerConnectionInner>,
 ) {
     let mut rx = ice_transport.subscribe_gathering_state();
     let mut ice_state_rx = ice_transport.subscribe_state();
@@ -4305,17 +4527,31 @@ async fn run_gathering_loop(
         if state == crate::transports::ice::IceGathererState::Complete {
             break;
         }
-        tokio::select! {
-            res = rx.changed() => {
-                if res.is_err() { break; }
-            }
-            res = ice_state_rx.changed() => {
-                if res.is_err() { break; }
-                if matches!(*ice_state_rx.borrow(), crate::transports::ice::IceTransportState::Closed | crate::transports::ice::IceTransportState::Failed) {
+        let __which = {
+            let __s0 = core::pin::pin!(rx.changed());
+            let __s1 = core::pin::pin!(ice_state_rx.changed());
+            let __s2 = core::pin::pin!(cand_rx.recv());
+            crate::platform::select::select3(__s0, __s1, __s2).await
+        };
+        match __which {
+            crate::platform::select::Which3::A(res) => {
+                if res.is_err() {
                     break;
                 }
             }
-            _ = cand_rx.recv() => {
+            crate::platform::select::Which3::B(res) => {
+                if res.is_err() {
+                    break;
+                }
+                if matches!(
+                    *ice_state_rx.borrow(),
+                    crate::transports::ice::IceTransportState::Closed
+                        | crate::transports::ice::IceTransportState::Failed
+                ) {
+                    break;
+                }
+            }
+            crate::platform::select::Which3::C(_) => {
                 if let Some(inner) = inner_weak.upgrade()
                     && inner.config.transport_mode == TransportMode::WebRtc
                 {
@@ -4340,7 +4576,7 @@ async fn run_gathering_loop(
 async fn run_rtp_direct_loop(
     ice_transport: IceTransport,
     ice_connection_state_tx: watch::Sender<IceConnectionState>,
-    inner_weak: std::sync::Weak<PeerConnectionInner>,
+    inner_weak: Weak<PeerConnectionInner>,
 ) {
     let mut ice_state_rx = ice_transport.subscribe_state();
     loop {
@@ -4408,11 +4644,11 @@ async fn run_ice_dtls_loop(
     ice_transport: IceTransport,
     ice_connection_state_tx: watch::Sender<IceConnectionState>,
     mut dtls_role_rx: watch::Receiver<Option<bool>>,
-    inner_weak: std::sync::Weak<PeerConnectionInner>,
+    inner_weak: Weak<PeerConnectionInner>,
 ) {
     let mut ice_state_rx = ice_transport.subscribe_state();
     // Subscribe once; the channel starts as None and transitions to Some(_) exactly once.
-    let mut nomination_complete_rx = ice_transport.subscribe_nomination_complete();
+    let nomination_complete_rx = ice_transport.subscribe_nomination_complete();
     loop {
         let ice_state = *ice_state_rx.borrow_and_update();
 
@@ -4432,7 +4668,7 @@ async fn run_ice_dtls_loop(
             crate::transports::ice::IceTransportState::Connected
             | crate::transports::ice::IceTransportState::Completed => {
                 ice_transport.nudge_passive_tcp_nomination();
-                tokio::task::yield_now().await;
+                crate::platform::task::yield_now().await;
                 // Wait for ICE nomination to complete before starting DTLS.
                 // This prevents a race where DTLS and the USE-CANDIDATE binding check
                 // compete for the same UDP socket, causing spurious nomination timeouts.
@@ -4446,12 +4682,11 @@ async fn run_ice_dtls_loop(
                 // ICE now tries candidate pairs in priority order (host → srflx → relay).
                 // Each pair gets `nomination_timeout` for its STUN retransmissions.
                 if nomination_complete_rx.borrow().is_none() {
-                    let wait_result = tokio::select! {
-                        changed = nomination_complete_rx.changed() => {
-                            changed.ok().and_then(|_| *nomination_complete_rx.borrow())
-                        }
+                    let wait_result = {
+                        let mut __nom0 = nomination_complete_rx.clone();
+                        let __s0 = core::pin::pin!(__nom0.changed());
                         // Guard: abort if ICE transitions away from connected/completed.
-                        _ = async {
+                        let __s1 = core::pin::pin!(async {
                             loop {
                                 if ice_state_rx.changed().await.is_err() {
                                     break;
@@ -4460,14 +4695,23 @@ async fn run_ice_dtls_loop(
                                 if !matches!(
                                     s,
                                     crate::transports::ice::IceTransportState::Connected
-                                    | crate::transports::ice::IceTransportState::Completed
+                                        | crate::transports::ice::IceTransportState::Completed
                                 ) {
                                     break;
                                 }
                             }
-                        } => None,
+                        });
                         // Allow time for multiple candidate pairs to be tried.
-                        _ = tokio::time::sleep(nomination_timeout.saturating_mul(6)) => None,
+                        let __s2 = core::pin::pin!(crate::platform::task::sleep(
+                            nomination_timeout.saturating_mul(6)
+                        ));
+                        match crate::platform::select::select3(__s0, __s1, __s2).await {
+                            crate::platform::select::Which3::A(changed) => {
+                                changed.ok().and_then(|_| *nomination_complete_rx.borrow())
+                            }
+                            crate::platform::select::Which3::B(_) => None,
+                            crate::platform::select::Which3::C(_) => None,
+                        }
                     };
 
                     if wait_result != Some(true) {
@@ -4599,7 +4843,7 @@ fn propagate_sctp_close_reason(inner: &PeerConnectionInner) {
 }
 
 async fn handle_connected_state_no_dtls(
-    inner_weak: &std::sync::Weak<PeerConnectionInner>,
+    inner_weak: &Weak<PeerConnectionInner>,
     ice_state_rx: &mut watch::Receiver<crate::transports::ice::IceTransportState>,
 ) -> bool {
     if let Some(inner) = inner_weak.upgrade() {
@@ -4626,19 +4870,34 @@ async fn handle_connected_state_no_dtls(
                 let grace = inner.config.ice_disconnect_grace;
                 drop(inner);
 
-                let (grace_tx, mut grace_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+                let (grace_tx, mut grace_rx) = mpsc::unbounded_channel::<u64>();
                 let mut disconnect_epoch: u64 = 0;
 
+                let mut grace_open = true;
                 loop {
-                    tokio::select! {
-                        _ = &mut rtcp_loop => {
+                    let __which = {
+                        let __s0 = core::pin::pin!(&mut rtcp_loop);
+                        let __s1 = core::pin::pin!(ice_state_rx.changed());
+                        let __s2 = if grace_open {
+                            crate::platform::select::Either::A(core::pin::pin!(grace_rx.recv()))
+                        } else {
+                            crate::platform::select::Either::B(
+                                core::future::pending::<Option<u64>>(),
+                            )
+                        };
+                        crate::platform::select::select3(__s0, __s1, __s2).await
+                    };
+                    match __which {
+                        crate::platform::select::Which3::A(_) => {
                             if let Some(inner) = inner_weak.upgrade() {
                                 propagate_sctp_close_reason(&inner);
                             }
                             break;
                         }
-                        res = ice_state_rx.changed() => {
-                            if res.is_err() { return false; }
+                        crate::platform::select::Which3::B(res) => {
+                            if res.is_err() {
+                                return false;
+                            }
                             let new_state = *ice_state_rx.borrow();
                             if is_ice_failed_or_closed(new_state) {
                                 return true;
@@ -4646,50 +4905,69 @@ async fn handle_connected_state_no_dtls(
                             match new_state {
                                 crate::transports::ice::IceTransportState::Disconnected => {
                                     if let Some(inner) = inner_weak.upgrade() {
-                                        let _ = inner.peer_state.send(PeerConnectionState::Disconnected);
+                                        let _ = inner
+                                            .peer_state
+                                            .send(PeerConnectionState::Disconnected);
                                     }
                                     let epoch = disconnect_epoch;
                                     let tx = grace_tx.clone();
-                                    tokio::spawn(
+                                    crate::platform::task::spawn(
                                         async move {
-                                            tokio::time::sleep(grace).await;
+                                            crate::platform::task::sleep(grace).await;
                                             let _ = tx.send(epoch);
                                         }
                                         .instrument(tracing::Span::current()),
                                     );
-                                    debug!("ICE Disconnected, grace timer started ({:.1}s, epoch {})", grace.as_secs_f64(), epoch);
+                                    debug!(
+                                        "ICE Disconnected, grace timer started ({:.1}s, epoch {})",
+                                        grace.as_secs_f64(),
+                                        epoch
+                                    );
                                 }
                                 crate::transports::ice::IceTransportState::Connected
                                 | crate::transports::ice::IceTransportState::Completed => {
                                     disconnect_epoch += 1;
                                     if let Some(inner) = inner_weak.upgrade() {
-                                        let _ = inner.peer_state.send(PeerConnectionState::Connected);
+                                        let _ =
+                                            inner.peer_state.send(PeerConnectionState::Connected);
                                     }
-                                    debug!("ICE recovered (epoch {}), grace cancelled", disconnect_epoch);
+                                    debug!(
+                                        "ICE recovered (epoch {}), grace cancelled",
+                                        disconnect_epoch
+                                    );
                                 }
                                 _ => {}
                             }
                         }
-                        Some(epoch) = grace_rx.recv() => {
-                            if epoch == disconnect_epoch {
-                                if let Some(inner) = inner_weak.upgrade() {
-                                    let _ = inner.disconnect_reason.send_if_modified(|cur| {
-                                        if cur.is_none() {
-                                            *cur = Some(DisconnectReason::IceDisconnected);
-                                            true
-                                        } else {
-                                            false
+                        crate::platform::select::Which3::C(grace_msg) => {
+                            match grace_msg {
+                                Some(epoch) if epoch == disconnect_epoch => {
+                                    if let Some(inner) = inner_weak.upgrade() {
+                                        let _ = inner.disconnect_reason.send_if_modified(|cur| {
+                                            if cur.is_none() {
+                                                *cur = Some(DisconnectReason::IceDisconnected);
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        });
+                                        let _ = inner
+                                            .peer_state
+                                            .send(PeerConnectionState::Disconnected);
+                                        if let Some(sctp) = inner.sctp_transport.lock().as_ref() {
+                                            sctp.close();
                                         }
-                                    });
-                                    let _ = inner.peer_state.send(PeerConnectionState::Disconnected);
-                                    if let Some(sctp) = inner.sctp_transport.lock().as_ref() {
-                                        sctp.close();
                                     }
+                                    debug!("ICE disconnect grace expired, cycling transport");
+                                    return true;
                                 }
-                                debug!("ICE disconnect grace expired, cycling transport");
-                                return true;
+                                // Stale timer from a previous disconnect epoch — ignore.
+                                None => {
+                                    // channel closed: stop polling the grace arm
+                                    grace_open = false;
+                                }
+                                Some(_) => {}
                             }
-                            // Stale timer from a previous disconnect epoch — ignore.
                         }
                     }
                 }
@@ -4700,7 +4978,7 @@ async fn handle_connected_state_no_dtls(
 }
 
 async fn handle_connected_state(
-    inner_weak: &std::sync::Weak<PeerConnectionInner>,
+    inner_weak: &Weak<PeerConnectionInner>,
     ice_connection_state_tx: &watch::Sender<IceConnectionState>,
     dtls_role_rx: &mut watch::Receiver<Option<bool>>,
     ice_state_rx: &mut watch::Receiver<crate::transports::ice::IceTransportState>,
@@ -4730,24 +5008,49 @@ async fn handle_connected_state(
                     Ok(mut rtcp_loop) => {
                         let _ = inner.peer_state.send(PeerConnectionState::Connected);
 
+                        #[cfg(feature = "std")]
+                        #[cfg(feature = "std")]
                         let dtls_state_rx = {
                             let dtls_guard = inner.dtls_transport.lock();
                             (*dtls_guard).as_ref().map(|dtls| dtls.subscribe_state())
                         };
+                        #[cfg(not(feature = "std"))]
+                        let dtls_state_rx: Option<
+                            crate::platform::sync::watch::Receiver<dtls::DtlsState>,
+                        > = None;
 
-                        if let Some(mut dtls_rx) = dtls_state_rx {
+                        if let Some(dtls_rx) = dtls_state_rx {
                             let grace = inner.config.ice_disconnect_grace;
-                            let (grace_tx, mut grace_rx) =
-                                tokio::sync::mpsc::unbounded_channel::<u64>();
+                            let (grace_tx, mut grace_rx) = mpsc::unbounded_channel::<u64>();
                             let mut disconnect_epoch: u64 = 0;
                             loop {
-                                tokio::select! {
-                                    _ = &mut rtcp_loop => {
+                                let mut grace_open = true;
+                                let __s0 = core::pin::pin!(&mut rtcp_loop);
+                                let mut __dtls2 = dtls_rx.clone();
+                                let __which = {
+                                    let __s1 = core::pin::pin!(ice_state_rx.changed());
+                                    let __s2 = core::pin::pin!(__dtls2.changed());
+                                    let __s3 = if grace_open {
+                                        crate::platform::select::Either::A(core::pin::pin!(
+                                            grace_rx.recv()
+                                        ))
+                                    } else {
+                                        crate::platform::select::Either::B(core::future::pending::<
+                                            Option<u64>,
+                                        >(
+                                        ))
+                                    };
+                                    crate::platform::select::select4(__s0, __s1, __s2, __s3).await
+                                };
+                                match __which {
+                                    crate::platform::select::Which4::A(_) => {
                                         propagate_sctp_close_reason(&inner);
                                         break;
                                     }
-                                    res = ice_state_rx.changed() => {
-                                        if res.is_err() { return false; }
+                                    crate::platform::select::Which4::B(res) => {
+                                        if res.is_err() {
+                                            return false;
+                                        }
                                         let new_state = *ice_state_rx.borrow();
                                         if is_ice_failed_or_closed(new_state) {
                                             return true;
@@ -4758,9 +5061,9 @@ async fn handle_connected_state(
                                                 let _ = ice_connection_state_tx.send(IceConnectionState::Disconnected);
                                                 let epoch = disconnect_epoch;
                                                 let tx = grace_tx.clone();
-                                                tokio::spawn(
+                                                crate::platform::task::spawn(
                                                     async move {
-                                                        tokio::time::sleep(grace).await;
+                                                        crate::platform::task::sleep(grace).await;
                                                         let _ = tx.send(epoch);
                                                     }
                                                     .instrument(tracing::Span::current()),
@@ -4777,61 +5080,109 @@ async fn handle_connected_state(
                                             _ => {}
                                         }
                                     }
-                                    res = dtls_rx.changed() => {
+                                    crate::platform::select::Which4::C(res) => {
                                         if res.is_ok() {
                                             let state = dtls_rx.borrow().clone();
-                                            if state == crate::transports::dtls::DtlsState::Closed || state == crate::transports::dtls::DtlsState::Failed {
+                                            if state == dtls::DtlsState::Closed
+                                                || state == dtls::DtlsState::Failed
+                                            {
                                                 debug!("DTLS closed/failed, disconnecting PC");
-                                                let reason = if state == crate::transports::dtls::DtlsState::Failed {
+                                                let reason = if state == dtls::DtlsState::Failed {
                                                     DisconnectReason::DtlsFailed
                                                 } else {
                                                     DisconnectReason::DtlsClosed
                                                 };
-                                                let _ = inner.disconnect_reason.send_if_modified(|cur| {
-                                                    if cur.is_none() { *cur = Some(reason); true } else { false }
-                                                });
-                                                let _ = inner.peer_state.send(PeerConnectionState::Disconnected);
-                                                let _ = ice_connection_state_tx.send(IceConnectionState::Disconnected);
+                                                let _ = inner.disconnect_reason.send_if_modified(
+                                                    |cur| {
+                                                        if cur.is_none() {
+                                                            *cur = Some(reason);
+                                                            true
+                                                        } else {
+                                                            false
+                                                        }
+                                                    },
+                                                );
+                                                let _ = inner
+                                                    .peer_state
+                                                    .send(PeerConnectionState::Disconnected);
+                                                let _ = ice_connection_state_tx
+                                                    .send(IceConnectionState::Disconnected);
                                                 return false;
                                             }
                                         } else {
                                             break;
                                         }
                                     }
-                                    Some(epoch) = grace_rx.recv() => {
-                                        if epoch == disconnect_epoch {
-                                            let _ = inner.disconnect_reason.send_if_modified(|cur| {
-                                                if cur.is_none() {
-                                                    *cur = Some(DisconnectReason::IceDisconnected);
-                                                    true
-                                                } else {
-                                                    false
+                                    crate::platform::select::Which4::D(grace_msg) => {
+                                        match grace_msg {
+                                            Some(epoch) if epoch == disconnect_epoch => {
+                                                let _ = inner.disconnect_reason.send_if_modified(
+                                                    |cur| {
+                                                        if cur.is_none() {
+                                                            *cur = Some(
+                                                                DisconnectReason::IceDisconnected,
+                                                            );
+                                                            true
+                                                        } else {
+                                                            false
+                                                        }
+                                                    },
+                                                );
+                                                let _ = inner
+                                                    .peer_state
+                                                    .send(PeerConnectionState::Disconnected);
+                                                let _ = ice_connection_state_tx
+                                                    .send(IceConnectionState::Disconnected);
+                                                if let Some(sctp) =
+                                                    inner.sctp_transport.lock().as_ref()
+                                                {
+                                                    sctp.close();
                                                 }
-                                            });
-                                            let _ = inner.peer_state.send(PeerConnectionState::Disconnected);
-                                            let _ = ice_connection_state_tx.send(IceConnectionState::Disconnected);
-                                            if let Some(sctp) = inner.sctp_transport.lock().as_ref() {
-                                                sctp.close();
+                                                debug!(
+                                                    "ICE disconnect grace expired, cycling transport"
+                                                );
+                                                return true;
                                             }
-                                            debug!("ICE disconnect grace expired, cycling transport");
-                                            return true;
+                                            // Stale timer from a previous epoch — ignore.
+                                            Some(_) => {}
+                                            None => {
+                                                // channel closed: stop polling the grace arm
+                                                grace_open = false;
+                                            }
                                         }
                                     }
                                 }
                             }
                         } else {
                             let grace = inner.config.ice_disconnect_grace;
-                            let (grace_tx, mut grace_rx) =
-                                tokio::sync::mpsc::unbounded_channel::<u64>();
+                            let (grace_tx, mut grace_rx) = mpsc::unbounded_channel::<u64>();
                             let mut disconnect_epoch: u64 = 0;
                             loop {
-                                tokio::select! {
-                                    _ = &mut rtcp_loop => {
+                                let mut grace_open = true;
+                                let __s0 = core::pin::pin!(&mut rtcp_loop);
+                                let __which = {
+                                    let __s1 = core::pin::pin!(ice_state_rx.changed());
+                                    let __s2 = if grace_open {
+                                        crate::platform::select::Either::A(core::pin::pin!(
+                                            grace_rx.recv()
+                                        ))
+                                    } else {
+                                        crate::platform::select::Either::B(core::future::pending::<
+                                            Option<u64>,
+                                        >(
+                                        ))
+                                    };
+                                    crate::platform::select::select3(__s0, __s1, __s2).await
+                                };
+                                match __which {
+                                    crate::platform::select::Which3::A(_) => {
                                         propagate_sctp_close_reason(&inner);
                                         break;
                                     }
-                                    res = ice_state_rx.changed() => {
-                                        if res.is_err() { return false; }
+                                    crate::platform::select::Which3::B(res) => {
+                                        if res.is_err() {
+                                            return false;
+                                        }
                                         let new_state = *ice_state_rx.borrow();
                                         if is_ice_failed_or_closed(new_state) {
                                             return true;
@@ -4842,9 +5193,9 @@ async fn handle_connected_state(
                                                 let _ = ice_connection_state_tx.send(IceConnectionState::Disconnected);
                                                 let epoch = disconnect_epoch;
                                                 let tx = grace_tx.clone();
-                                                tokio::spawn(
+                                                crate::platform::task::spawn(
                                                     async move {
-                                                        tokio::time::sleep(grace).await;
+                                                        crate::platform::task::sleep(grace).await;
                                                         let _ = tx.send(epoch);
                                                     }
                                                     .instrument(tracing::Span::current()),
@@ -4861,23 +5212,42 @@ async fn handle_connected_state(
                                             _ => {}
                                         }
                                     }
-                                    Some(epoch) = grace_rx.recv() => {
-                                        if epoch == disconnect_epoch {
-                                            let _ = inner.disconnect_reason.send_if_modified(|cur| {
-                                                if cur.is_none() {
-                                                    *cur = Some(DisconnectReason::IceDisconnected);
-                                                    true
-                                                } else {
-                                                    false
+                                    crate::platform::select::Which3::C(grace_msg) => {
+                                        match grace_msg {
+                                            Some(epoch) if epoch == disconnect_epoch => {
+                                                let _ = inner.disconnect_reason.send_if_modified(
+                                                    |cur| {
+                                                        if cur.is_none() {
+                                                            *cur = Some(
+                                                                DisconnectReason::IceDisconnected,
+                                                            );
+                                                            true
+                                                        } else {
+                                                            false
+                                                        }
+                                                    },
+                                                );
+                                                let _ = inner
+                                                    .peer_state
+                                                    .send(PeerConnectionState::Disconnected);
+                                                let _ = ice_connection_state_tx
+                                                    .send(IceConnectionState::Disconnected);
+                                                if let Some(sctp) =
+                                                    inner.sctp_transport.lock().as_ref()
+                                                {
+                                                    sctp.close();
                                                 }
-                                            });
-                                            let _ = inner.peer_state.send(PeerConnectionState::Disconnected);
-                                            let _ = ice_connection_state_tx.send(IceConnectionState::Disconnected);
-                                            if let Some(sctp) = inner.sctp_transport.lock().as_ref() {
-                                                sctp.close();
+                                                debug!(
+                                                    "ICE disconnect grace expired, cycling transport"
+                                                );
+                                                return true;
                                             }
-                                            debug!("ICE disconnect grace expired, cycling transport");
-                                            return true;
+                                            // Stale timer from a previous epoch — ignore.
+                                            Some(_) => {}
+                                            None => {
+                                                // channel closed: stop polling the grace arm
+                                                grace_open = false;
+                                            }
                                         }
                                     }
                                 }
@@ -4894,12 +5264,21 @@ async fn handle_connected_state(
             return false;
         }
 
-        tokio::select! {
-            res = dtls_role_rx.changed() => {
-                if res.is_err() { return false; }
+        let __which = {
+            let __s0 = core::pin::pin!(dtls_role_rx.changed());
+            let __s1 = core::pin::pin!(ice_state_rx.changed());
+            crate::platform::select::select2(__s0, __s1).await
+        };
+        match __which {
+            crate::platform::select::Either::A(res) => {
+                if res.is_err() {
+                    return false;
+                }
             }
-            res = ice_state_rx.changed() => {
-                if res.is_err() { return false; }
+            crate::platform::select::Either::B(res) => {
+                if res.is_err() {
+                    return false;
+                }
                 let new_state = *ice_state_rx.borrow();
                 if is_ice_failed_or_closed(new_state) {
                     return true;
@@ -4929,6 +5308,7 @@ fn is_ice_failed_or_closed(state: crate::transports::ice::IceTransportState) -> 
 impl PeerConnectionInner {
     /// Track a spawned task so it can be aborted on close. Only meant for
     /// fire-and-forget tasks whose lifetime should be bounded by the connection.
+    #[cfg(feature = "std")]
     fn track_task(&self, handle: tokio::task::JoinHandle<()>) {
         // Opportunistically prune finished handles so the vec stays small over
         // a long-lived connection with many renegotiations.
@@ -4937,8 +5317,13 @@ impl PeerConnectionInner {
         tasks.push(handle);
     }
 
+    /// no_std counterpart: no task handles exist; loops exit cooperatively.
+    #[cfg(not(feature = "std"))]
+    fn track_task(&self, _handle: ()) {}
+
     /// Abort every tracked task. Called as a belt-and-suspenders cleanup after
     /// cooperative shutdown signals have been sent.
+    #[cfg(feature = "std")]
     fn abort_tracked_tasks(&self) {
         let mut tasks = self.tasks.lock();
         for handle in tasks.drain(..) {
@@ -5003,7 +5388,7 @@ impl PeerConnectionInner {
             }
 
             let mut ordered = Vec::new();
-            let mut used_indices = std::collections::HashSet::new();
+            let mut used_indices = alloc::collections::BTreeSet::new();
             for section in &remote.media_sections {
                 let mid = &section.mid;
                 let mut found: Option<(usize, Arc<RtpTransceiver>)> = None;
@@ -5110,11 +5495,15 @@ impl PeerConnectionInner {
             let mut candidates = self.ice_transport.local_candidates();
             if candidates.is_empty() {
                 let mut rx = self.ice_transport.subscribe_candidates();
-                let start = tokio::time::Instant::now();
-                let timeout_dur = tokio::time::Duration::from_millis(500);
+                let start = crate::platform::time::Instant::now();
+                let timeout_dur = core::time::Duration::from_millis(500);
 
                 while candidates.is_empty() && start.elapsed() < timeout_dur {
-                    let _ = tokio::time::timeout(timeout_dur - start.elapsed(), rx.recv()).await;
+                    let _ = crate::platform::time::with_timeout(
+                        timeout_dur - start.elapsed(),
+                        rx.recv(),
+                    )
+                    .await;
                     candidates = self.ice_transport.local_candidates();
                 }
             }
@@ -5252,7 +5641,8 @@ impl PeerConnectionInner {
                 }
             }
 
-            let mut local_rtcp_addr = None;
+            let mut local_rtcp_addr: Option<core::net::SocketAddr> = None;
+            #[cfg(feature = "std")]
             if transceiver.kind() == MediaKind::Image
                 && (mode == TransportMode::Rtp || mode == TransportMode::Srtp)
             {
@@ -5267,8 +5657,8 @@ impl PeerConnectionInner {
                                 })?;
                         let transport = Arc::new(UdtlTransport::new(
                             Arc::new(socket),
-                            std::net::SocketAddr::new(
-                                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                            core::net::SocketAddr::new(
+                                core::net::IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED),
                                 0,
                             ),
                         ));
@@ -5960,8 +6350,8 @@ impl PeerConnectionInner {
     }
 
     /// All extension ids the remote has mapped on the given m-line.
-    fn get_remote_extmap_ids(&self, mid: &str) -> std::collections::HashSet<u8> {
-        let mut ids = std::collections::HashSet::new();
+    fn get_remote_extmap_ids(&self, mid: &str) -> alloc::collections::BTreeSet<u8> {
+        let mut ids = alloc::collections::BTreeSet::new();
         let remote = self.remote_description.lock();
         if let Some(desc) = &*remote
             && let Some(remote_section) = desc.media_sections.iter().find(|s| s.mid == mid)
@@ -5981,7 +6371,7 @@ impl PeerConnectionInner {
 
     /// Pick `preferred` if free, otherwise the lowest free one-byte
     /// extension id (RFC 8285: 1-14), and mark it as used.
-    fn claim_free_extmap_id(used: &mut std::collections::HashSet<u8>, preferred: u8) -> String {
+    fn claim_free_extmap_id(used: &mut alloc::collections::BTreeSet<u8>, preferred: u8) -> String {
         let id = if used.contains(&preferred) {
             (1..=14u8)
                 .find(|candidate| !used.contains(candidate))
@@ -6092,10 +6482,8 @@ impl PeerConnectionInner {
             }
         }
 
-        let extra_transports = self
-            .rtp_media_transports
-            .lock()
-            .drain()
+        let extra_transports = core::mem::take(&mut *self.rtp_media_transports.lock())
+            .into_iter()
             .map(|(_, transport)| transport)
             .collect::<Vec<_>>();
         for transport in extra_transports {
@@ -6118,10 +6506,8 @@ impl PeerConnectionInner {
         }
 
         self.ice_transport.stop();
-        let extra_ice = self
-            .rtp_media_ice_transports
-            .lock()
-            .drain()
+        let extra_ice = core::mem::take(&mut *self.rtp_media_ice_transports.lock())
+            .into_iter()
             .map(|(_, transport)| transport)
             .collect::<Vec<_>>();
         for transport in extra_ice {
@@ -6137,6 +6523,7 @@ impl Drop for PeerConnectionInner {
         self.close_with_reason(DisconnectReason::Dropped);
         // Belt-and-suspenders: abort any tracked task that survived cooperative
         // shutdown so it (and the Arcs it captured) cannot outlive the PC.
+        #[cfg(feature = "std")]
         self.abort_tracked_tasks();
     }
 }
@@ -6161,10 +6548,7 @@ fn section_rejected(desc: &SessionDescription, section: &MediaSection) -> bool {
 
 fn default_origin() -> Origin {
     let mut origin = Origin::default();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = crate::platform::time::unix_ms().unwrap_or(0) / 1000;
     origin.session_id = now;
     origin.session_version = now;
     if let Ok(ip) = get_local_ip() {
@@ -6214,8 +6598,8 @@ pub enum DisconnectReason {
     Unknown(String),
 }
 
-impl std::fmt::Display for DisconnectReason {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for DisconnectReason {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             DisconnectReason::LocalClose => write!(f, "local close"),
             DisconnectReason::Dropped => write!(f, "connection dropped"),
@@ -6383,8 +6767,8 @@ pub struct RtpTransceiver {
     sender_rtx_payload_type: Mutex<Option<u8>>,
     sender_stream_id: Mutex<Option<String>>,
     sender_track_id: Mutex<Option<String>>,
-    payload_map: Arc<RwLock<HashMap<u8, RtpCodecParameters>>>,
-    extmap: Arc<RwLock<HashMap<u8, String>>>,
+    payload_map: Arc<RwLock<BTreeMap<u8, RtpCodecParameters>>>,
+    extmap: Arc<RwLock<BTreeMap<u8, String>>>,
     /// Deferred sdes:mid configuration: stored here when update_extmap() is called
     /// but the sender has not been created yet.  Applied in set_sender().
     pending_sdes_mid: Mutex<Option<(u8, Arc<str>)>>,
@@ -6412,8 +6796,8 @@ impl RtpTransceiver {
             sender_rtx_payload_type: Mutex::new(None),
             sender_stream_id: Mutex::new(None),
             sender_track_id: Mutex::new(None),
-            payload_map: Arc::new(RwLock::new(HashMap::new())),
-            extmap: Arc::new(RwLock::new(HashMap::new())),
+            payload_map: Arc::new(RwLock::new(BTreeMap::new())),
+            extmap: Arc::new(RwLock::new(BTreeMap::new())),
             pending_sdes_mid: Mutex::new(None),
             send_permitted: AtomicBool::new(true),
             rejected: AtomicBool::new(false),
@@ -6615,7 +6999,7 @@ impl RtpTransceiver {
     }
 
     /// Update payload type mapping for reinvite scenarios
-    pub fn update_payload_map(&self, new_map: HashMap<u8, RtpCodecParameters>) -> RtcResult<()> {
+    pub fn update_payload_map(&self, new_map: BTreeMap<u8, RtpCodecParameters>) -> RtcResult<()> {
         let mut payload_map = self.payload_map.write();
 
         // Log changes for debugging
@@ -6643,7 +7027,7 @@ impl RtpTransceiver {
     }
 
     /// Update RTP header extension mapping for reinvite scenarios
-    pub fn update_extmap(&self, new_extmap: HashMap<u8, String>) -> RtcResult<()> {
+    pub fn update_extmap(&self, new_extmap: BTreeMap<u8, String>) -> RtcResult<()> {
         let mut extmap = self.extmap.write();
 
         // Log changes
@@ -6723,12 +7107,12 @@ impl RtpTransceiver {
     }
 
     /// Get current payload type mapping (for testing/debugging)
-    pub fn get_payload_map(&self) -> HashMap<u8, RtpCodecParameters> {
+    pub fn get_payload_map(&self) -> BTreeMap<u8, RtpCodecParameters> {
         self.payload_map.read().clone()
     }
 
     /// Get current extmap (for testing/debugging)
-    pub fn get_extmap(&self) -> HashMap<u8, String> {
+    pub fn get_extmap(&self) -> BTreeMap<u8, String> {
         self.extmap.read().clone()
     }
 }
@@ -6742,7 +7126,7 @@ pub struct RtpSender {
     stream_id: Arc<str>,
     cname: Arc<str>,
     rtcp_tx: broadcast::Sender<RtcpPacket>,
-    stop_tx: Arc<tokio::sync::Notify>,
+    stop_tx: Arc<Notify>,
     next_sequence_number: Arc<AtomicU16>,
     packets_sent: Arc<AtomicU32>,
     octets_sent: Arc<AtomicU32>,
@@ -6765,7 +7149,7 @@ pub struct RtpSender {
     /// send-loop task so its logs stay grouped with the rest of the session.
     pc_span: tracing::Span,
     /// Dedicated runtime for the send loop (see `RtcConfiguration.runtime_handle`).
-    runtime_handle: Option<tokio::runtime::Handle>,
+    runtime_handle: Option<crate::config::RuntimeHandle>,
 }
 
 pub struct RtpSenderBuilder {
@@ -6776,7 +7160,7 @@ pub struct RtpSenderBuilder {
     interceptors: Vec<Arc<dyn RtpSenderInterceptor + Send + Sync>>,
     cname: Option<String>,
     pc_span: tracing::Span,
-    runtime_handle: Option<tokio::runtime::Handle>,
+    runtime_handle: Option<crate::config::RuntimeHandle>,
 }
 
 impl RtpSenderBuilder {
@@ -6834,7 +7218,7 @@ impl RtpSenderBuilder {
 
     /// Attach the owning PeerConnection's dedicated runtime handle (see
     /// `RtcConfiguration.runtime_handle`).
-    pub fn runtime_handle(mut self, handle: Option<tokio::runtime::Handle>) -> Self {
+    pub fn runtime_handle(mut self, handle: Option<crate::config::RuntimeHandle>) -> Self {
         self.runtime_handle = handle;
         self
     }
@@ -6885,7 +7269,7 @@ impl RtpSender {
         interceptors: Vec<Arc<dyn RtpSenderInterceptor + Send + Sync>>,
         cname_override: Option<String>,
         pc_span: tracing::Span,
-        runtime_handle: Option<tokio::runtime::Handle>,
+        runtime_handle: Option<crate::config::RuntimeHandle>,
     ) -> Self {
         let track_label = track.id().to_string();
         let track_id = Arc::<str>::from(track_label.clone());
@@ -6904,7 +7288,7 @@ impl RtpSender {
             stream_id,
             cname,
             rtcp_tx,
-            stop_tx: Arc::new(tokio::sync::Notify::new()),
+            stop_tx: Arc::new(Notify::new()),
             next_sequence_number: Arc::new(AtomicU16::new(random_u32() as u16)),
             packets_sent: Arc::new(AtomicU32::new(0)),
             octets_sent: Arc::new(AtomicU32::new(0)),
@@ -6940,20 +7324,36 @@ impl RtpSender {
     /// enabled AND a TWCC-feedback-producing peer is connected. Returns
     /// `None` when no estimator is installed.
     pub fn target_bitrate(&self) -> Option<u64> {
-        self.interceptors
-            .iter()
-            .find_map(|i| i.clone().as_gcc_stats().map(|g| g.target_bitrate()))
+        #[cfg(feature = "std")]
+        {
+            self.interceptors
+                .iter()
+                .find_map(|i| i.clone().as_gcc_stats().map(|g| g.target_bitrate()))
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = &self.interceptors;
+            None
+        }
     }
 
     /// Subscribe to GCC target-bitrate changes (bps). Returns `None` when no
     /// estimator is installed. Applications driving an encoder should spawn a
     /// task on this receiver and adapt the encoder bitrate.
-    pub fn subscribe_target_bitrate(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
-        self.interceptors.iter().find_map(|i| {
-            i.clone()
-                .as_gcc_stats()
-                .map(|g| g.subscribe_target_bitrate())
-        })
+    pub fn subscribe_target_bitrate(&self) -> Option<watch::Receiver<u64>> {
+        #[cfg(feature = "std")]
+        {
+            self.interceptors.iter().find_map(|i| {
+                i.clone()
+                    .as_gcc_stats()
+                    .map(|g| g.subscribe_target_bitrate())
+            })
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = &self.interceptors;
+            None
+        }
     }
 
     /// Next sequence number the paced send loop will put on the wire.
@@ -7107,7 +7507,7 @@ impl RtpSender {
         });
         let params_lock = self.params.clone();
         let stop_rx = self.stop_tx.clone();
-        let mut transport_change_rx = self.transport_change_tx.subscribe();
+        let transport_change_rx = self.transport_change_tx.subscribe();
         let transport_generation = self.transport_generation.clone();
         let next_seq = self.next_sequence_number.clone();
         let packets_sent = self.packets_sent.clone();
@@ -7131,33 +7531,44 @@ impl RtpSender {
             let mut timestamp_offset = random_u32(); // Start with random offset
             // Delay the first SR so the initial RTP burst is not immediately followed by RTCP
             // on the same 5-tuple, which can confuse consumers that are expecting RTP first.
-            let mut rtcp_interval = tokio::time::interval_at(
-                tokio::time::Instant::now() + std::time::Duration::from_secs(3),
-                std::time::Duration::from_secs(3),
+            let mut rtcp_interval = crate::platform::task::interval_after(
+                core::time::Duration::from_secs(3),
+                core::time::Duration::from_secs(3),
             );
-            rtcp_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let notified = stop_rx.notified();
-            tokio::pin!(notified);
+            rtcp_interval.set_missed_tick_behavior(crate::platform::task::MissedTickBehavior::Skip);
+            // seam select5 takes Unpin futures; std's Notified is !Unpin
+            let mut notified = core::pin::pin!(stop_rx.notified());
 
             loop {
                 if transport_generation.load(Ordering::SeqCst) != generation {
                     break;
                 }
 
-                tokio::select! {
-                    _ = &mut notified => break,
-                    changed = transport_change_rx.changed() => {
-                        match changed {
-                            Ok(()) => {
-                                if *transport_change_rx.borrow() != generation {
-                                    break;
-                                }
+                let mut __tch = transport_change_rx.clone();
+                let __s0 = core::pin::pin!(&mut notified);
+                let __s1 = core::pin::pin!(__tch.changed());
+                // Conditional select! arm becomes either(ticker, pending):
+                // SRs only tick while samples are flowing and RTCP is on.
+                let __s2 = if packets_sent.load(Ordering::Relaxed) > 0
+                    && rtcp_enabled.load(Ordering::Relaxed)
+                {
+                    crate::platform::select::Either::A(core::pin::pin!(rtcp_interval.tick()))
+                } else {
+                    crate::platform::select::Either::B(core::future::pending::<()>())
+                };
+                let __s3 = core::pin::pin!(rtcp_rx.recv());
+                let __s4 = core::pin::pin!(track.recv());
+                match crate::platform::select::select5(__s0, __s1, __s2, __s3, __s4).await {
+                    crate::platform::select::Which5::A(_) => break,
+                    crate::platform::select::Which5::B(changed) => match changed {
+                        Ok(()) => {
+                            if *transport_change_rx.borrow() != generation {
+                                break;
                             }
-                            Err(_) => break,
                         }
-                    }
-                    _ = rtcp_interval.tick(), if packets_sent.load(Ordering::Relaxed) > 0
-                        && rtcp_enabled.load(Ordering::Relaxed) => {
+                        Err(_) => break,
+                    },
+                    crate::platform::select::Which5::C(_) => {
                         if transport_generation.load(Ordering::SeqCst) != generation {
                             break;
                         }
@@ -7171,7 +7582,7 @@ impl RtpSender {
                         }
                         // Deduplicate by media SSRC (multiple interceptors may report).
                         {
-                            let mut seen = std::collections::HashSet::new();
+                            let mut seen = alloc::collections::BTreeSet::new();
                             report_blocks.retain(|b| seen.insert(b.ssrc));
                         }
                         let report = Self::build_sender_report(
@@ -7179,7 +7590,7 @@ impl RtpSender {
                             rtp_timestamp,
                             packet_count,
                             octet_count,
-                            SystemTime::now(),
+                            crate::platform::time::unix_ms().unwrap_or(0),
                             report_blocks,
                         );
 
@@ -7194,17 +7605,19 @@ impl RtpSender {
                             interceptor.on_sr_sent(ssrc, compact_ntp);
                         }
                     }
-                    rtcp = rtcp_rx.recv() => {
+                    crate::platform::select::Which5::D(rtcp) => {
                         if transport_generation.load(Ordering::SeqCst) != generation {
                             break;
                         }
                         if let Ok(packet) = rtcp {
                             for interceptor in &interceptors {
-                                interceptor.on_rtcp_received(&packet, transport.clone()).await;
+                                interceptor
+                                    .on_rtcp_received(&packet, transport.clone())
+                                    .await;
                             }
                         }
                     }
-                    res = track.recv() => {
+                    crate::platform::select::Which5::E(res) => {
                         if transport_generation.load(Ordering::SeqCst) != generation {
                             break;
                         }
@@ -7229,8 +7642,12 @@ impl RtpSender {
 
                                 // Check if application provided sequence_number (indicates app wants control)
                                 let app_controlled = match &sample {
-                                    crate::media::MediaSample::Audio(f) => f.sequence_number.is_some(),
-                                    crate::media::MediaSample::Video(f) => f.sequence_number.is_some(),
+                                    crate::media::MediaSample::Audio(f) => {
+                                        f.sequence_number.is_some()
+                                    }
+                                    crate::media::MediaSample::Video(f) => {
+                                        f.sequence_number.is_some()
+                                    }
                                 };
 
                                 // Always rewrite sequence numbers to ensure continuity on the wire
@@ -7268,7 +7685,10 @@ impl RtpSender {
                                                 // new_out_ts = last_src + old_offset + 3000.
                                                 // new_out_ts = src_ts + new_offset.
                                                 // => new_offset = last_src + old_offset + 3000 - src_ts.
-                                                timestamp_offset = last_src.wrapping_add(timestamp_offset).wrapping_add(3000).wrapping_sub(src_ts);
+                                                timestamp_offset = last_src
+                                                    .wrapping_add(timestamp_offset)
+                                                    .wrapping_add(3000)
+                                                    .wrapping_sub(src_ts);
                                             }
                                             last_source_ts = Some(src_ts);
                                         }
@@ -7311,9 +7731,7 @@ impl RtpSender {
                                 // extension when negotiated (GCC loop).
                                 if let Some(tcc_id) = *transport_cc_ext_id.lock() {
                                     let seq = transport_cc_seq.fetch_add(1, Ordering::SeqCst);
-                                    let _ = packet
-                                        .header
-                                        .set_extension(tcc_id, &seq.to_be_bytes());
+                                    let _ = packet.header.set_extension(tcc_id, &seq.to_be_bytes());
                                 }
                                 let payload_len = packet.payload.len() as u32;
                                 let packet_timestamp = packet.header.timestamp;
@@ -7321,7 +7739,10 @@ impl RtpSender {
                                 if let Err(e) = transport.send_rtp(packet).await {
                                     let n = packets_sent.load(Ordering::Relaxed);
                                     if n < 5 {
-                                        warn!("RtpSender: failed to send RTP (ssrc={}): {}", ssrc, e);
+                                        warn!(
+                                            "RtpSender: failed to send RTP (ssrc={}): {}",
+                                            ssrc, e
+                                        );
                                     } else {
                                         trace!("Failed to send RTP: {}", e);
                                     }
@@ -7354,12 +7775,12 @@ impl RtpSender {
         rtp_timestamp: u32,
         packet_count: u32,
         octet_count: u32,
-        now: SystemTime,
+        now_unix_ms: u64,
         report_blocks: Vec<crate::rtp::ReportBlock>,
     ) -> SenderReport {
-        let duration = now.duration_since(UNIX_EPOCH).unwrap_or_default();
-        let ntp_seconds = duration.as_secs().saturating_add(2_208_988_800);
-        let ntp_fraction = (duration.subsec_nanos() as u64 * (1u64 << 32) / 1_000_000_000) as u32;
+        // NTP epoch (1900-01-01) precedes the Unix epoch by 2_208_988_800 s.
+        let ntp_seconds = (now_unix_ms / 1000).saturating_add(2_208_988_800);
+        let ntp_fraction = (now_unix_ms % 1000 * (1u64 << 32) / 1_000) as u32;
 
         SenderReport {
             sender_ssrc,
@@ -7395,22 +7816,22 @@ pub struct RtpReceiver {
     source: Arc<SampleStreamSource>,
     ssrc: Mutex<u32>,
     params: Mutex<RtpCodecParameters>,
-    payload_map: Arc<RwLock<HashMap<u8, RtpCodecParameters>>>,
+    payload_map: Arc<RwLock<BTreeMap<u8, RtpCodecParameters>>>,
     transport: Mutex<Option<Arc<RtpTransport>>>,
-    packet_tx: Mutex<Option<mpsc::Sender<(crate::rtp::RtpPacket, std::net::SocketAddr)>>>,
+    packet_tx: Mutex<Option<mpsc::Sender<(crate::rtp::RtpPacket, core::net::SocketAddr)>>>,
     rtcp_feedback_ssrc: Mutex<Option<u32>>,
     rtx_ssrc: Mutex<Option<u32>>,
     /// RTX payload type → primary payload type (from SDP `a=fmtp:<rtx> apt=<primary>`).
     rtx_apt: Mutex<alloc::collections::BTreeMap<u8, u8>>,
     fir_seq: AtomicU8,
-    feedback_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<crate::media::track::FeedbackEvent>>>,
+    feedback_rx: Arc<sync::AsyncMutex<mpsc::Receiver<crate::media::track::FeedbackEvent>>>,
     simulcast_tracks: Mutex<
-        HashMap<
+        BTreeMap<
             String,
             (
                 Arc<SampleStreamSource>,
                 Arc<SampleStreamTrack>,
-                Arc<tokio::sync::Mutex<mpsc::Receiver<crate::media::track::FeedbackEvent>>>,
+                Arc<sync::AsyncMutex<mpsc::Receiver<crate::media::track::FeedbackEvent>>>,
                 Arc<Mutex<Option<u32>>>,
             ),
         >,
@@ -7429,12 +7850,12 @@ pub struct RtpReceiver {
     pub depacketizer_factory: Arc<dyn DepacketizerFactory>,
     /// TWCC feedback generator (present when the GCC loop is enabled). Set via
     /// the builder; the ext id / feedback ssrc are updated on negotiation.
-    pub twcc: Option<Arc<crate::media::twcc_feedback::TwccFeedbackGenerator>>,
+    pub twcc: Option<Arc<TwccFeedbackGenerator>>,
     /// Correlation span of the owning PeerConnection; instrumented onto the
     /// receive-loop task so its logs stay grouped with the rest of the session.
     pc_span: tracing::Span,
     /// Dedicated runtime for the receive loop (see `RtcConfiguration.runtime_handle`).
-    runtime_handle: Option<tokio::runtime::Handle>,
+    runtime_handle: Option<crate::config::RuntimeHandle>,
 }
 
 pub struct RtpReceiverBuilder {
@@ -7443,10 +7864,10 @@ pub struct RtpReceiverBuilder {
     interceptors: Vec<Arc<dyn RtpReceiverInterceptor>>,
     reception_stats: Option<Arc<StatsCollector>>,
     depacketizer_factory: Option<Arc<dyn DepacketizerFactory>>,
-    payload_map: Arc<RwLock<HashMap<u8, RtpCodecParameters>>>,
+    payload_map: Arc<RwLock<BTreeMap<u8, RtpCodecParameters>>>,
     pc_span: tracing::Span,
-    runtime_handle: Option<tokio::runtime::Handle>,
-    twcc: Option<Arc<crate::media::twcc_feedback::TwccFeedbackGenerator>>,
+    runtime_handle: Option<crate::config::RuntimeHandle>,
+    twcc: Option<Arc<TwccFeedbackGenerator>>,
 }
 
 impl RtpReceiverBuilder {
@@ -7457,7 +7878,7 @@ impl RtpReceiverBuilder {
             interceptors: Vec::new(),
             reception_stats: None,
             depacketizer_factory: None,
-            payload_map: Arc::new(RwLock::new(HashMap::new())),
+            payload_map: Arc::new(RwLock::new(BTreeMap::new())),
             pc_span: debug_span!("pc"),
             runtime_handle: None,
             twcc: None,
@@ -7466,10 +7887,7 @@ impl RtpReceiverBuilder {
 
     /// Attach a TWCC feedback generator (GCC loop). The generator is also
     /// registered as a receiver interceptor so inbound packets feed it.
-    pub fn twcc_feedback(
-        mut self,
-        generator: Arc<crate::media::twcc_feedback::TwccFeedbackGenerator>,
-    ) -> Self {
+    pub fn twcc_feedback(mut self, generator: Arc<TwccFeedbackGenerator>) -> Self {
         self.interceptors.push(generator.clone());
         self.twcc = Some(generator);
         self
@@ -7482,7 +7900,7 @@ impl RtpReceiverBuilder {
 
     pub fn payload_map(
         mut self,
-        payload_map: Arc<RwLock<HashMap<u8, RtpCodecParameters>>>,
+        payload_map: Arc<RwLock<BTreeMap<u8, RtpCodecParameters>>>,
     ) -> Self {
         self.payload_map = payload_map;
         self
@@ -7513,7 +7931,7 @@ impl RtpReceiverBuilder {
 
     /// Attach the owning PeerConnection's dedicated runtime handle (see
     /// `RtcConfiguration.runtime_handle`).
-    pub fn runtime_handle(mut self, handle: Option<tokio::runtime::Handle>) -> Self {
+    pub fn runtime_handle(mut self, handle: Option<crate::config::RuntimeHandle>) -> Self {
         self.runtime_handle = handle;
         self
     }
@@ -7554,8 +7972,8 @@ impl RtpReceiverBuilder {
             rtx_ssrc: Mutex::new(None),
             rtx_apt: Mutex::new(alloc::collections::BTreeMap::new()),
             fir_seq: AtomicU8::new(0),
-            feedback_rx: Arc::new(tokio::sync::Mutex::new(feedback_rx)),
-            simulcast_tracks: Mutex::new(HashMap::new()),
+            feedback_rx: Arc::new(sync::AsyncMutex::new(feedback_rx)),
+            simulcast_tracks: Mutex::new(BTreeMap::new()),
             runner_tx: Mutex::new(None),
             interceptors: self.interceptors,
             reception_stats: self.reception_stats,
@@ -7608,15 +8026,15 @@ impl RtpReceiver {
             source: Arc::new(source),
             ssrc: Mutex::new(ssrc),
             params: Mutex::new(params),
-            payload_map: Arc::new(RwLock::new(HashMap::new())),
+            payload_map: Arc::new(RwLock::new(BTreeMap::new())),
             transport: Mutex::new(None),
             packet_tx: Mutex::new(None),
             rtcp_feedback_ssrc: Mutex::new(None),
             rtx_ssrc: Mutex::new(None),
             rtx_apt: Mutex::new(alloc::collections::BTreeMap::new()),
             fir_seq: AtomicU8::new(0),
-            feedback_rx: Arc::new(tokio::sync::Mutex::new(feedback_rx)),
-            simulcast_tracks: Mutex::new(HashMap::new()),
+            feedback_rx: Arc::new(sync::AsyncMutex::new(feedback_rx)),
+            simulcast_tracks: Mutex::new(BTreeMap::new()),
             runner_tx: Mutex::new(None),
             interceptors,
             reception_stats: None,
@@ -7636,7 +8054,7 @@ impl RtpReceiver {
         let (source, track, feedback_rx) =
             sample_track(self.track.kind(), RTP_RECEIVER_SAMPLE_CAPACITY);
         let source = Arc::new(source);
-        let feedback_rx = Arc::new(tokio::sync::Mutex::new(feedback_rx));
+        let feedback_rx = Arc::new(sync::AsyncMutex::new(feedback_rx));
         let simulcast_ssrc = Arc::new(Mutex::new(None));
 
         // If runner is active, send command
@@ -7697,7 +8115,9 @@ impl RtpReceiver {
         *self.ssrc.lock()
     }
 
-    pub fn packet_tx(&self) -> Option<mpsc::Sender<(crate::rtp::RtpPacket, std::net::SocketAddr)>> {
+    pub fn packet_tx(
+        &self,
+    ) -> Option<mpsc::Sender<(crate::rtp::RtpPacket, core::net::SocketAddr)>> {
         self.packet_tx.lock().clone()
     }
 
@@ -8033,17 +8453,17 @@ impl RtpReceiver {
         };
 
         let mut futures = FuturesUnordered::new();
-        let mut tracks = HashMap::new();
+        let mut tracks = BTreeMap::new();
 
         fn handle_add_track(
             cmd: ReceiverCommand,
             futures: &mut FuturesUnordered<Pin<Box<dyn Future<Output = LoopEvent> + Send>>>,
-            tracks: &mut HashMap<
+            tracks: &mut BTreeMap<
                 Option<String>,
                 (
                     Arc<crate::media::track::SampleStreamSource>,
                     Arc<Mutex<Option<u32>>>,
-                    Arc<tokio::sync::Mutex<mpsc::Receiver<crate::media::track::FeedbackEvent>>>,
+                    Arc<sync::AsyncMutex<mpsc::Receiver<crate::media::track::FeedbackEvent>>>,
                 ),
             >,
             depacketizer_factory: &Arc<dyn DepacketizerFactory>,
@@ -8086,14 +8506,23 @@ impl RtpReceiver {
         }
 
         loop {
-            tokio::select! {
-                cmd = cmd_rx.recv() => {
-                    match cmd {
-                        Some(cmd) => handle_add_track(cmd, &mut futures, &mut tracks, &depacketizer_factory),
-                        None => break,
+            let __s0 = core::pin::pin!(cmd_rx.recv());
+            // Conditional select! arm: the stream arm is only live while the
+            // FuturesUnordered has a pending loop; otherwise it waits forever
+            // and the command arm runs alone.
+            let __s1 = if !futures.is_empty() {
+                crate::platform::select::Either::A(core::pin::pin!(futures.next()))
+            } else {
+                crate::platform::select::Either::B(core::future::pending::<Option<LoopEvent>>())
+            };
+            match crate::platform::select::select2(__s0, __s1).await {
+                crate::platform::select::Either::A(cmd) => match cmd {
+                    Some(cmd) => {
+                        handle_add_track(cmd, &mut futures, &mut tracks, &depacketizer_factory)
                     }
-                }
-                event = futures.next(), if !futures.is_empty() => {
+                    None => break,
+                },
+                crate::platform::select::Either::B(event) => {
                     if let Some(event) = event {
                         match event {
                             LoopEvent::Packet(packet_opt, rid, packet_rx, mut depacketizer) => {
@@ -8141,15 +8570,22 @@ impl RtpReceiver {
                                                     "RTP run_loop: first packet — SSRC learned, sending Track event",
                                                 );
                                                 // Use swap to atomically check and set the flag
-                                                if !this.track_event_sent.swap(true, Ordering::SeqCst)
-                                                    && let Some(ref event_tx) = *this.track_ready_event_tx.lock()
+                                                if !this
+                                                    .track_event_sent
+                                                    .swap(true, Ordering::SeqCst)
+                                                    && let Some(ref event_tx) =
+                                                        *this.track_ready_event_tx.lock()
                                                 {
-                                                    let transceiver = this.track_ready_transceiver.lock();
-                                                    if let Some(transceiver) =
-                                                        transceiver.as_ref().and_then(|t| t.upgrade())
+                                                    let transceiver =
+                                                        this.track_ready_transceiver.lock();
+                                                    if let Some(transceiver) = transceiver
+                                                        .as_ref()
+                                                        .and_then(|t| t.upgrade())
                                                     {
                                                         let _ = event_tx.send(
-                                                            PeerConnectionEvent::Track(transceiver.clone()),
+                                                            PeerConnectionEvent::Track(
+                                                                transceiver.clone(),
+                                                            ),
                                                         );
                                                         trace!(
                                                             "RTP mode: Sent Track event after SSRC latching complete"
@@ -8164,14 +8600,14 @@ impl RtpReceiver {
                                     let local_addr = transport
                                         .as_ref()
                                         .map(|t| t.local_addr())
-                                        .unwrap_or(std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+                                        .unwrap_or(core::net::SocketAddr::from(([0, 0, 0, 0], 0)));
                                     for interceptor in &this.interceptors {
-                                        if let Some(mut rtcp_packet) =
-                                            interceptor
-                                                .on_packet_received(&packet, addr, local_addr)
-                                                .await
+                                        if let Some(mut rtcp_packet) = interceptor
+                                            .on_packet_received(&packet, addr, local_addr)
+                                            .await
                                         {
-                                            if let RtcpPacket::GenericNack(ref mut nack) = rtcp_packet
+                                            if let RtcpPacket::GenericNack(ref mut nack) =
+                                                rtcp_packet
                                             {
                                                 let sender_ssrc =
                                                     this.rtcp_feedback_ssrc.lock().unwrap_or(0);
@@ -8190,8 +8626,8 @@ impl RtpReceiver {
                                         }
                                     }
 
-                                    let clock_rate =
-                                        this.clock_rate_for_payload_type(packet.header.payload_type);
+                                    let clock_rate = this
+                                        .clock_rate_for_payload_type(packet.header.payload_type);
 
                                     // Track depacketizer drop count changes
                                     let prev_drop = depacketizer.drop_count();
@@ -8217,46 +8653,50 @@ impl RtpReceiver {
                             }
                             LoopEvent::Feedback(event_opt, rid) => {
                                 if let Some(event) = event_opt
-                                    && let Some((_, simulcast_ssrc, feedback_rx)) = tracks.get(&rid) {
-                                        if let Some(this) = weak_self.upgrade() {
-                                            match event {
-                                                crate::media::track::FeedbackEvent::RequestKeyFrame => {
-                                                    let media_ssrc = if rid.is_some() {
-                                                        *simulcast_ssrc.lock()
-                                                    } else {
-                                                        Some(*this.ssrc.lock())
+                                    && let Some((_, simulcast_ssrc, feedback_rx)) = tracks.get(&rid)
+                                {
+                                    if let Some(this) = weak_self.upgrade() {
+                                        match event {
+                                            crate::media::track::FeedbackEvent::RequestKeyFrame => {
+                                                let media_ssrc = if rid.is_some() {
+                                                    *simulcast_ssrc.lock()
+                                                } else {
+                                                    Some(*this.ssrc.lock())
+                                                };
+
+                                                if let Some(ssrc) = media_ssrc {
+                                                    let sender_ssrc =
+                                                        *this.rtcp_feedback_ssrc.lock();
+                                                    let pli = crate::rtp::PictureLossIndication {
+                                                        sender_ssrc: sender_ssrc.unwrap_or(0),
+                                                        media_ssrc: ssrc,
                                                     };
+                                                    let packet = crate::rtp::RtcpPacket::PictureLossIndication(pli);
 
-                                                    if let Some(ssrc) = media_ssrc {
-                                                        let sender_ssrc = *this.rtcp_feedback_ssrc.lock();
-                                                        let pli = crate::rtp::PictureLossIndication {
-                                                            sender_ssrc: sender_ssrc.unwrap_or(0),
-                                                            media_ssrc: ssrc,
-                                                        };
-                                                        let packet = crate::rtp::RtcpPacket::PictureLossIndication(pli);
-
-                                                        let transport = this.transport.lock().clone();
-                                                        if let Some(transport) = transport
-                                                            && let Err(e) = transport.send_rtcp(&[packet]).await {
-                                                                    trace!("Failed to send PLI: {}", e);
-                                                            }
+                                                    let transport = this.transport.lock().clone();
+                                                    if let Some(transport) = transport
+                                                        && let Err(e) =
+                                                            transport.send_rtcp(&[packet]).await
+                                                    {
+                                                        trace!("Failed to send PLI: {}", e);
                                                     }
                                                 }
                                             }
-
-                                            let rid_clone = rid.clone();
-                                            let feedback_rx = feedback_rx.clone();
-                                            futures.push(Box::pin(async move {
-                                                let event = {
-                                                    let mut lock = feedback_rx.lock().await;
-                                                    lock.recv().await
-                                                };
-                                                LoopEvent::Feedback(event, rid_clone)
-                                            }));
-                                        } else {
-                                            break;
                                         }
+
+                                        let rid_clone = rid.clone();
+                                        let feedback_rx = feedback_rx.clone();
+                                        futures.push(Box::pin(async move {
+                                            let event = {
+                                                let mut lock = feedback_rx.lock().await;
+                                                lock.recv().await
+                                            };
+                                            LoopEvent::Feedback(event, rid_clone)
+                                        }));
+                                    } else {
+                                        break;
                                     }
+                                }
                             }
                         }
                     }
@@ -8386,9 +8826,9 @@ impl PeerConnection {
 #[cfg(test)]
 mod tests {
 
-    fn test_addr() -> std::net::SocketAddr {
-        std::net::SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+    fn test_addr() -> core::net::SocketAddr {
+        core::net::SocketAddr::new(
+            core::net::IpAddr::V4(core::net::Ipv4Addr::new(127, 0, 0, 1)),
             5000,
         )
     }
@@ -8456,22 +8896,23 @@ mod tests {
     /// DTMF right after answer) was silently invisible to stats/DTMF/recording.
     #[tokio::test]
     async fn rtp_observer_registered_before_transport_sees_first_packets() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use crate::platform::atomic64::AtomicU64;
+        use core::sync::atomic::{AtomicUsize, Ordering};
         use tokio::net::UdpSocket;
 
-        struct IngressCounter(std::sync::Arc<AtomicUsize>);
+        struct IngressCounter(Arc<AtomicUsize>);
         impl RtpObserver for IngressCounter {
-            fn on_ingress(&self, _packet: &crate::rtp::RtpPacket, _src: std::net::SocketAddr) {
+            fn on_ingress(&self, _packet: &crate::rtp::RtpPacket, _src: core::net::SocketAddr) {
                 self.0.fetch_add(1, Ordering::Relaxed);
             }
         }
 
-        let counter = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = Arc::new(AtomicUsize::new(0));
         let mut cfg = RtcConfiguration::default();
         cfg.transport_mode = TransportMode::Rtp;
         let pc = PeerConnection::new(cfg);
         // Register BEFORE any RTP transport exists.
-        pc.add_observer(std::sync::Arc::new(IngressCounter(counter.clone())));
+        pc.add_observer(Arc::new(IngressCounter(counter.clone())));
 
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
         let offer = pc.create_offer().await.unwrap();
@@ -8481,7 +8922,7 @@ mod tests {
         let answer = SessionDescription::parse(SdpType::Answer, answer_sdp).unwrap();
         pc.set_remote_description(answer).await.unwrap();
 
-        pc.wait_for_rtp_transport_ready(std::time::Duration::from_secs(5))
+        pc.wait_for_rtp_transport_ready(core::time::Duration::from_secs(5))
             .await
             .expect("rtp transport");
 
@@ -8496,12 +8937,12 @@ mod tests {
             .and_then(|rest| rest.split_whitespace().next())
             .and_then(|p| p.parse().ok())
             .expect("audio port in local offer");
-        let ip: std::net::IpAddr = sdp
+        let ip: core::net::IpAddr = sdp
             .lines()
             .find_map(|l| l.strip_prefix("c=IN IP4 "))
             .and_then(|rest| rest.split_whitespace().next())
             .and_then(|p| p.parse().ok())
-            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+            .unwrap_or(core::net::IpAddr::V4(core::net::Ipv4Addr::LOCALHOST));
         assert!(port > 0);
 
         // Minimal RTP packet (PT 0 / PCMU).
@@ -8509,13 +8950,13 @@ mod tests {
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         sock.send_to(&pkt, (ip, port)).await.unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = crate::platform::time::Instant::now() + core::time::Duration::from_secs(2);
         while counter.load(Ordering::Relaxed) == 0 {
             assert!(
-                std::time::Instant::now() < deadline,
+                crate::platform::time::Instant::now() < deadline,
                 "observer registered before transport never saw the first packet"
             );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            crate::platform::task::sleep(core::time::Duration::from_millis(10)).await;
         }
     }
 
@@ -8562,7 +9003,7 @@ mod tests {
             let late_track = if dynamic_rid {
                 let transceiver = pc.get_transceivers().remove(0);
                 transceiver
-                    .update_extmap(HashMap::from([(
+                    .update_extmap(BTreeMap::from([(
                         3,
                         "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id".into(),
                     )]))
@@ -8585,7 +9026,7 @@ mod tests {
             }
 
             let mut report: Option<ReportBlock> = None;
-            tokio::time::timeout(Duration::from_secs(2), async {
+            crate::platform::time::with_timeout(Duration::from_secs(2), async {
                 let mut buffer = [0u8; 1500];
                 for sequence in 1u16..=50 {
                     let mut header =
@@ -8654,11 +9095,13 @@ mod tests {
             );
             if report.is_none() {
                 let mut buffer = [0u8; 1500];
-                let (size, _) =
-                    tokio::time::timeout(Duration::from_secs(1), remote.recv_from(&mut buffer))
-                        .await
-                        .expect("the peer must receive the direct reception report")
-                        .unwrap();
+                let (size, _) = crate::platform::time::with_timeout(
+                    Duration::from_secs(1),
+                    remote.recv_from(&mut buffer),
+                )
+                .await
+                .expect("the peer must receive the direct reception report")
+                .unwrap();
                 if let RtcpPacket::ReceiverReport(rr) =
                     parse_rtcp_packets(&buffer[..size], None).unwrap().remove(0)
                 {
@@ -8683,11 +9126,13 @@ mod tests {
                     .await
                     .unwrap();
                 let mut buffer = [0u8; 1500];
-                let (size, _) =
-                    tokio::time::timeout(Duration::from_secs(1), remote.recv_from(&mut buffer))
-                        .await
-                        .expect("unknown codecs must retain the existing direct forwarding path")
-                        .unwrap();
+                let (size, _) = crate::platform::time::with_timeout(
+                    Duration::from_secs(1),
+                    remote.recv_from(&mut buffer),
+                )
+                .await
+                .expect("unknown codecs must retain the existing direct forwarding path")
+                .unwrap();
                 assert_eq!(
                     RtpPacket::parse(&buffer[..size]).unwrap().payload,
                     unknown.payload
@@ -8716,9 +9161,9 @@ mod tests {
     #[tokio::test]
     async fn repro_pair_monitor_must_not_override_latched_rtp_remote() {
         use crate::transports::PacketReceiver;
-        use std::net::{Ipv4Addr, SocketAddr};
+        use core::net::{Ipv4Addr, SocketAddr};
 
-        let (_socket_tx, socket_rx) = tokio::sync::watch::channel(None);
+        let (_socket_tx, socket_rx) = watch::channel(None);
         let initial_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         let rtp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
         let sdp_private = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 4162);
@@ -8742,7 +9187,7 @@ mod tests {
         let local = IceCandidate::host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 20000), 1);
         let remote = IceCandidate::host(sdp_private, 1);
         let pair = crate::transports::ice::IceCandidatePair::new(local, remote);
-        let (pair_tx, pair_rx) = tokio::sync::watch::channel(Some(pair));
+        let (pair_tx, pair_rx) = watch::channel(Some(pair));
         drop(pair_tx);
 
         PeerConnection::create_pair_monitor(pair_rx, conn.clone()).await;
@@ -9951,7 +10396,7 @@ a=ssrc:67890 cname:foo\r\n";
             // Exercise the production SDES setup with the generated answer,
             // then ensure neither short nor oversized material is accepted.
             *pc.inner.local_description.lock() = Some(answer.clone());
-            let (_tx, socket_rx) = tokio::sync::watch::channel(None);
+            let (_tx, socket_rx) = watch::channel(None);
             let transport = Arc::new(RtpTransport::new(
                 IceConn::new(socket_rx, "127.0.0.1:4000".parse().unwrap(), None),
                 true,
@@ -10151,7 +10596,7 @@ a=sendrecv\r\n";
         use crate::rtp::RtpHeader;
         use crate::transports::ice::conn::IceConn;
         use crate::transports::rtp::RtpTransport;
-        use std::net::{Ipv4Addr, SocketAddr};
+        use core::net::{Ipv4Addr, SocketAddr};
 
         #[derive(Default)]
         struct Egress(AtomicU32);
@@ -10170,7 +10615,7 @@ a=sendrecv\r\n";
             handler
         };
 
-        let (_, socket_rx) = tokio::sync::watch::channel(None);
+        let (_, socket_rx) = watch::channel(None);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1234);
         let transport = Arc::new(RtpTransport::new(
             IceConn::new(socket_rx, addr, None),
@@ -10232,7 +10677,7 @@ a=sendrecv\r\n";
         use crate::rtp::RtpHeader;
         use crate::transports::ice::conn::IceConn;
         use crate::transports::rtp::RtpTransport;
-        use std::net::{Ipv4Addr, SocketAddr};
+        use core::net::{Ipv4Addr, SocketAddr};
 
         let handler = DefaultRtpSenderNackHandler::new(10);
         let mut header = RtpHeader::new(96, 100, 0, 1234);
@@ -10243,7 +10688,7 @@ a=sendrecv\r\n";
             .await;
 
         // Mock transport (we just need it to not crash, though it won't actually send)
-        let (_, socket_rx) = tokio::sync::watch::channel(None);
+        let (_, socket_rx) = watch::channel(None);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1234);
         let ice_conn = IceConn::new(socket_rx, addr, None);
         let transport = Arc::new(RtpTransport::new(ice_conn, false));
@@ -10285,7 +10730,7 @@ a=sendrecv\r\n";
 
         // We can't easily check if it was sent without a mock transport that records sends,
         // but we can at least verify it doesn't panic and the logic runs.
-        let (_, socket_rx2) = tokio::sync::watch::channel(None);
+        let (_, socket_rx2) = watch::channel(None);
         let ice_conn2 = IceConn::new(socket_rx2, addr, None);
         let transport2 = Arc::new(RtpTransport::new(ice_conn2, false));
         handler
@@ -10550,7 +10995,7 @@ a=mid:0
             .build();
         transceiver.set_receiver(Some(receiver.clone()));
 
-        let mut payload_map = HashMap::new();
+        let mut payload_map = BTreeMap::new();
         payload_map.insert(
             8,
             RtpCodecParameters {
@@ -10563,7 +11008,7 @@ a=mid:0
         transceiver.update_payload_map(payload_map).unwrap();
 
         let (_socket_tx, socket_rx) =
-            tokio::sync::watch::channel::<Option<crate::transports::ice::IceSocketWrapper>>(None);
+            watch::channel::<Option<crate::transports::ice::IceSocketWrapper>>(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_rx,
             "127.0.0.1:0".parse().unwrap(),
@@ -10582,11 +11027,13 @@ a=mid:0
             .await
             .unwrap();
 
-        let sample =
-            tokio::time::timeout(std::time::Duration::from_secs(1), receiver.track().recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let sample = crate::platform::time::with_timeout(
+            core::time::Duration::from_secs(1),
+            receiver.track().recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
         match sample {
             crate::media::MediaSample::Audio(frame) => {
@@ -10642,7 +11089,7 @@ a=mid:0
 
         let receiver = transceiver.receiver().unwrap();
         let (_socket_tx, socket_rx) =
-            tokio::sync::watch::channel::<Option<crate::transports::ice::IceSocketWrapper>>(None);
+            watch::channel::<Option<crate::transports::ice::IceSocketWrapper>>(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_rx,
             "127.0.0.1:0".parse().unwrap(),
@@ -10650,7 +11097,7 @@ a=mid:0
         );
         let transport = Arc::new(crate::transports::rtp::RtpTransport::new(ice_conn, false));
         receiver.set_transport(transport, None, None);
-        tokio::task::yield_now().await;
+        crate::platform::task::yield_now().await;
 
         let packet_tx = receiver.packet_tx().unwrap();
         let packet = RtpPacket::new(
@@ -10662,11 +11109,13 @@ a=mid:0
             .await
             .unwrap();
 
-        let sample =
-            tokio::time::timeout(std::time::Duration::from_secs(1), receiver.track().recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let sample = crate::platform::time::with_timeout(
+            core::time::Duration::from_secs(1),
+            receiver.track().recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
         match sample {
             crate::media::MediaSample::Audio(frame) => {
@@ -10866,7 +11315,7 @@ a=mid:0
 
         // Should reach Connected
         let mut state_rx = pc.subscribe_peer_state();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        crate::platform::time::with_timeout(core::time::Duration::from_secs(2), async {
             loop {
                 if *state_rx.borrow() == PeerConnectionState::Connected {
                     return;
@@ -10893,8 +11342,8 @@ a=mid:0
         use crate::transports::ice::IceSocketWrapper;
         use crate::transports::ice::conn::IceConn;
         use crate::transports::rtp::RtpTransport;
+        use core::time::Duration;
         use std::sync::Arc;
-        use std::time::Duration;
         use tokio::sync::watch;
 
         let (_source, track, _feedback_rx) =
@@ -10931,7 +11380,7 @@ a=mid:0
 
         // Both loops should be short-lived because transport_generation changes.
         // After a brief sleep, transport_a should only be held by the test code.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        crate::platform::task::sleep(Duration::from_millis(100)).await;
         let refcnt = Arc::strong_count(&transport_a);
         // transport_a is held by the test variable; any additional strong refs
         // from the (now exited) old send-loop must have been released.
@@ -11089,8 +11538,8 @@ a=mid:0
 
         // wait_for_gathering_complete must return instantly in RTP mode
         // (would hang before the fix if called before create_offer)
-        tokio::time::timeout(
-            std::time::Duration::from_millis(200),
+        crate::platform::time::with_timeout(
+            core::time::Duration::from_millis(200),
             pc.wait_for_gathering_complete(),
         )
         .await
@@ -11139,7 +11588,7 @@ a=mid:0
 
         // Wait for connected state
         let mut state_rx = pc.subscribe_peer_state();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        crate::platform::time::with_timeout(core::time::Duration::from_secs(2), async {
             loop {
                 if *state_rx.borrow() == PeerConnectionState::Connected {
                     return;
@@ -11209,7 +11658,7 @@ a=mid:0
 
         // Should reach Connected via complete_direct_rtp
         let mut state_rx = pc.subscribe_peer_state();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        crate::platform::time::with_timeout(core::time::Duration::from_secs(2), async {
             loop {
                 if *state_rx.borrow() == PeerConnectionState::Connected {
                     return;
@@ -11251,7 +11700,7 @@ a=mid:0
 
         // Should reach Connected via setup_direct_rtp (answerer path)
         let mut state_rx = pc.subscribe_peer_state();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        crate::platform::time::with_timeout(core::time::Duration::from_secs(2), async {
             loop {
                 if *state_rx.borrow() == PeerConnectionState::Connected {
                     return;
@@ -11349,7 +11798,7 @@ a=mid:0
         pc.set_remote_description(desc).await.unwrap();
 
         let mut state_rx = pc.subscribe_peer_state();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        crate::platform::time::with_timeout(core::time::Duration::from_secs(2), async {
             loop {
                 if *state_rx.borrow() == PeerConnectionState::Connected {
                     return;
@@ -11394,7 +11843,7 @@ a=mid:0
         pc.set_remote_description(desc).await.unwrap();
 
         let mut state_rx = pc.subscribe_peer_state();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        crate::platform::time::with_timeout(core::time::Duration::from_secs(2), async {
             loop {
                 if *state_rx.borrow() == PeerConnectionState::Connected {
                     return;
@@ -11440,7 +11889,7 @@ a=mid:0
         pc.set_remote_description(desc).await.unwrap();
 
         let mut state_rx = pc.subscribe_peer_state();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        crate::platform::time::with_timeout(core::time::Duration::from_secs(2), async {
             loop {
                 if *state_rx.borrow() == PeerConnectionState::Connected {
                     return;
@@ -11742,8 +12191,8 @@ a=mid:0
         );
         assert_eq!(
             initial_pair.unwrap().remote.address,
-            std::net::SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+            core::net::SocketAddr::new(
+                core::net::IpAddr::V4(core::net::Ipv4Addr::new(10, 0, 0, 1)),
                 8000
             )
         );
@@ -11772,8 +12221,8 @@ a=mid:0
         );
         assert_eq!(
             updated_pair.unwrap().remote.address,
-            std::net::SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 50)),
+            core::net::SocketAddr::new(
+                core::net::IpAddr::V4(core::net::Ipv4Addr::new(192, 168, 1, 50)),
                 9000
             ),
             "reinvite should update RTP remote address"
@@ -11809,19 +12258,20 @@ a=mid:0
         let pranswer = SessionDescription::parse(SdpType::Pranswer, pranswer_sdp).unwrap();
         pc.set_remote_description(pranswer).await.unwrap();
 
-        let transport = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if let Some(transport) = pc.inner.rtp_transport.lock().clone() {
-                    return transport;
+        let transport =
+            crate::platform::time::with_timeout(core::time::Duration::from_secs(1), async {
+                loop {
+                    if let Some(transport) = pc.inner.rtp_transport.lock().clone() {
+                        return transport;
+                    }
+                    crate::platform::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+            })
+            .await
+            .unwrap();
         let ice_conn = transport.ice_conn();
-        let latched_nat_addr = std::net::SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 20)),
+        let latched_nat_addr = core::net::SocketAddr::new(
+            core::net::IpAddr::V4(core::net::Ipv4Addr::new(198, 51, 100, 20)),
             42000,
         );
         *ice_conn.remote_addr.write() = latched_nat_addr;
@@ -11881,19 +12331,20 @@ a=mid:0
         let pranswer = SessionDescription::parse(SdpType::Pranswer, pranswer_sdp).unwrap();
         pc.set_remote_description(pranswer).await.unwrap();
 
-        let transport = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if let Some(transport) = pc.inner.rtp_transport.lock().clone() {
-                    return transport;
+        let transport =
+            crate::platform::time::with_timeout(core::time::Duration::from_secs(1), async {
+                loop {
+                    if let Some(transport) = pc.inner.rtp_transport.lock().clone() {
+                        return transport;
+                    }
+                    crate::platform::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+            })
+            .await
+            .unwrap();
         let ice_conn = transport.ice_conn();
-        let latched_nat_addr = std::net::SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 20)),
+        let latched_nat_addr = core::net::SocketAddr::new(
+            core::net::IpAddr::V4(core::net::Ipv4Addr::new(198, 51, 100, 20)),
             42000,
         );
         *ice_conn.remote_addr.write() = latched_nat_addr;
@@ -11910,8 +12361,8 @@ a=mid:0
         let answer = SessionDescription::parse(SdpType::Answer, answer_sdp).unwrap();
         pc.set_remote_description(answer).await.unwrap();
 
-        let expected_remote = std::net::SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2)),
+        let expected_remote = core::net::SocketAddr::new(
+            core::net::IpAddr::V4(core::net::Ipv4Addr::new(10, 0, 0, 2)),
             9000,
         );
         assert_eq!(*ice_conn.remote_addr.read(), expected_remote);
@@ -11962,16 +12413,17 @@ a=mid:0
         pc.set_remote_description(first_pranswer).await.unwrap();
         assert_eq!(pc.signaling_state(), SignalingState::HaveLocalOffer);
 
-        let transport = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if let Some(transport) = pc.inner.rtp_transport.lock().clone() {
-                    return transport;
+        let transport =
+            crate::platform::time::with_timeout(core::time::Duration::from_secs(1), async {
+                loop {
+                    if let Some(transport) = pc.inner.rtp_transport.lock().clone() {
+                        return transport;
+                    }
+                    crate::platform::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+            })
+            .await
+            .unwrap();
 
         let second_pranswer_sdp = "v=0\r\n\
             o=- 1 2 IN IP4 10.0.0.2\r\n\
@@ -11992,8 +12444,8 @@ a=mid:0
         ));
         assert_eq!(
             *transport.ice_conn().remote_addr.read(),
-            std::net::SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2)),
+            core::net::SocketAddr::new(
+                core::net::IpAddr::V4(core::net::Ipv4Addr::new(10, 0, 0, 2)),
                 9000,
             )
         );
@@ -12264,9 +12716,10 @@ a=mid:0
         );
 
         // Verify Track event is receivable
-        let event = tokio::time::timeout(std::time::Duration::from_millis(100), pc.recv())
-            .await
-            .expect("Should receive Track event within timeout");
+        let event =
+            crate::platform::time::with_timeout(core::time::Duration::from_millis(100), pc.recv())
+                .await
+                .expect("Should receive Track event within timeout");
         assert!(event.is_some(), "Should receive a PeerConnectionEvent");
         match event.unwrap() {
             PeerConnectionEvent::Track(t) => {
@@ -12302,7 +12755,7 @@ a=mid:0
 
         // Wait for connected state
         let mut state_rx = pc.subscribe_peer_state();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        crate::platform::time::with_timeout(core::time::Duration::from_secs(2), async {
             loop {
                 if *state_rx.borrow() == PeerConnectionState::Connected {
                     return;
@@ -12376,7 +12829,7 @@ a=mid:0
             .unwrap();
 
         // The peer derives LSR directly from SR wire bytes, independently of both collectors.
-        let (lsr, address) = tokio::time::timeout(Duration::from_secs(5), async {
+        let (lsr, address) = crate::platform::time::with_timeout(Duration::from_secs(5), async {
             let mut buffer = [0u8; 1500];
             loop {
                 let (size, address) = remote.recv_from(&mut buffer).await.unwrap();
@@ -12401,7 +12854,7 @@ a=mid:0
         rr[8..12].copy_from_slice(&sender.ssrc().to_be_bytes());
         rr[24..28].copy_from_slice(&lsr.to_be_bytes());
         remote.send_to(&rr, address).await.unwrap();
-        let entry = tokio::time::timeout(Duration::from_secs(2), async {
+        let entry = crate::platform::time::with_timeout(Duration::from_secs(2), async {
             loop {
                 let stats = pc.get_stats().await.unwrap();
                 if let Some(entry) = stats.entries.into_iter().find(|entry| {
@@ -12410,7 +12863,7 @@ a=mid:0
                 }) {
                     break entry;
                 }
-                tokio::task::yield_now().await;
+                crate::platform::task::yield_now().await;
             }
         })
         .await
@@ -12428,8 +12881,7 @@ a=mid:0
 
     #[test]
     fn sender_report_builder_uses_rtp_counters() {
-        let report =
-            RtpSender::build_sender_report(10000, 123456, 42, 4096, UNIX_EPOCH, Vec::new());
+        let report = RtpSender::build_sender_report(10000, 123456, 42, 4096, 0, Vec::new());
 
         assert_eq!(report.sender_ssrc, 10000);
         assert_eq!(report.rtp_timestamp, 123456);
@@ -12836,7 +13288,7 @@ a=mid:0
     async fn rtp_mode_midless_non_bundle_offer_maps_each_media_transport() {
         use crate::TransportMode;
         use crate::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode};
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 
         let mut config = RtcConfiguration::default();
         config.transport_mode = TransportMode::Rtp;
@@ -12867,7 +13319,7 @@ a=mid:0
 
         let offer = SessionDescription::parse(SdpType::Offer, remote_offer).unwrap();
         pc.set_remote_description(offer).await.unwrap();
-        pc.wait_for_rtp_transport_ready(std::time::Duration::from_secs(2))
+        pc.wait_for_rtp_transport_ready(core::time::Duration::from_secs(2))
             .await
             .unwrap();
 
@@ -12982,7 +13434,7 @@ a=mid:0
     async fn rtp_mode_midless_non_bundle_answer_maps_each_media_transport() {
         use crate::TransportMode;
         use crate::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode};
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 
         let mut config = RtcConfiguration::default();
         config.transport_mode = TransportMode::Rtp;
@@ -13027,7 +13479,7 @@ a=mid:0
             a=sendonly\r\n";
         let answer = SessionDescription::parse(SdpType::Answer, remote_answer).unwrap();
         pc.set_remote_description(answer).await.unwrap();
-        pc.wait_for_rtp_transport_ready(std::time::Duration::from_secs(2))
+        pc.wait_for_rtp_transport_ready(core::time::Duration::from_secs(2))
             .await
             .unwrap();
 
@@ -13239,7 +13691,7 @@ a=rtpmap:8 PCMA/8000\r\n";
 
         // Give start_dtls (spawned async) time to register the provisional
         // listener and call set_data_receiver before we send the packet.
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        crate::platform::task::sleep(core::time::Duration::from_millis(50)).await;
 
         // ── inject a minimal PCMA RTP packet from "callee" ──
         let fake_callee = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -13254,9 +13706,12 @@ a=rtpmap:8 PCMA/8000\r\n";
         fake_callee.send_to(&rtp, local_addr).await.unwrap();
 
         // ── expect Track event within 500 ms ──
-        let event = tokio::time::timeout(tokio::time::Duration::from_millis(500), pc.recv())
-            .await
-            .expect("timed out waiting for PeerConnectionEvent::Track – Track event never fired");
+        let event =
+            crate::platform::time::with_timeout(core::time::Duration::from_millis(500), pc.recv())
+                .await
+                .expect(
+                    "timed out waiting for PeerConnectionEvent::Track – Track event never fired",
+                );
 
         assert!(
             matches!(event, Some(PeerConnectionEvent::Track(_))),
@@ -13328,9 +13783,12 @@ a=rtpmap:8 PCMA/8000\r\n";
         fake_callee.send_to(&rtp, local_addr).await.unwrap();
 
         // Allow time for start_dtls + buffer flush + run_loop processing
-        let event = tokio::time::timeout(tokio::time::Duration::from_millis(500), pc.recv())
-            .await
-            .expect("timed out – packet received before start_dtls; buffer flush must deliver it");
+        let event =
+            crate::platform::time::with_timeout(core::time::Duration::from_millis(500), pc.recv())
+                .await
+                .expect(
+                    "timed out – packet received before start_dtls; buffer flush must deliver it",
+                );
 
         assert!(
             matches!(event, Some(PeerConnectionEvent::Track(_))),
@@ -13392,13 +13850,17 @@ a=rtpmap:8 PCMA/8000\r\n";
         // Simulate bridge polling rtp_pc.recv() (as spawn_bidirectional_forwarder does).
         // This must start BEFORE the Track event fires.
         let pc_clone = pc.clone();
-        let recv_handle = tokio::spawn(async move {
-            tokio::time::timeout(tokio::time::Duration::from_millis(2000), pc_clone.recv()).await
+        let recv_handle = crate::platform::task::spawn(async move {
+            crate::platform::time::with_timeout(
+                core::time::Duration::from_millis(2000),
+                pc_clone.recv(),
+            )
+            .await
         });
 
         // Allow 183 to be fully processed (ICE=Connected, transport set up)
         // but callee sends NO audio during 183
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        crate::platform::task::sleep(core::time::Duration::from_millis(100)).await;
 
         // -------- 200 OK Answer: callee picks up ----------
         let answer_sdp = format!(
@@ -13410,7 +13872,7 @@ a=rtpmap:8 PCMA/8000\r\n";
         pc.set_remote_description(answer).await.unwrap();
 
         // Allow time for reinvite processing
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        crate::platform::task::sleep(core::time::Duration::from_millis(50)).await;
 
         // -------- Callee sends its first RTP packet after 200 OK -----------
         let mut rtp = vec![
@@ -13479,12 +13941,16 @@ a=rtpmap:8 PCMA/8000\r\n";
         pc.set_remote_description(pranswer).await.unwrap();
 
         let pc_clone = pc.clone();
-        let recv_handle = tokio::spawn(async move {
-            tokio::time::timeout(tokio::time::Duration::from_millis(2000), pc_clone.recv()).await
+        let recv_handle = crate::platform::task::spawn(async move {
+            crate::platform::time::with_timeout(
+                core::time::Duration::from_millis(2000),
+                pc_clone.recv(),
+            )
+            .await
         });
 
         // 183 phase: no audio
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        crate::platform::task::sleep(core::time::Duration::from_millis(100)).await;
 
         // 200 OK Answer with NEW (different) address
         let answer_sdp = format!(
@@ -13495,7 +13961,7 @@ a=rtpmap:8 PCMA/8000\r\n";
         let answer = SessionDescription::parse(SdpType::Answer, &answer_sdp).unwrap();
         pc.set_remote_description(answer).await.unwrap();
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        crate::platform::task::sleep(core::time::Duration::from_millis(50)).await;
 
         // Send RTP from the NEW callee address
         let mut rtp = vec![
@@ -13620,8 +14086,8 @@ a=rtpmap:8 PCMA/8000\r\n";
         use crate::rtp::RtpHeader;
         use crate::transports::ice::conn::IceConn;
         use crate::transports::rtp::RtpTransport;
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-        use std::sync::atomic::Ordering;
+        use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use core::sync::atomic::Ordering;
 
         let transceiver = Arc::new(RtpTransceiver::new_for_test(
             MediaKind::Audio,
@@ -13631,7 +14097,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             .payload_map(transceiver.payload_map.clone())
             .build();
         transceiver.set_receiver(Some(receiver.clone()));
-        let _ = transceiver.update_payload_map(HashMap::from([(
+        let _ = transceiver.update_payload_map(BTreeMap::from([(
             8u8,
             RtpCodecParameters {
                 payload_type: 8,
@@ -13643,9 +14109,8 @@ a=rtpmap:8 PCMA/8000\r\n";
 
         // Helper: create a fresh RtpTransport backed by a dummy IceConn.
         let make_transport = || {
-            let (_, socket_rx) = tokio::sync::watch::channel::<
-                Option<crate::transports::ice::IceSocketWrapper>,
-            >(None);
+            let (_, socket_rx) =
+                watch::channel::<Option<crate::transports::ice::IceSocketWrapper>>(None);
             let ice_conn = IceConn::new(
                 socket_rx,
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
@@ -13654,8 +14119,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             Arc::new(RtpTransport::new(ice_conn, false))
         };
 
-        let (event_tx, mut event_rx) =
-            tokio::sync::mpsc::unbounded_channel::<PeerConnectionEvent>();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
         let transceiver_weak = Arc::downgrade(&transceiver);
 
         // ── Phase 1: transport A — simulate 183 early media ──────────────
@@ -13666,7 +14130,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             Some(event_tx.clone()),
             Some(transceiver_weak.clone()),
         );
-        tokio::task::yield_now().await;
+        crate::platform::task::yield_now().await;
 
         // Inject a PT=8 packet directly into the run_loop via packet_tx.
         let packet_tx_a = receiver
@@ -13680,11 +14144,12 @@ a=rtpmap:8 PCMA/8000\r\n";
             .unwrap();
 
         // First Track event must arrive (SSRC latched from first packet).
-        let first_event = tokio::time::timeout(tokio::time::Duration::from_millis(500), async {
-            event_rx.recv().await
-        })
-        .await
-        .expect("first Track event must arrive (early-media phase)");
+        let first_event =
+            crate::platform::time::with_timeout(core::time::Duration::from_millis(500), async {
+                event_rx.recv().await
+            })
+            .await
+            .expect("first Track event must arrive (early-media phase)");
         assert!(
             matches!(first_event, Some(PeerConnectionEvent::Track(_))),
             "expected Track event from early-media packet"
@@ -13720,7 +14185,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             "Bug 3 fix: ssrc must be reset to 0 when transport switches"
         );
 
-        tokio::task::yield_now().await;
+        crate::platform::task::yield_now().await;
 
         // ── Phase 3: verify second Track event fires on transport B ──────
 
@@ -13741,11 +14206,12 @@ a=rtpmap:8 PCMA/8000\r\n";
             .unwrap();
 
         // Without Bug 3 fix this would time out (track_event_sent still true).
-        let second_event = tokio::time::timeout(tokio::time::Duration::from_millis(500), async {
-            event_rx.recv().await
-        })
-        .await
-        .expect("second Track event must arrive after transport switch — Bug 3 regression");
+        let second_event =
+            crate::platform::time::with_timeout(core::time::Duration::from_millis(500), async {
+                event_rx.recv().await
+            })
+            .await
+            .expect("second Track event must arrive after transport switch — Bug 3 regression");
         assert!(
             matches!(second_event, Some(PeerConnectionEvent::Track(_))),
             "expected second Track event after transport replacement"
@@ -13766,8 +14232,8 @@ a=rtpmap:8 PCMA/8000\r\n";
         use crate::rtp::RtpHeader;
         use crate::transports::ice::conn::IceConn;
         use crate::transports::rtp::RtpTransport;
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-        use std::sync::atomic::Ordering;
+        use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use core::sync::atomic::Ordering;
 
         let transceiver = Arc::new(RtpTransceiver::new_for_test(
             MediaKind::Audio,
@@ -13777,7 +14243,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             .payload_map(transceiver.payload_map.clone())
             .build();
         transceiver.set_receiver(Some(receiver.clone()));
-        let _ = transceiver.update_payload_map(HashMap::from([(
+        let _ = transceiver.update_payload_map(BTreeMap::from([(
             8u8,
             RtpCodecParameters {
                 payload_type: 8,
@@ -13787,12 +14253,11 @@ a=rtpmap:8 PCMA/8000\r\n";
             },
         )]));
 
-        let (event_tx, mut event_rx) =
-            tokio::sync::mpsc::unbounded_channel::<PeerConnectionEvent>();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
         let transceiver_weak = Arc::downgrade(&transceiver);
 
         let (_, socket_rx) =
-            tokio::sync::watch::channel::<Option<crate::transports::ice::IceSocketWrapper>>(None);
+            watch::channel::<Option<crate::transports::ice::IceSocketWrapper>>(None);
         let ice_conn = IceConn::new(
             socket_rx,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
@@ -13806,7 +14271,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             Some(event_tx.clone()),
             Some(transceiver_weak.clone()),
         );
-        tokio::task::yield_now().await;
+        crate::platform::task::yield_now().await;
 
         // Send one packet → Track event fires → track_event_sent=true
         let packet_tx = receiver.packet_tx().unwrap();
@@ -13817,11 +14282,12 @@ a=rtpmap:8 PCMA/8000\r\n";
             .await
             .unwrap();
 
-        let first_event = tokio::time::timeout(tokio::time::Duration::from_millis(500), async {
-            event_rx.recv().await
-        })
-        .await
-        .expect("first Track event must arrive");
+        let first_event =
+            crate::platform::time::with_timeout(core::time::Duration::from_millis(500), async {
+                event_rx.recv().await
+            })
+            .await
+            .expect("first Track event must arrive");
         assert!(matches!(first_event, Some(PeerConnectionEvent::Track(_))));
         assert!(receiver.track_event_sent.load(Ordering::SeqCst));
 
@@ -13831,7 +14297,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             Some(event_tx.clone()),
             Some(transceiver_weak.clone()),
         );
-        tokio::task::yield_now().await;
+        crate::platform::task::yield_now().await;
 
         // track_event_sent must still be true — no reset happened
         assert!(
@@ -13840,7 +14306,7 @@ a=rtpmap:8 PCMA/8000\r\n";
         );
 
         // No spurious second Track event in the channel
-        tokio::task::yield_now().await;
+        crate::platform::task::yield_now().await;
         assert!(
             event_rx.try_recv().is_err(),
             "ptr_eq match: no spurious Track event must be emitted when transport is reused"
@@ -13858,8 +14324,8 @@ a=rtpmap:8 PCMA/8000\r\n";
         use crate::rtp::RtpHeader;
         use crate::transports::ice::conn::IceConn;
         use crate::transports::rtp::RtpTransport;
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-        use std::sync::atomic::Ordering;
+        use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use core::sync::atomic::Ordering;
 
         let transceiver = Arc::new(RtpTransceiver::new_for_test(
             MediaKind::Audio,
@@ -13869,7 +14335,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             .payload_map(transceiver.payload_map.clone())
             .build();
         transceiver.set_receiver(Some(receiver.clone()));
-        let _ = transceiver.update_payload_map(HashMap::from([(
+        let _ = transceiver.update_payload_map(BTreeMap::from([(
             8u8,
             RtpCodecParameters {
                 payload_type: 8,
@@ -13882,12 +14348,11 @@ a=rtpmap:8 PCMA/8000\r\n";
         // Precondition: starts as false
         assert!(!receiver.track_event_sent.load(Ordering::SeqCst));
 
-        let (event_tx, mut event_rx) =
-            tokio::sync::mpsc::unbounded_channel::<PeerConnectionEvent>();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
         let transceiver_weak = Arc::downgrade(&transceiver);
 
         let (_, socket_rx) =
-            tokio::sync::watch::channel::<Option<crate::transports::ice::IceSocketWrapper>>(None);
+            watch::channel::<Option<crate::transports::ice::IceSocketWrapper>>(None);
         let ice_conn = IceConn::new(
             socket_rx,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
@@ -13900,7 +14365,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             Some(event_tx.clone()),
             Some(transceiver_weak.clone()),
         );
-        tokio::task::yield_now().await;
+        crate::platform::task::yield_now().await;
 
         // After first set_transport, track_event_sent must still be false
         // (no spurious reset from the "existing=None" branch)
@@ -13918,15 +14383,16 @@ a=rtpmap:8 PCMA/8000\r\n";
             .await
             .unwrap();
 
-        let ev = tokio::time::timeout(tokio::time::Duration::from_millis(500), async {
-            event_rx.recv().await
-        })
-        .await
-        .expect("Track event must arrive after first packet on first transport");
+        let ev =
+            crate::platform::time::with_timeout(core::time::Duration::from_millis(500), async {
+                event_rx.recv().await
+            })
+            .await
+            .expect("Track event must arrive after first packet on first transport");
         assert!(matches!(ev, Some(PeerConnectionEvent::Track(_))));
 
         // Exactly one — channel is now empty
-        tokio::task::yield_now().await;
+        crate::platform::task::yield_now().await;
         assert!(
             event_rx.try_recv().is_err(),
             "only one Track event must be emitted per transport lifetime"
@@ -13944,7 +14410,7 @@ a=rtpmap:8 PCMA/8000\r\n";
         use crate::rtp::RtpHeader;
         use crate::transports::ice::conn::IceConn;
         use crate::transports::rtp::RtpTransport;
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 
         let transceiver = Arc::new(RtpTransceiver::new_for_test(
             MediaKind::Audio,
@@ -13954,7 +14420,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             .payload_map(transceiver.payload_map.clone())
             .build();
         transceiver.set_receiver(Some(receiver.clone()));
-        let _ = transceiver.update_payload_map(HashMap::from([(
+        let _ = transceiver.update_payload_map(BTreeMap::from([(
             8u8,
             RtpCodecParameters {
                 payload_type: 8,
@@ -13965,9 +14431,8 @@ a=rtpmap:8 PCMA/8000\r\n";
         )]));
 
         let make_transport = || {
-            let (_, socket_rx) = tokio::sync::watch::channel::<
-                Option<crate::transports::ice::IceSocketWrapper>,
-            >(None);
+            let (_, socket_rx) =
+                watch::channel::<Option<crate::transports::ice::IceSocketWrapper>>(None);
             let ice_conn = IceConn::new(
                 socket_rx,
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
@@ -13976,14 +14441,13 @@ a=rtpmap:8 PCMA/8000\r\n";
             Arc::new(RtpTransport::new(ice_conn, false))
         };
 
-        let (event_tx, mut event_rx) =
-            tokio::sync::mpsc::unbounded_channel::<PeerConnectionEvent>();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
         let tw = Arc::downgrade(&transceiver);
 
         // Transport A — SSRC = 0xAAAA_1111
         let ta = make_transport();
         receiver.set_transport(ta.clone(), Some(event_tx.clone()), Some(tw.clone()));
-        tokio::task::yield_now().await;
+        crate::platform::task::yield_now().await;
         let ptx_a = receiver.packet_tx().unwrap();
         ptx_a
             .send((
@@ -13992,11 +14456,12 @@ a=rtpmap:8 PCMA/8000\r\n";
             ))
             .await
             .unwrap();
-        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(500), async {
-            event_rx.recv().await
-        })
-        .await
-        .expect("first Track event on transport A");
+        let _ =
+            crate::platform::time::with_timeout(core::time::Duration::from_millis(500), async {
+                event_rx.recv().await
+            })
+            .await
+            .expect("first Track event on transport A");
         assert_eq!(*receiver.ssrc.lock(), 0xAAAA_1111);
 
         // Transport B — use a DIFFERENT SSRC (0xBBBB_2222)
@@ -14008,7 +14473,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             "ssrc reset to 0 on transport switch"
         );
 
-        tokio::task::yield_now().await;
+        crate::platform::task::yield_now().await;
         let ptx_b = receiver.packet_tx().unwrap();
         ptx_b
             .send((
@@ -14021,11 +14486,12 @@ a=rtpmap:8 PCMA/8000\r\n";
             .await
             .unwrap();
 
-        let second_event = tokio::time::timeout(tokio::time::Duration::from_millis(500), async {
-            event_rx.recv().await
-        })
-        .await
-        .expect("Track event must fire on transport B with new SSRC");
+        let second_event =
+            crate::platform::time::with_timeout(core::time::Duration::from_millis(500), async {
+                event_rx.recv().await
+            })
+            .await
+            .expect("Track event must fire on transport B with new SSRC");
         assert!(matches!(second_event, Some(PeerConnectionEvent::Track(_))));
         // SSRC correctly updated to the new value
         assert_eq!(
@@ -14130,16 +14596,16 @@ a=rtpmap:8 PCMA/8000\r\n";
     async fn repro_bug3_ice_reconnect_cycle_re_fires_track_event() {
         use crate::rtp::RtpHeader;
         use crate::transports::ice::IceTransportState;
-        use std::net::SocketAddr;
-        use std::sync::atomic::Ordering;
+        use core::net::SocketAddr;
+        use core::sync::atomic::Ordering;
 
         let mut config = RtcConfiguration::default();
         config.transport_mode = TransportMode::Rtp;
-        config.ice_disconnect_grace = std::time::Duration::from_millis(1);
+        config.ice_disconnect_grace = core::time::Duration::from_millis(1);
 
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::RecvOnly);
-        let _ = pc.get_transceivers()[0].update_payload_map(HashMap::from([(
+        let _ = pc.get_transceivers()[0].update_payload_map(BTreeMap::from([(
             8u8,
             RtpCodecParameters {
                 payload_type: 8,
@@ -14157,7 +14623,7 @@ a=rtpmap:8 PCMA/8000\r\n";
         ice.setup_direct_rtp(loopback).await.unwrap();
 
         // Allow run_rtp_direct_loop to process Connected and call start_dtls.
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        crate::platform::task::sleep(core::time::Duration::from_millis(50)).await;
 
         // Grab the receiver and its current packet channel (transport A).
         let receiver = pc.get_transceivers()[0].receiver.lock().clone().unwrap();
@@ -14174,9 +14640,10 @@ a=rtpmap:8 PCMA/8000\r\n";
             .await
             .unwrap();
 
-        let ev1 = tokio::time::timeout(tokio::time::Duration::from_millis(500), pc.recv())
-            .await
-            .expect("Track event must arrive after first packet on transport A");
+        let ev1 =
+            crate::platform::time::with_timeout(core::time::Duration::from_millis(500), pc.recv())
+                .await
+                .expect("Track event must arrive after first packet on transport A");
         assert!(
             matches!(ev1, Some(PeerConnectionEvent::Track(_))),
             "Phase 1: first Track event must fire"
@@ -14193,13 +14660,13 @@ a=rtpmap:8 PCMA/8000\r\n";
         ice.force_state_for_test(IceTransportState::Disconnected);
         // Wait for grace timer to expire (1ms) and handle_connected_state_no_dtls
         // to return true, so the outer loop re-evaluates ICE state.
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        crate::platform::task::sleep(core::time::Duration::from_millis(50)).await;
 
         // Recovery: outer run_rtp_direct_loop sees Connected →
         // calls handle_connected_state_no_dtls again → start_dtls →
         // new Arc<RtpTransport> (transport B) → set_transport → Bug 3 fix resets flag.
         ice.force_state_for_test(IceTransportState::Connected);
-        tokio::time::sleep(tokio::time::Duration::from_millis(80)).await;
+        crate::platform::task::sleep(core::time::Duration::from_millis(80)).await;
 
         // ── Phase 3: verify Bug 3 fix applied ─────────────────────────────────
         assert!(
@@ -14229,9 +14696,10 @@ a=rtpmap:8 PCMA/8000\r\n";
             .await
             .unwrap();
 
-        let ev2 = tokio::time::timeout(tokio::time::Duration::from_millis(500), pc.recv())
-            .await
-            .expect("second Track event must arrive after ICE reconnect");
+        let ev2 =
+            crate::platform::time::with_timeout(core::time::Duration::from_millis(500), pc.recv())
+                .await
+                .expect("second Track event must arrive after ICE reconnect");
         assert!(
             matches!(ev2, Some(PeerConnectionEvent::Track(_))),
             "Bug 3 fix (ICE reconnect): Track event must re-fire after ICE \
@@ -14443,7 +14911,7 @@ a=mid:0
 
         let reoffer = pc.create_offer().await.unwrap();
         for section in &reoffer.media_sections {
-            let mut seen = std::collections::HashSet::new();
+            let mut seen = alloc::collections::BTreeSet::new();
             for attr in &section.attributes {
                 if attr.key == "extmap" {
                     let id: u8 = attr

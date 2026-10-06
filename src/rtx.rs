@@ -112,7 +112,6 @@ pub fn extract_rtx_apt_map(attributes: &[(String, Option<String>)]) -> RtxAptMap
 }
 
 /// Convenience over SDP `Attribute` list.
-#[cfg(feature = "std")]
 pub fn extract_rtx_apt_map_from_attrs(attrs: &[crate::sdp::Attribute]) -> RtxAptMap {
     let pairs: Vec<(String, Option<String>)> = attrs
         .iter()
@@ -127,7 +126,6 @@ pub fn allocate_rtx_payload_type(used: &[u8]) -> Option<u8> {
 }
 
 /// Append RTX rtpmap/fmtp lines and the PT to `formats` for a primary codec.
-#[cfg(feature = "std")]
 pub fn append_rtx_to_section(
     formats: &mut Vec<String>,
     attributes: &mut Vec<crate::sdp::Attribute>,

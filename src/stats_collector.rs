@@ -1,13 +1,14 @@
 use crate::errors::RtcResult;
 use crate::peer_connection::{RtpReceiverInterceptor, RtpSenderInterceptor};
+use crate::platform::atomic64::AtomicU64;
+use crate::platform::{sync::Mutex, time::Instant};
+use crate::prelude::*;
 use crate::rtp::{ReceiverReport, ReportBlock, RtcpPacket, RtpPacket, SenderReport};
 use crate::stats::{StatsEntry, StatsId, StatsKind, StatsProvider};
 use async_trait::async_trait;
-use parking_lot::Mutex;
+use core::sync::atomic::Ordering;
+use core::time::Duration;
 use serde_json::json;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 
 /// Entries in `sent_sr_times` older than this are stale for RTT computation and
 /// eligible for eviction (prevents unbounded growth over long calls).
@@ -131,7 +132,8 @@ impl LocalInboundStats {
         self.packets_received += 1;
 
         // RFC 3550 A.8 interarrival jitter (arrival in RTP timestamp units).
-        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        static START: crate::platform::sync::OnceLock<Instant> =
+            crate::platform::sync::OnceLock::new();
         let start = START.get_or_init(Instant::now);
         let arrival_units =
             (now.duration_since(*start).as_secs_f64() * self.clock_rate as f64) as u32;
@@ -216,13 +218,13 @@ impl Default for LocalOutboundStats {
 
 #[derive(Default)]
 pub struct StatsCollector {
-    remote_inbound: Mutex<HashMap<u32, RemoteInboundStats>>,
-    remote_outbound: Mutex<HashMap<u32, RemoteOutboundStats>>,
-    local_inbound: Mutex<HashMap<u32, LocalInboundStats>>,
-    local_outbound: Mutex<HashMap<u32, LocalOutboundStats>>,
+    remote_inbound: Mutex<BTreeMap<u32, RemoteInboundStats>>,
+    remote_outbound: Mutex<BTreeMap<u32, RemoteOutboundStats>>,
+    local_inbound: Mutex<BTreeMap<u32, LocalInboundStats>>,
+    local_outbound: Mutex<BTreeMap<u32, LocalOutboundStats>>,
     /// Maps compact NTP → Instant for outgoing Sender Reports, used to compute
     /// round-trip time from the LSR/DLSR fields of incoming Receiver Reports.
-    sent_sr_times: Mutex<HashMap<u32, std::time::Instant>>,
+    sent_sr_times: Mutex<BTreeMap<u32, Instant>>,
     last_rr_sent: Mutex<Option<Instant>>,
     /// Monotonic counter used only to pace RR emission.
     packets_since_rr: AtomicU64,
@@ -232,7 +234,7 @@ pub struct StatsCollector {
 /// layer switches, relay rewrite) cannot grow it without bound. First drops
 /// entries not seen within `SENT_SR_TIME_MAX_AGE`; if the map is still over the
 /// high-water mark (all entries fresh), trims the least-recently-seen half.
-fn evict_stale_ssrcs<V>(map: &mut HashMap<u32, V>, last_seen: impl Fn(&V) -> Instant) {
+fn evict_stale_ssrcs<V>(map: &mut BTreeMap<u32, V>, last_seen: impl Fn(&V) -> Instant) {
     if map.len() < SSRC_STATS_HIGH_WATERMARK {
         return;
     }
@@ -422,8 +424,8 @@ impl RtpSenderInterceptor for StatsCollector {
     async fn on_packet_sent(
         &self,
         packet: &RtpPacket,
-        _dst_addr: std::net::SocketAddr,
-        _local_addr: std::net::SocketAddr,
+        _dst_addr: core::net::SocketAddr,
+        _local_addr: core::net::SocketAddr,
     ) {
         let size = Self::packet_size(packet);
         let mut outbound = self.local_outbound.lock();
@@ -448,8 +450,8 @@ impl RtpReceiverInterceptor for StatsCollector {
     async fn on_packet_received(
         &self,
         packet: &RtpPacket,
-        _src_addr: std::net::SocketAddr,
-        _local_addr: std::net::SocketAddr,
+        _src_addr: core::net::SocketAddr,
+        _local_addr: core::net::SocketAddr,
     ) -> Option<RtcpPacket> {
         self.observe_packet(packet, 90000)
     }
@@ -526,12 +528,12 @@ impl StatsProvider for StatsCollector {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
 
-    fn test_addr() -> std::net::SocketAddr {
-        std::net::SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+    fn test_addr() -> core::net::SocketAddr {
+        core::net::SocketAddr::new(
+            core::net::IpAddr::V4(core::net::Ipv4Addr::new(127, 0, 0, 1)),
             5000,
         )
     }

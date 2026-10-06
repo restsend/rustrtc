@@ -1,3 +1,4 @@
+use crate::platform::atomic64::AtomicU64;
 use crate::prelude::*;
 use crate::{
     media::{
@@ -5,16 +6,16 @@ use crate::{
         frame::{AudioFrame, MediaKind, MediaSample, VideoFrame},
         spsc::SpscRing,
     },
+    platform::{
+        select::{Either, select2},
+        sync,
+        sync::broadcast::TryRecvError as BroadcastTryRecvError,
+        task::spawn,
+    },
     transports::ice::stun::random_u64,
 };
 use async_trait::async_trait;
-use parking_lot::Mutex as SyncMutex;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
-};
-use tokio::sync::broadcast::error::TryRecvError as BroadcastTryRecvError;
-use tokio::sync::{Mutex, Notify, broadcast, mpsc};
+use core::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, warn};
 
 #[derive(Debug, Clone)]
@@ -70,11 +71,11 @@ pub struct SampleStreamTrack {
     id: Arc<str>,
     kind: MediaKind,
     queue: Arc<SpscRing<MediaSample>>,
-    notify: Arc<Notify>,
-    pop_lock: Arc<SyncMutex<()>>,
+    notify: Arc<sync::Notify>,
+    pop_lock: Arc<sync::Mutex<()>>,
     source_closed: Arc<AtomicBool>,
     ended: AtomicBool,
-    feedback_tx: mpsc::Sender<FeedbackEvent>,
+    feedback_tx: sync::mpsc::Sender<FeedbackEvent>,
     drop_count: Arc<AtomicU64>,
 }
 
@@ -85,7 +86,7 @@ impl SampleStreamTrack {
 
     /// Stop this track by marking it as ended
     pub fn stop(&self) {
-        self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.ended.store(true, core::sync::atomic::Ordering::SeqCst);
         self.notify.notify_waiters();
     }
 }
@@ -94,13 +95,13 @@ pub struct SampleStreamSource {
     id: Arc<str>,
     kind: MediaKind,
     queue: Arc<SpscRing<MediaSample>>,
-    notify: Arc<Notify>,
-    pop_lock: Arc<SyncMutex<()>>,
+    notify: Arc<sync::Notify>,
+    pop_lock: Arc<sync::Mutex<()>>,
     /// Serializes pushes: `queue` is single-producer, but clones of a source
     /// share it.
-    push_lock: Arc<SyncMutex<()>>,
+    push_lock: Arc<sync::Mutex<()>>,
     source_closed: Arc<AtomicBool>,
-    active_senders: Arc<std::sync::atomic::AtomicUsize>,
+    active_senders: Arc<core::sync::atomic::AtomicUsize>,
     drop_count: Arc<AtomicU64>,
 }
 
@@ -120,15 +121,15 @@ pub fn sample_track(
 ) -> (
     SampleStreamSource,
     Arc<SampleStreamTrack>,
-    mpsc::Receiver<FeedbackEvent>,
+    sync::mpsc::Receiver<FeedbackEvent>,
 ) {
     let queue = Arc::new(SpscRing::with_capacity(capacity));
-    let notify = Arc::new(Notify::new());
-    let pop_lock = Arc::new(SyncMutex::new(()));
+    let notify = Arc::new(sync::Notify::new());
+    let pop_lock = Arc::new(sync::Mutex::new(()));
     let source_closed = Arc::new(AtomicBool::new(false));
-    let active_senders = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let active_senders = Arc::new(core::sync::atomic::AtomicUsize::new(1));
     let drop_count = Arc::new(AtomicU64::new(0));
-    let (feedback_tx, feedback_rx) = mpsc::channel(10);
+    let (feedback_tx, feedback_rx) = sync::mpsc::channel(10);
     let id = next_track_id();
     let track = Arc::new(SampleStreamTrack {
         id: id.clone(),
@@ -147,7 +148,7 @@ pub fn sample_track(
         queue,
         notify,
         pop_lock,
-        push_lock: Arc::new(SyncMutex::new(())),
+        push_lock: Arc::new(sync::Mutex::new(())),
         source_closed,
         active_senders,
         drop_count,
@@ -158,7 +159,7 @@ pub fn sample_track(
 impl Clone for SampleStreamSource {
     fn clone(&self) -> Self {
         self.active_senders
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Self {
             id: self.id.clone(),
             kind: self.kind,
@@ -288,7 +289,7 @@ impl Drop for SampleStreamSource {
     fn drop(&mut self) {
         if self
             .active_senders
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            .fetch_sub(1, core::sync::atomic::Ordering::AcqRel)
             == 1
         {
             self.source_closed.store(true, Ordering::Release);
@@ -314,15 +315,15 @@ struct RelayInner {
     base_id: Arc<str>,
     kind: MediaKind,
     track: Arc<dyn MediaStreamTrack>,
-    sender: broadcast::Sender<RelayEvent>,
+    sender: sync::broadcast::Sender<RelayEvent>,
     started: AtomicBool,
     ended: AtomicBool,
-    feedback_tx: mpsc::Sender<FeedbackEvent>,
-    feedback_rx: SyncMutex<Option<mpsc::Receiver<FeedbackEvent>>>,
+    feedback_tx: sync::mpsc::Sender<FeedbackEvent>,
+    feedback_rx: sync::Mutex<Option<sync::mpsc::Receiver<FeedbackEvent>>>,
     /// Serializes the "no subscribers → shut down" transition against a racing
     /// `subscribe()` so the relay task cannot exit while a new subscriber is
     /// being attached (and vice-versa).
-    lifecycle: SyncMutex<()>,
+    lifecycle: sync::Mutex<()>,
 }
 
 impl MediaRelay {
@@ -343,8 +344,8 @@ impl MediaRelay {
         );
         let base_id = Arc::<str>::from(track.id().to_string());
         let kind = track.kind();
-        let (sender, _) = broadcast::channel(capacity);
-        let (feedback_tx, feedback_rx) = mpsc::channel(10);
+        let (sender, _) = sync::broadcast::channel(capacity);
+        let (feedback_tx, feedback_rx) = sync::mpsc::channel(10);
         let dyn_track: Arc<dyn MediaStreamTrack> = track;
         Self {
             inner: Arc::new(RelayInner {
@@ -355,8 +356,8 @@ impl MediaRelay {
                 started: AtomicBool::new(false),
                 ended: AtomicBool::new(false),
                 feedback_tx,
-                feedback_rx: SyncMutex::new(Some(feedback_rx)),
-                lifecycle: SyncMutex::new(()),
+                feedback_rx: sync::Mutex::new(Some(feedback_rx)),
+                lifecycle: sync::Mutex::new(()),
             }),
         }
     }
@@ -389,13 +390,39 @@ impl RelayInner {
             let mut rx_guard = self.feedback_rx.lock();
             let mut feedback_rx = rx_guard.take().unwrap();
 
-            tokio::spawn(async move {
+            spawn(async move {
+                // select2 parity of the former tokio::select!: its
+                // `Some(event) =` pattern disabled the feedback arm once the
+                // channel closed. select2 has no arm patterns, so openness
+                // is tracked with a flag; afterwards we wait on the source
+                // track alone.
+                let mut feedback_open = true;
                 loop {
-                    tokio::select! {
-                        res = this.track.recv() => {
+                    enum Arm {
+                        Sample(Result<MediaSample, MediaError>),
+                        Feedback(FeedbackEvent),
+                    }
+                    let arm = if feedback_open {
+                        // tokio's `Recv` future is !Unpin; the seam's select2
+                        // takes Unpin futures, so pin to the stack (no_std
+                        // backend futures are Unpin and pass through pin!).
+                        let feedback_fut = feedback_rx.recv();
+                        match select2(this.track.recv(), core::pin::pin!(feedback_fut)).await {
+                            Either::A(res) => Arm::Sample(res),
+                            Either::B(Some(event)) => Arm::Feedback(event),
+                            Either::B(None) => {
+                                feedback_open = false;
+                                continue;
+                            }
+                        }
+                    } else {
+                        Arm::Sample(this.track.recv().await)
+                    };
+                    match arm {
+                        Arm::Sample(res) => {
                             match res {
                                 Ok(sample) => {
-                                    // broadcast::send returns Err when there are
+                                    // sync::broadcast::send returns Err when there are
                                     // no active receivers. When that happens the
                                     // relay has no consumers; shut down (race-free
                                     // w.r.t. subscribe() via the lifecycle lock) so
@@ -438,13 +465,9 @@ impl RelayInner {
                                 }
                             }
                         }
-                        Some(event) = feedback_rx.recv() => {
-                            match event {
-                                FeedbackEvent::RequestKeyFrame => {
-                                    if let Err(e) = this.track.request_key_frame().await {
-                                        debug!(target: "rustrtc::media", track = %this.base_id, "failed to forward key frame request: {}", e);
-                                    }
-                                }
+                        Arm::Feedback(FeedbackEvent::RequestKeyFrame) => {
+                            if let Err(e) = this.track.request_key_frame().await {
+                                debug!(target: "rustrtc::media", track = %this.base_id, "failed to forward key frame request: {}", e);
                             }
                         }
                     }
@@ -458,23 +481,23 @@ impl RelayInner {
 pub struct RelayStreamTrack {
     id: Arc<str>,
     kind: MediaKind,
-    receiver: Mutex<broadcast::Receiver<RelayEvent>>,
+    receiver: sync::AsyncMutex<sync::broadcast::Receiver<RelayEvent>>,
     ended: AtomicBool,
-    feedback_tx: mpsc::Sender<FeedbackEvent>,
+    feedback_tx: sync::mpsc::Sender<FeedbackEvent>,
 }
 
 impl RelayStreamTrack {
     fn new(
         id: Arc<str>,
         kind: MediaKind,
-        receiver: broadcast::Receiver<RelayEvent>,
+        receiver: sync::broadcast::Receiver<RelayEvent>,
         ended: bool,
-        feedback_tx: mpsc::Sender<FeedbackEvent>,
+        feedback_tx: sync::mpsc::Sender<FeedbackEvent>,
     ) -> Self {
         Self {
             id,
             kind,
-            receiver: Mutex::new(receiver),
+            receiver: sync::AsyncMutex::new(receiver),
             ended: AtomicBool::new(ended),
             feedback_tx,
         }
@@ -581,8 +604,8 @@ impl MediaStreamTrack for RelayStreamTrack {
                 self.ended.store(true, Ordering::SeqCst);
                 Err(MediaError::EndOfStream)
             }
-            Err(broadcast::error::RecvError::Lagged(_)) => Err(MediaError::Lagged),
-            Err(broadcast::error::RecvError::Closed) => {
+            Err(sync::broadcast::RecvError::Lagged(_)) => Err(MediaError::Lagged),
+            Err(sync::broadcast::RecvError::Closed) => {
                 self.ended.store(true, Ordering::SeqCst);
                 Err(MediaError::EndOfStream)
             }
@@ -605,8 +628,8 @@ impl VideoStreamTrack for RelayStreamTrack {}
 pub struct SelectorTrack {
     id: Arc<str>,
     kind: MediaKind,
-    current_track: Mutex<Arc<dyn MediaStreamTrack>>,
-    switch_notify: Arc<tokio::sync::Notify>,
+    current_track: sync::AsyncMutex<Arc<dyn MediaStreamTrack>>,
+    switch_notify: Arc<sync::Notify>,
 }
 
 impl SelectorTrack {
@@ -614,8 +637,8 @@ impl SelectorTrack {
         Self {
             id: next_relay_track_id(initial_track.id()),
             kind: initial_track.kind(),
-            current_track: Mutex::new(initial_track),
-            switch_notify: Arc::new(tokio::sync::Notify::new()),
+            current_track: sync::AsyncMutex::new(initial_track),
+            switch_notify: Arc::new(sync::Notify::new()),
         }
     }
 
@@ -655,9 +678,10 @@ impl MediaStreamTrack for SelectorTrack {
     async fn recv(&self) -> MediaResult<MediaSample> {
         loop {
             let track = self.current_track.lock().await.clone();
-            tokio::select! {
-                res = track.recv() => return res,
-                _ = self.switch_notify.notified() => {
+            let notified = self.switch_notify.notified();
+            match select2(track.recv(), core::pin::pin!(notified)).await {
+                Either::A(res) => return res,
+                Either::B(()) => {
                     // Track switched, loop again to pick up new track
                     continue;
                 }
@@ -674,7 +698,9 @@ impl MediaStreamTrack for SelectorTrack {
 impl AudioStreamTrack for SelectorTrack {}
 impl VideoStreamTrack for SelectorTrack {}
 
-#[cfg(test)]
+// Tests drive real async runtimes (tokio); they stay std-only. no_std
+// behavior parity for the seam types is covered by the WP3 host-parity suite.
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use bytes::Bytes;
 
