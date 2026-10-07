@@ -3117,7 +3117,11 @@ async fn use_candidate_follows_renomination_from_new_candidate() -> Result<()> {
     send_renomination_and_verify(&second_socket, second_addr, controlled_addr).await?;
 
     // 5. Assert: the controlled agent followed the verified re-nomination.
-    wait_selected_remote(&t2.clone(), second_addr, Duration::from_secs(3)).await?;
+    // The switch waits on the agent's path-verification check, which itself
+    // budgets a full stun_timeout — under a loaded test runner that can take
+    // longer than a nominal round trip, so allow headroom (matches the 10s
+    // connect/nomination waits above).
+    wait_selected_remote(&t2.clone(), second_addr, Duration::from_secs(10)).await?;
 
     Ok(())
 }
@@ -3165,7 +3169,8 @@ async fn use_candidate_follows_renomination_to_higher_priority_pair() -> Result<
     let controlled_addr = nominated_pair.local.base_address();
     send_renomination_and_verify(&second_socket, second_addr, controlled_addr).await?;
 
-    wait_selected_remote(&t2.clone(), second_addr, Duration::from_secs(3)).await?;
+    // Same headroom rationale as the re-nomination test above.
+    wait_selected_remote(&t2.clone(), second_addr, Duration::from_secs(10)).await?;
 
     Ok(())
 }
