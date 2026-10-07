@@ -16,7 +16,7 @@ A high-performance, full-stack real-time communication library — **WebRTC, RTP
 - **Bandwidth estimation (GCC)** — generates TWCC receiver feedback, stamps transport-wide sequence numbers on outbound RTP, and exposes a live `target_bitrate` estimate for encoder adaptation (`RtpSender::subscribe_target_bitrate`).
 - **Full ICE** — STUN, TURN (UDP + TCP), ICE Lite, ICE TCP (RFC 6544), single-port UDP mux for SFU/WHEP deployments, and **mDNS candidate obfuscation** (`enable_mdns`).
 - **NAT traversal & deployment** — RTP latching, UPnP IGD port mapping, and firewall-friendly port ranges (`rtp_start_port`/`rtp_end_port`).
-- **`no_std` / embassy-ready** — the `Rtp`/`Srtp` delivery surface (ICE/STUN/TURN, SDES-SRTP, DTLS, media pipeline) runs on any executor behind seven injected platform seams, end-to-end tested against a mock embedded runtime (`scripts/check-no_std.sh`).
+- **`no_std` / embassy-ready** — the full ICE/STUN/TURN + DTLS-SRTP + SDES media stack (WebRtc, Srtp, and Rtp transport modes) runs on any executor behind seven injected platform seams, end-to-end tested against a mock embedded runtime (`scripts/check-no_std.sh`).
 - **Production extras** — RTP rewrite bridge (SSRC/PT/sequence remapping) and a WebRTC-compatible stats model.
 
 ## no_std / Embedded Support
@@ -25,26 +25,33 @@ rustrtc builds without `std` (`alloc`-only) and runs its embedded delivery
 surface entirely on top of platform seams that the embedder implements
 (embassy, esp-rtos, or any executor).
 
-**Embedded delivery surface (`Rtp`/`Srtp` mode, plan D6):**
+**Embedded delivery surface:**
 
-- Full **ICE/STUN/TURN** stack, RTP/RTX, **SDP**, **SDES-SRTP**
-- `PeerConnection` pipeline in `Rtp`/`Srtp` mode: offer/answer with
-  `a=crypto` negotiation, direct transport, media send/receive
+- Full **ICE/STUN/TURN** stack, RTP/RTX, **SDP**
+- `PeerConnection` in **`WebRtc` mode** (ICE + DTLS-SRTP) and in
+  **`Rtp`/`Srtp` mode** (SDES-SRTP over a direct transport):
+  offer/answer, media send/receive
 - Self-contained **DTLS 1.2** implementation behind the crypto seam
   (ECDSA-P256 + ECDH), with a pure-Rust `crypto-p256` reference backend
 - Media pipeline: packetizers/depacketizers, jitter buffer, NACK/RTX
+
+WebRtc mode on no_std requires a pre-provisioned DTLS certificate
+(`RtcConfiguration::dtls_certificate` — DER leaf + PKCS#8 key, e.g.
+factory-provisioned); there is no certificate generation without `std`.
 
 This surface is covered by end-to-end tests against a mock embedded runtime
 (`tests/no_std_ice_e2e.rs`, `no_std_dtls_e2e.rs`, `no_std_pc_srtp_e2e.rs`):
 two no_std `PeerConnection`s negotiate SDES via offer/answer, connect over a
 loopback network, and exchange SRTP media with payload-order verification; a
 no_std DTLS 1.2 handshake runs against the `crypto-p256` reference backend.
+A full-WebRTC-mode integration suite (`no_std_pc_webrtc_e2e.rs`) drives the
+same flow through `PeerConnection` and is landing alongside executor-fidelity
+work in the test harness.
 
-**Still std-only:** the `WebRtc` transport mode inside `PeerConnection`
-(DTLS transport upgrade fails fast on no_std), SCTP/DataChannel, T.38/UDPTL,
-GCC/TWCC bandwidth estimation (media modules compile, the PC pipeline uses a
-stub), ICE-TCP, UPnP, mDNS, and certificate *generation* — load
-pre-provisioned DER instead (`Certificate::from_pkcs8_der`).
+**Still std-only:** SCTP/DataChannel, T.38/UDPTL, GCC/TWCC bandwidth
+estimation (the media modules compile, the PC pipeline uses a stub),
+ICE-TCP, UPnP, mDNS, and certificate *generation* (use
+`dtls_certificate` instead).
 
 ### Gates
 
@@ -241,6 +248,17 @@ Remote-initiated restarts (peer offers new credentials) are detected and mirrore
 ### UPnP
 - **`enable_upnp`** — Auto-map ports via UPnP IGD.
 - **`upnp_lease_duration`** — UPnP port mapping lease duration in seconds (default: 3600).
+
+### DTLS
+- **`dtls_certificate`** — Pre-provisioned DTLS certificate (DER leaf + PKCS#8 key) for WebRtc mode. Optional on `std` (a self-signed certificate is generated per connection); **required on no_std**, where certificates cannot be generated. `Debug` output is redacted; the field is `serde`-skipped so key material never enters serialized configs.
+
+```rust,ignore
+let cert = rustrtc::transports::dtls::Certificate::from_pkcs8_der(cert_der, key_der)?;
+let config = RtcConfigurationBuilder::new()
+    .transport_mode(TransportMode::WebRtc)
+    .dtls_certificate(Arc::new(cert))
+    .build();
+```
 
 ### RTP Latching
 - **`enable_latching`** — Enable dynamic remote address detection for RTP-only mode.
