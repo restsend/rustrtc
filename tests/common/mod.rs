@@ -229,7 +229,15 @@ pub fn install_mock_platform() {
 /// Polls every registered task after each clock step until `pred` holds or
 /// the simulated budget (ms of logical time) runs out. Returns the final
 /// predicate value.
+pub fn drive_until_raw(pred: impl FnMut() -> bool, budget_ms: u64) -> bool {
+    drive_until_raw_inner(pred, budget_ms)
+}
+
 pub fn drive_until(pred: impl Fn() -> bool, budget_ms: u64) -> bool {
+    drive_until_raw_inner(pred, budget_ms)
+}
+
+fn drive_until_raw_inner(mut pred: impl FnMut() -> bool, budget_ms: u64) -> bool {
     let waker = noop_waker();
     let mut cx = std::task::Context::from_waker(&waker);
     let deadline = clock() + budget_ms;
