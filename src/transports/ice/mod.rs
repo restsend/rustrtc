@@ -37,8 +37,6 @@ use core::sync::atomic::Ordering;
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
 #[cfg(feature = "std")]
-#[cfg(feature = "std")]
-#[cfg(feature = "std")]
 use std::io::ErrorKind;
 
 #[cfg(not(feature = "std"))]
@@ -4495,7 +4493,18 @@ impl IceGatherer {
                         // not assigned to a local interface, permissions, ...)
                         // fails for every port in the range and must not be
                         // misreported as port exhaustion below.
-                        if e.kind() != ErrorKind::AddrInUse {
+                        let busy = {
+                            #[cfg(feature = "std")]
+                            {
+                                e.kind() == ErrorKind::AddrInUse
+                            }
+                            #[cfg(not(feature = "std"))]
+                            {
+                                let _ = &e; // no error-kind info without std; retry every port
+                                true
+                            }
+                        };
+                        if !busy {
                             error!(
                                 label = self.config.label.as_deref().unwrap_or("-"),
                                 "binding RTP port {} on {} failed: {}", port, ip, e
