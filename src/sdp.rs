@@ -1465,7 +1465,7 @@ pub fn parse_bundle_mid_info(sdp: &str) -> Option<(u8, String, String)> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
 

@@ -779,7 +779,7 @@ impl StatsProvider for IceConn {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
     use bytes::Bytes;

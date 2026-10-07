@@ -44,13 +44,33 @@ pub trait PacketReceiver: Send + Sync {
     async fn receive(&self, packet: Bytes, addr: SocketAddr, marshal_buf: &mut Vec<u8>);
 }
 
-/// No_std placeholder: the embedder's socket adapter reports the real
-/// local address, so interface enumeration never runs on the target.
+/// No_std local-IP seam: the embedder (rtcembed) injects the target's
+/// station address (WiFi STA IP, static config, …) — interface enumeration
+/// never runs on the target. Falls back to an error when not wired, which
+/// callers treat as "bind to UNSPECIFIED / candidate supplied externally".
+#[cfg(not(feature = "std"))]
+static LOCAL_IP_FN: crate::platform::sync::Mutex<Option<fn() -> Option<IpAddr>>> =
+    crate::platform::sync::Mutex::new(None);
+
+/// Installs the local-IP provider (no_std).
+#[cfg(not(feature = "std"))]
+pub fn set_local_ip_fn(f: fn() -> Option<IpAddr>) {
+    *LOCAL_IP_FN.lock() = Some(f);
+}
+
 #[cfg(not(feature = "std"))]
 pub fn get_local_ip() -> Result<IpAddr, crate::errors::RtcError> {
-    Err(crate::errors::RtcError::Internal(
-        alloc::string::String::from("get_local_ip: no_std target (adapter supplies IP)"),
-    ))
+    let f = *LOCAL_IP_FN.lock();
+    match f {
+        Some(f) => f().ok_or_else(|| {
+            crate::errors::RtcError::Internal(alloc::string::String::from(
+                "get_local_ip: provider has no address yet (network down?)",
+            ))
+        }),
+        None => Err(crate::errors::RtcError::Internal(
+            alloc::string::String::from("get_local_ip: no provider wired (set_local_ip_fn)"),
+        )),
+    }
 }
 
 #[cfg(feature = "std")]

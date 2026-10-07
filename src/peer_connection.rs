@@ -1106,14 +1106,12 @@ impl PeerConnection {
                 pc.inner.config.runtime_handle.as_ref(),
                 pc.inner.pc_span.clone(),
                 async move {
-                    #[cfg(feature = "std")]
                     let gathering_loop = run_gathering_loop(
                         ice_transport_gathering,
                         ice_gathering_state_tx,
                         inner_weak_gathering,
                     );
 
-                    #[cfg(feature = "std")]
                     let dtls_loop = run_ice_dtls_loop(
                         ice_transport,
                         ice_connection_state_tx,
@@ -1121,28 +1119,10 @@ impl PeerConnection {
                         inner_weak,
                     );
 
-                    #[cfg(feature = "std")]
-                    {
-                        let gathering_loop = core::pin::pin!(gathering_loop);
-                        let dtls_loop = core::pin::pin!(dtls_loop);
-                        let ice_runner = core::pin::pin!(ice_runner);
-                        join3(gathering_loop, dtls_loop, ice_runner).await;
-                    }
-                    #[cfg(not(feature = "std"))]
-                    {
-                        // WebRtc transport loops do not exist on no_std (D6);
-                        // keep the socket read loop alive.
-                        let _ = (
-                            &inner_weak_gathering,
-                            &ice_gathering_state_tx,
-                            &ice_transport_gathering,
-                            &dtls_role_rx,
-                            &ice_connection_state_tx,
-                            &inner_weak,
-                            &ice_transport,
-                        );
-                        ice_runner.await;
-                    }
+                    let gathering_loop = core::pin::pin!(gathering_loop);
+                    let dtls_loop = core::pin::pin!(dtls_loop);
+                    let ice_runner = core::pin::pin!(ice_runner);
+                    join3(gathering_loop, dtls_loop, ice_runner).await;
                 },
             );
             pc.inner.track_task(h);
@@ -5642,10 +5622,23 @@ impl PeerConnectionInner {
             }
 
             let mut local_rtcp_addr: Option<core::net::SocketAddr> = None;
-            #[cfg(feature = "std")]
+            // NOTE: the T.38/Image branch is std-only, but the cfg must sit on
+            // its BODY — putting `#[cfg(feature = "std")]` on the `if` removed
+            // the whole if/else-if chain under no_std, leaving offer m=/c=
+            // lines as placeholders (port 9, no connection line) and making
+            // the Srtp/Rtp delivery surface unable to connect.
             if transceiver.kind() == MediaKind::Image
                 && (mode == TransportMode::Rtp || mode == TransportMode::Srtp)
             {
+                #[cfg(not(feature = "std"))]
+                {
+                    // T.38/UDPTL is a std-only delivery surface (D6).
+                    return Err(RtcError::NotImplemented(
+                        "T.38 (Image media) is not available on no_std",
+                    ));
+                }
+                #[cfg(feature = "std")]
+                {
                 let transport = match transceiver.udtl_transport() {
                     Some(t) => t,
                     None => {
@@ -5679,6 +5672,7 @@ impl PeerConnectionInner {
                     })
                     .unwrap_or_else(|| "127.0.0.1".to_string());
                 section.connection = Some(format!("IN IP4 {}", ip));
+                }
             } else if mode == TransportMode::WebRtc {
                 section.connection = Some("IN IP4 0.0.0.0".to_string());
                 section
@@ -5722,7 +5716,7 @@ impl PeerConnectionInner {
                             SdpType::Answer => !remote_offered_rtcp_mux,
                             _ => !local_offers_rtcp_mux,
                         };
-                        if ice_transport.local_candidates().is_empty() {
+                                if ice_transport.local_candidates().is_empty() {
                             ice_transport
                                 .setup_direct_rtp_offer_with_rtcp(needs_rtcp)
                                 .await
@@ -8815,7 +8809,7 @@ fn random_rtc_id() -> String {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 impl PeerConnection {
     /// Expose the ICE transport for state manipulation in unit tests.
     pub fn ice_transport_for_test(&self) -> &crate::transports::ice::IceTransport {
@@ -8823,7 +8817,7 @@ impl PeerConnection {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
 
     fn test_addr() -> core::net::SocketAddr {

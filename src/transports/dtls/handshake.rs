@@ -558,7 +558,7 @@ impl<T: BufMut> BufMutExt for T {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
 

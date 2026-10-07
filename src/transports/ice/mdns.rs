@@ -259,7 +259,7 @@ fn build_response(query: &[u8], question_end: usize, qtype: u16, addresses: &[&I
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
 

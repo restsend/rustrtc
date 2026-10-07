@@ -226,7 +226,7 @@ pub(crate) fn peer_ufrag_from_binding_request(data: &[u8]) -> Option<String> {
     Some(peer.to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
     use crate::transports::ice::stun::{StunAttribute, StunMessage, random_bytes};

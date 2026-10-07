@@ -54,6 +54,47 @@ impl core::fmt::Display for NetError {
 
 impl core::error::Error for NetError {}
 
+impl core::fmt::Debug for dyn UdpSocket {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let addr = self
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "?".into());
+        write!(f, "UdpSocket({addr})")
+    }
+}
+
+/// UDP bind factory seam: creates the sockets behind ICE host candidates and
+/// the direct-RTP path. std default: tokio sockets. Embedded: the embedder
+/// (rtcembed) installs a factory over embassy-net — usually its demux socket
+/// (single reader + dispatch), so `recv_from` here is served from an inbox
+/// and `send_to`/`try_send_to` enqueue to the shared TX path.
+pub type UdpBindFn =
+    fn(core::net::SocketAddr) -> crate::errors::RtcResult<alloc::sync::Arc<dyn UdpSocket>>;
+
+static UDP_BIND_FN: crate::platform::sync::Mutex<Option<UdpBindFn>> =
+    crate::platform::sync::Mutex::new(None);
+
+/// Installs the UDP bind factory (embedded targets; overrides the tokio
+/// backend on std too, which host tests use for deterministic loopbacks).
+pub fn set_udp_bind_fn(f: UdpBindFn) {
+    *UDP_BIND_FN.lock() = Some(f);
+}
+
+/// Clears the UDP bind factory (test isolation).
+pub fn clear_udp_bind_fn() {
+    *UDP_BIND_FN.lock() = None;
+}
+
+/// Runs a bind through the installed factory; `None` when no factory is set
+/// (callers fall back to the tokio backend, or fail on embedded).
+pub(crate) fn udp_bind_via_factory(
+    addr: core::net::SocketAddr,
+) -> Option<crate::errors::RtcResult<alloc::sync::Arc<dyn UdpSocket>>> {
+    let f = *UDP_BIND_FN.lock();
+    f.map(|f| f(addr))
+}
+
 // ── tokio backend implementation (platform-tokio) ──
 #[cfg(feature = "std")]
 pub mod tokio_impl {

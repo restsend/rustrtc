@@ -197,9 +197,9 @@ struct DtlsInner {
 /// After this deadline the transport transitions to `Failed` and the background
 /// task exits — preventing infinite retransmit loops when the peer never
 /// responds.
-#[cfg(not(test))]
+#[cfg(not(all(test, feature = "std")))]
 const DTLS_HANDSHAKE_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(30);
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 const DTLS_HANDSHAKE_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(5);
 
 /// Maximum plaintext payload carried in a single DTLS ApplicationData record.

@@ -382,8 +382,8 @@ pub mod time {
         }
 
         /// Duration elapsed since this instant.
-        /// std: real wall-clock delta. no_std: zero for the logical clock
-        /// until WP3 wires a real timer.
+        /// std: real wall-clock delta. no_std: logical-clock delta
+        /// (advances only when [`advance_ms`]/[`set_now_ms`] run).
         pub fn elapsed(&self) -> core::time::Duration {
             #[cfg(feature = "std")]
             {
@@ -395,7 +395,9 @@ pub mod time {
             }
             #[cfg(not(feature = "std"))]
             {
-                core::time::Duration::ZERO
+                core::time::Duration::from_millis(
+                    NOW_MS.load(Ordering::Relaxed).saturating_sub(self.ms),
+                )
             }
         }
 
@@ -553,16 +555,32 @@ pub mod task {
     use core::pin::Pin;
     use core::task::{Context, Poll};
 
-    /// Injected task spawner (the embedder's embassy executor). Set once at
-    /// boot via [`set_spawn_fn`].
-    type SpawnFn = fn(Box<dyn Future<Output = ()> + Send>);
+    /// A task the embedder's executor must run. rtcembed passes these to its
+    /// embassy/esp-rtos spawner adapter.
+    pub type BoxedTask = Box<dyn Future<Output = ()> + Send>;
 
-    static SPAWN_FN: crate::platform::sync::Mutex<Option<SpawnFn>> =
+    /// Injected task spawner. Either a plain `fn` (see [`set_spawn_fn`]) or
+    /// a `&'static dyn Fn` (see [`set_spawner`]) — the latter lets the
+    /// embedder's executor adapter capture its handle in a static.
+    enum Spawner {
+        Fn(fn(BoxedTask)),
+        Dyn(&'static (dyn Fn(BoxedTask) + Send + Sync)),
+    }
+
+    static SPAWN_FN: crate::platform::sync::Mutex<Option<Spawner>> =
         crate::platform::sync::Mutex::new(None);
 
-    /// Installs the task spawner. Must be called before any task spawn.
-    pub fn set_spawn_fn(f: SpawnFn) {
-        *SPAWN_FN.lock() = Some(f);
+    /// Installs the task spawner (fn-pointer form). Must be called before
+    /// any task spawn.
+    pub fn set_spawn_fn(f: fn(BoxedTask)) {
+        *SPAWN_FN.lock() = Some(Spawner::Fn(f));
+    }
+
+    /// Installs the task spawner (closure form — e.g. an executor adapter
+    /// holding the embassy `Spawner` in a static). Must be called before
+    /// any task spawn.
+    pub fn set_spawner(f: &'static (dyn Fn(BoxedTask) + Send + Sync)) {
+        *SPAWN_FN.lock() = Some(Spawner::Dyn(f));
     }
 
     /// Spawns a detached task through the injected spawner. Panics if the
@@ -571,10 +589,14 @@ pub mod task {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let f = SPAWN_FN
-            .lock()
-            .expect("platform::task::set_spawn_fn not called");
-        f(Box::new(fut));
+        let spawner = SPAWN_FN.lock();
+        let Some(spawner) = spawner.as_ref() else {
+            panic!("platform::task::set_spawn_fn not called");
+        };
+        match spawner {
+            Spawner::Fn(f) => f(Box::new(fut)),
+            Spawner::Dyn(f) => f(Box::new(fut)),
+        }
     }
 
     /// Injected timer factory: turns a duration into a sleep future driven

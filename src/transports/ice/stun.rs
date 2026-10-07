@@ -466,39 +466,37 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
     #[cfg(feature = "std")]
     rand::rng().fill_bytes(&mut buf);
     #[cfg(not(feature = "std"))]
-    {
-        let _ = &mut buf;
-    }
+    crate::platform::rng::fill(&mut buf);
     buf
 }
 
 pub fn random_u64() -> u64 {
+    #[cfg(feature = "std")]
     {
-        #[cfg(feature = "std")]
-        {
-            rand::rng().random()
-        }
-        #[cfg(not(feature = "std"))]
-        {
-            0
-        }
+        rand::rng().random()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let mut buf = [0u8; 8];
+        crate::platform::rng::fill(&mut buf);
+        u64::from_le_bytes(buf)
     }
 }
 
 pub fn random_u32() -> u32 {
+    #[cfg(feature = "std")]
     {
-        #[cfg(feature = "std")]
-        {
-            rand::rng().random()
-        }
-        #[cfg(not(feature = "std"))]
-        {
-            0
-        }
+        rand::rng().random()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let mut buf = [0u8; 4];
+        crate::platform::rng::fill(&mut buf);
+        u32::from_le_bytes(buf)
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
 

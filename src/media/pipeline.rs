@@ -322,7 +322,7 @@ pub fn track_from_source(
     Ok((track, pump))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use bytes::Bytes;
 

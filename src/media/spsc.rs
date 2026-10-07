@@ -132,7 +132,7 @@ impl<T> Drop for SpscRing<T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::SpscRing;
 

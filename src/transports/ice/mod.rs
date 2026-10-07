@@ -10,7 +10,7 @@ pub mod shared_tcp;
 pub struct SharedTcpRegistration;
 pub mod shared_udp;
 pub mod stun;
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests;
 pub mod turn;
 #[cfg(feature = "std")] // UPnP is excluded from the embedded target
@@ -188,11 +188,18 @@ pub(crate) fn should_drop_packet() -> bool {
     {
         let mut rate = PACKET_LOSS_RATE.load(Ordering::Relaxed);
         if rate == u32::MAX {
-            rate = std::env::var("RUSTRTC_PACKET_LOSS")
-                .ok()
-                .and_then(|s| s.parse::<f64>().ok())
-                .map(|f| (f * 100.0) as u32)
-                .unwrap_or(0);
+            #[cfg(feature = "std")]
+            {
+                rate = std::env::var("RUSTRTC_PACKET_LOSS")
+                    .ok()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .map(|f| (f * 100.0) as u32)
+                    .unwrap_or(0);
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                rate = 0;
+            }
             PACKET_LOSS_RATE.store(rate, Ordering::Relaxed);
         }
 
@@ -218,34 +225,33 @@ pub(crate) fn should_drop_packet() -> bool {
 /// direct (non-TURN) socket. Only used by tests.
 #[cfg(any(test, feature = "simulator"))]
 async fn simulate_stun_respond_delay(sender: &IceSocketWrapper) {
-    let spec = match std::env::var("RUSTRTC_STUN_RESPOND_DELAY_MS").ok() {
-        Some(s) => s,
-        None => return,
-    };
-    let Ok(ms) = spec.trim().parse::<u64>() else {
-        return;
-    };
-    if ms == 0 {
-        return;
+    #[cfg(not(feature = "std"))]
+    {
+        // No env vars on the embedded target: the simulator hook is a no-op.
+        let _ = sender;
     }
-    let is_relayed_or_tcp = matches!(sender, IceSocketWrapper::Turn(_, _)) || {
-        #[cfg(feature = "std")]
-        {
-            matches!(
-                sender,
-                IceSocketWrapper::TcpListener(_) | IceSocketWrapper::TcpStream(_, _, _)
-            )
+    #[cfg(feature = "std")]
+    {
+        let spec = match std::env::var("RUSTRTC_STUN_RESPOND_DELAY_MS").ok() {
+            Some(s) => s,
+            None => return,
+        };
+        let Ok(ms) = spec.trim().parse::<u64>() else {
+            return;
+        };
+        if ms == 0 {
+            return;
         }
-        #[cfg(not(feature = "std"))]
-        {
-            false
+        let is_relayed_or_tcp = matches!(sender, IceSocketWrapper::Turn(_, _)) || matches!(
+            sender,
+            IceSocketWrapper::TcpListener(_) | IceSocketWrapper::TcpStream(_, _, _)
+        );
+        if is_relayed_or_tcp {
+            return;
         }
-    };
-    if is_relayed_or_tcp {
-        return;
+        trace!("SIMULATOR: delaying STUN response by {}ms", ms);
+        crate::platform::task::sleep(Duration::from_millis(ms)).await;
     }
-    trace!("SIMULATOR: delaying STUN response by {}ms", ms);
-    crate::platform::task::sleep(Duration::from_millis(ms)).await;
 }
 
 /// Statistics for monitoring buffer behavior
@@ -417,6 +423,7 @@ struct IceTransportRunner {
 
 impl IceTransportRunner {
     async fn run(mut self) {
+
         // mDNS responder lifetime: started when `enable_mdns` is set, stopped
         // when the runner loop exits (the guard's Drop signals the task).
         #[cfg(feature = "std")]
@@ -479,6 +486,7 @@ impl IceTransportRunner {
             }
             let mut socket_rx_open = true;
             let mut cmd_rx_open = true;
+
             let arm = core::future::poll_fn(|cx| {
                 use core::task::Poll;
                 let mut state_fut = core::pin::pin!(self.state_rx.changed());
@@ -604,8 +612,7 @@ impl IceTransportRunner {
                         }
                     }
                 }
-                GatherArm::Candidate(res) => match res {
-                    Ok(_) => {
+                GatherArm::Candidate(res) => match res {                    Ok(_) => {
                         let inner = self.inner.clone();
                         read_futures.push(Box::pin(async move {
                             perform_connectivity_checks_async(inner).await;
@@ -613,8 +620,10 @@ impl IceTransportRunner {
                     }
                     Err(broadcast::RecvError::Closed) => break,
                     Err(broadcast::RecvError::Lagged(_)) => continue,
-                },
+                }
                 GatherArm::Cmd(cmd) => {
+
+
                     trace!("Runner received command: {:?}", cmd);
                     match cmd {
                         IceCommand::StartGathering => {
@@ -1773,17 +1782,10 @@ impl IceTransport {
 
         let socket = self.inner.gatherer.bind_socket(bind_ip).await?;
         let local_addr = socket.local_addr()?;
-        let socket = Arc::new(socket);
 
-        // Store the socket
-        self.inner.gatherer.sockets.lock().push(socket.clone());
-
-        // Register the socket wrapper for the read loop (handled by runner)
-        let _ = self
-            .inner
-            .gatherer
-            .socket_tx
-            .send(IceSocketWrapper::Udp(socket.clone()));
+        // Register the socket wrapper for the read loop (handled by runner);
+        // backend bookkeeping already happened in bind_one.
+        self.inner.gatherer.register_bound(&socket);
 
         // Build a local candidate for SDP generation
         let mut cand_addr = local_addr;
@@ -1866,12 +1868,12 @@ impl IceTransport {
         let _ = self
             .inner
             .selected_socket
-            .send(Some(IceSocketWrapper::Udp(socket.clone())));
+            .send(Some(socket.clone()));
         let rtcp_socket = rtcp_socket.unwrap_or_else(|| socket.clone());
         let _ = self
             .inner
             .selected_rtcp_socket
-            .send(Some(IceSocketWrapper::Udp(rtcp_socket)));
+            .send(Some(rtcp_socket));
         let _ = self.inner.set_state(IceTransportState::Connected);
 
         Ok(cand_addr)
@@ -1900,14 +1902,7 @@ impl IceTransport {
 
         let socket = self.inner.gatherer.bind_socket(bind_ip).await?;
         let local_addr = socket.local_addr()?;
-        let socket = Arc::new(socket);
-
-        self.inner.gatherer.sockets.lock().push(socket.clone());
-        let _ = self
-            .inner
-            .gatherer
-            .socket_tx
-            .send(IceSocketWrapper::Udp(socket));
+        self.inner.gatherer.register_bound(&socket);
 
         let mut cand_addr = local_addr;
         let mut upnp_external_addr: Option<SocketAddr> = None;
@@ -1980,7 +1975,7 @@ impl IceTransport {
             let _ = self
                 .inner
                 .selected_rtcp_socket
-                .send(Some(IceSocketWrapper::Udp(rtcp_socket)));
+                .send(Some(rtcp_socket));
         }
 
         *self.inner.gatherer.state.lock() = IceGathererState::Complete;
@@ -2596,6 +2591,10 @@ fn resolve_socket(inner: &IceTransportInner, pair: &IceCandidatePair) -> Option<
         {
             return Some(shared);
         }
+        // Factory-bound platform sockets (rtcembed / loopback backends).
+        if let Some(platform) = inner.gatherer.get_platform_socket(pair.local.base_address()) {
+            return Some(IceSocketWrapper::Platform(platform));
+        }
         let socket = inner.gatherer.get_socket(pair.local.base_address());
         if socket.is_none() {
             debug!(
@@ -2774,6 +2773,10 @@ fn resolve_rtcp_socket(inner: &IceTransportInner) -> Option<IceSocketWrapper> {
     } else if candidate.transport == "tcp" {
         inner.gatherer.get_tcp_socket(candidate.base_address())
     } else {
+        // Factory-bound platform sockets (rtcembed / loopback backends).
+        if let Some(platform) = inner.gatherer.get_platform_socket(candidate.base_address()) {
+            return Some(IceSocketWrapper::Platform(platform));
+        }
         let socket = inner.gatherer.get_socket(candidate.base_address());
         if socket.is_none() {
             debug!(
@@ -2795,32 +2798,33 @@ async fn bind_direct_rtcp_socket(
     inner: &IceTransportInner,
     rtp_base: SocketAddr,
     advertised_ip: IpAddr,
-) -> RtcResult<(Arc<UdpSocket>, IceCandidate)> {
+) -> RtcResult<(IceSocketWrapper, IceCandidate)> {
     let rtcp_bind_addr = rtp_base
         .port()
         .checked_add(1)
         .map(|port| SocketAddr::new(rtp_base.ip(), port));
     let rtcp = if let Some(addr) = rtcp_bind_addr {
-        match UdpSocket::bind(addr).await {
+        match inner.gatherer.bind_one(addr).await {
             Ok(socket) => socket,
             Err(err) => {
                 debug!(
                     "Failed to bind RTCP socket on {}, falling back to ephemeral port: {}",
                     addr, err
                 );
-                UdpSocket::bind(SocketAddr::new(rtp_base.ip(), 0)).await?
+                inner
+                    .gatherer
+                    .bind_one(SocketAddr::new(rtp_base.ip(), 0))
+                    .await?
             }
         }
     } else {
-        UdpSocket::bind(SocketAddr::new(rtp_base.ip(), 0)).await?
+        inner
+            .gatherer
+            .bind_one(SocketAddr::new(rtp_base.ip(), 0))
+            .await?
     };
     let local_rtcp_addr = rtcp.local_addr()?;
-    let rtcp = Arc::new(rtcp);
-    inner.gatherer.sockets.lock().push(rtcp.clone());
-    let _ = inner
-        .gatherer
-        .socket_tx
-        .send(IceSocketWrapper::Udp(rtcp.clone()));
+    inner.gatherer.register_bound(&rtcp);
 
     let mut rtcp_cand_addr = local_rtcp_addr;
     rtcp_cand_addr.set_ip(advertised_ip);
@@ -3374,14 +3378,15 @@ async fn perform_binding_check(
         tx_id,
     };
 
-    let (socket, turn_client) = if local.typ == IceCandidateType::Relay {
+    let (socket, platform_socket, turn_client) = if local.typ == IceCandidateType::Relay {
         let gatherer = &inner.gatherer;
         let clients = gatherer.turn_clients.lock();
         let client = clients.get(&local.address).cloned();
-        (None, client)
+        (None, None, client)
     } else {
         let socket = inner.gatherer.get_socket(local.base_address());
-        (socket, None)
+        let platform_socket = inner.gatherer.get_platform_socket(local.base_address());
+        (socket, platform_socket, None)
     };
 
     if local.typ == IceCandidateType::Relay {
@@ -3452,7 +3457,7 @@ async fn perform_binding_check(
                 return Err(RtcError::Internal(format!("CreatePermission timeout")));
             }
         }
-    } else if socket.is_none() {
+    } else if socket.is_none() && platform_socket.is_none() {
         return Err(RtcError::Internal(format!(
             "no socket found for local candidate"
         )));
@@ -3520,6 +3525,16 @@ async fn perform_binding_check(
                 }
                 Ok(Err(e)) => return Err(e),
                 Err(_) => return Err(RtcError::Internal(format!("TCP binding check timeout"))),
+            }
+        } else if let Some(platform_socket) = &platform_socket {
+            // Platform sockets report NetError without an errno carrier:
+            // treat every send failure as transient and wait for the next
+            // RTO (matches the tolerant path below).
+            if let Err(e) = platform_socket.send_to(&bytes, remote.address).await {
+                debug!(
+                    "platform socket send_to {} failed (transient): {}",
+                    remote.address, e
+                );
             }
         } else if let Some(socket) = &socket
             && let Err(e) = socket.send_to(&bytes, remote.address).await
@@ -3824,7 +3839,7 @@ impl IceTransportInner {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod state_tests {
     use super::{IceTransportState, store_ice_state};
     use tokio::sync::watch;
@@ -4287,6 +4302,13 @@ struct IceGatherer {
     state: Arc<crate::platform::sync::Mutex<IceGathererState>>,
     local_candidates: Arc<crate::platform::sync::Mutex<Vec<IceCandidate>>>,
     sockets: Arc<crate::platform::sync::Mutex<Vec<Arc<UdpSocket>>>>,
+    /// Sockets created through the platform bind factory
+    /// ([`crate::platform::net::set_udp_bind_fn`] — rtcembed's embassy-net
+    /// backend, or a host-test loopback). Kept so socket resolution can
+    /// send from the same base socket the candidate advertises.
+    platform_sockets: Arc<
+        crate::platform::sync::Mutex<Vec<Arc<dyn crate::platform::net::UdpSocket>>>,
+    >,
     #[cfg_attr(not(feature = "std"), allow(dead_code))]
     tcp_listeners: Arc<crate::platform::sync::Mutex<Vec<Arc<TcpListener>>>>,
     tcp_streams: Arc<crate::platform::sync::Mutex<BTreeMap<SocketAddr, IceSocketWrapper>>>,
@@ -4317,6 +4339,7 @@ impl IceGatherer {
             state: Arc::new(crate::platform::sync::Mutex::new(IceGathererState::New)),
             local_candidates: Arc::new(crate::platform::sync::Mutex::new(Vec::new())),
             sockets: Arc::new(crate::platform::sync::Mutex::new(Vec::new())),
+            platform_sockets: Arc::new(crate::platform::sync::Mutex::new(Vec::new())),
             tcp_listeners: Arc::new(crate::platform::sync::Mutex::new(Vec::new())),
             tcp_streams: Arc::new(crate::platform::sync::Mutex::new(BTreeMap::new())),
             shared_tcp_regs: Arc::new(crate::platform::sync::Mutex::new(Vec::new())),
@@ -4468,7 +4491,7 @@ impl IceGatherer {
         self.local_candidates.lock().clone()
     }
 
-    async fn bind_socket(&self, ip: IpAddr) -> RtcResult<UdpSocket> {
+    async fn bind_socket(&self, ip: IpAddr) -> RtcResult<IceSocketWrapper> {
         if let (Some(start), Some(end)) = (self.config.rtp_start_port, self.config.rtp_end_port) {
             let start = start.saturating_add(start % 2);
             let end = end - (end % 2);
@@ -4485,34 +4508,22 @@ impl IceGatherer {
             let mut port = start + (start_index * 2);
 
             for _ in 0..port_count {
-                match UdpSocket::bind(SocketAddr::new(ip, port)).await {
+                match self.bind_one(SocketAddr::new(ip, port)).await {
                     Ok(socket) => return Ok(socket),
                     Err(e) => {
-                        // Only a genuinely busy port is worth retrying with the
-                        // next port in the range. Any other error kind (bind IP
-                        // not assigned to a local interface, permissions, ...)
-                        // fails for every port in the range and must not be
-                        // misreported as port exhaustion below.
-                        let busy = {
-                            #[cfg(feature = "std")]
-                            {
-                                e.kind() == ErrorKind::AddrInUse
-                            }
-                            #[cfg(not(feature = "std"))]
-                            {
-                                let _ = &e; // no error-kind info without std; retry every port
-                                true
-                            }
-                        };
-                        if !busy {
+                        // Only a genuinely busy port is worth retrying with
+                        // the next port in the range (std io::Error and the
+                        // platform factory both surface it as
+                        // RtcError::AddrInUse). Any other error kind (bind IP
+                        // not assigned to a local interface, permissions,
+                        // ...) fails for every port in the range and must not
+                        // be misreported as port exhaustion below.
+                        if !e.is_addr_in_use() {
                             error!(
                                 label = self.config.label.as_deref().unwrap_or("-"),
                                 "binding RTP port {} on {} failed: {}", port, ip, e
                             );
-                            return Err(RtcError::Internal(format!(
-                                "binding RTP port {} on {} failed: {}",
-                                port, ip, e
-                            )));
+                            return Err(e);
                         }
                         port = port.saturating_add(2);
                         if port > end {
@@ -4528,10 +4539,62 @@ impl IceGatherer {
                 label = self.config.label.as_deref().unwrap_or("-")
             )));
         } else {
-            UdpSocket::bind(SocketAddr::new(ip, 0))
-                .await
-                .map_err(|e| RtcError::Internal(format!("udp bind: {e}")))
+            self.bind_one(SocketAddr::new(ip, 0)).await
         }
+    }
+
+    /// One bind attempt through the active backend: the platform factory
+    /// when installed ([`crate::platform::net::set_udp_bind_fn`] — rtcembed's
+    /// embassy-net backend, or a host-test loopback), else the tokio socket
+    /// (std). Backend bookkeeping (sockets list) is done here so callers
+    /// only deal with the wrapper.
+    async fn bind_one(&self, addr: SocketAddr) -> RtcResult<IceSocketWrapper> {
+        if let Some(result) = crate::platform::net::udp_bind_via_factory(addr) {
+            let socket = result?;
+            let wrapper = IceSocketWrapper::Platform(socket.clone());
+            self.platform_sockets.lock().push(socket);
+            return Ok(wrapper);
+        }
+
+        #[cfg(feature = "std")]
+        {
+            let socket = UdpSocket::bind(addr).await?;
+            let socket = Arc::new(socket);
+            self.sockets.lock().push(socket.clone());
+            Ok(IceSocketWrapper::Udp(socket))
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = addr;
+            Err(RtcError::Internal(alloc::string::String::from(
+                "no UDP bind backend: install one via platform::net::set_udp_bind_fn (rtcembed)",
+            )))
+        }
+    }
+
+    /// Looks up a factory-bound platform socket by local address (exact
+    /// match, or unspecified-IP with matching port).
+    pub(crate) fn get_platform_socket(
+        &self,
+        addr: SocketAddr,
+    ) -> Option<Arc<dyn crate::platform::net::UdpSocket>> {
+        let sockets = self.platform_sockets.lock();
+        sockets.iter().find_map(|socket| {
+            let local = socket.local_addr().ok()?;
+            let matches =
+                local == addr || (local.ip().is_unspecified() && local.port() == addr.port());
+            matches.then(|| socket.clone())
+        })
+    }
+
+    /// Registers a bound socket: backend bookkeeping (tokio sockets list;
+    /// platform sockets are registered in `bind_one`) plus handing the
+    /// wrapper to the runner so it starts a read loop.
+    pub(crate) fn register_bound(&self, wrapper: &IceSocketWrapper) {
+        if let IceSocketWrapper::Udp(s) = wrapper {
+            self.sockets.lock().push(s.clone());
+        }
+        let _ = self.socket_tx.send(wrapper.clone());
     }
 
     fn get_socket(&self, addr: SocketAddr) -> Option<Arc<UdpSocket>> {
@@ -4826,9 +4889,7 @@ impl IceGatherer {
             match self.bind_socket(ip).await {
                 Ok(socket) => {
                     if let Ok(addr) = socket.local_addr() {
-                        let socket = Arc::new(socket);
-                        self.sockets.lock().push(socket.clone());
-                        let _ = self.socket_tx.send(IceSocketWrapper::Udp(socket));
+                        self.register_bound(&socket);
 
                         if self.push_host_with_external_srflx(addr, ip, None) {
                             // host + external server-reflexive pushed
@@ -5305,9 +5366,7 @@ impl IceGatherer {
         }
         let parsed = StunMessage::decode(&buf[..len])?;
         if let Some(mapped) = parsed.xor_mapped_address {
-            let socket = Arc::new(socket);
-            self.sockets.lock().push(socket.clone());
-            let _ = self.socket_tx.send(IceSocketWrapper::Udp(socket));
+            self.register_bound(&socket);
             return Ok(Some(IceCandidate::server_reflexive(local_addr, mapped, 1)));
         }
         Ok(None)
@@ -5560,6 +5619,21 @@ impl core::fmt::Debug for IceSocketWrapper {
 }
 
 impl IceSocketWrapper {
+    /// Local address of the underlying socket (best effort: TURN/TCP
+    /// variants report the relay/listen endpoint where meaningful).
+    pub fn local_addr(&self) -> RtcResult<SocketAddr> {
+        match self {
+            IceSocketWrapper::Platform(s) => s.local_addr().map_err(RtcError::from),
+            IceSocketWrapper::Udp(s) => s.local_addr().map_err(RtcError::from),
+            IceSocketWrapper::SharedUdp(h) => h.local_addr(),
+            #[cfg(feature = "std")]
+            IceSocketWrapper::TcpListener(l) => l.local_addr().map_err(RtcError::from),
+            #[cfg(feature = "std")]
+            IceSocketWrapper::TcpStream(_, _, peer) => Ok(*peer),
+            IceSocketWrapper::Turn(_, addr) => Ok(*addr),
+        }
+    }
+
     /// Short description for diagnostic logs (no async I/O).
     pub fn diag(&self) -> String {
         match self {
@@ -5599,6 +5673,18 @@ impl IceSocketWrapper {
     /// `writable()`. Used by the RTP bridge fast-path.
     pub fn try_send_to(&self, data: &[u8], addr: SocketAddr) -> RtcResult<usize> {
         match self {
+            IceSocketWrapper::Platform(s) => {
+                match <dyn crate::platform::net::UdpSocket>::try_send_to(
+                    s.as_ref(),
+                    data,
+                    addr,
+                ) {
+                    Ok(len) => Ok(len),
+                    Err(e) => Err(RtcError::Internal(alloc::format!(
+                        "platform try_send_to: {e}"
+                    ))),
+                }
+            }
             IceSocketWrapper::Udp(s) => match s.try_send_to(data, addr) {
                 Ok(len) => Ok(len),
                 Err(e) => {
@@ -5760,7 +5846,7 @@ impl IceSocketWrapper {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod bind_socket_retry_tests {
     //! An EADDRINUSE port must be skipped in favor of the next one in the
     //! configured range (the old string check never matched the platform

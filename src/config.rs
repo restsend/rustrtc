@@ -1160,7 +1160,7 @@ impl From<RtcConfigurationBuilder> for RtcConfiguration {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
     use core::time::Duration;

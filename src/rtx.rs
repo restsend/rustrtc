@@ -171,7 +171,7 @@ pub fn decode_osn(payload: &[u8]) -> Option<u16> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
     use crate::rtp::RtpHeader;

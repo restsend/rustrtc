@@ -451,7 +451,7 @@ pub fn decode_wire_bytes(buf: Bytes) -> Result<WirePacket, WireRxError> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
 

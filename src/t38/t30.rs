@@ -1407,7 +1407,7 @@ impl std::fmt::Debug for T30Session {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 
 mod ecm_tests {
     use super::*;
@@ -1538,7 +1538,7 @@ mod ecm_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
 

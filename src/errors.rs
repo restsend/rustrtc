@@ -9,7 +9,11 @@ pub type SrtpResult<T> = Result<T, SrtpError>;
 #[cfg(feature = "std")]
 impl From<std::io::Error> for RtcError {
     fn from(e: std::io::Error) -> Self {
-        RtcError::Transport(alloc::format!("io: {e}"))
+        if e.kind() == std::io::ErrorKind::AddrInUse {
+            RtcError::AddrInUse
+        } else {
+            RtcError::Transport(alloc::format!("io: {e}"))
+        }
     }
 }
 
@@ -27,6 +31,18 @@ pub enum RtcError {
     Transport(String),
     #[error("internal error: {0}")]
     Internal(String),
+    /// The local address (IP:port) is already bound by another socket.
+    /// Distinct variant so port-exhaustion retry loops work on every
+    /// backend (std io::Error mapping and future platform sockets).
+    #[error("address already in use")]
+    AddrInUse,
+}
+
+impl RtcError {
+    /// True when the error reports a busy local port (see [`RtcError::AddrInUse`]).
+    pub fn is_addr_in_use(&self) -> bool {
+        matches!(self, RtcError::AddrInUse)
+    }
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]

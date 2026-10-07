@@ -329,7 +329,7 @@ fn is_newer(seq: u16, last: u16) -> bool {
     diff < 32768
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
     use crate::media::frame::AudioFrame;

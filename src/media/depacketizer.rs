@@ -471,7 +471,7 @@ impl Depacketizer for Vp9Depacketizer {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
     use crate::rtp::RtpHeader;

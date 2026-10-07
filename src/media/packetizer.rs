@@ -204,7 +204,7 @@ impl Payloader for SimplePayloader {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod vp9_tests {
     use super::*;
     use crate::media::Depacketizer;

@@ -1172,7 +1172,7 @@ pub fn is_rtcp(packet: &[u8]) -> bool {
     packet.len() >= 2 && (192..=208).contains(&packet[1])
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
 

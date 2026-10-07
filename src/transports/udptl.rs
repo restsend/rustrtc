@@ -476,7 +476,7 @@ impl UdtlReceiveBuffer {
 unsafe impl Send for UdtlTransport {}
 unsafe impl Sync for UdtlTransport {}
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
 
@@ -686,7 +686,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod fec_tests {
     use super::*;
 

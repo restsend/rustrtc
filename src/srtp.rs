@@ -1097,7 +1097,7 @@ impl SrtpContext {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
     use crate::rtp::{RtpHeader, RtpHeaderExtension, RtpPacket};
@@ -1645,7 +1645,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod security_tests {
     use super::*;
     use crate::rtp::{RtpHeader, RtpPacket};

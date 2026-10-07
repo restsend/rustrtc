@@ -4,7 +4,7 @@ use tokio::net::UdpSocket;
 
 use crate::errors::RtcResult;
 use crate::t38::ifp::{DataField, IfpPacket, T30Indicator};
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 use crate::t38::t30::T30FaxConfig;
 use crate::t38::t30::{T30Event, T30Session};
 use crate::t38::wire::{WirePacket, decode_wire};
@@ -394,7 +394,7 @@ impl FaxEndpoint {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
     use crate::t38::ifp::DataFieldType;

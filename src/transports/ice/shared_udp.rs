@@ -373,7 +373,7 @@ pub(crate) async fn acquire(
 
 /// Test helper: return the number of sessions currently registered on a shared
 /// socket bound at `bind_addr` (0 if none).
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 pub(crate) fn session_count(bind_addr: SocketAddr) -> usize {
     registry()
         .lock()
@@ -384,7 +384,7 @@ pub(crate) fn session_count(bind_addr: SocketAddr) -> usize {
 
 /// Look up the local ufrag registered for a given remote peer addr on a shared
 /// socket. Used by tests to verify routing table state.
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 pub(crate) fn ufrag_for_peer(bind_addr: SocketAddr, peer_addr: SocketAddr) -> Option<String> {
     registry()
         .lock()

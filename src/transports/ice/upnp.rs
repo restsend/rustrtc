@@ -666,7 +666,7 @@ pub async fn try_create_upnp_candidate(local_addr: SocketAddr) -> Option<IceCand
 /// Shared in-process mock UPnP IGD used by upnp unit tests and the ICE
 /// runner integration tests (`ice::tests`). Serves SOAP responses over a
 /// loopback TCP listener so the real `igd` client code path is exercised.
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 pub(crate) mod test_mock_igd {
     use super::*;
     use igd::aio::Gateway;
@@ -848,7 +848,7 @@ pub(crate) mod test_mock_igd {
     pub const FRESH_AGE: Duration = Duration::from_secs(60);
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::test_mock_igd::{FRESH_AGE, MockAddResponse, MockIgd, STALE_AGE};
     use super::*;
