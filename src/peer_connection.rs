@@ -15,14 +15,13 @@ use crate::rtp::{
 use crate::media::gcc::GccBandwidthEstimator;
 #[cfg(feature = "std")]
 use crate::media::twcc_feedback::TwccFeedbackGenerator;
-#[cfg(not(feature = "std"))]
-use crate::peer_connection::std_gated::dtls;
+use crate::transports::dtls;
 #[cfg(not(feature = "std"))]
 use crate::peer_connection::std_gated::gcc::GccBandwidthEstimator;
 #[cfg(not(feature = "std"))]
 use crate::peer_connection::std_gated::twcc_feedback::TwccFeedbackGenerator;
 #[cfg(not(feature = "std"))]
-use crate::peer_connection::std_gated::{DataChannel, DtlsTransport, SctpTransport, UdtlTransport};
+use crate::peer_connection::std_gated::{DataChannel, SctpTransport, UdtlTransport};
 use crate::platform::atomic64::AtomicU64;
 use crate::sdp::{
     Attribute, Direction, MediaKind, MediaSection, Origin, SdpType, SessionDescription,
@@ -33,8 +32,7 @@ use crate::stats_collector::StatsCollector;
 use crate::t38::endpoint::FaxEndpoint;
 #[cfg(feature = "t38")]
 use crate::t38::t30::{T30FaxConfig, T30Role, T30Session};
-#[cfg(feature = "std")]
-use crate::transports::dtls::{self, DtlsTransport};
+use crate::transports::dtls::DtlsTransport;
 use crate::transports::get_local_ip;
 use crate::transports::ice::conn::IceConn;
 use crate::transports::ice::stun::random_u32;
@@ -69,52 +67,8 @@ use tracing::{Instrument, debug, debug_span, trace, warn};
 pub(crate) mod std_gated {
     use crate::prelude::*;
 
-    pub mod dtls {
-        use crate::prelude::*;
-
-        /// Placeholder certificate: rtp/srtp mode carries no DTLS
-        /// fingerprint, so nothing ever reads its key material.
-        #[derive(Debug, Default, Clone)]
-        pub struct Certificate;
-
-        /// Only reachable if a no_std peer configures WebRtc mode; the
-        /// transport setup fails fast afterwards.
-        pub fn generate_certificate() -> crate::errors::RtcResult<Certificate> {
-            Ok(Certificate)
-        }
-
-        /// Empty fingerprint: rtp/srtp SDP carries no `a=fingerprint`.
-        pub fn fingerprint(_cert: &Certificate) -> String {
-            String::new()
-        }
-
-        #[derive(Debug)]
-        pub struct DtlsTransport;
-
-        impl DtlsTransport {
-            pub fn close(&self) {}
-
-            /// Inert: no DTLS transport exists, so there is no state stream.
-            pub fn subscribe_state(
-                &self,
-            ) -> Option<crate::platform::sync::watch::Receiver<DtlsState>> {
-                None
-            }
-        }
-
-        /// State names shared with the std DTLS transport so flavor-shared
-        /// monitors compile; the stub never emits any of them.
-        #[derive(Debug, Clone, PartialEq, Eq)]
-        pub enum DtlsState {
-            New,
-            Handshaking,
-            Connected,
-            Failed,
-            Closed,
-        }
-    }
-
-    pub use dtls::DtlsTransport;
+    // dtls: the real transports::dtls module is no_std-ready and is used
+    // directly (see the `use crate::transports::dtls` import above).
 
     #[derive(Debug)]
     pub struct SctpTransport;
@@ -995,11 +949,26 @@ impl PeerConnection {
         // generation + PEM round-trip for plain RTP mode.
         let (certificate, dtls_fingerprint) = if is_rtp_mode {
             (Arc::new(dtls::Certificate::default()), String::new())
-        } else {
-            let cert =
-                Arc::new(dtls::generate_certificate().expect("failed to generate certificate"));
+        } else if let Some(cert) = config.dtls_certificate.clone() {
+            // Pre-provisioned DER certificate (the embedded path: no
+            // certificate generation without std).
             let fp = dtls::fingerprint(&cert);
             (cert, fp)
+        } else {
+            #[cfg(feature = "std")]
+            {
+                let cert = Arc::new(
+                    dtls::generate_certificate().expect("failed to generate certificate"),
+                );
+                let fp = dtls::fingerprint(&cert);
+                (cert, fp)
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                // Empty placeholder: WebRtc mode fails fast in start_dtls
+                // with a clear message instead of half-starting a handshake.
+                (Arc::new(dtls::Certificate::default()), String::new())
+            }
         };
 
         let (signaling_state_tx, signaling_state_rx) = watch::channel(SignalingState::Stable);
@@ -2660,19 +2629,17 @@ impl PeerConnection {
             );
         }
 
-        // ── WebRtc (DTLS/SCTP) transport path — server-side only (plan D6). ──
-        // The rtp and srtp transport modes returned above; on no_std this
-        // mode fails fast instead of half-starting a DTLS setup.
-        #[cfg(not(feature = "std"))]
+        // ── WebRtc (DTLS/SRTP) transport path. ──
+        // The rtp and srtp transport modes returned above.
         {
-            let _ = ice_conn;
-            return Err(RtcError::NotImplemented(
-                "WebRtc (DTLS/SCTP) transport mode requires the std feature \
-                 (D6 embedded scope: rtp/srtp only)",
-            ));
-        }
-        #[cfg(feature = "std")]
-        {
+            #[cfg(not(feature = "std"))]
+            if self.inner.certificate.certificate.is_empty() {
+                // No certificate generation without std: provide one via
+                // `RtcConfiguration::dtls_certificate`.
+                return Err(RtcError::InvalidState(
+                    "WebRtc mode on no_std requires a pre-provisioned DTLS                      certificate (RtcConfiguration::dtls_certificate)".to_string(),
+                ));
+            }
             let remote_dtls_fingerprint = self.inner.remote_dtls_fingerprint.lock().clone();
             let ice_conn_for_data = ice_conn.clone();
             let (dtls, incoming_data_rx, dtls_runner) = DtlsTransport::new(
@@ -2687,6 +2654,10 @@ impl PeerConnection {
 
             // Start the handshake loop before flushing buffered packets so inbound
             // DTLS records are not dropped on the try_send race.
+            // std: spawn_rtc returns a JoinHandle the select arm polls; no_std:
+            // the runner parks in the injected executor (the state watch
+            // carries the outcome), so there is no handle to poll.
+            #[cfg_attr(not(feature = "std"), allow(unused_mut, unused_variables))]
             let mut dtls_runner_task = crate::spawn_rtc(
                 self.inner.config.runtime_handle.as_ref(),
                 self.inner.pc_span.clone(),
@@ -2714,7 +2685,8 @@ impl PeerConnection {
                 5000
             };
 
-            let sctp_needed = {
+            #[cfg_attr(not(feature = "std"), allow(unused_mut))]
+            let mut sctp_needed = {
                 let remote = self.inner.remote_description.lock();
                 if let Some(desc) = &*remote {
                     desc.media_sections
@@ -2724,11 +2696,17 @@ impl PeerConnection {
                     false
                 }
             };
+            #[cfg(not(feature = "std"))]
+            {
+                // SCTP/DataChannel remains std-gated; DTLS-SRTP media is unaffected.
+                sctp_needed = false;
+            }
 
             let (dc_tx, mut dc_rx) = mpsc::unbounded_channel();
 
             let mut sctp_runner: Pin<Box<dyn Future<Output = ()> + Send>>;
 
+            #[cfg(feature = "std")]
             if sctp_needed {
                 let (sctp, runner) = SctpTransport::new(
                     dtls.clone(),
@@ -2743,6 +2721,12 @@ impl PeerConnection {
                 *self.inner.sctp_transport.lock() = Some(sctp);
                 sctp_runner = Box::pin(runner);
             } else {
+                drop(incoming_data_rx);
+                sctp_runner = Box::pin(core::future::pending());
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                let _ = (&dc_tx, sctp_port, is_client);
                 drop(incoming_data_rx);
                 sctp_runner = Box::pin(core::future::pending());
             }
@@ -2824,33 +2808,102 @@ impl PeerConnection {
                     continue;
                 }
 
-                tokio::select! {
-                    res = &mut dtls_runner_task => {
-                        if let Err(e) = res {
-                            return Err(RtcError::Internal(format!("DTLS runner panicked: {e}")));
+                // The dtls runner arm exists only where spawn_rtc returns a
+                // JoinHandle (std); on no_std the runner lives in the injected
+                // executor and reports through the state watch.
+                #[cfg(feature = "std")]
+                {
+                    use crate::platform::select::select5;
+                    let mut arm_state = core::pin::pin!(state_rx.changed());
+                    let mut pair_arm_rx = pair_rx.clone();
+                    let mut arm_pair = core::pin::pin!(pair_arm_rx.changed());
+                    match select5(
+                        &mut dtls_runner_task,
+                        &mut sctp_runner,
+                        &mut dc_listener,
+                        &mut arm_state,
+                        &mut arm_pair,
+                    )
+                    .await
+                    {
+                        crate::platform::select::Which5::A(res) => {
+                            if let Err(e) = res {
+                                return Err(RtcError::Internal(format!(
+                                    "DTLS runner panicked: {e}"
+                                )));
+                            }
+                            dtls_runner_done = true;
+                            // Loop back: the top-of-loop state check will return/err
+                            // based on the final DtlsState set by the handshake.
                         }
-                        dtls_runner_done = true;
-                        // Loop back: the top-of-loop state check will return/err
-                        // based on the final DtlsState set by the handshake.
-                    }
-                    _ = &mut sctp_runner => {
-                         return Err(RtcError::Internal("SCTP runner stopped unexpectedly".into()));
-                    }
-                    _ = &mut dc_listener => {
-                         debug!("DataChannel listener stopped unexpectedly");
-                         return Err(RtcError::Internal("DataChannel listener stopped unexpectedly".into()));
-                    }
-                    res = state_rx.changed() => {
-                        if res.is_err() { break; }
-                    }
-                    res = pair_rx.changed() => {
-                        if res.is_ok()
-                            && let Some(pair) = pair_rx.borrow().clone() {
+                        crate::platform::select::Which5::B(_) => {
+                            return Err(RtcError::Internal(
+                                "SCTP runner stopped unexpectedly".into(),
+                            ));
+                        }
+                        crate::platform::select::Which5::C(_) => {
+                            debug!("DataChannel listener stopped unexpectedly");
+                            return Err(RtcError::Internal(
+                                "DataChannel listener stopped unexpectedly".into(),
+                            ));
+                        }
+                        crate::platform::select::Which5::D(res) => {
+                            if res.is_err() {
+                                break;
+                            }
+                        }
+                        crate::platform::select::Which5::E(res) => {
+                            if res.is_ok()
+                                && let Some(pair) = pair_rx.borrow().clone()
+                            {
                                 ice_conn_monitor.set_remote_addr_from_selected_pair(
                                     pair.remote.address,
                                     "dtls pair monitor update",
                                 );
                             }
+                        }
+                    }
+                }
+                #[cfg(not(feature = "std"))]
+                {
+                    use crate::platform::select::select4;
+                    let mut arm_state = core::pin::pin!(state_rx.changed());
+                    let mut pair_arm_rx = pair_rx.clone();
+                    let mut arm_pair = core::pin::pin!(pair_arm_rx.changed());
+                    match select4(
+                        &mut sctp_runner,
+                        &mut dc_listener,
+                        &mut arm_state,
+                        &mut arm_pair,
+                    )
+                    .await
+                    {
+                        crate::platform::select::Which4::A(_) => {
+                            return Err(RtcError::Internal(
+                                "SCTP runner stopped unexpectedly".into(),
+                            ));
+                        }
+                        crate::platform::select::Which4::B(_) => {
+                            debug!("DataChannel listener stopped unexpectedly");
+                            return Err(RtcError::Internal(
+                                "DataChannel listener stopped unexpectedly".into(),
+                            ));
+                        }
+                        crate::platform::select::Which4::C(res) => {
+                            if res.is_err() {
+                                break;
+                            }
+                        }
+                        crate::platform::select::Which4::D(res) => {
+                            if res.is_ok()
+                                && let Some(pair) = pair_rx.borrow().clone()
+                            {
+                                ice_conn_monitor.set_remote_addr_from_selected_pair(
+                                    pair.remote.address,
+                                    "dtls pair monitor update",
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -2961,7 +3014,6 @@ impl PeerConnection {
         Ok(())
     }
 
-    #[cfg(feature = "std")]
     fn setup_srtp(
         &self,
         dtls: &DtlsTransport,
@@ -4648,7 +4700,7 @@ async fn run_ice_dtls_loop(
             crate::transports::ice::IceTransportState::Connected
             | crate::transports::ice::IceTransportState::Completed => {
                 ice_transport.nudge_passive_tcp_nomination();
-                crate::platform::task::yield_now().await;
+                        crate::platform::task::yield_now().await;
                 // Wait for ICE nomination to complete before starting DTLS.
                 // This prevents a race where DTLS and the USE-CANDIDATE binding check
                 // compete for the same UDP socket, causing spurious nomination timeouts.

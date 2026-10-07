@@ -151,10 +151,20 @@ pub fn get_client_hello_cipher_suites() -> Vec<u16> {
     ]
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub struct Certificate {
     pub certificate: Vec<Vec<u8>>,
     pub private_key_pkcs8: Vec<u8>, // PKCS#8 DER
+}
+
+impl core::fmt::Debug for Certificate {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Redacted: this struct carries private key material.
+        f.debug_struct("Certificate")
+            .field("certs", &self.certificate.len())
+            .field("private_key_bytes", &self.private_key_pkcs8.len())
+            .finish()
+    }
 }
 
 impl Certificate {

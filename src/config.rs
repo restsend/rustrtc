@@ -563,6 +563,12 @@ pub struct RtcConfiguration {
     /// peer speed. Default 256 KB;  0 disables the gate (unbounded).
     pub sctp_max_buffered_amount: usize,
     pub dtls_buffer_size: usize,
+    /// Pre-provisioned DTLS leaf certificate (DER) + PKCS#8 private key.
+    /// Required for WebRtc mode without `std` (no certificate generation
+    /// on embedded); ignored in `Rtp` mode. When unset on `std`, a fresh
+    /// self-signed certificate is generated per connection.
+    #[serde(skip)]
+    pub dtls_certificate: Option<Arc<crate::transports::dtls::Certificate>>,
     pub rtp_start_port: Option<u16>,
     pub rtp_end_port: Option<u16>,
     pub ice_gather_udp_hosts: bool,
@@ -694,6 +700,7 @@ impl PartialEq for RtcConfiguration {
             && self.sctp_max_cwnd == other.sctp_max_cwnd
             && self.sctp_max_buffered_amount == other.sctp_max_buffered_amount
             && self.dtls_buffer_size == other.dtls_buffer_size
+            && self.dtls_certificate == other.dtls_certificate
             && self.rtp_start_port == other.rtp_start_port
             && self.rtp_end_port == other.rtp_end_port
             && self.ice_gather_udp_hosts == other.ice_gather_udp_hosts
@@ -759,6 +766,7 @@ impl Default for RtcConfiguration {
             sctp_max_cwnd: 256 * 1024,            // 256 KB
             sctp_max_buffered_amount: 256 * 1024, // 256 KB
             dtls_buffer_size: 2048,
+            dtls_certificate: None,
             rtp_start_port: None,
             rtp_end_port: None,
             ice_gather_udp_hosts: true,
@@ -1003,6 +1011,17 @@ impl RtcConfigurationBuilder {
 
     pub fn dtls_buffer_size(mut self, size: usize) -> Self {
         self.inner.dtls_buffer_size = size;
+        self
+    }
+
+    /// Pre-provisioned DTLS certificate (DER leaf + PKCS#8 key). Required
+    /// for WebRtc mode on no_std; on std a self-signed certificate is
+    /// generated when this is unset.
+    pub fn dtls_certificate(
+        mut self,
+        cert: Arc<crate::transports::dtls::Certificate>,
+    ) -> Self {
+        self.inner.dtls_certificate = Some(cert);
         self
     }
 
