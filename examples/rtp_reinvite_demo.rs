@@ -5,7 +5,7 @@
 ///
 /// Run with: cargo run --example rtp_reinvite_demo
 use rustrtc::*;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Simulate initial payload mapping (PT 111 = Opus)
-    let mut initial_payload_map = HashMap::new();
+    let mut initial_payload_map = BTreeMap::new();
     initial_payload_map.insert(
         111,
         peer_connection::RtpCodecParameters {
@@ -42,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     transceiver.update_payload_map(initial_payload_map)?;
 
     // Simulate initial extmap
-    let mut initial_extmap = HashMap::new();
+    let mut initial_extmap = BTreeMap::new();
     initial_extmap.insert(1, "urn:ietf:params:rtp-hdrext:ssrc-audio-level".to_string());
     initial_extmap.insert(
         3,
@@ -66,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     // Simulate reinvite with different PT (120 = Opus) and extmap changes
-    let mut reinvite_payload_map = HashMap::new();
+    let mut reinvite_payload_map = BTreeMap::new();
     reinvite_payload_map.insert(
         120, // Changed from 111
         peer_connection::RtpCodecParameters {
@@ -77,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
-    let mut reinvite_extmap = HashMap::new();
+    let mut reinvite_extmap = BTreeMap::new();
     reinvite_extmap.insert(1, "urn:ietf:params:rtp-hdrext:ssrc-audio-level".to_string()); // Kept
     reinvite_extmap.insert(
         5,

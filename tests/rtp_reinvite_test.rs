@@ -1,5 +1,5 @@
 use rustrtc::*;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// Test basic payload type map update functionality
 #[tokio::test]
@@ -11,7 +11,7 @@ async fn test_payload_type_update() {
     ));
 
     // Initial mapping: PT 111 = Opus at 48000Hz
-    let mut initial_map = HashMap::new();
+    let mut initial_map = BTreeMap::new();
     initial_map.insert(
         111,
         peer_connection::RtpCodecParameters {
@@ -30,7 +30,7 @@ async fn test_payload_type_update() {
     assert_eq!(payload_map.get(&111).unwrap().channels, 2);
 
     // Update mapping: change PT 111 to different parameters
-    let mut updated_map = HashMap::new();
+    let mut updated_map = BTreeMap::new();
     updated_map.insert(
         111,
         peer_connection::RtpCodecParameters {
@@ -48,7 +48,7 @@ async fn test_payload_type_update() {
     assert_eq!(payload_map.get(&111).unwrap().channels, 1);
 
     // Add new PT mapping
-    let mut new_map = HashMap::new();
+    let mut new_map = BTreeMap::new();
     new_map.insert(
         120,
         peer_connection::RtpCodecParameters {
@@ -76,7 +76,7 @@ async fn test_extmap_update() {
     ));
 
     // Initial extmap
-    let mut initial_extmap = HashMap::new();
+    let mut initial_extmap = BTreeMap::new();
     initial_extmap.insert(1, "urn:ietf:params:rtp-hdrext:ssrc-audio-level".to_string());
     initial_extmap.insert(
         3,
@@ -93,7 +93,7 @@ async fn test_extmap_update() {
     );
 
     // Update extmap: change ID for abs-send-time
-    let mut updated_extmap = HashMap::new();
+    let mut updated_extmap = BTreeMap::new();
     updated_extmap.insert(1, "urn:ietf:params:rtp-hdrext:ssrc-audio-level".to_string());
     updated_extmap.insert(
         5,
@@ -117,7 +117,7 @@ async fn test_concurrent_payload_map_access() {
     ));
 
     // Initial mapping
-    let mut initial_map = HashMap::new();
+    let mut initial_map = BTreeMap::new();
     initial_map.insert(
         96,
         peer_connection::RtpCodecParameters {
@@ -151,7 +151,7 @@ async fn test_concurrent_payload_map_access() {
 
     // Perform a write in the middle
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    let mut new_map = HashMap::new();
+    let mut new_map = BTreeMap::new();
     new_map.insert(
         97,
         peer_connection::RtpCodecParameters {
@@ -275,7 +275,7 @@ async fn test_reinvite_payload_change() {
     ));
 
     // Initial payload map
-    let mut initial_map = HashMap::new();
+    let mut initial_map = BTreeMap::new();
     initial_map.insert(
         111,
         peer_connection::RtpCodecParameters {
@@ -294,7 +294,7 @@ async fn test_reinvite_payload_change() {
     );
 
     // Simulate reinvite with different PT
-    let mut reinvite_map = HashMap::new();
+    let mut reinvite_map = BTreeMap::new();
     reinvite_map.insert(
         120,
         peer_connection::RtpCodecParameters {
@@ -322,7 +322,7 @@ async fn test_reinvite_comprehensive() {
     ));
 
     // Stage 1: Initial negotiation
-    let mut initial_payload_map = HashMap::new();
+    let mut initial_payload_map = BTreeMap::new();
     initial_payload_map.insert(
         96,
         peer_connection::RtpCodecParameters {
@@ -343,7 +343,7 @@ async fn test_reinvite_comprehensive() {
     );
     transceiver.update_payload_map(initial_payload_map).unwrap();
 
-    let mut initial_extmap = HashMap::new();
+    let mut initial_extmap = BTreeMap::new();
     initial_extmap.insert(1, "urn:ietf:params:rtp-hdrext:toffset".to_string());
     initial_extmap.insert(
         3,
@@ -363,7 +363,7 @@ async fn test_reinvite_comprehensive() {
     assert!(extmap.contains_key(&3));
 
     // Stage 2: Reinvite - change PT 96 to 98, keep 97, change extmap IDs
-    let mut updated_payload_map = HashMap::new();
+    let mut updated_payload_map = BTreeMap::new();
     updated_payload_map.insert(
         98, // Changed from 96
         peer_connection::RtpCodecParameters {
@@ -384,7 +384,7 @@ async fn test_reinvite_comprehensive() {
     );
     transceiver.update_payload_map(updated_payload_map).unwrap();
 
-    let mut updated_extmap = HashMap::new();
+    let mut updated_extmap = BTreeMap::new();
     updated_extmap.insert(2, "urn:ietf:params:rtp-hdrext:toffset".to_string()); // Changed from 1
     updated_extmap.insert(
         5,
@@ -412,7 +412,7 @@ async fn test_reinvite_comprehensive() {
     assert!(extmap.contains_key(&7)); // New
 
     // Stage 3: Another reinvite - simplify to single codec
-    let mut final_payload_map = HashMap::new();
+    let mut final_payload_map = BTreeMap::new();
     final_payload_map.insert(
         100,
         peer_connection::RtpCodecParameters {
@@ -435,8 +435,8 @@ async fn test_reinvite_comprehensive() {
 // Helper functions to test private methods
 fn extract_payload_map_helper(
     section: &rustrtc::MediaSection,
-) -> HashMap<u8, peer_connection::RtpCodecParameters> {
-    let mut payload_map = HashMap::new();
+) -> BTreeMap<u8, peer_connection::RtpCodecParameters> {
+    let mut payload_map = BTreeMap::new();
 
     for attr in &section.attributes {
         if attr.key == "rtpmap"
@@ -472,8 +472,8 @@ fn extract_payload_map_helper(
     payload_map
 }
 
-fn extract_extmap_helper(section: &rustrtc::MediaSection) -> HashMap<u8, String> {
-    let mut extmap = HashMap::new();
+fn extract_extmap_helper(section: &rustrtc::MediaSection) -> BTreeMap<u8, String> {
+    let mut extmap = BTreeMap::new();
 
     for attr in &section.attributes {
         if attr.key == "extmap"
