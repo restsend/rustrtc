@@ -141,3 +141,98 @@ strip = "symbols"
 [profile.bench]
 lto = "fat"
 codegen-units = 1
+
+# Host-only demo: gated out of the no_std build (WP2/G1).
+[[example]]
+name = "audio_saver"
+required-features = ["std"]
+
+# Host-only demo: gated out of the no_std build (WP2/G1).
+[[example]]
+name = "benchmark"
+required-features = ["std"]
+
+# Host-only demo: gated out of the no_std build (WP2/G1).
+[[example]]
+name = "datachannel_chat"
+required-features = ["std"]
+
+# Host-only demo: gated out of the no_std build (WP2/G1).
+[[example]]
+name = "datachannel_stress"
+required-features = ["std"]
+
+# Host-only demo: gated out of the no_std build (WP2/G1).
+[[example]]
+name = "dtls_srtp_bench"
+required-features = ["std"]
+
+# Host-only demo: gated out of the no_std build (WP2/G1).
+[[example]]
+name = "echo_server"
+required-features = ["std"]
+
+# Host-only demo: gated out of the no_std build (WP2/G1).
+[[example]]
+name = "interop_pion"
+required-features = ["std"]
+
+# Host-only demo: gated out of the no_std build (WP2/G1).
+[[example]]
+name = "latency_optimization"
+required-features = ["std"]
+
+# Host-only demo: gated out of the no_std build (WP2/G1).
+[[example]]
+name = "repro_sdp"
+required-features = ["std"]
+
+# Host-only demo: gated out of the no_std build (WP2/G1).
+[[example]]
+name = "rewrite_relay_e2e"
+required-features = ["std"]
+
+# Host-only demo: gated out of the no_std build (WP2/G1).
+[[example]]
+name = "rtp_bench_echo"
+required-features = ["std"]
+
+# Host-only demo: gated out of the no_std build (WP2/G1).
+[[example]]
+name = "rtp_bench_generator"
+required-features = ["std"]
+
+# Host-only demo: gated out of the no_std build (WP2/G1).
+[[example]]
+name = "rtp_bench_sut"
+required-features = ["std"]
+
+# Host-only demo: gated out of the no_std build (WP2/G1).
+[[example]]
+name = "rtp_pc_echo_bench"
+required-features = ["std"]
+
+# Host-only demo: gated out of the no_std build (WP2/G1).
+[[example]]
+name = "rtp_play"
+required-features = ["std"]
+
+# Host-only demo: gated out of the no_std build (WP2/G1).
+[[example]]
+name = "rtp_reinvite_demo"
+required-features = ["std"]
+
+# Host-only demo: gated out of the no_std build (WP2/G1).
+[[example]]
+name = "rtp_track_event"
+required-features = ["std"]
+
+# Host-only demo: gated out of the no_std build (WP2/G1).
+[[example]]
+name = "rustrtc_sfu"
+required-features = ["std"]
+
+# Host-only demo: gated out of the no_std build (WP2/G1).
+[[example]]
+name = "sctp_benchmark"
+required-features = ["std"]

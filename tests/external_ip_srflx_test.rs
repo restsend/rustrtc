@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 //! ServerReflexive mode advertises `external_ip` as a srflx candidate
 //! alongside the host candidate (RFC 8445 §5.1.1.2, the 1:1 NAT case).
 use anyhow::Result;

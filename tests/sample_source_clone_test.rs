@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 //! `SampleStreamSource` is `Clone + Send + Sync`, so several threads may send
 //! into one track through their own clones. Every sample a send accepted
 //! must come out of the track exactly once.

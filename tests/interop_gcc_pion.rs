@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 // Interop test: TWCC feedback + GCC bandwidth estimation between rustrtc
 // (client/offerer, sending video) and pion v3 (Go, server/answerer with
 // TWCC interceptors). The pion side generates TWCC feedback for the inbound

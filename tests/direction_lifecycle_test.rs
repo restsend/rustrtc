@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 //! Direction-semantics regression tests — locks in the fixes from PRs #41/#44/#45:
 //!
 //! - answers intersect the offered direction with our own intent

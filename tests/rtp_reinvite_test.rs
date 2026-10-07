@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 use rustrtc::*;
 use std::collections::BTreeMap;
 

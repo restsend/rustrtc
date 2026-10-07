@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 use anyhow::Result;
 use bytes::Bytes;
 use rustrtc::media::track::MediaStreamTrack;

@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 //! A sender installed with `RtpTransceiver::set_sender` must reach the wire no
 //! matter when it is installed relative to transport setup:
 //!

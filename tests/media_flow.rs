@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 use anyhow::Result;
 use rustrtc::media::MediaStreamTrack;
 use rustrtc::media::frame::{MediaSample, VideoFrame};

@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 #![cfg(feature = "t38")]
 
 use bytes::Bytes;

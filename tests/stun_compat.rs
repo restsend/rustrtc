@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 use rustrtc::transports::ice::stun::{StunAttribute, StunMessage};
 use std::net::SocketAddr;
 use webrtc::stun::integrity::MessageIntegrity;

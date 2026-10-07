@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 //! RFC 3264 §6 / §8.2: a media section with port 0 is rejected and carries
 //! no media, except a `bundle-only` section inside a BUNDLE group, which
 //! uses port 0 while sharing the group's transport (RFC 9143 §7).

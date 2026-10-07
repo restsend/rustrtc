@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 //! The negotiated send direction (RFC 3264 §6.1/§7, RFC 8829 §5.11) applies
 //! to every RTP egress path, not only the RtpSender's sample loop.
 use anyhow::Result;

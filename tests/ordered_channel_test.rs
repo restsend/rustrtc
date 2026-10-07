@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 use anyhow::Result;
 use rustrtc::{DataChannelEvent, PeerConnection, RtcConfiguration};
 use std::collections::HashMap;

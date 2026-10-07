@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 use anyhow::Result;
 use rustrtc::{PeerConnection, PeerConnectionEvent, RtcConfiguration};
 use std::sync::Arc;

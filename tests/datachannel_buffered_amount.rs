@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 // E2E tests: DataChannel per-channel buffered amount + BufferedAmountLow
 // event (W3C `bufferedAmount` / `bufferedamountlow`).
 #![allow(clippy::field_reassign_with_default)]

@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 use rustrtc::transports::ice::stun::{StunAttribute, StunMessage};
 use webrtc::stun::attributes::*;
 use webrtc::stun::integrity::*;

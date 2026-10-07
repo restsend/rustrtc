@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 // Test for SCTP congestion control in rate-limited scenarios

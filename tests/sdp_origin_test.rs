@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 //! RFC 3264 §8 and RFC 8829 §5.2.2 / §5.3.2: once a session description has
 //! been sent, every later offer or answer keeps the `o=` line of the previous
 //! local description and increments `<sess-version>` by one.

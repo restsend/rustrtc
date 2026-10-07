@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 // Tests for mDNS candidate obfuscation (draft-ietf-rtcweb-mdns):
 // 1. With `enable_mdns`, host candidates are advertised as `<random>.local`
 //    hostnames in SDP while the internal address stays real — so ICE still

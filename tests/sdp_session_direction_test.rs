@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 //! RFC 8866 §6.7 (RFC 4566 §6): a direction attribute at session level
 //! applies to every media section that does not carry its own.
 use rustrtc::sdp::{Direction, SdpType, SessionDescription};

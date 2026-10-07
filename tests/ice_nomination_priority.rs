@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 //! Regression test for the ICE nomination race across cascaded NAT.
 //!
 //! Symptom (real deployment): the controlling side (rport client) selected a

@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 // Test/example crate: relax pedantic style lints that are noisy in fixtures.
 #![allow(clippy::field_reassign_with_default)]
 #![allow(clippy::redundant_pattern_matching)]

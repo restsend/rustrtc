@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 //! A sender transmits RTP only while the negotiated direction allows it
 //! (RFC 3264 §6.1 / §7, RFC 8829 §5.11): not after the remote answered
 //! `recvonly` / `inactive`, and not after we answered a remote `sendonly` /

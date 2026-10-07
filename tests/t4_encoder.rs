@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 //! T.4 MH encoder roundtrip tests: encode bitmaps with the library encoder
 //! and decode them with the fixture-validated replay decoder.
 

@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 // E2E tests: TWCC feedback + GCC bandwidth adaptation loop.
 //
 // PC1 sends video (transport-cc sequence numbers stamped on the wire when the
