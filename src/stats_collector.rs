@@ -10,6 +10,17 @@ use core::sync::atomic::Ordering;
 use core::time::Duration;
 use serde_json::json;
 
+/// Clock for `sent_sr_times` (RTT from LSR/DLSR, RFC 3550 §6.4.1).
+///
+/// The platform `Instant` is wall-clock milliseconds, which quantizes a
+/// loopback round trip to zero and drops the RTT sample entirely. std uses
+/// the monotonic clock for sub-millisecond resolution; no_std has no timer
+/// yet (WP3), where `elapsed()` stays zero so RTT samples remain unset.
+#[cfg(feature = "std")]
+use std::time::Instant as RttInstant;
+#[cfg(not(feature = "std"))]
+use crate::platform::time::Instant as RttInstant;
+
 /// Entries in `sent_sr_times` older than this are stale for RTT computation and
 /// eligible for eviction (prevents unbounded growth over long calls).
 const SENT_SR_TIME_MAX_AGE: Duration = Duration::from_secs(60);
@@ -222,9 +233,9 @@ pub struct StatsCollector {
     remote_outbound: Mutex<BTreeMap<u32, RemoteOutboundStats>>,
     local_inbound: Mutex<BTreeMap<u32, LocalInboundStats>>,
     local_outbound: Mutex<BTreeMap<u32, LocalOutboundStats>>,
-    /// Maps compact NTP → Instant for outgoing Sender Reports, used to compute
+    /// Maps compact NTP → send time for outgoing Sender Reports, used to compute
     /// round-trip time from the LSR/DLSR fields of incoming Receiver Reports.
-    sent_sr_times: Mutex<BTreeMap<u32, Instant>>,
+    sent_sr_times: Mutex<BTreeMap<u32, RttInstant>>,
     last_rr_sent: Mutex<Option<Instant>>,
     /// Monotonic counter used only to pace RR emission.
     packets_since_rr: AtomicU64,
@@ -279,10 +290,10 @@ impl StatsCollector {
         // does not grow without bound over a long-lived call. RTT samples older
         // than `SENT_SR_TIME_MAX_AGE` are no longer useful anyway.
         if times.len() >= SENT_SR_TIME_HIGH_WATERMARK {
-            let now = Instant::now();
+            let now = RttInstant::now();
             times.retain(|_, t| now.duration_since(*t) < SENT_SR_TIME_MAX_AGE);
         }
-        times.insert(compact_ntp, Instant::now());
+        times.insert(compact_ntp, RttInstant::now());
     }
 
     /// Build RFC 3550 reception report blocks for all locally received SSRCs.
