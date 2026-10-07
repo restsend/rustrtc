@@ -1,5 +1,7 @@
-use anyhow::{Result, bail};
+use super::{Result, bail};
+use crate::prelude::*;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use core::convert::TryFrom;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentType {
@@ -11,7 +13,7 @@ pub enum ContentType {
 }
 
 impl TryFrom<u8> for ContentType {
-    type Error = anyhow::Error;
+    type Error = crate::errors::RtcError;
 
     fn try_from(value: u8) -> Result<Self> {
         match value {

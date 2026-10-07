@@ -1,6 +1,5 @@
 #[cfg(feature = "std")]
 pub mod datachannel;
-#[cfg(feature = "std")]
 pub mod dtls;
 pub mod ice;
 pub mod rtp;

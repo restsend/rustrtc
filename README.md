@@ -18,6 +18,77 @@ A high-performance, full-stack real-time communication library — **WebRTC, RTP
 - **NAT traversal & deployment** — RTP latching, UPnP IGD port mapping, and firewall-friendly port ranges (`rtp_start_port`/`rtp_end_port`).
 - **Production extras** — RTP rewrite bridge (SSRC/PT/sequence remapping) and a WebRTC-compatible stats model.
 
+## no_std / Embedded Support
+
+rustrtc builds without `std` (`alloc`-only) and cross-compiles for embedded
+targets — verified on `xtensa-esp32s3-none-elf` (ESP32-S3).
+
+**Available without std:** RTP/RTX, SRTP (incl. SDES), SDP, the full-ICE /
+STUN / TURN stack, the `PeerConnection` pipeline (`Rtp` / `Srtp` transport
+modes), and the self-contained DTLS implementation (`dtls` feature) used for
+DTLS-SRTP.
+
+**Still std-only:** the `WebRtc` transport-mode wiring inside
+`PeerConnection`, SCTP/DataChannel, T.38/UDPTL, TWCC/GCC, ICE-TCP, UPnP, mDNS,
+and certificate *generation* (`rcgen`; load pre-provisioned DER instead).
+
+### Building
+
+```bash
+# no_std check (host toolchain)
+cargo check --no-default-features --features dtls
+
+# ESP32-S3 (Xtensa)
+espup install --targets esp32s3
+. ~/export-esp.sh
+CARGO_UNSTABLE_BUILD_STD=core,alloc \
+cargo +esp check -Zbuild-std=core,alloc --target xtensa-esp32s3-none-elf \
+      --no-default-features --features dtls --lib
+```
+
+### Platform seams
+
+`dtls` has **no mandatory crypto dependency**. Choose a backend for
+ECDSA-P256-SHA256 + ECDH-P256:
+
+- `crypto-p256` feature (implied by `std`): pure-Rust p256 reference; or
+- inject your own — e.g. hardware-accelerated or mbedtls-backed:
+
+```rust,ignore
+rustrtc::platform::crypto::set_crypto(Arc::new(MyCryptoBackend));
+```
+
+Timers (handshake retransmission, keepalives) go through a sleep factory:
+
+```rust,ignore
+// Example: embassy-time. Any executor-backed timer works.
+rustrtc::platform::task::set_sleep_fn(|dur| {
+    Box::pin(embassy_time::Timer::after(embassy_time::Duration::from_millis(
+        dur.as_millis() as u64,
+    ))) as Pin<Box<dyn Future<Output = ()> + Send>>
+});
+```
+
+### Using it on no_std
+
+Install the platform seams (see `src/platform.rs`) before first use, and load
+a flash-persisted certificate instead of generating one:
+
+```rust,ignore
+// CSPRNG — REQUIRED before any key material is derived (SRTP/SDES/DTLS).
+// Example: wrap the esp-hal hardware RNG.
+rustrtc::platform::rng::set_fill_fn(hal::rng_fill);
+
+// Task spawner — hands futures to your executor (embassy / esp-rtos).
+rustrtc::platform::task::set_spawn_fn(|fut| spawner.spawn(fut).ok());
+
+// DTLS certificate: DER leaf cert + PKCS#8 DER key.
+let cert = rustrtc::transports::dtls::Certificate::from_pkcs8_der(cert_der, key_der)?;
+```
+
+The no_std wall clock is a logical clock (`platform::time::advance_ms`);
+advance it from a periodic task if uptime-based accounting matters to you.
+
 ## Benchmark (rustrtc vs webrtc-rs & pion) in 0.3.141
 
 **CPU:** `Intel(R) Core(TM) i7-9700T CPU @ 2.00GHz` (8 cores)  

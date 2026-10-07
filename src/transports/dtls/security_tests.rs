@@ -1,3 +1,4 @@
+use super::dtls_err;
 use super::*;
 use crate::transports::PacketReceiver;
 use crate::transports::ice::IceSocketWrapper;
@@ -91,7 +92,10 @@ async fn test_dtls_handshake_with_fingerprint_verification() -> Result<()> {
         if now >= deadline {
             panic!("timed out waiting for client DTLS terminal state");
         }
-        tokio::time::timeout(deadline - now, client_state_rx.changed()).await??;
+        tokio::time::timeout(deadline - now, client_state_rx.changed())
+            .await
+            .map_err(|e| dtls_err!("wait failed: {e}"))?
+            .map_err(|e| dtls_err!("watch closed: {e}"))?;
     }
 
     let mut server_state_rx = server_dtls.subscribe_state();
@@ -109,7 +113,10 @@ async fn test_dtls_handshake_with_fingerprint_verification() -> Result<()> {
         if now >= deadline {
             panic!("timed out waiting for server DTLS terminal state");
         }
-        tokio::time::timeout(deadline - now, server_state_rx.changed()).await??;
+        tokio::time::timeout(deadline - now, server_state_rx.changed())
+            .await
+            .map_err(|e| dtls_err!("wait failed: {e}"))?
+            .map_err(|e| dtls_err!("watch closed: {e}"))?;
     }
 
     Ok(())
@@ -197,7 +204,10 @@ async fn test_dtls_handshake_rejects_wrong_fingerprint() -> Result<()> {
         if now >= deadline {
             panic!("timed out waiting for DTLS terminal state");
         }
-        tokio::time::timeout(deadline - now, client_state_rx.changed()).await??;
+        tokio::time::timeout(deadline - now, client_state_rx.changed())
+            .await
+            .map_err(|e| dtls_err!("wait failed: {e}"))?
+            .map_err(|e| dtls_err!("watch closed: {e}"))?;
     }
 
     Ok(())
@@ -281,7 +291,10 @@ async fn test_dtls_encrypted_data_exchange() -> Result<()> {
         if now >= deadline {
             panic!("timed out");
         }
-        tokio::time::timeout(deadline - now, client_state_rx.changed()).await??;
+        tokio::time::timeout(deadline - now, client_state_rx.changed())
+            .await
+            .map_err(|e| dtls_err!("wait failed: {e}"))?
+            .map_err(|e| dtls_err!("watch closed: {e}"))?;
     }
 
     let mut server_state_rx = server_dtls.subscribe_state();
@@ -299,7 +312,10 @@ async fn test_dtls_encrypted_data_exchange() -> Result<()> {
         if now >= deadline {
             panic!("timed out");
         }
-        tokio::time::timeout(deadline - now, server_state_rx.changed()).await??;
+        tokio::time::timeout(deadline - now, server_state_rx.changed())
+            .await
+            .map_err(|e| dtls_err!("wait failed: {e}"))?
+            .map_err(|e| dtls_err!("watch closed: {e}"))?;
     }
 
     // Client sends encrypted data
@@ -308,8 +324,8 @@ async fn test_dtls_encrypted_data_exchange() -> Result<()> {
 
     let received = tokio::time::timeout(std::time::Duration::from_secs(3), server_rx.recv())
         .await
-        .map_err(|e| anyhow::anyhow!("timeout: {}", e))?
-        .ok_or_else(|| anyhow::anyhow!("channel closed"))?;
+        .map_err(|e| dtls_err!("timeout: {}", e))?
+        .ok_or_else(|| dtls_err!("channel closed"))?;
     assert_eq!(&received[..], test_msg);
 
     // Server sends back
@@ -318,8 +334,8 @@ async fn test_dtls_encrypted_data_exchange() -> Result<()> {
 
     let received = tokio::time::timeout(std::time::Duration::from_secs(3), client_rx.recv())
         .await
-        .map_err(|e| anyhow::anyhow!("timeout: {}", e))?
-        .ok_or_else(|| anyhow::anyhow!("channel closed"))?;
+        .map_err(|e| dtls_err!("timeout: {}", e))?
+        .ok_or_else(|| dtls_err!("channel closed"))?;
     assert_eq!(&received[..], reply);
 
     Ok(())

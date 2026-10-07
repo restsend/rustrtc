@@ -1,6 +1,8 @@
 use super::record::ProtocolVersion;
-use anyhow::{Result, bail};
+use super::{Result, bail};
+use crate::prelude::*;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use core::convert::TryFrom;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandshakeType {
@@ -18,7 +20,7 @@ pub enum HandshakeType {
 }
 
 impl TryFrom<u8> for HandshakeType {
-    type Error = anyhow::Error;
+    type Error = crate::errors::RtcError;
 
     fn try_from(value: u8) -> Result<Self> {
         match value {
@@ -120,13 +122,10 @@ impl Default for Random {
 
 impl Random {
     pub fn new() -> Self {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let start = SystemTime::now();
-        let since_the_epoch = start.duration_since(UNIX_EPOCH).unwrap_or_default();
-        let gmt_unix_time = since_the_epoch.as_secs() as u32;
+        let gmt_unix_time = crate::platform::time::unix_ms().unwrap_or(0) as u32;
 
         let mut random_bytes = [0u8; 28];
-        rand::fill(&mut random_bytes);
+        crate::platform::rng::fill(&mut random_bytes);
 
         Self {
             gmt_unix_time,

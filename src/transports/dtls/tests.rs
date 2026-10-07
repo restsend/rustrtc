@@ -1,4 +1,6 @@
 use super::*;
+use super::{bail, dtls_err};
+use crate::platform::crypto;
 use crate::transports::PacketReceiver;
 use crate::transports::ice::IceSocketWrapper;
 use bytes::Bytes;
@@ -36,10 +38,13 @@ async fn wait_for_terminal_state(dtls: &Arc<DtlsTransport>) -> Result<DtlsState>
 
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            return Err(anyhow::anyhow!("timed out waiting for DTLS terminal state"));
+            return Err(dtls_err!("timed out waiting for DTLS terminal state"));
         }
 
-        tokio::time::timeout(deadline - now, state_rx.changed()).await??;
+        tokio::time::timeout(deadline - now, state_rx.changed())
+            .await
+            .map_err(|e| dtls_err!("timed out waiting for DTLS terminal state: {e}"))?
+            .map_err(|e| dtls_err!("DTLS state watch closed: {e}"))?;
     }
 }
 
@@ -317,13 +322,9 @@ async fn test_dtls_handshake_fails_on_fingerprint_mismatch() -> Result<()> {
 #[test]
 fn test_verify_server_key_exchange_signature_rejects_tampering() -> Result<()> {
     let certificate = generate_certificate()?;
-    let signing_key = certificate.dtls_signing_key.as_ref().unwrap().clone();
-    let secret = EphemeralSecret::random(&mut OsRng);
-    let public_key = secret
-        .public_key()
-        .to_encoded_point(false)
-        .as_bytes()
-        .to_vec();
+    let signing_key =
+        crypto::crypto().signing_key_from_pkcs8_der(&certificate.private_key_pkcs8)?;
+    let (public_key, _secret) = crypto::crypto().ecdh_generate()?;
     let client_random = Random::new().to_bytes();
     let server_random = Random::new().to_bytes();
 
@@ -335,12 +336,12 @@ fn test_verify_server_key_exchange_signature_rejects_tampering() -> Result<()> {
     signed_params.push(public_key.len() as u8);
     signed_params.extend_from_slice(&public_key);
 
-    let signature: p256::ecdsa::Signature = signing_key.sign_with_rng(&mut OsRng, &signed_params);
+    let signature_bytes = signing_key.sign(&signed_params)?;
     let server_key_exchange = ServerKeyExchange {
         curve_type: 3,
         named_curve: 23,
         public_key: public_key.clone(),
-        signature: signature.to_der().as_bytes().to_vec(),
+        signature: signature_bytes,
     };
 
     verify_server_key_exchange_signature(
@@ -475,7 +476,9 @@ async fn test_dtls_exits_when_ice_socket_cleared() -> Result<()> {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // Simulate ICE stopping — the selected socket goes to None.
-    socket_tx.send(None)?;
+    socket_tx
+        .send(None)
+        .map_err(|e| dtls_err!("socket watch send failed: {e}"))?;
 
     // The task must exit (not spin forever).  If the fix is missing it will
     // hang indefinitely and the timeout below will fire.
@@ -579,7 +582,9 @@ async fn test_dtls_exits_after_connected_when_ice_socket_cleared() -> Result<()>
     ));
 
     // Simulate ICE stopping on the client side.
-    client_socket_tx.send(None)?;
+    client_socket_tx
+        .send(None)
+        .map_err(|e| dtls_err!("socket watch send failed: {e}"))?;
 
     // The client DTLS task must transition to Closed and exit.
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), client_task).await;
@@ -700,8 +705,8 @@ async fn send_and_collect_records(
         );
         let record = tokio::time::timeout(std::time::Duration::from_secs(5), server_rx.recv())
             .await
-            .map_err(|_| anyhow::anyhow!("record recv timeout"))?
-            .ok_or_else(|| anyhow::anyhow!("DTLS channel closed"))?;
+            .map_err(|_| dtls_err!("record recv timeout"))?
+            .ok_or_else(|| dtls_err!("DTLS channel closed"))?;
         record_count += 1;
         assert!(
             record.len() <= MAX_APP_DATA_RECORD_SIZE,
@@ -940,7 +945,7 @@ async fn server_handle_client_hello(
         body: body.freeze(),
     };
 
-    let mut ctx = HandshakeContext::new(None);
+    let mut ctx = HandshakeContext::new(None).unwrap();
     let certificate = generate_certificate()?;
     server_dtls
         .inner
@@ -1242,7 +1247,7 @@ async fn client_transport_for_handling() -> Result<Arc<DtlsTransport>> {
 #[tokio::test]
 async fn client_rejects_server_hello_with_unsupported_suite() -> Result<()> {
     let dtls = client_transport_for_handling().await?;
-    let mut ctx = HandshakeContext::new(None);
+    let mut ctx = HandshakeContext::new(None).unwrap();
     let res = dtls
         .inner
         .handle_server_hello(server_hello_message(0xC02F), &mut ctx, true);
@@ -1261,7 +1266,7 @@ async fn client_rejects_server_hello_with_unsupported_suite() -> Result<()> {
 #[tokio::test]
 async fn client_accepts_server_hello_with_supported_suite() -> Result<()> {
     let dtls = client_transport_for_handling().await?;
-    let mut ctx = HandshakeContext::new(None);
+    let mut ctx = HandshakeContext::new(None).unwrap();
     dtls.inner
         .handle_server_hello(server_hello_message(0xC02B), &mut ctx, true)?;
     assert!(ctx.server_random.is_some(), "ServerHello state recorded");
@@ -1296,7 +1301,7 @@ async fn client_processes_reordered_server_flight() -> Result<()> {
     certificate.encode(&mut payload);
     server_hello.encode(&mut payload);
 
-    let mut ctx = HandshakeContext::new(None);
+    let mut ctx = HandshakeContext::new(None).unwrap();
     dtls.inner
         .process_handshake_payload(payload.freeze(), &mut ctx, &own_cert, true)
         .await?;

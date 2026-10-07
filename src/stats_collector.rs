@@ -10,6 +10,8 @@ use core::sync::atomic::Ordering;
 use core::time::Duration;
 use serde_json::json;
 
+#[cfg(not(feature = "std"))]
+use crate::platform::time::Instant as RttInstant;
 /// Clock for `sent_sr_times` (RTT from LSR/DLSR, RFC 3550 §6.4.1).
 ///
 /// The platform `Instant` is wall-clock milliseconds, which quantizes a
@@ -18,8 +20,6 @@ use serde_json::json;
 /// yet (WP3), where `elapsed()` stays zero so RTT samples remain unset.
 #[cfg(feature = "std")]
 use std::time::Instant as RttInstant;
-#[cfg(not(feature = "std"))]
-use crate::platform::time::Instant as RttInstant;
 
 /// Entries in `sent_sr_times` older than this are stale for RTT computation and
 /// eligible for eviction (prevents unbounded growth over long calls).

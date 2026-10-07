@@ -12,6 +12,13 @@
 
 pub mod net;
 
+/// Crypto seam for the DTLS transport (ECDSA-P256 + ECDH-P256). Backends:
+/// the built-in p256 reference (`crypto-p256` feature) or an injected
+/// implementation (`crypto::set_crypto`) — e.g. hardware-accelerated.
+pub mod crypto;
+#[cfg(feature = "crypto-p256")]
+pub mod crypto_p256;
+
 /// 64-bit atomic counters that degrade gracefully on targets without 64-bit
 /// atomics (ESP32-S3 etc.): backed by `AtomicU32`, values wrap at 2^32.
 pub mod atomic64 {
@@ -77,6 +84,18 @@ pub mod rng {
                 (*FILL_FN.lock()).expect("platform::rng: set_fill_fn not called before fill");
             fill(buf);
         }
+    }
+
+    // getrandom's "custom" backend requires this symbol on targets without an
+    // OS implementation (xtensa). Route into the platform RNG seam so any
+    // accidental rand_core::OsRng use stays CSPRNG-backed instead of failing
+    // to link.
+    #[cfg(target_arch = "xtensa")]
+    #[unsafe(no_mangle)]
+    unsafe fn __getrandom_custom(dest: *mut u8, len: usize) -> u32 {
+        let slice = unsafe { core::slice::from_raw_parts_mut(dest, len) };
+        fill(slice);
+        0
     }
 }
 
@@ -439,15 +458,19 @@ pub mod time {
         None
     }
 
-    /// no_std placeholder: runs a future without a real timeout. WP3 swaps
-    /// in `embassy_time::with_timeout`.
+    /// no_std: races the future against the injected sleep factory.
     #[cfg(not(feature = "std"))]
-    pub async fn with_timeout<F: core::future::Future>(
+    pub async fn with_timeout<F: Future>(
         dur: core::time::Duration,
         fut: F,
     ) -> core::result::Result<F::Output, ()> {
-        let _ = dur;
-        Ok(fut.await)
+        use crate::platform::select::{Either, select2};
+        let mut fut = core::pin::pin!(fut);
+        let timer = alloc::boxed::Box::pin(super::task::sleep(dur));
+        match select2(timer, &mut fut).await {
+            Either::A(_) => Err(()),
+            Either::B(out) => Ok(out),
+        }
     }
 
     /// std: tokio-backed timeout.
@@ -554,10 +577,30 @@ pub mod task {
         f(Box::new(fut));
     }
 
-    /// no_std placeholder sleep: pends forever. WP3 replaces this with
-    /// `embassy_time::Timer::after`.
-    pub async fn sleep(_dur: core::time::Duration) {
-        core::future::pending::<()>().await;
+    /// Injected timer factory: turns a duration into a sleep future driven
+    /// by the embedder's timer wheel (e.g. `embassy_time::Timer::after`).
+    /// Set once at boot via [`set_sleep_fn`].
+    type SleepFn = fn(core::time::Duration) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+
+    static SLEEP_FN: crate::platform::sync::Mutex<Option<SleepFn>> =
+        crate::platform::sync::Mutex::new(None);
+
+    /// Installs the sleep factory. Must be called before any timer use
+    /// (`sleep` / `Interval` / `time::with_timeout`).
+    pub fn set_sleep_fn(f: SleepFn) {
+        *SLEEP_FN.lock() = Some(f);
+    }
+
+    /// Waits at least `dur` through the injected timer factory. Panics if
+    /// the embedder never installed one (mirrors `platform::rng::fill`).
+    pub async fn sleep(dur: core::time::Duration) {
+        let fut = {
+            let f = SLEEP_FN
+                .lock()
+                .expect("platform::task::set_sleep_fn not called");
+            f(dur)
+        };
+        fut.await;
     }
 
     /// Yields once: pends a single poll with a self-wake so the executor
@@ -579,19 +622,27 @@ pub mod task {
         YieldNow(false).await;
     }
 
-    /// no_std placeholder ticker (WP3: embassy Ticker).
-    pub struct Interval;
+    /// Sequential ticker over the injected sleep factory: the first tick
+    /// waits `delay`, later ticks wait `period` after the previous tick
+    /// completes — so ticks never bunch up (implicit `Skip`).
+    pub struct Interval {
+        first: Option<core::time::Duration>,
+        period: core::time::Duration,
+    }
 
     impl Interval {
         pub async fn tick(&mut self) {
-            core::future::pending::<()>().await;
+            let dur = self.first.take().unwrap_or(self.period);
+            sleep(dur).await;
         }
 
-        /// no-op on the placeholder ticker (WP3 wires the embassy policy).
+        /// Accepted for tokio parity; sequential ticks already skip missed
+        /// intervals by construction.
         pub fn set_missed_tick_behavior(&mut self, _behavior: MissedTickBehavior) {}
     }
 
-    /// Missed-tick policy (tokio parity enum; placeholder accepts it).
+    /// Missed-tick policy (tokio parity enum; the sequential ticker
+    /// implicitly skips).
     #[derive(Debug, Clone, Copy)]
     pub enum MissedTickBehavior {
         Burst,
@@ -599,8 +650,12 @@ pub mod task {
         Skip,
     }
 
-    pub fn interval_after(_delay: core::time::Duration, _period: core::time::Duration) -> Interval {
-        Interval
+    /// Creates a ticker that fires `period` apart, first after `delay`.
+    pub fn interval_after(delay: core::time::Duration, period: core::time::Duration) -> Interval {
+        Interval {
+            first: Some(delay),
+            period,
+        }
     }
 }
 

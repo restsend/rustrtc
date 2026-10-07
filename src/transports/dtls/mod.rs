@@ -1,56 +1,67 @@
 pub mod handshake;
-#[cfg(test)]
+#[cfg(all(test, feature = "std", feature = "crypto-p256"))]
 mod interop_tests;
 pub mod record;
-#[cfg(test)]
+#[cfg(all(test, feature = "std", feature = "crypto-p256"))]
 mod security_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "std", feature = "crypto-p256"))]
 mod tests;
+pub mod x509_min;
 
+use crate::prelude::*;
 use aes_gcm::{
     Aes128Gcm, Nonce, Tag,
     aead::{Aead, AeadInPlace, KeyInit, Payload},
 };
-use anyhow::Result;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use core::fmt;
+use core::sync::atomic::{AtomicU16, Ordering};
 use hmac::{Hmac, Mac};
-use p256::ecdsa::signature::Verifier;
-use p256::ecdsa::{Signature, SigningKey, VerifyingKey, signature::RandomizedSigner};
-use p256::pkcs8::DecodePrivateKey;
-use p256::{
-    PublicKey,
-    ecdh::EphemeralSecret,
-    elliptic_curve::{rand_core::OsRng, sec1::ToEncodedPoint},
-};
-use parking_lot::Mutex;
+#[cfg(feature = "std")]
 use rcgen::generate_simple_self_signed;
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
-use tokio::sync::mpsc;
-use x509_parser::certificate::X509Certificate;
-use x509_parser::prelude::FromDer;
-use x509_parser::public_key::PublicKey as X509PublicKey;
 
 use self::handshake::{
     CertificateMessage, ClientHello, ClientKeyExchange, Finished, HandshakeMessage, HandshakeType,
     HelloVerifyRequest, Random, ServerHello, ServerHelloDone, ServerKeyExchange,
 };
 use self::record::{ContentType, DtlsRecord, ProtocolVersion};
+use crate::platform::atomic64::AtomicU64;
+use crate::platform::crypto::{self, EcdhSecret, SigningKey};
+use crate::platform::sync::{Mutex, Notify, mpsc, watch};
 use crate::transports::ice::conn::IceConn;
 use tracing::{debug, trace, warn};
 
+pub type Result<T> = core::result::Result<T, crate::errors::RtcError>;
+
+macro_rules! bail {
+    ($($arg:tt)*) => {
+        return Err(crate::errors::RtcError::Internal(alloc::format!($($arg)*)))
+    };
+}
+pub(crate) use bail;
+
+macro_rules! dtls_err {
+    ($($arg:tt)*) => {
+        crate::errors::RtcError::Internal(alloc::format!($($arg)*))
+    };
+}
+pub(crate) use dtls_err;
+
 /// Generate a fresh self-signed DTLS certificate (EC keypair + PEM round-trip).
+/// std-only: certificate *generation* needs rcgen. Embedded targets load a
+/// pre-provisioned DER cert + PKCS#8 key via [`Certificate::from_pkcs8_der`].
+#[cfg(feature = "std")]
 pub fn generate_certificate() -> Result<Certificate> {
-    let cert = generate_simple_self_signed(vec!["localhost".to_string()])?;
-    let pem = cert.signing_key.serialize_pem();
-    let signing_key = SigningKey::from_pkcs8_pem(&pem).ok().map(Arc::new);
+    let cert = generate_simple_self_signed(vec!["localhost".to_string()])
+        .map_err(|e| dtls_err!("failed to generate DTLS certificate: {}", e))?;
+    let key_der = cert.signing_key.serialize_der();
+    // Validate through the active crypto backend.
+    crypto::crypto().signing_key_from_pkcs8_der(&key_der)?;
 
     Ok(Certificate {
         certificate: vec![cert.cert.der().to_vec()],
-        private_key: pem,
-        dtls_signing_key: signing_key,
+        private_key_pkcs8: key_der,
     })
 }
 
@@ -69,21 +80,9 @@ pub(crate) fn fingerprint_from_der(certificate_der: &[u8]) -> String {
         .join(":")
 }
 
-fn certificate_public_key(certificate_der: &[u8]) -> Result<VerifyingKey> {
-    let (_, certificate) = X509Certificate::from_der(certificate_der)
-        .map_err(|e| anyhow::anyhow!("Failed to parse DTLS certificate: {:?}", e))?;
-
-    match certificate
-        .public_key()
-        .parsed()
-        .map_err(|e| anyhow::anyhow!("Failed to parse certificate public key: {:?}", e))?
-    {
-        X509PublicKey::EC(point) => VerifyingKey::from_sec1_bytes(point.data())
-            .map_err(|e| anyhow::anyhow!("Unsupported DTLS certificate EC key: {}", e)),
-        _ => Err(anyhow::anyhow!(
-            "Unsupported DTLS certificate public key algorithm"
-        )),
-    }
+fn certificate_public_key(certificate_der: &[u8]) -> Result<Box<dyn crypto::VerifyingKey>> {
+    let point = x509_min::extract_p256_point(certificate_der)?;
+    crypto::crypto().verifying_key_from_point(&point)
 }
 
 pub(crate) fn verify_server_key_exchange_signature(
@@ -94,15 +93,13 @@ pub(crate) fn verify_server_key_exchange_signature(
 ) -> Result<()> {
     let pk_len = server_key_exchange.public_key.len();
     if pk_len > 255 {
-        return Err(anyhow::anyhow!(
+        return Err(dtls_err!(
             "ServerKeyExchange public key too long: {} bytes",
             pk_len
         ));
     }
 
     let verifying_key = certificate_public_key(certificate_der)?;
-    let signature = Signature::from_der(&server_key_exchange.signature)
-        .map_err(|e| anyhow::anyhow!("Invalid ServerKeyExchange signature format: {}", e))?;
 
     let mut signed_params =
         Vec::with_capacity(client_random.len() + server_random.len() + 4 + pk_len);
@@ -114,8 +111,8 @@ pub(crate) fn verify_server_key_exchange_signature(
     signed_params.extend_from_slice(&server_key_exchange.public_key);
 
     verifying_key
-        .verify(&signed_params, &signature)
-        .map_err(|e| anyhow::anyhow!("ServerKeyExchange signature verification failed: {}", e))
+        .verify(&signed_params, &server_key_exchange.signature)
+        .map_err(|e| dtls_err!("ServerKeyExchange signature verification failed: {}", e))
 }
 
 pub fn get_client_hello_extensions() -> Vec<u8> {
@@ -157,8 +154,20 @@ pub fn get_client_hello_cipher_suites() -> Vec<u16> {
 #[derive(Clone, Default)]
 pub struct Certificate {
     pub certificate: Vec<Vec<u8>>,
-    pub private_key: String, // PEM encoded key
-    pub(crate) dtls_signing_key: Option<Arc<SigningKey>>,
+    pub private_key_pkcs8: Vec<u8>, // PKCS#8 DER
+}
+
+impl Certificate {
+    /// Pre-provisioned DER leaf certificate + PKCS#8 DER private key
+    /// (no_std-friendly; no certificate generation involved).
+    pub fn from_pkcs8_der(certificate_der: Vec<u8>, private_key_pkcs8: Vec<u8>) -> Result<Self> {
+        // Validate the key through the active crypto backend.
+        crypto::crypto().signing_key_from_pkcs8_der(&private_key_pkcs8)?;
+        Ok(Self {
+            certificate: vec![certificate_der],
+            private_key_pkcs8,
+        })
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -175,8 +184,8 @@ pub struct SessionKeys {
 struct DtlsInner {
     conn: Arc<IceConn>,
     state: Arc<Mutex<DtlsState>>,
-    state_tx: tokio::sync::watch::Sender<DtlsState>,
-    state_rx: tokio::sync::watch::Receiver<DtlsState>,
+    state_tx: watch::Sender<DtlsState>,
+    state_rx: watch::Receiver<DtlsState>,
     handshake_rx_feeder: mpsc::UnboundedSender<Bytes>,
     write_seq: AtomicU64,
     write_epoch: AtomicU16,
@@ -189,9 +198,9 @@ struct DtlsInner {
 /// task exits — preventing infinite retransmit loops when the peer never
 /// responds.
 #[cfg(not(test))]
-const DTLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const DTLS_HANDSHAKE_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(30);
 #[cfg(test)]
-const DTLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const DTLS_HANDSHAKE_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(5);
 
 /// Maximum plaintext payload carried in a single DTLS ApplicationData record.
 ///
@@ -211,7 +220,7 @@ pub const MAX_APP_DATA_RECORD_SIZE: usize = 1200;
 
 pub struct DtlsTransport {
     inner: Arc<DtlsInner>,
-    close_tx: Arc<tokio::sync::Notify>,
+    close_tx: Arc<Notify>,
 }
 
 #[derive(Clone)]
@@ -262,11 +271,11 @@ impl DtlsTransport {
     ) -> Result<(
         Arc<Self>,
         mpsc::UnboundedReceiver<Bytes>,
-        impl std::future::Future<Output = ()> + Send,
+        impl core::future::Future<Output = ()> + Send,
     )> {
         let (incoming_data_tx, incoming_data_rx) = mpsc::unbounded_channel();
         let (handshake_rx_feeder, handshake_rx) = mpsc::unbounded_channel();
-        let (state_tx, state_rx) = tokio::sync::watch::channel(DtlsState::New);
+        let (state_tx, state_rx) = watch::channel(DtlsState::New);
 
         let inner = Arc::new(DtlsInner {
             conn: conn.clone(),
@@ -280,7 +289,7 @@ impl DtlsTransport {
             expected_remote_fingerprint,
         });
 
-        let close_tx = Arc::new(tokio::sync::Notify::new());
+        let close_tx = Arc::new(Notify::new());
         let close_rx = close_tx.clone();
 
         let transport = Arc::new(Self {
@@ -306,7 +315,7 @@ impl DtlsTransport {
                 debug!(
                     label = inner_clone.conn.label.as_deref().unwrap_or("-"),
                     "DTLS handshake failed: {e} (remote={})",
-                    inner_clone.conn.remote_addr.read()
+                    (*inner_clone.conn.remote_addr.read())
                 );
                 *inner_clone.state.lock() = DtlsState::Failed;
                 let _ = inner_clone.state_tx.send(DtlsState::Failed);
@@ -317,7 +326,7 @@ impl DtlsTransport {
         Ok((transport, incoming_data_rx, runner))
     }
 
-    pub fn subscribe_state(&self) -> tokio::sync::watch::Receiver<DtlsState> {
+    pub fn subscribe_state(&self) -> watch::Receiver<DtlsState> {
         self.inner.state_rx.clone()
     }
 
@@ -331,7 +340,7 @@ impl DtlsTransport {
             if let DtlsState::Connected(crypto, _) = &*state_guard {
                 crypto.clone()
             } else {
-                return Err(anyhow::anyhow!("DTLS not connected"));
+                return Err(dtls_err!("DTLS not connected"));
             }
         };
 
@@ -409,7 +418,7 @@ impl DtlsTransport {
                 &aad,
                 &mut buf[payload_offset..payload_offset + payload_len],
             )
-            .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
+            .map_err(|e| dtls_err!("Encryption failed: {}", e))?;
 
         // 5. Append Tag
         buf.put_slice(&tag);
@@ -419,7 +428,7 @@ impl DtlsTransport {
             .send(&buf)
             .await
             .map(|_| ())
-            .map_err(|e| anyhow::anyhow!("Send failed: {}", e))
+            .map_err(|e| dtls_err!("Send failed: {}", e))
     }
 
     pub fn export_keying_material(&self, label: &str, len: usize) -> Result<Vec<u8>> {
@@ -433,7 +442,7 @@ impl DtlsTransport {
             .concat();
             prf_sha256(&crypto.keys.master_secret, label.as_bytes(), &seed, len)
         } else {
-            Err(anyhow::anyhow!("DTLS not connected"))
+            Err(dtls_err!("DTLS not connected"))
         }
     }
 }
@@ -542,7 +551,7 @@ impl DtlsInner {
                         record.version,
                         record.payload.len()
                     );
-                    Err(anyhow::anyhow!("Decryption failed: {}", e))
+                    Err(dtls_err!("Decryption failed: {}", e))
                 }
             }
         } else if let Some(keys) = &ctx.session_keys {
@@ -570,13 +579,11 @@ impl DtlsInner {
                         record.version,
                         record.payload.len()
                     );
-                    Err(anyhow::anyhow!("Decryption failed: {}", e))
+                    Err(dtls_err!("Decryption failed: {}", e))
                 }
             }
         } else {
-            Err(anyhow::anyhow!(
-                "Received encrypted record but no keys available"
-            ))
+            Err(dtls_err!("Received encrypted record but no keys available"))
         }
     }
 
@@ -852,7 +859,7 @@ impl DtlsInner {
         let Some(leaf_certificate) = certificate.certificates.first() else {
             *self.state.lock() = DtlsState::Failed;
             let _ = self.state_tx.send(DtlsState::Failed);
-            return Err(anyhow::anyhow!(
+            return Err(dtls_err!(
                 "DTLS certificate message did not contain a leaf certificate"
             ));
         };
@@ -864,7 +871,7 @@ impl DtlsInner {
         {
             *self.state.lock() = DtlsState::Failed;
             let _ = self.state_tx.send(DtlsState::Failed);
-            return Err(anyhow::anyhow!(
+            return Err(dtls_err!(
                 "DTLS fingerprint mismatch: expected {}, got {}",
                 expected_fingerprint,
                 actual_fingerprint
@@ -1019,7 +1026,7 @@ impl DtlsInner {
 
         // Generate new Session ID to force full handshake
         let mut session_id = vec![0u8; 32];
-        rand::fill(&mut session_id[..]);
+        crate::platform::rng::fill(&mut session_id[..]);
 
         // Negotiate the cipher suite instead of blindly echoing a fixed one.
         // This stack implements exactly TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
@@ -1038,7 +1045,7 @@ impl DtlsInner {
                 self.send_handshake_failure_alert(ctx).await;
                 *self.state.lock() = DtlsState::Failed;
                 let _ = self.state_tx.send(DtlsState::Failed);
-                anyhow::bail!("ClientHello offers no supported cipher suite (need 0xC02B)");
+                bail!("ClientHello offers no supported cipher suite (need 0xC02B)");
             }
         };
 
@@ -1118,19 +1125,14 @@ impl DtlsInner {
         params.push(ctx.local_public_key_bytes.len() as u8);
         params.extend_from_slice(&ctx.local_public_key_bytes);
 
-        let signing_key = if let Some(k) = &certificate.dtls_signing_key {
-            k.clone()
-        } else {
-            Arc::new(
-                SigningKey::from_pkcs8_pem(&certificate.private_key)
-                    .map_err(|e| anyhow::anyhow!("Failed to parse private key: {}", e))?,
-            )
-        };
-        let signature: p256::ecdsa::Signature = signing_key.sign_with_rng(&mut OsRng, &params);
-        let signature_bytes = signature.to_der().as_bytes().to_vec();
-        // Self-verification
-        let verifying_key = signing_key.verifying_key();
-        if let Err(e) = verifying_key.verify(&params, &signature) {
+        let signing_key =
+            crypto::crypto().signing_key_from_pkcs8_der(&certificate.private_key_pkcs8)?;
+        let signature_bytes = signing_key.sign(&params)?;
+        // Self-verification (sign/verify round-trip through the backend)
+        if let Err(e) = signing_key
+            .verifying_key()
+            .and_then(|vk| vk.verify(&params, &signature_bytes))
+        {
             warn!("SELF-VERIFICATION FAILED: {}", e);
         }
 
@@ -1240,15 +1242,13 @@ impl DtlsInner {
             return Ok(());
         };
 
-        let pk = match PublicKey::from_sec1_bytes(peer_key) {
-            Ok(pk) => pk,
+        let shared_secret = match secret.shared_secret(peer_key) {
+            Ok(s) => s,
             Err(_) => {
-                warn!("Failed to parse peer public key");
+                warn!("Failed to compute ECDH shared secret");
                 return Ok(());
             }
         };
-
-        let shared_secret = secret.diffie_hellman(&pk);
         trace!("Shared secret computed (Server)");
 
         let (cr, sr) = match (&ctx.client_random, &ctx.server_random) {
@@ -1256,7 +1256,7 @@ impl DtlsInner {
             _ => return Ok(()),
         };
 
-        let pre_master_secret = shared_secret.raw_secret_bytes();
+        let pre_master_secret = &shared_secret;
         let mut seed = Vec::new();
         seed.extend_from_slice(cr);
         seed.extend_from_slice(sr);
@@ -1323,7 +1323,7 @@ impl DtlsInner {
                         expected_verify_data, finished.verify_data
                     );
                     *self.state.lock() = DtlsState::Failed;
-                    return Err(anyhow::anyhow!("Finished verification failed"));
+                    return Err(dtls_err!("Finished verification failed"));
                 } else {
                     trace!("Client Finished verified");
                 }
@@ -1400,14 +1400,14 @@ impl DtlsInner {
                 debug!(
                     label = self.conn.label.as_deref().unwrap_or("-"),
                     "DTLS handshake complete (server role) (remote={})",
-                    self.conn.remote_addr.read()
+                    (*self.conn.remote_addr.read())
                 );
                 // Clear ephemeral secret as handshake is complete
                 ctx.local_secret = None;
             } else {
                 *self.state.lock() = DtlsState::Failed;
                 let _ = self.state_tx.send(DtlsState::Failed);
-                return Err(anyhow::anyhow!("Session keys not derived"));
+                return Err(dtls_err!("Session keys not derived"));
             }
         } else {
             // Client logic: Verify Finished
@@ -1424,7 +1424,7 @@ impl DtlsInner {
                         expected_verify_data, finished.verify_data
                     );
                     *self.state.lock() = DtlsState::Failed;
-                    return Err(anyhow::anyhow!("Finished verification failed"));
+                    return Err(dtls_err!("Finished verification failed"));
                 } else {
                     if let Some(keys) = &ctx.session_keys {
                         let crypto = create_session_crypto(keys.clone())?;
@@ -1437,7 +1437,7 @@ impl DtlsInner {
                         debug!(
                             label = self.conn.label.as_deref().unwrap_or("-"),
                             "DTLS handshake complete (client role) (remote={})",
-                            self.conn.remote_addr.read()
+                            (*self.conn.remote_addr.read())
                         );
                         ctx.local_secret = None;
                     }
@@ -1555,7 +1555,7 @@ impl DtlsInner {
             );
             *self.state.lock() = DtlsState::Failed;
             let _ = self.state_tx.send(DtlsState::Failed);
-            anyhow::bail!(
+            bail!(
                 "ServerHello negotiated unsupported cipher suite {:#06x} (expected {:#06x})",
                 server_hello.cipher_suite,
                 SUPPORTED_CIPHER_SUITE
@@ -1606,7 +1606,7 @@ impl DtlsInner {
                 let Some(peer_certificate) = ctx.peer_certificate.as_deref() else {
                     *self.state.lock() = DtlsState::Failed;
                     let _ = self.state_tx.send(DtlsState::Failed);
-                    return Err(anyhow::anyhow!(
+                    return Err(dtls_err!(
                         "Received ServerKeyExchange before a verifiable DTLS certificate"
                     ));
                 };
@@ -1615,7 +1615,7 @@ impl DtlsInner {
                 else {
                     *self.state.lock() = DtlsState::Failed;
                     let _ = self.state_tx.send(DtlsState::Failed);
-                    return Err(anyhow::anyhow!(
+                    return Err(dtls_err!(
                         "Missing DTLS random values for ServerKeyExchange verification"
                     ));
                 };
@@ -1649,7 +1649,7 @@ impl DtlsInner {
         if is_client && !ctx.server_key_exchange_verified {
             *self.state.lock() = DtlsState::Failed;
             let _ = self.state_tx.send(DtlsState::Failed);
-            return Err(anyhow::anyhow!(
+            return Err(dtls_err!(
                 "DTLS server identity was not verified before ServerHelloDone"
             ));
         }
@@ -1700,22 +1700,20 @@ impl DtlsInner {
             return Ok(());
         };
 
-        let pk = match PublicKey::from_sec1_bytes(peer_key) {
-            Ok(pk) => pk,
+        let shared_secret = match secret.shared_secret(peer_key) {
+            Ok(s) => s,
             Err(_) => {
-                warn!("Failed to parse peer public key");
+                warn!("Failed to compute ECDH shared secret");
                 return Ok(());
             }
         };
-
-        let shared_secret = secret.diffie_hellman(&pk);
 
         let (cr, sr) = match (&ctx.client_random, &ctx.server_random) {
             (Some(cr), Some(sr)) => (cr, sr),
             _ => return Ok(()),
         };
 
-        let pre_master_secret = shared_secret.raw_secret_bytes();
+        let pre_master_secret = &shared_secret;
         let mut seed = Vec::new();
         seed.extend_from_slice(cr);
         seed.extend_from_slice(sr);
@@ -1805,19 +1803,20 @@ impl DtlsInner {
         is_client: bool,
         incoming_data_tx: mpsc::UnboundedSender<Bytes>,
         mut handshake_rx: mpsc::UnboundedReceiver<Bytes>,
-        close_rx: Arc<tokio::sync::Notify>,
+        close_rx: Arc<Notify>,
     ) -> Result<()> {
         *self.state.lock() = DtlsState::Handshaking;
         let _ = self.state_tx.send(DtlsState::Handshaking);
 
-        let mut ctx = HandshakeContext::new(self.expected_remote_fingerprint.clone());
+        let mut ctx = HandshakeContext::new(self.expected_remote_fingerprint.clone())?;
 
         // Retransmission state
-        let mut retransmit_interval = tokio::time::interval_at(
-            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
-            std::time::Duration::from_secs(1),
+        let mut retransmit_interval = crate::platform::task::interval_after(
+            core::time::Duration::from_secs(1),
+            core::time::Duration::from_secs(1),
         );
-        retransmit_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        retransmit_interval
+            .set_missed_tick_behavior(crate::platform::task::MissedTickBehavior::Skip);
 
         // Watch the ICE socket so we can detect peer disappearance immediately
         // rather than spinning on retransmits forever.
@@ -1825,9 +1824,7 @@ impl DtlsInner {
 
         // Handshake deadline — prevents the task from living forever if the peer
         // never responds.  Once `Connected` the deadline is disabled.
-        let handshake_deadline = tokio::time::Instant::now() + DTLS_HANDSHAKE_TIMEOUT;
-        let handshake_timeout = tokio::time::sleep_until(handshake_deadline);
-        tokio::pin!(handshake_timeout);
+        let handshake_deadline = crate::platform::time::Instant::now() + DTLS_HANDSHAKE_TIMEOUT;
 
         if is_client {
             // Send ClientHello
@@ -1891,7 +1888,7 @@ impl DtlsInner {
                     warn!("ICE socket closed during DTLS handshake — aborting");
                     *self.state.lock() = DtlsState::Failed;
                     let _ = self.state_tx.send(DtlsState::Failed);
-                    return Err(anyhow::anyhow!("ICE socket closed during DTLS handshake"));
+                    return Err(dtls_err!("ICE socket closed during DTLS handshake"));
                 } else {
                     debug!("ICE socket closed after DTLS connected — closing transport");
                     *self.state.lock() = DtlsState::Closed;
@@ -1900,8 +1897,28 @@ impl DtlsInner {
                 }
             }
 
-            tokio::select! {
-                _ = close_rx.notified() => {
+            // Seam select4 takes Unpin futures; pin each arm per iteration.
+            // The conditional timeout arm becomes Either(sleep, pending):
+            // it only races while the handshake is still in progress.
+            let mut s_close = core::pin::pin!(close_rx.notified());
+            let s_timeout = if matches!(*self.state.lock(), DtlsState::Handshaking) {
+                crate::platform::select::Either::A(core::pin::pin!(crate::platform::task::sleep(
+                    handshake_deadline.duration_since(crate::platform::time::Instant::now())
+                )))
+            } else {
+                crate::platform::select::Either::B(core::future::pending::<()>())
+            };
+            let mut s_tick = core::pin::pin!(retransmit_interval.tick());
+            let mut s_recv = core::pin::pin!(handshake_rx.recv());
+            match crate::platform::select::select4(
+                s_close.as_mut(),
+                s_timeout,
+                s_tick.as_mut(),
+                s_recv.as_mut(),
+            )
+            .await
+            {
+                crate::platform::select::Which4::A(_) => {
                     // Send CloseNotify
                     if let Some(keys) = &ctx.session_keys {
                         let alert = vec![1, 0]; // Level: Warning (1), Description: CloseNotify (0)
@@ -1917,7 +1934,7 @@ impl DtlsInner {
                             full_seq,
                             &alert,
                             key,
-                            iv
+                            iv,
                         ) {
                             let record = DtlsRecord {
                                 content_type: ContentType::Alert,
@@ -1934,24 +1951,38 @@ impl DtlsInner {
                     return Ok(());
                 }
                 // Handshake timeout — abort if the peer never responds.
-                _ = &mut handshake_timeout, if matches!(*self.state.lock(), DtlsState::Handshaking) => {
-                    debug!(label = self.conn.label.as_deref().unwrap_or("-"), "DTLS handshake timed out after {}s — aborting (remote={})", DTLS_HANDSHAKE_TIMEOUT.as_secs(), self.conn.remote_addr.read());
+                crate::platform::select::Which4::B(_) => {
+                    debug!(
+                        label = self.conn.label.as_deref().unwrap_or("-"),
+                        "DTLS handshake timed out after {}s — aborting (remote={})",
+                        DTLS_HANDSHAKE_TIMEOUT.as_secs(),
+                        (*self.conn.remote_addr.read())
+                    );
                     *self.state.lock() = DtlsState::Failed;
                     let _ = self.state_tx.send(DtlsState::Failed);
-                    return Err(anyhow::anyhow!(
+                    return Err(dtls_err!(
                         "DTLS handshake timed out after {}s",
                         DTLS_HANDSHAKE_TIMEOUT.as_secs()
                     ));
                 }
-                _ = retransmit_interval.tick() => {
+                crate::platform::select::Which4::C(_) => {
                     self.handle_retransmit(&ctx, is_client).await;
                 }
-                packet = handshake_rx.recv() => {
+                crate::platform::select::Which4::D(packet) => {
                     let Some(packet) = packet else {
                         debug!("DTLS handshake feeder closed — exiting loop");
                         return Ok(());
                     };
-                    if let Err(e) = self.handle_incoming_packet(packet, &mut ctx, &incoming_data_tx, &certificate, is_client).await {
+                    if let Err(e) = self
+                        .handle_incoming_packet(
+                            packet,
+                            &mut ctx,
+                            &incoming_data_tx,
+                            &certificate,
+                            is_client,
+                        )
+                        .await
+                    {
                         warn!("DTLS handshake loop error in handle_incoming_packet: {}", e);
                         // Bad records can be ignored, but once verification has
                         // marked the transport as failed we should stop retrying.
@@ -2035,7 +2066,7 @@ impl DtlsInner {
             } else {
                 warn!("Failed to send DTLS record: {}", e);
             }
-            return Err(anyhow::Error::from(e));
+            return Err(e);
         }
 
         Ok(buf.to_vec())
@@ -2052,7 +2083,7 @@ impl Clone for DtlsTransport {
 }
 
 use crate::transports::PacketReceiver;
-use std::net::SocketAddr;
+use core::net::SocketAddr;
 
 #[async_trait::async_trait]
 impl PacketReceiver for DtlsTransport {
@@ -2071,7 +2102,7 @@ fn prf_sha256(secret: &[u8], label: &[u8], seed: &[u8], output_length: usize) ->
 
     let mut a = real_seed.clone();
     let mac_prototype = <Hmac<Sha256> as hmac::digest::KeyInit>::new_from_slice(secret)
-        .map_err(|_| anyhow::anyhow!("Invalid key length"))?;
+        .map_err(|_| dtls_err!("Invalid key length"))?;
 
     while output.len() < output_length {
         let mut mac = mac_prototype.clone();
@@ -2083,7 +2114,7 @@ fn prf_sha256(secret: &[u8], label: &[u8], seed: &[u8], output_length: usize) ->
         mac.update(&real_seed);
         let block = mac.finalize().into_bytes();
 
-        let len = std::cmp::min(block.len(), output_length - output.len());
+        let len = core::cmp::min(block.len(), output_length - output.len());
         output.extend_from_slice(&block[..len]);
     }
 
@@ -2122,9 +2153,9 @@ fn expand_keys(
 
 fn create_session_crypto(keys: SessionKeys) -> Result<SessionCrypto> {
     let client_write_cipher = Aes128Gcm::new_from_slice(&keys.client_write_key)
-        .map_err(|_| anyhow::anyhow!("Invalid key length"))?;
+        .map_err(|_| dtls_err!("Invalid key length"))?;
     let server_write_cipher = Aes128Gcm::new_from_slice(&keys.server_write_key)
-        .map_err(|_| anyhow::anyhow!("Invalid key length"))?;
+        .map_err(|_| dtls_err!("Invalid key length"))?;
     Ok(SessionCrypto {
         keys,
         client_write_cipher,
@@ -2168,7 +2199,7 @@ fn decrypt_record_with_cipher(
     iv: &[u8],
 ) -> Result<Bytes> {
     if payload.len() < 8 + 16 {
-        return Err(anyhow::anyhow!("Record too short"));
+        return Err(dtls_err!("Record too short"));
     }
 
     let explicit_nonce = &payload[0..8];
@@ -2190,7 +2221,7 @@ fn decrypt_record_with_cipher(
 
     cipher
         .decrypt_in_place_detached(nonce, &aad, &mut buf, tag)
-        .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
+        .map_err(|e| dtls_err!("Decryption failed: {}", e))?;
 
     Ok(buf.freeze())
 }
@@ -2204,14 +2235,14 @@ fn decrypt_record(
     iv: &[u8],
 ) -> Result<Vec<u8>> {
     if payload.len() < 8 {
-        return Err(anyhow::anyhow!("Record too short for explicit nonce"));
+        return Err(dtls_err!("Record too short for explicit nonce"));
     }
 
     let explicit_nonce = &payload[0..8];
     let ciphertext = &payload[8..];
 
     if ciphertext.len() < 16 {
-        return Err(anyhow::anyhow!("Ciphertext too short for tag"));
+        return Err(dtls_err!("Ciphertext too short for tag"));
     }
 
     let mut nonce_bytes = [0u8; 12];
@@ -2219,8 +2250,7 @@ fn decrypt_record(
     nonce_bytes[4..12].copy_from_slice(explicit_nonce);
 
     let nonce = Nonce::from_slice(&nonce_bytes);
-    let cipher =
-        Aes128Gcm::new_from_slice(key).map_err(|_| anyhow::anyhow!("Invalid key length"))?;
+    let cipher = Aes128Gcm::new_from_slice(key).map_err(|_| dtls_err!("Invalid key length"))?;
 
     let plaintext_len = ciphertext.len() - 16;
     let aad = make_aad(seq, content_type, version, plaintext_len);
@@ -2233,7 +2263,7 @@ fn decrypt_record(
                 aad: &aad,
             },
         )
-        .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
+        .map_err(|e| dtls_err!("Decryption failed: {}", e))?;
 
     Ok(decrypted_payload)
 }
@@ -2251,8 +2281,7 @@ fn encrypt_record(
     nonce_bytes[4..12].copy_from_slice(&seq.to_be_bytes());
 
     let nonce = Nonce::from_slice(&nonce_bytes);
-    let cipher =
-        Aes128Gcm::new_from_slice(key).map_err(|_| anyhow::anyhow!("Invalid key length"))?;
+    let cipher = Aes128Gcm::new_from_slice(key).map_err(|_| dtls_err!("Invalid key length"))?;
 
     let aad = make_aad(seq, content_type, version, payload.len());
 
@@ -2262,7 +2291,7 @@ fn encrypt_record(
 
     let tag = cipher
         .encrypt_in_place_detached(nonce, &aad, &mut result[8..])
-        .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
+        .map_err(|e| dtls_err!("Encryption failed: {}", e))?;
 
     result.extend_from_slice(&tag);
 
@@ -2319,10 +2348,10 @@ impl HandshakeReassembly {
         body: &[u8],
     ) -> Result<Option<Vec<u8>>> {
         if total_length == 0 || total_length > MAX_HANDSHAKE_MESSAGE_LEN {
-            anyhow::bail!("handshake message total_length {total_length} out of range");
+            bail!("handshake message total_length {total_length} out of range");
         }
         if fragment_offset as usize + body.len() > total_length {
-            anyhow::bail!(
+            bail!(
                 "handshake fragment offset {} + len {} exceeds total_length {}",
                 fragment_offset,
                 body.len(),
@@ -2343,7 +2372,7 @@ impl HandshakeReassembly {
             // header length field is fixed per message, RFC 6347 §4.2.2); a
             // change is garbage or an attempt to churn allocations — reject
             // instead of silently reallocating.
-            anyhow::bail!(
+            bail!(
                 "handshake message_seq {message_seq} changed total_length {} -> {}",
                 self.total_length,
                 total_length
@@ -2372,7 +2401,7 @@ impl HandshakeReassembly {
             return Ok(None);
         }
 
-        let body = std::mem::take(&mut self.buf);
+        let body = core::mem::take(&mut self.buf);
         debug!(
             message_seq,
             total_length, "Handshake message reassembled from fragments"
@@ -2401,8 +2430,8 @@ struct HandshakeContext {
     /// (message_seq > expected), buffered per RFC 6347 §4.2.4 so reordered
     /// flights don't stall the handshake until retransmission. Bounded by
     /// [`MAX_PENDING_HANDSHAKE_MESSAGES`].
-    pending_messages: std::collections::BTreeMap<u16, (HandshakeMessage, Bytes)>,
-    local_secret: Option<EphemeralSecret>,
+    pending_messages: BTreeMap<u16, (HandshakeMessage, Bytes)>,
+    local_secret: Option<Box<dyn EcdhSecret>>,
     local_public_key_bytes: Vec<u8>,
     peer_public_key: Option<Vec<u8>>,
     peer_certificate: Option<Vec<u8>>,
@@ -2418,13 +2447,11 @@ struct HandshakeContext {
 }
 
 impl HandshakeContext {
-    fn new(expected_remote_fingerprint: Option<String>) -> Self {
+    fn new(expected_remote_fingerprint: Option<String>) -> Result<Self> {
         // Generate ephemeral key for ECDHE
-        let local_secret = EphemeralSecret::random(&mut OsRng);
-        let local_public = local_secret.public_key();
-        let local_public_key_bytes = local_public.to_encoded_point(false).as_bytes().to_vec();
+        let (local_public_key_bytes, local_secret) = crypto::crypto().ecdh_generate()?;
 
-        Self {
+        Ok(Self {
             sequence_number: 0,
             epoch: 0,
             read_epoch: 0,
@@ -2433,7 +2460,7 @@ impl HandshakeContext {
             post_hvr: false,
             last_flight_records: None,
             incomplete_fragments: HandshakeReassembly::default(),
-            pending_messages: std::collections::BTreeMap::new(),
+            pending_messages: BTreeMap::new(),
             local_secret: Some(local_secret),
             local_public_key_bytes,
             peer_public_key: None,
@@ -2447,6 +2474,6 @@ impl HandshakeContext {
             srtp_profile: None,
             expected_remote_fingerprint,
             server_key_exchange_verified: false,
-        }
+        })
     }
 }

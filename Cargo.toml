@@ -1,6 +1,6 @@
 [package]
 name = "rustrtc"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 repository = "https://github.com/restsend/rustrtc"
@@ -33,7 +33,7 @@ hmac = "0.13.0"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
 md5 = { package = "md-5", version = "0.11.0" }
-p256 = { version = "0.13.2", optional = true, features = ["ecdh", "std", "ecdsa", "pkcs8"] }
+p256 = { version = "0.13.2", optional = true, default-features = false, features = ["alloc", "ecdh", "ecdsa", "pkcs8"] }
 aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
 futures = { version = "0.3.32", default-features = false, features = ["alloc"] }
 crc32fast = { version = "1.5.0", default-features = false }
@@ -43,7 +43,6 @@ local-ip-address = { version = "0.6", optional = true }
 rand = { version = "0.10.1", optional = true }
 parking_lot = { version = "0.12", optional = true }
 socket2 = { version = "0.6", optional = true }
-x509-parser = { version = "0.18.1", optional = true }
 igd = { version = "0.12", optional = true, features = ["aio"] }
 rcgen = { version = "0.14.8", optional = true, default-features = false, features = [
     "pem",
@@ -98,16 +97,22 @@ std = [
     "dep:socket2",
     "dep:igd",
     "dep:rcgen",
-    "dep:x509-parser",
-    "dep:p256",
     "dep:crc32c",
     "dep:rand",
+    "crypto-p256",
+    "dtls",
     "bytes/std",
     "bytes/serde",
 ]
 simulator = []
 t38 = []
 t38-interop = []
+# Self-implemented DTLS transport (transports/dtls). Crypto goes through the
+# platform::crypto seam: enable `crypto-p256` for the pure-Rust backend or
+# inject one via platform::crypto::set_crypto (hardware-accelerated /
+# mbedtls-backed) — the p256 dependency chain then stays out of the build.
+dtls = []
+crypto-p256 = ["dep:p256"]
 
 # The T.38 benchmark imports `rustrtc::t38`, which only exists with the
 # feature enabled; without this gate plain `cargo test/build` fails on it.
