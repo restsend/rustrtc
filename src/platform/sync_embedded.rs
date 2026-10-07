@@ -330,7 +330,16 @@ pub struct Notify {
 
 struct NotifyState {
     permit: bool,
-    waiters: Vec<Waker>,
+    /// Registered waiters with their notification flag: `notify_one` marks
+    /// ONE entry notified (tokio parity) instead of relying on the waker —
+    /// a woken-but-not-yet-repolled future must still observe the
+    /// notification on its next poll.
+    waiters: Vec<NotifyWaiter>,
+}
+
+struct NotifyWaiter {
+    waker: Waker,
+    notified: bool,
 }
 
 impl Notify {
@@ -353,14 +362,27 @@ impl Notify {
                 state.permit = true;
                 return;
             }
-            woken = Some(state.waiters.remove(0));
+            // Mark the first waiter not yet notified (fairness); several
+            // entries may already carry the flag after notify_waiters.
+            let idx = state
+                .waiters
+                .iter()
+                .position(|w| !w.notified)
+                .unwrap_or(0);
+            state.waiters[idx].notified = true;
+            woken = Some(state.waiters[idx].waker.clone());
         }
         woken.unwrap().wake();
     }
 
     /// Wakes every currently registered waiter. Stores no permit.
     pub fn notify_waiters(&self) {
-        let woken = core::mem::take(&mut self.state.lock().waiters);
+        let mut state = self.state.lock();
+        for w in state.waiters.iter_mut() {
+            w.notified = true;
+        }
+        let woken: Vec<Waker> = state.waiters.iter().map(|w| w.waker.clone()).collect();
+        drop(state);
         for w in woken {
             w.wake();
         }
@@ -396,9 +418,25 @@ impl Future for NotifyNotified<'_> {
         // Re-poll replaces the stored waker (same task, same future) so a
         // long-lived loop does not accumulate stale entries; a different
         // waker means a genuinely distinct waiter and is appended.
-        match state.waiters.iter_mut().find(|w| w.will_wake(cx.waker())) {
-            Some(slot) => *slot = cx.waker().clone(),
-            None => state.waiters.push(cx.waker().clone()),
+        match state
+            .waiters
+            .iter_mut()
+            .find(|w| w.waker.will_wake(cx.waker()))
+        {
+            Some(slot) => {
+                if slot.notified {
+                    // This waiter was woken while the task was busy: the
+                    // notification is consumed here, not lost.
+                    slot.notified = false;
+                    drop(state);
+                    return Poll::Ready(());
+                }
+                slot.waker = cx.waker().clone();
+            }
+            None => state.waiters.push(NotifyWaiter {
+                waker: cx.waker().clone(),
+                notified: false,
+            }),
         }
         drop(state);
         Poll::Pending
@@ -421,12 +459,17 @@ struct WatchInner<T> {
 
 pub struct watch_Sender<T> {
     inner: Arc<WatchInner<T>>,
+    /// Live-sender count: the channel reports `Closed` only when the LAST
+    /// clone drops (tokio parity — `watch::Sender` is `Clone` here).
+    senders: Arc<AtomicUsize>,
 }
 
 impl<T> Clone for watch_Sender<T> {
     fn clone(&self) -> Self {
+        self.senders.fetch_add(1, Ordering::AcqRel);
         Self {
             inner: self.inner.clone(),
+            senders: self.senders.clone(),
         }
     }
 }
@@ -480,6 +523,7 @@ pub mod watch {
         (
             Sender {
                 inner: inner.clone(),
+                senders: Arc::new(core::sync::atomic::AtomicUsize::new(1)),
             },
             Receiver { inner },
         )
@@ -594,6 +638,10 @@ impl<'a, T> Future for watch_Changed<'a, T> {
 
 impl<T> Drop for watch_Sender<T> {
     fn drop(&mut self) {
+        // Only the LAST live clone closes the channel.
+        if self.senders.fetch_sub(1, Ordering::AcqRel) > 1 {
+            return;
+        }
         let mut state = self.inner.state.lock();
         state.sender_gone = true;
         let woken = core::mem::take(&mut state.wakers);
@@ -717,6 +765,8 @@ struct MpscState<T> {
 
 pub struct mpsc_UnboundedSender<T> {
     inner: Arc<Mutex<MpscState<T>>>,
+    /// Live-sender count: the channel closes when the LAST clone drops.
+    senders: Arc<AtomicUsize>,
 }
 
 pub struct mpsc_UnboundedReceiver<T> {
@@ -725,8 +775,10 @@ pub struct mpsc_UnboundedReceiver<T> {
 
 impl<T> Clone for mpsc_UnboundedSender<T> {
     fn clone(&self) -> Self {
+        self.senders.fetch_add(1, Ordering::AcqRel);
         Self {
             inner: self.inner.clone(),
+            senders: self.senders.clone(),
         }
     }
 }
@@ -755,6 +807,7 @@ pub mod mpsc {
         (
             UnboundedSender {
                 inner: inner.clone(),
+                senders: Arc::new(core::sync::atomic::AtomicUsize::new(1)),
             },
             UnboundedReceiver { inner },
         )
@@ -783,6 +836,10 @@ impl<T> mpsc_UnboundedSender<T> {
 
 impl<T> Drop for mpsc_UnboundedSender<T> {
     fn drop(&mut self) {
+        // Only the LAST live clone closes the channel.
+        if self.senders.fetch_sub(1, Ordering::AcqRel) > 1 {
+            return;
+        }
         let mut state = self.inner.lock();
         state.sender_gone = true;
         let woken = core::mem::take(&mut state.wakers);
@@ -841,6 +898,9 @@ struct BroadcastState<T> {
 
 pub struct broadcast_Sender<T> {
     inner: Arc<Mutex<BroadcastState<T>>>,
+    /// Live-sender count: the channel reports `Closed` once the LAST
+    /// sender clone drops (tokio parity).
+    senders: Arc<AtomicUsize>,
     /// Live receiver count (tokio `receiver_count` parity). Senders share
     /// the counter; only receiver creation/drop changes it.
     receivers: Arc<AtomicUsize>,
@@ -909,10 +969,12 @@ pub mod broadcast {
             wakers: Vec::new(),
             sender_gone: false,
         }));
+        let senders = Arc::new(AtomicUsize::new(1));
         let receivers = Arc::new(AtomicUsize::new(1));
         (
             Sender {
                 inner: inner.clone(),
+                senders: senders.clone(),
                 receivers: receivers.clone(),
             },
             Receiver {
@@ -926,8 +988,10 @@ pub mod broadcast {
 
 impl<T> Clone for broadcast_Sender<T> {
     fn clone(&self) -> Self {
+        self.senders.fetch_add(1, Ordering::AcqRel);
         Self {
             inner: self.inner.clone(),
+            senders: self.senders.clone(),
             receivers: self.receivers.clone(),
         }
     }
@@ -1041,6 +1105,10 @@ impl<'a, T: Clone> Future for BroadcastRecvFuture<'a, T> {
 
 impl<T> Drop for broadcast_Sender<T> {
     fn drop(&mut self) {
+        // Only the LAST live clone closes the channel.
+        if self.senders.fetch_sub(1, Ordering::AcqRel) > 1 {
+            return;
+        }
         let mut state = self.inner.lock();
         state.sender_gone = true;
         let woken = core::mem::take(&mut state.wakers);
@@ -1108,16 +1176,22 @@ struct BoundedState<T> {
     capacity: usize,
     wakers: Vec<Waker>,
     receiver_gone: bool,
+    /// Set when the LAST sender clone drops: `recv` then returns `None`.
+    sender_gone: bool,
 }
 
 pub struct mpsc_BoundedSender<T> {
     inner: Arc<Mutex<BoundedState<T>>>,
+    /// Live-sender count: the channel closes when the LAST clone drops.
+    senders: Arc<AtomicUsize>,
 }
 
 impl<T> Clone for mpsc_BoundedSender<T> {
     fn clone(&self) -> Self {
+        self.senders.fetch_add(1, Ordering::AcqRel);
         Self {
             inner: self.inner.clone(),
+            senders: self.senders.clone(),
         }
     }
 }
@@ -1148,10 +1222,12 @@ pub mod mpsc_bounded {
             capacity,
             wakers: Vec::new(),
             receiver_gone: false,
+            sender_gone: false,
         }));
         (
             Sender {
                 inner: inner.clone(),
+                senders: Arc::new(core::sync::atomic::AtomicUsize::new(1)),
             },
             Receiver { inner },
         )
@@ -1267,6 +1343,10 @@ impl<'a, T> Future for BoundedRecvFuture<'a, T> {
                 w.wake();
             }
             return Poll::Ready(Some(v));
+        }
+        if state.sender_gone {
+            drop(state);
+            return Poll::Ready(None);
         }
         state.wakers.push(cx.waker().clone());
         drop(state);
