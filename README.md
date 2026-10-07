@@ -16,78 +16,85 @@ A high-performance, full-stack real-time communication library — **WebRTC, RTP
 - **Bandwidth estimation (GCC)** — generates TWCC receiver feedback, stamps transport-wide sequence numbers on outbound RTP, and exposes a live `target_bitrate` estimate for encoder adaptation (`RtpSender::subscribe_target_bitrate`).
 - **Full ICE** — STUN, TURN (UDP + TCP), ICE Lite, ICE TCP (RFC 6544), single-port UDP mux for SFU/WHEP deployments, and **mDNS candidate obfuscation** (`enable_mdns`).
 - **NAT traversal & deployment** — RTP latching, UPnP IGD port mapping, and firewall-friendly port ranges (`rtp_start_port`/`rtp_end_port`).
+- **`no_std` / embassy-ready** — the `Rtp`/`Srtp` delivery surface (ICE/STUN/TURN, SDES-SRTP, DTLS, media pipeline) runs on any executor behind seven injected platform seams, end-to-end tested against a mock embedded runtime (`scripts/check-no_std.sh`).
 - **Production extras** — RTP rewrite bridge (SSRC/PT/sequence remapping) and a WebRTC-compatible stats model.
 
 ## no_std / Embedded Support
 
-rustrtc builds without `std` (`alloc`-only) and cross-compiles for embedded
-targets — verified on `xtensa-esp32s3-none-elf` (ESP32-S3).
+rustrtc builds without `std` (`alloc`-only) and runs its embedded delivery
+surface — **ICE/STUN/TURN + `PeerConnection` in `Rtp`/`Srtp` mode (SDES-SRTP)
++ RTP/SRTP + SDP + the media pipeline + DTLS** — entirely on top of six
+platform seams that the embedder implements (embassy, esp-rtos, or any
+executor). This surface is covered by end-to-end tests that execute the
+library against a mock embedded runtime (`tests/no_std_ice_e2e.rs`,
+`no_std_dtls_e2e.rs`, `no_std_pc_srtp_e2e.rs`): two no_std `PeerConnection`s
+negotiate SDES via offer/answer, connect over a loopback network, and exchange
+SRTP media with payload-order verification; a no_std DTLS 1.2 handshake
+(ECDSA-P256 + ECDH) runs against the `crypto-p256` reference backend.
 
-**Available without std:** RTP/RTX, SRTP (incl. SDES), SDP, the full-ICE /
-STUN / TURN stack, the `PeerConnection` pipeline (`Rtp` / `Srtp` transport
-modes), and the self-contained DTLS implementation (`dtls` feature) used for
-DTLS-SRTP.
+**Available without std:** RTP/RTX, SRTP (incl. SDES negotiation), SDP, the
+full ICE/STUN/TURN stack, the `PeerConnection` pipeline in `Rtp`/`Srtp` mode,
+the self-contained DTLS 1.2 implementation (via the crypto seam), and the
+media pipeline (packetizers, jitter buffer, NACK/RTX, GCC/TWCC).
 
-**Still std-only:** the `WebRtc` transport-mode wiring inside
-`PeerConnection`, SCTP/DataChannel, T.38/UDPTL, TWCC/GCC, ICE-TCP, UPnP, mDNS,
-and certificate *generation* (`rcgen`; load pre-provisioned DER instead).
+**Still std-only:** the `WebRtc` transport-mode wiring inside `PeerConnection`
+(DTLS transport upgrade on no_std fails fast), SCTP/DataChannel, T.38/UDPTL,
+ICE-TCP, UPnP, mDNS, and certificate *generation* — load pre-provisioned DER
+instead (`Certificate::from_pkcs8_der`).
 
-### Building
+### Gates
 
 ```bash
-# no_std check (host toolchain)
-cargo check --no-default-features --features dtls
-
-# ESP32-S3 (Xtensa)
-espup install --targets esp32s3
-. ~/export-esp.sh
-CARGO_UNSTABLE_BUILD_STD=core,alloc \
-cargo +esp check -Zbuild-std=core,alloc --target xtensa-esp32s3-none-elf \
-      --no-default-features --features dtls --lib
+sh scripts/check-no_std.sh
 ```
+
+runs the full no_std gate suite: host `--no-default-features` check, a
+cross-check for `riscv32imac-unknown-none-elf` (ESP32-C3 core; exercises the
+64-bit-atomic fallback), all seam/e2e suites, a DTLS e2e with the
+`crypto-p256` backend, and the std matrix guard. For Xtensa targets
+(`xtensa-esp32s3-none-elf`) install `espup` and build the same way with
+`-Zbuild-std=core,alloc`.
 
 ### Platform seams
 
-`dtls` has **no mandatory crypto dependency**. Choose a backend for
-ECDSA-P256-SHA256 + ECDH-P256:
+The library is backend-free under `no_std`: every runtime capability is an
+injection point in `src/platform.rs` that the embedder wires once at boot.
 
-- `crypto-p256` feature (implied by `std`): pure-Rust p256 reference; or
-- inject your own — e.g. hardware-accelerated or mbedtls-backed:
+| Seam | Wire it to | Contract |
+|---|---|---|
+| `platform::task::set_sleep_fn` | embassy-time `Timer::after` | Panic if unset — no hidden fallbacks |
+| `platform::task::set_spawn_fn` / `set_spawner` | your executor's spawner | Panic if unset |
+| `platform::rng::set_fill_fn` | TRNG (e.g. `esp_hal::rng::Rng`) | Panic if unset — never zeros |
+| `platform::net::set_udp_bind_fn` | embassy-net UDP (+ demux) | First bind backend; tokio under std |
+| `transports::set_local_ip_fn` | station IP (WiFi up) | Error until wired |
+| `platform::dns::set_resolver` | embassy-net DNS | Error until wired |
+| `platform::crypto::set_crypto` | optional: `crypto-p256` reference or hw-accel | Built-in fallback with the feature |
+
+A boot sequence looks like this (the complete, runnable shape lives in
+`tests/no_std_pc_srtp_e2e.rs`):
 
 ```rust,ignore
-rustrtc::platform::crypto::set_crypto(Arc::new(MyCryptoBackend));
-```
-
-Timers (handshake retransmission, keepalives) go through a sleep factory:
-
-```rust,ignore
-// Example: embassy-time. Any executor-backed timer works.
+// CSPRNG — REQUIRED before any key material exists (ICE/DTLS/SDES).
+rustrtc::platform::rng::set_fill_fn(trng_fill);            // esp-hal TRNG
+// Timers — embassy-time (handshake retransmits, keepalives, RTCP).
 rustrtc::platform::task::set_sleep_fn(|dur| {
     Box::pin(embassy_time::Timer::after(embassy_time::Duration::from_millis(
         dur.as_millis() as u64,
     ))) as Pin<Box<dyn Future<Output = ()> + Send>>
 });
-```
-
-### Using it on no_std
-
-Install the platform seams (see `src/platform.rs`) before first use, and load
-a flash-persisted certificate instead of generating one:
-
-```rust,ignore
-// CSPRNG — REQUIRED before any key material is derived (SRTP/SDES/DTLS).
-// Example: wrap the esp-hal hardware RNG.
-rustrtc::platform::rng::set_fill_fn(hal::rng_fill);
-
-// Task spawner — hands futures to your executor (embassy / esp-rtos).
+// Executor — spawn ICE/PC tasks onto esp-rtos/embassy.
 rustrtc::platform::task::set_spawn_fn(|fut| spawner.spawn(fut).ok());
-
-// DTLS certificate: DER leaf cert + PKCS#8 DER key.
-let cert = rustrtc::transports::dtls::Certificate::from_pkcs8_der(cert_der, key_der)?;
+// UDP — embassy-net socket factory behind ICE candidates / direct RTP.
+rustrtc::platform::net::set_udp_bind_fn(embassy_udp_bind);
+// Network identity — once WiFi/DHCP is up.
+rustrtc::transports::set_local_ip_fn(|| Some(sta_ip));
 ```
 
-The no_std wall clock is a logical clock (`platform::time::advance_ms`);
-advance it from a periodic task if uptime-based accounting matters to you.
+The no_std wall clock is a logical clock (`platform::time::advance_ms` /
+`set_now_ms`); tick it from a periodic task if uptime-based accounting or
+`Instant::elapsed()` matter to you. The DTLS certificate is flash-provisioned
+DER (`Certificate::from_pkcs8_der`) — there is no certificate generation
+without `std`.
 
 ## Benchmark (rustrtc vs webrtc-rs & pion) in 0.3.141
 
