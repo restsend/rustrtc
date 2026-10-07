@@ -4495,7 +4495,7 @@ impl IceGatherer {
                         // not assigned to a local interface, permissions, ...)
                         // fails for every port in the range and must not be
                         // misreported as port exhaustion below.
-                        if !e.to_string().contains("address in use") {
+                        if e.kind() != ErrorKind::AddrInUse {
                             error!(
                                 label = self.config.label.as_deref().unwrap_or("-"),
                                 "binding RTP port {} on {} failed: {}", port, ip, e
@@ -5748,5 +5748,66 @@ impl IceSocketWrapper {
                 "recv_from not supported on TURN wrapper directly"
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod bind_socket_retry_tests {
+    //! An EADDRINUSE port must be skipped in favor of the next one in the
+    //! configured range (the old string check never matched the platform
+    //! errno text "Address already in use" and failed the bind outright).
+
+    use super::*;
+
+    fn gatherer(start: u16, end: u16) -> IceGatherer {
+        let (candidate_tx, _) = broadcast::channel(1);
+        let (socket_tx, _socket_rx) = crate::platform::sync::mpsc::unbounded_channel();
+        let mut config = RtcConfiguration::default();
+        config.rtp_start_port = Some(start);
+        config.rtp_end_port = Some(end);
+        IceGatherer::new(config, candidate_tx, socket_tx)
+    }
+
+    /// A socket actually occupying an even port (bind_socket scans even
+    /// ports only).
+    async fn occupy_even_port() -> (tokio::net::UdpSocket, u16) {
+        loop {
+            let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let p = s.local_addr().unwrap().port();
+            if p % 2 == 0 {
+                return (s, p);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn skips_a_busy_port_and_binds_the_next_one() {
+        // One busy even port; a two-port range must still yield the other.
+        let (_blocker, busy) = occupy_even_port().await;
+        let other = busy + 2;
+
+        let g = gatherer(busy, other);
+        let socket = g
+            .bind_socket(IpAddr::from([127, 0, 0, 1]))
+            .await
+            .expect("bind_socket must skip the busy port");
+        assert_eq!(socket.local_addr().unwrap().port(), other);
+    }
+
+    #[tokio::test]
+    async fn exhausts_the_range_with_the_port_exhaustion_error() {
+        // A single-port range whose port is busy reports exhaustion, not a
+        // raw bind failure.
+        let (_blocker, busy) = occupy_even_port().await;
+
+        let g = gatherer(busy, busy);
+        let err = g
+            .bind_socket(IpAddr::from([127, 0, 0, 1]))
+            .await
+            .expect_err("a fully busy range must fail");
+        assert!(
+            err.to_string().contains("No available even RTP ports"),
+            "expected port exhaustion, got: {err}"
+        );
     }
 }

@@ -8805,8 +8805,9 @@ mod tests {
         // level a=msid on top of it.
         assert!(attrs.iter().all(|a| a.key != "msid"));
         assert!(
-            attrs.iter().any(|a| a.key == "ssrc"
-                && a.value.as_deref().is_some_and(|v| v.contains(" msid:"))),
+            attrs.iter().any(
+                |a| a.key == "ssrc" && a.value.as_deref().is_some_and(|v| v.contains(" msid:"))
+            ),
             "ssrc msid attribute must be present"
         );
 
