@@ -22,25 +22,29 @@ A high-performance, full-stack real-time communication library — **WebRTC, RTP
 ## no_std / Embedded Support
 
 rustrtc builds without `std` (`alloc`-only) and runs its embedded delivery
-surface — **ICE/STUN/TURN + `PeerConnection` in `Rtp`/`Srtp` mode (SDES-SRTP)
-+ RTP/SRTP + SDP + the media pipeline + DTLS** — entirely on top of six
-platform seams that the embedder implements (embassy, esp-rtos, or any
-executor). This surface is covered by end-to-end tests that execute the
-library against a mock embedded runtime (`tests/no_std_ice_e2e.rs`,
-`no_std_dtls_e2e.rs`, `no_std_pc_srtp_e2e.rs`): two no_std `PeerConnection`s
-negotiate SDES via offer/answer, connect over a loopback network, and exchange
-SRTP media with payload-order verification; a no_std DTLS 1.2 handshake
-(ECDSA-P256 + ECDH) runs against the `crypto-p256` reference backend.
+surface entirely on top of platform seams that the embedder implements
+(embassy, esp-rtos, or any executor).
 
-**Available without std:** RTP/RTX, SRTP (incl. SDES negotiation), SDP, the
-full ICE/STUN/TURN stack, the `PeerConnection` pipeline in `Rtp`/`Srtp` mode,
-the self-contained DTLS 1.2 implementation (via the crypto seam), and the
-media pipeline (packetizers, jitter buffer, NACK/RTX, GCC/TWCC).
+**Embedded delivery surface (`Rtp`/`Srtp` mode, plan D6):**
 
-**Still std-only:** the `WebRtc` transport-mode wiring inside `PeerConnection`
-(DTLS transport upgrade on no_std fails fast), SCTP/DataChannel, T.38/UDPTL,
-ICE-TCP, UPnP, mDNS, and certificate *generation* — load pre-provisioned DER
-instead (`Certificate::from_pkcs8_der`).
+- Full **ICE/STUN/TURN** stack, RTP/RTX, **SDP**, **SDES-SRTP**
+- `PeerConnection` pipeline in `Rtp`/`Srtp` mode: offer/answer with
+  `a=crypto` negotiation, direct transport, media send/receive
+- Self-contained **DTLS 1.2** implementation behind the crypto seam
+  (ECDSA-P256 + ECDH), with a pure-Rust `crypto-p256` reference backend
+- Media pipeline: packetizers/depacketizers, jitter buffer, NACK/RTX
+
+This surface is covered by end-to-end tests against a mock embedded runtime
+(`tests/no_std_ice_e2e.rs`, `no_std_dtls_e2e.rs`, `no_std_pc_srtp_e2e.rs`):
+two no_std `PeerConnection`s negotiate SDES via offer/answer, connect over a
+loopback network, and exchange SRTP media with payload-order verification; a
+no_std DTLS 1.2 handshake runs against the `crypto-p256` reference backend.
+
+**Still std-only:** the `WebRtc` transport mode inside `PeerConnection`
+(DTLS transport upgrade fails fast on no_std), SCTP/DataChannel, T.38/UDPTL,
+GCC/TWCC bandwidth estimation (media modules compile, the PC pipeline uses a
+stub), ICE-TCP, UPnP, mDNS, and certificate *generation* — load
+pre-provisioned DER instead (`Certificate::from_pkcs8_der`).
 
 ### Gates
 
