@@ -405,26 +405,45 @@ pub mod time {
         pub fn duration_since(&self, earlier: Self) -> core::time::Duration {
             core::time::Duration::from_millis(self.ms.saturating_sub(earlier.ms))
         }
+
+        /// Instant arithmetic (std `Instant` parity): `instant + duration`.
+        /// Milliseconds saturate at `u64::MAX` (no overflow panic on the
+        /// logical clock).
+        pub fn checked_add_ms(&self, dur: core::time::Duration) -> Self {
+            Self {
+                ms: self.ms.saturating_add(dur.as_millis() as u64),
+            }
+        }
+
+        /// Instant arithmetic (std `Instant` parity): `instant - duration`,
+        /// saturating at zero.
+        pub fn checked_sub_ms(&self, dur: core::time::Duration) -> Self {
+            Self {
+                ms: self.ms.saturating_sub(dur.as_millis() as u64),
+            }
+        }
     }
 
     impl core::ops::Add<core::time::Duration> for Instant {
         type Output = Instant;
         fn add(self, rhs: core::time::Duration) -> Instant {
-            Instant {
-                ms: self.ms.saturating_add(rhs.as_millis() as u64),
-            }
+            self.checked_add_ms(rhs)
         }
     }
 
     impl core::ops::Sub<core::time::Duration> for Instant {
         type Output = Instant;
         fn sub(self, rhs: core::time::Duration) -> Instant {
-            Instant {
-                ms: self.ms.saturating_sub(rhs.as_millis() as u64),
-            }
+            self.checked_sub_ms(rhs)
         }
     }
 
+    impl core::ops::Sub<Instant> for Instant {
+        type Output = core::time::Duration;
+        fn sub(self, rhs: Instant) -> core::time::Duration {
+            self.duration_since(rhs)
+        }
+    }
     #[cfg(not(feature = "std"))]
     static NOW_MS: AtomicU64 = AtomicU64::new(0);
 

@@ -21,7 +21,10 @@ use crate::peer_connection::std_gated::gcc::GccBandwidthEstimator;
 #[cfg(not(feature = "std"))]
 use crate::peer_connection::std_gated::twcc_feedback::TwccFeedbackGenerator;
 #[cfg(not(feature = "std"))]
-use crate::peer_connection::std_gated::{DataChannel, SctpTransport, UdtlTransport};
+use crate::peer_connection::std_gated::UdtlTransport;
+#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "std"))]
+use crate::transports::sctp::{DataChannel, SctpTransport};
 use crate::platform::atomic64::AtomicU64;
 use crate::sdp::{
     Attribute, Direction, MediaKind, MediaSection, Origin, SdpType, SessionDescription,
@@ -2685,8 +2688,7 @@ impl PeerConnection {
                 5000
             };
 
-            #[cfg_attr(not(feature = "std"), allow(unused_mut))]
-            let mut sctp_needed = {
+            let sctp_needed = {
                 let remote = self.inner.remote_description.lock();
                 if let Some(desc) = &*remote {
                     desc.media_sections
@@ -2696,17 +2698,11 @@ impl PeerConnection {
                     false
                 }
             };
-            #[cfg(not(feature = "std"))]
-            {
-                // SCTP/DataChannel remains std-gated; DTLS-SRTP media is unaffected.
-                sctp_needed = false;
-            }
 
             let (dc_tx, mut dc_rx) = mpsc::unbounded_channel();
 
             let mut sctp_runner: Pin<Box<dyn Future<Output = ()> + Send>>;
 
-            #[cfg(feature = "std")]
             if sctp_needed {
                 let (sctp, runner) = SctpTransport::new(
                     dtls.clone(),
@@ -2724,12 +2720,7 @@ impl PeerConnection {
                 drop(incoming_data_rx);
                 sctp_runner = Box::pin(core::future::pending());
             }
-            #[cfg(not(feature = "std"))]
-            {
-                let _ = (&dc_tx, sctp_port, is_client);
-                drop(incoming_data_rx);
-                sctp_runner = Box::pin(core::future::pending());
-            }
+
 
             // Close any previous DTLS transport so its background handshake/packet
             // task stops instead of being orphaned (which caused a memory leak and
@@ -2808,9 +2799,9 @@ impl PeerConnection {
                     continue;
                 }
 
-                // The dtls runner arm exists only where spawn_rtc returns a
-                // JoinHandle (std); on no_std the runner lives in the injected
-                // executor and reports through the state watch.
+                // On std spawn_rtc returns a polled JoinHandle arm; on no_std
+                // the DTLS runner parks in the injected executor and reports
+                // through the state watch, so the select has four arms.
                 #[cfg(feature = "std")]
                 {
                     use crate::platform::select::select5;
@@ -2833,8 +2824,6 @@ impl PeerConnection {
                                 )));
                             }
                             dtls_runner_done = true;
-                            // Loop back: the top-of-loop state check will return/err
-                            // based on the final DtlsState set by the handshake.
                         }
                         crate::platform::select::Which5::B(_) => {
                             return Err(RtcError::Internal(

@@ -48,10 +48,11 @@ A full-WebRTC-mode integration suite (`no_std_pc_webrtc_e2e.rs`) drives the
 same flow through `PeerConnection` and is landing alongside executor-fidelity
 work in the test harness.
 
-**Still std-only:** SCTP/DataChannel, T.38/UDPTL, GCC/TWCC bandwidth
-estimation (the media modules compile, the PC pipeline uses a stub),
-ICE-TCP, UPnP, mDNS, and certificate *generation* (use
-`dtls_certificate` instead).
+**Still std-only:** T.38/UDPTL, GCC/TWCC bandwidth estimation (the media
+modules compile, the PC pipeline uses a stub), ICE-TCP, UPnP, mDNS, and
+certificate *generation* (use `dtls_certificate` instead). SCTP/DataChannel
+compiles under no_std; its runtime e2e lands with the test-executor
+fidelity work in progress.
 
 ### Gates
 

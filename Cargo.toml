@@ -37,7 +37,6 @@ p256 = { version = "0.13.2", optional = true, default-features = false, features
 aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
 futures = { version = "0.3.32", default-features = false, features = ["alloc"] }
 crc32fast = { version = "1.5.0", default-features = false }
-crc32c = { version = "0.6", optional = true }
 base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
 local-ip-address = { version = "0.6", optional = true }
 rand = { version = "0.10.1", optional = true }
@@ -97,7 +96,6 @@ std = [
     "dep:socket2",
     "dep:igd",
     "dep:rcgen",
-    "dep:crc32c",
     "dep:rand",
     "crypto-p256",
     "dtls",

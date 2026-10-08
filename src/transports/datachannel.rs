@@ -1,8 +1,14 @@
-use anyhow::Result;
+use crate::errors::RtcError;
+use crate::platform::sync::Mutex;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
+use crate::platform::sync::{mpsc, AsyncMutex as TokioMutex};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
-use tokio::sync::{Mutex as TokioMutex, mpsc};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
+
+/// Local result alias (the module used `anyhow` before the no_std port).
+pub(crate) type Result<T> = core::result::Result<T, RtcError>;
 
 // DCEP Constants
 pub const DATA_CHANNEL_PPID_DCEP: u32 = 50;
@@ -45,12 +51,12 @@ impl DataChannelOpen {
     pub fn unmarshal(data: &[u8]) -> Result<Self> {
         let mut buf = Bytes::copy_from_slice(data);
         if buf.remaining() < 12 {
-            return Err(anyhow::anyhow!("DCEP Open message too short"));
+            return Err(RtcError::Internal("DCEP Open message too short".to_string()));
         }
 
         let message_type = buf.get_u8();
         if message_type != DCEP_TYPE_OPEN {
-            return Err(anyhow::anyhow!("Invalid DCEP message type"));
+            return Err(RtcError::Internal("Invalid DCEP message type".to_string()));
         }
 
         let channel_type = buf.get_u8();
@@ -60,7 +66,7 @@ impl DataChannelOpen {
         let protocol_len = buf.get_u16() as usize;
 
         if buf.remaining() < label_len + protocol_len {
-            return Err(anyhow::anyhow!("DCEP Open message too short for payload"));
+            return Err(RtcError::Internal("DCEP Open message too short for payload".to_string()));
         }
 
         let label_bytes = buf.split_to(label_len);
@@ -92,11 +98,11 @@ impl DataChannelAck {
 
     pub fn unmarshal(data: &[u8]) -> Result<Self> {
         if data.is_empty() {
-            return Err(anyhow::anyhow!("DCEP Ack message too short"));
+            return Err(RtcError::Internal("DCEP Ack message too short".to_string()));
         }
         let message_type = data[0];
         if message_type != DCEP_TYPE_ACK {
-            return Err(anyhow::anyhow!("Invalid DCEP message type"));
+            return Err(RtcError::Internal("Invalid DCEP message type".to_string()));
         }
         Ok(Self { message_type })
     }

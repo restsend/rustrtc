@@ -1,25 +1,35 @@
 use crate::RtcConfiguration;
 pub use crate::transports::datachannel::*;
+use crate::errors::RtcError;
+use crate::platform::sync::{mpsc, Mutex, Notify};
+use crate::platform::time::Instant;
 use crate::transports::dtls::{DtlsState, DtlsTransport};
 use crate::transports::ice::stun::random_u32;
-use anyhow::Result;
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use alloc::{format, vec};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+// 64-bit atomics are emulated on targets without them (ESP32-Xtensa, RISC-V).
+use crate::platform::atomic64::AtomicU64;
+use core::time::Duration;
 use hmac::{Hmac, Mac};
-use parking_lot::Mutex;
 use sha1::Sha1;
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
-use tokio::sync::{Notify, mpsc};
 use tracing::{debug, trace};
+use alloc::sync::{Arc, Weak};
+
+/// Local result alias: the module predates the typed error enum and used
+/// `anyhow`; messages surface as `RtcError::Internal`.
+pub(crate) type Result<T> = core::result::Result<T, RtcError>;
 
 type HmacSha1 = Hmac<Sha1>;
 
 // ---------------------------------------------------------------------------
 // CRC-32C (Castagnoli) — the SCTP checksum, computed for every packet on the
 // DataChannel path. Hardware-accelerated on x86-64 (SSE4.2 `crc32`) and
-// aarch64 (CRC extension), with a software fallback (the `crc32c` crate).
+// aarch64 (CRC extension) when `std` is on; every other target (embedded
+// Xtensa/RISC-V included) uses the dependency-free software table below.
 // ---------------------------------------------------------------------------
 
 /// Compute CRC-32C over `data` (init/xorout 0xFFFFFFFF). Equivalent to
@@ -29,12 +39,49 @@ pub(crate) fn sctp_crc32c(data: &[u8]) -> u32 {
     sctp_crc32c_append(0, data)
 }
 
+/// Software CRC-32C (reflected polynomial 0x82F63B78), byte-at-a-time over a
+/// const-generated table. Slower than the hardware paths but correct on every
+/// target and free of dependencies.
+fn crc32c_soft_append(mut crc: u32, data: &[u8]) -> u32 {
+    // Lazy const table: compute on first use behind the platform spin mutex
+    // (no_std has no OnceLock; the table is 1 KiB and built once).
+    static TABLE: crate::platform::sync::Mutex<Option<[u32; 256]>> =
+        crate::platform::sync::Mutex::new(None);
+    let mut guard = TABLE.lock();
+    let table = guard.get_or_insert(crc32c_table());
+    crc = !crc;
+    for &byte in data {
+        crc = table[((crc ^ byte as u32) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    !crc
+}
+
+const fn crc32c_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0x82F6_3B78
+            } else {
+                crc >> 1
+            };
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+}
+
 /// Append `data` to a running CRC-32C `crc`. Equivalent to
 /// `crc32c::crc32c_append` (i.e. `sctp_crc32c_append(sctp_crc32c(a), b) ==
 /// sctp_crc32c(a || b)`).
 #[inline]
 pub(crate) fn sctp_crc32c_append(crc: u32, data: &[u8]) -> u32 {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
     {
         if std::arch::is_x86_feature_detected!("sse4.2") {
             // SAFETY: feature detected above; the target_feature fn only uses
@@ -42,7 +89,7 @@ pub(crate) fn sctp_crc32c_append(crc: u32, data: &[u8]) -> u32 {
             return unsafe { crc32c_append_x86(crc, data) };
         }
     }
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(feature = "std", target_arch = "aarch64"))]
     {
         if std::arch::is_aarch64_feature_detected!("crc") {
             // SAFETY: feature detected above; the target_feature fn only uses
@@ -50,10 +97,10 @@ pub(crate) fn sctp_crc32c_append(crc: u32, data: &[u8]) -> u32 {
             return unsafe { crc32c_append_aarch64(crc, data) };
         }
     }
-    crc32c::crc32c_append(crc, data)
+    crc32c_soft_append(crc, data)
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
 #[target_feature(enable = "sse4.2")]
 unsafe fn crc32c_append_x86(crc: u32, data: &[u8]) -> u32 {
     use std::arch::x86_64::{_mm_crc32_u8, _mm_crc32_u64};
@@ -69,7 +116,7 @@ unsafe fn crc32c_append_x86(crc: u32, data: &[u8]) -> u32 {
     c32 ^ 0xFFFF_FFFF
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
 #[target_feature(enable = "crc")]
 unsafe fn crc32c_append_aarch64(crc: u32, data: &[u8]) -> u32 {
     use std::arch::aarch64::{__crc32cb, __crc32cd};
@@ -326,7 +373,7 @@ struct SctpInner {
     sent_queue: Mutex<BTreeMap<u32, ChunkRecord>>,
     /// Per-stream buffered byte counts (queued + unacked). Mirrored into each
     /// `DataChannel`'s atomic for `buffered_amount()` / `BufferedAmountLow`.
-    stream_buffered: Mutex<HashMap<u16, usize>>,
+    stream_buffered: Mutex<BTreeMap<u16, usize>>,
     received_queue: Mutex<BTreeMap<u32, (u8, Bytes)>>,
 
     // RTO State
@@ -415,7 +462,7 @@ struct SctpInner {
     cookie_hmac_key: [u8; 16],
 
     // Inbound stream state for ordered delivery
-    inbound_streams: Mutex<HashMap<u16, InboundStream>>,
+    inbound_streams: Mutex<BTreeMap<u16, InboundStream>>,
 
     // PR-SCTP: Advanced Peer Ack Point (RFC 3758)
     advanced_peer_ack_tsn: AtomicU32,
@@ -776,7 +823,7 @@ impl SctpLinkStats {
 
 pub struct SctpTransport {
     inner: Arc<SctpInner>,
-    close_tx: Arc<tokio::sync::Notify>,
+    close_tx: Arc<Notify>,
 }
 
 impl SctpTransport {
@@ -791,7 +838,7 @@ impl SctpTransport {
         config: &RtcConfiguration,
     ) -> (
         Arc<Self>,
-        impl std::future::Future<Output = ()> + Send + 'static,
+        impl core::future::Future<Output = ()> + Send + 'static,
     ) {
         let (outgoing_packet_tx, mut outgoing_packet_rx) = mpsc::unbounded_channel::<Bytes>();
 
@@ -808,7 +855,7 @@ impl SctpTransport {
             new_data_channel_tx,
             is_client,
             sent_queue: Mutex::new(BTreeMap::new()),
-            stream_buffered: Mutex::new(HashMap::new()),
+            stream_buffered: Mutex::new(BTreeMap::new()),
             received_queue: Mutex::new(BTreeMap::new()),
             rto_state: Mutex::new(RtoCalculator::new(
                 config.sctp_rto_initial.as_secs_f64(),
@@ -858,11 +905,10 @@ impl SctpTransport {
             t1_active: AtomicBool::new(false),
             cookie_hmac_key: {
                 let mut key = [0u8; 16];
-                use rand::Rng;
-                rand::rng().fill_bytes(&mut key);
+                crate::platform::rng::fill(&mut key);
                 key
             },
-            inbound_streams: Mutex::new(HashMap::new()),
+            inbound_streams: Mutex::new(BTreeMap::new()),
             advanced_peer_ack_tsn: AtomicU32::new(0),
             forward_tsn_pending: AtomicBool::new(false),
             forward_tsn_streams: Mutex::new(Vec::new()),
@@ -881,7 +927,7 @@ impl SctpTransport {
             outgoing_packet_tx,
         });
 
-        let close_tx = Arc::new(tokio::sync::Notify::new());
+        let close_tx = Arc::new(Notify::new());
         let close_rx = close_tx.clone();
 
         let transport = Arc::new(Self {
@@ -893,19 +939,25 @@ impl SctpTransport {
         let dtls_transport_clone = dtls_transport.clone();
         let runner = async move {
             let close_rx_2 = close_rx.clone();
-            tokio::select! {
-                _ = inner_clone.run_loop(close_rx, incoming_data_rx) => {},
-                _ = async {
-                    while let Some(packet) = outgoing_packet_rx.recv().await {
-                        if let Err(e) = dtls_transport_clone.send(packet).await {
-                            trace!("SCTP Failed to send outgoing DTLS packet: {}", e);
-                            if e.to_string().contains("DTLS not connected") {
-                                break;
-                            }
+            let run_loop_fut = inner_clone.run_loop(close_rx, incoming_data_rx);
+            let pump_fut = async {
+                while let Some(packet) = outgoing_packet_rx.recv().await {
+                    if let Err(e) = dtls_transport_clone.send(packet).await {
+                        trace!("SCTP Failed to send outgoing DTLS packet: {}", e);
+                        if e.to_string().contains("DTLS not connected") {
+                            break;
                         }
                     }
-                } => {},
-                _ = close_rx_2.notified() => {}
+                }
+            };
+            let close_fut = close_rx_2.notified();
+            let mut arm0 = core::pin::pin!(run_loop_fut);
+            let mut arm1 = core::pin::pin!(pump_fut);
+            let mut arm2 = core::pin::pin!(close_fut);
+            match crate::platform::select::select3(&mut arm0, &mut arm1, &mut arm2).await {
+                crate::platform::select::Which3::A(_) => {}
+                crate::platform::select::Which3::B(_) => {}
+                crate::platform::select::Which3::C(_) => {}
             }
         };
 
@@ -1071,7 +1123,7 @@ impl SctpInner {
 
     async fn run_loop(
         &self,
-        close_rx: Arc<tokio::sync::Notify>,
+        close_rx: Arc<Notify>,
         mut incoming_data_rx: mpsc::UnboundedReceiver<Bytes>,
     ) {
         debug!("SctpTransport run_loop started");
@@ -1237,13 +1289,29 @@ impl SctpInner {
                 .min(sack_timeout)
                 .min(tlp_timeout);
 
-            tokio::select! {
-                _ = close_rx.notified() => {
+            {
+                let close_fut = close_rx.notified();
+                let mut dtls_state_arm = dtls_state_rx.clone();
+                let dtls_fut = dtls_state_arm.changed();
+                let timer_fut = self.timer_notify.notified();
+                let sleep_fut = crate::platform::task::sleep(sleep_duration);
+                let recv_fut = incoming_data_rx.recv();
+                let mut arm0 = core::pin::pin!(close_fut);
+                let mut arm1 = core::pin::pin!(dtls_fut);
+                let mut arm2 = core::pin::pin!(timer_fut);
+                let mut arm3 = core::pin::pin!(sleep_fut);
+                let mut arm4 = core::pin::pin!(recv_fut);
+            match crate::platform::select::select5(
+                &mut arm0, &mut arm1, &mut arm2, &mut arm3, &mut arm4,
+            )
+            .await
+            {
+                crate::platform::select::Which5::A(_) => {
                     debug!("SctpTransport run_loop exiting (closed)");
                     *self.close_reason.lock() = Some("LOCAL_CLOSE".into());
                     break;
-                },
-                res = dtls_state_rx.changed() => {
+                }
+                crate::platform::select::Which5::B(res) => {
                     match res {
                         Ok(()) => {
                             let state = dtls_state_rx.borrow_and_update().clone();
@@ -1263,14 +1331,14 @@ impl SctpInner {
                             break;
                         }
                     }
-                },
-                _ = self.timer_notify.notified() => {
+                }
+                crate::platform::select::Which5::C(_) => {
                     // Woken up by sender, recalculate timeout
                     if let Err(e) = self.transmit().await {
                          trace!("Transmit error: {}", e);
                     }
-                },
-                _ = tokio::time::sleep(sleep_duration) => {
+                }
+                crate::platform::select::Which5::D(_) => {
                     // Check T1 Timer (INIT / COOKIE-ECHO retransmission)
                     if let Err(e) = self.handle_t1_timeout().await {
                         trace!("SCTP T1 timeout error: {}", e);
@@ -1295,32 +1363,46 @@ impl SctpInner {
                         }
                         last_heartbeat = Instant::now();
                     }
-                },
-                res = incoming_data_rx.recv() => {
+                }
+                crate::platform::select::Which5::E(res) => {
                     match res {
                         Some(packet) => {
                             if let Err(e) = self.handle_packet(packet).await {
                                 trace!("SCTP handle packet error: {}", e);
                             }
-                            // Batch receive: try to drain channel
-                            while let Ok(packet) = incoming_data_rx.try_recv() {
-                                if let Err(e) = self.handle_packet(packet).await {
-                                    trace!("SCTP handle packet error: {}", e);
-                                }
-                            }
-
-                            // Try to transmit immediately after processing packets (e.g. SACKs releasing Window)
-                            if let Err(e) = self.transmit().await {
-                                trace!("SCTP transmit error after packet: {}", e);
-                            }
                         }
                         None => {
                             debug!("SCTP loop error: Channel closed");
-                            *self.close_reason.lock() = Some("INCOMING_CHANNEL_CLOSED".into());
+                            *self.close_reason.lock() =
+                                Some("INCOMING_CHANNEL_CLOSED".into());
                             break;
                         }
                     }
                 }
+            }
+            }
+
+            // Batch receive: drain any packets queued behind the first one.
+            // (tokio's try_recv yields T; the sync_embedded backend yields
+            // Option<T>.) Kept outside the select so the arm futures'
+            // receiver borrows have ended.
+            #[cfg(feature = "std")]
+            while let Ok(packet) = incoming_data_rx.try_recv() {
+                if let Err(e) = self.handle_packet(packet).await {
+                    trace!("SCTP handle packet error: {}", e);
+                }
+            }
+            #[cfg(not(feature = "std"))]
+            while let Ok(Some(packet)) = incoming_data_rx.try_recv() {
+                if let Err(e) = self.handle_packet(packet).await {
+                    trace!("SCTP handle packet error: {}", e);
+                }
+            }
+
+            // Transmit immediately after processing packets (e.g. SACKs
+            // releasing the congestion window).
+            if let Err(e) = self.transmit().await {
+                trace!("SCTP transmit error after packet: {}", e);
             }
         }
         debug!("SctpTransport run_loop finished");
@@ -1387,11 +1469,10 @@ impl SctpInner {
     }
 
     fn generate_cookie(&self) -> Vec<u8> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        // Wall-clock milliseconds where a wall clock exists; on targets
+        // without one the stamp is a constant 0, which keeps the HMAC
+        // verification consistent (freshness degrades gracefully).
+        let now_ms = crate::platform::time::unix_ms().unwrap_or(0);
         let timestamp = now_ms.to_be_bytes();
         let mut mac = <HmacSha1 as hmac::digest::KeyInit>::new_from_slice(&self.cookie_hmac_key)
             .expect("HMAC key length is valid");
@@ -1404,7 +1485,7 @@ impl SctpInner {
     }
 
     fn validate_cookie(&self, cookie: &[u8]) -> bool {
-        use std::time::{SystemTime, UNIX_EPOCH};
+        let now_ms = crate::platform::time::unix_ms().unwrap_or(0);
         if cookie.len() != COOKIE_TOTAL_LEN {
             return false;
         }
@@ -1421,10 +1502,6 @@ impl SctpInner {
                 .try_into()
                 .expect("COOKIE_TIMESTAMP_LEN must be 8"),
         );
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
         if now_ms < stamp_ms || now_ms - stamp_ms > COOKIE_LIFETIME_MS {
             return false;
         }
@@ -2833,7 +2910,7 @@ impl SctpInner {
             }
             buffer.extend_from_slice(&user_data);
             if e_bit {
-                let msg = std::mem::take(&mut *buffer).freeze();
+                let msg = core::mem::take(&mut *buffer).freeze();
                 drop(buffer);
 
                 if unordered || !dc.ordered {
@@ -3201,7 +3278,7 @@ impl SctpInner {
             debug!("Failed to send SCTP packet to transport: channel closed");
             *self.close_reason.lock() = Some("TRANSPORT_CLOSED".into());
             self.set_state(SctpState::Closed);
-            return Err(anyhow::anyhow!("Transport channel closed"));
+            return Err(RtcError::Internal("Transport channel closed".to_string()));
         }
         Ok(())
     }
@@ -3285,7 +3362,7 @@ impl SctpInner {
             // for window credit, otherwise this task (and the Arc<SctpInner> /
             // DataChannel it captures) would live forever.
             if *self.state.lock() == SctpState::Closed {
-                return Err(anyhow::anyhow!("sctp association closed"));
+                return Err(RtcError::Internal("sctp association closed".to_string()));
             }
             let flight = self.flight_size.load(Ordering::Relaxed);
             let queued = self.queued_bytes.load(Ordering::Relaxed);
@@ -3321,7 +3398,7 @@ impl SctpInner {
 
         while offset < total_len {
             let remaining = total_len - offset;
-            let chunk_payload_size = std::cmp::min(remaining, max_payload_size);
+            let chunk_payload_size = core::cmp::min(remaining, max_payload_size);
 
             let mut flags = flags_base;
             if offset == 0 {
@@ -3531,8 +3608,8 @@ impl SctpInner {
         // First: collect the (stream, ssn) pairs of messages whose chunks should
         // be abandoned. Using a set lets the marking pass below run in a single
         // O(n) sweep instead of re-scanning the whole queue per abandoned message.
-        let mut abandon_set: std::collections::HashSet<(u16, u16)> =
-            std::collections::HashSet::new();
+        let mut abandon_set: alloc::collections::BTreeSet<(u16, u16)> =
+            alloc::collections::BTreeSet::new();
         for record in sent_queue.values_mut() {
             if record.acked || record.abandoned {
                 continue;
@@ -3593,7 +3670,7 @@ impl SctpInner {
                 .store(new_advanced, Ordering::SeqCst);
             self.forward_tsn_pending.store(true, Ordering::SeqCst);
             // Collect stream/SSN pairs for FORWARD-TSN before removing
-            let mut stream_ssn: HashMap<u16, u16> = HashMap::new();
+            let mut stream_ssn: BTreeMap<u16, u16> = BTreeMap::new();
             let remove: Vec<u32> = sent_queue
                 .keys()
                 .filter(|&&t| !tsn_gt(t, new_advanced))
@@ -3632,7 +3709,7 @@ impl SctpInner {
 
         let stream_ssn_pairs: Vec<(u16, u16)> = {
             let mut fwd = self.forward_tsn_streams.lock();
-            std::mem::take(&mut *fwd)
+            core::mem::take(&mut *fwd)
         };
 
         let pair_bytes = stream_ssn_pairs.len() * 4;
@@ -4161,7 +4238,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sctp_association_retransmission_limit() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -4192,7 +4269,7 @@ mod tests {
         );
 
         // Spawn the runner to handle outgoing packets
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
 
         // Set state to Connecting
         *sctp.inner.state.lock() = SctpState::Connecting;
@@ -4269,7 +4346,7 @@ mod tests {
     /// the "permanent stall after high packet loss" symptom.
     #[tokio::test]
     async fn test_bug1_reliable_abandon_freezes_cumulative_ack() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -4294,7 +4371,7 @@ mod tests {
             true,
             &config,
         );
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
         *sctp.inner.state.lock() = SctpState::Connected;
 
         // Reliable channel (max_retransmits=None, expiry=None) — must NEVER be
@@ -4368,7 +4445,7 @@ mod tests {
     /// be abandoned at the limit — partial reliability is unaffected by BUG #1 fix.
     #[tokio::test]
     async fn test_bug1_pr_sctp_chunk_still_abandoned() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -4393,7 +4470,7 @@ mod tests {
             true,
             &config,
         );
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
         *sctp.inner.state.lock() = SctpState::Connected;
 
         // PR-SCTP chunk: per-channel max_retransmits = 2
@@ -4432,7 +4509,7 @@ mod tests {
     /// recovery glacially slow on lossy links.
     #[tokio::test]
     async fn test_bug3_t3_retransmits_only_one_chunk() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -4457,7 +4534,7 @@ mod tests {
             true,
             &config,
         );
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
         *sctp.inner.state.lock() = SctpState::Connected;
 
         // Five stale, in-flight, unacked chunks — a burst loss scenario.
@@ -4516,7 +4593,7 @@ mod tests {
     /// the minimum on lossy (but non-congested) links like WiFi / TURN relays.
     #[tokio::test]
     async fn test_bug4_cwnd_collapses_below_ssthresh_on_rto() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -4541,7 +4618,7 @@ mod tests {
             true,
             &config,
         );
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
         *sctp.inner.state.lock() = SctpState::Connected;
 
         // A well-opened window.
@@ -4597,7 +4674,7 @@ mod tests {
     /// RTO cycle instead of one-packet-per-cycle.
     #[tokio::test]
     async fn test_gap_ack_reduces_error_count() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -4625,7 +4702,7 @@ mod tests {
             &config,
         );
 
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
 
         *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
@@ -4867,7 +4944,7 @@ mod tests {
     /// This shows how quickly connection can fail with even modest packet loss
     #[tokio::test]
     async fn test_realistic_packet_loss_scenario() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -4895,7 +4972,7 @@ mod tests {
             &config,
         );
 
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
 
         *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
@@ -5060,7 +5137,7 @@ mod tests {
     /// and that cumulative TSN advancement resets error count
     #[tokio::test]
     async fn test_cumulative_ack_resets_error_count() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -5085,7 +5162,7 @@ mod tests {
             &config,
         );
 
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
 
         *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
@@ -5146,7 +5223,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // sent_queue guard is dropped before the .await
     async fn test_sent_queue_buildup_scenario() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -5173,7 +5250,7 @@ mod tests {
             &config,
         );
 
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
 
         *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
@@ -5232,7 +5309,7 @@ mod tests {
     /// This is the CRITICAL bug causing user's send hang issue
     #[tokio::test]
     async fn test_flight_size_race_condition() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -5257,7 +5334,7 @@ mod tests {
             &config,
         );
 
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
 
         *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
@@ -5379,7 +5456,7 @@ mod tests {
 
         println!("\n=== Testing Real Race with Gap ACK ===");
 
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -5404,7 +5481,7 @@ mod tests {
             &config,
         );
 
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
 
         let tsn1 = 100u32;
         let tsn2 = 101u32;
@@ -5615,7 +5692,7 @@ mod tests {
     fn test_global_retransmit_limit_logic() {
         // Test the retransmit limit logic in isolation without network I/O
         let mut channel_info: std::collections::HashMap<u16, Option<u16>> =
-            std::collections::HashMap::new();
+            std::collections::BTreeMap::new();
         channel_info.insert(1, None); // Reliable channel on stream 1
         channel_info.insert(2, Some(5)); // Unreliable channel with max 5 retransmits
 
@@ -5920,7 +5997,7 @@ mod tests {
     /// Test RTO backoff is capped at 4s (fix verification)
     #[tokio::test]
     async fn test_rto_backoff_capped_at_10s() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -5946,7 +6023,7 @@ mod tests {
             &config,
         );
 
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
 
         *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
@@ -6004,7 +6081,7 @@ mod tests {
     /// Test peer_rwnd=0 doesn't increment error_count (fix verification)
     #[tokio::test]
     async fn test_peer_rwnd_zero_doesnt_increment_error_count() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -6029,7 +6106,7 @@ mod tests {
             &config,
         );
 
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
 
         *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
@@ -6087,7 +6164,7 @@ mod tests {
     /// Test Gap ACK error_count reduction works correctly (fix verification)
     #[tokio::test]
     async fn test_gap_ack_reduces_error_count_correctly() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -6112,7 +6189,7 @@ mod tests {
             &config,
         );
 
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
 
         // Set initial state
         *sctp.inner.state.lock() = SctpState::Connected;
@@ -6189,7 +6266,7 @@ mod tests {
     /// Test adaptive fast retransmit based on transmit_count
     #[tokio::test]
     async fn test_adaptive_fast_retransmit_for_repeatedly_lost_packets() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -6214,7 +6291,7 @@ mod tests {
             &config,
         );
 
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
 
         *sctp.inner.state.lock() = SctpState::Connected;
         sctp.inner
@@ -6317,7 +6394,7 @@ mod tests {
     /// Test that fast retransmit is limited to prevent infinite loops
     #[tokio::test]
     async fn test_fast_retransmit_limit_prevents_infinite_loop() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -6342,7 +6419,7 @@ mod tests {
             &config,
         );
 
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
 
         *sctp.inner.state.lock() = SctpState::Connected;
         sctp.inner
@@ -6443,7 +6520,7 @@ mod tests {
         println!("Simulates: high packet loss / rate-limited TURN relay");
         println!("Expected: connection stays alive if peer keeps sending SACKs\n");
 
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -6472,7 +6549,7 @@ mod tests {
             &config,
         );
 
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
         *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner.next_tsn.store(101, Ordering::SeqCst);
 
@@ -7125,7 +7202,7 @@ mod tests {
         assert!(tsn_gt(new_advanced, advanced));
 
         // Collect stream/SSN pairs
-        let mut stream_ssn: HashMap<u16, u16> = HashMap::new();
+        let mut stream_ssn: BTreeMap<u16, u16> = BTreeMap::new();
         for (&t, record) in sent.iter() {
             if !tsn_gt(t, new_advanced) && record.abandoned {
                 let e = stream_ssn.entry(record.stream_id).or_insert(0);
@@ -7288,7 +7365,7 @@ mod tests {
     async fn test_sack_generation_with_out_of_order_packets() {
         println!("\n=== Testing SACK generation with out-of-order packets ===");
 
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -7313,7 +7390,7 @@ mod tests {
             &config,
         );
 
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
 
         *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
@@ -7426,7 +7503,7 @@ mod tests {
     async fn test_repeated_retransmission_without_sack() {
         println!("\n=== Testing repeated retransmission without SACK ===");
 
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -7453,7 +7530,7 @@ mod tests {
             &config,
         );
 
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
 
         *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
@@ -7569,7 +7646,7 @@ mod tests {
     async fn test_retransmitted_packet_updates_cumulative_ack() {
         println!("\n=== Testing retransmitted packet updates cumulative_ack ===");
 
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -7594,7 +7671,7 @@ mod tests {
             &config,
         );
 
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
 
         *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
@@ -7654,7 +7731,7 @@ mod tests {
             "This simulates: connection works fine, then goes idle, then single packet fails repeatedly"
         );
 
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -7681,7 +7758,7 @@ mod tests {
             &config,
         );
 
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
 
         *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
@@ -7828,7 +7905,7 @@ mod tests {
         println!("\n=== Testing gap filling on retransmit ===");
         println!("Scenario: TSN 100 lost, 101-102 received, 100 retransmitted");
 
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -7853,7 +7930,7 @@ mod tests {
             &config,
         );
 
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
 
         *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
@@ -7970,7 +8047,7 @@ mod tests {
         println!("\n=== Testing sack_needed flag interaction ===");
         println!("Scenario: Multiple packets received, verify sack_needed behavior");
 
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -7995,7 +8072,7 @@ mod tests {
             &config,
         );
 
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
 
         *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
@@ -8068,7 +8145,7 @@ mod tests {
         println!("\n=== Testing error count reduction on gap ACK ===");
         println!("Scenario: Error count increases, then gap ACK reduces it");
 
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -8095,7 +8172,7 @@ mod tests {
             &config,
         );
 
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
 
         *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
@@ -8186,7 +8263,7 @@ mod tests {
     /// should prevent the heartbeat-failure-based disconnect.
     #[tokio::test]
     async fn test_turn_rate_limit_heartbeat_disconnect() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -8213,7 +8290,7 @@ mod tests {
             true,
             &config,
         );
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
 
         // Set up a connected state with RTO backed off (simulates TURN loss)
         *sctp.inner.state.lock() = SctpState::Connected;
@@ -8350,7 +8427,7 @@ mod tests {
     /// max_association_retransmits to keep the test fast.
     #[tokio::test]
     async fn test_heartbeat_kills_connection_when_peer_dead() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -8376,7 +8453,7 @@ mod tests {
             true,
             &config,
         );
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
 
         *sctp.inner.state.lock() = SctpState::Connected;
         sctp.inner
@@ -8430,7 +8507,7 @@ mod tests {
     /// cwnd recovery mechanism (ssthresh raise when cwnd approaches floor).
     #[tokio::test]
     async fn test_cwnd_collapse_under_turn_rate_limit() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -8454,7 +8531,7 @@ mod tests {
             true,
             &config,
         );
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
 
         *sctp.inner.state.lock() = SctpState::Connected;
         sctp.inner
@@ -8629,7 +8706,7 @@ mod tests {
     /// We verify the field is stored and accessible.
     #[tokio::test]
     async fn test_configurable_heartbeat_interval() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -8693,7 +8770,7 @@ mod tests {
     /// Test: configurable max_burst is correctly stored and used by transmit logic.
     #[tokio::test]
     async fn test_configurable_max_burst() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -8746,7 +8823,7 @@ mod tests {
     /// Test: configurable max_cwnd is correctly stored and caps cwnd growth.
     #[tokio::test]
     async fn test_configurable_max_cwnd() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -8775,7 +8852,7 @@ mod tests {
             &config,
         );
 
-        tokio::spawn(_runner);
+        crate::platform::task::spawn(_runner);
         *sctp.inner.state.lock() = SctpState::Connected;
         sctp.inner
             .remote_verification_tag
@@ -8841,7 +8918,7 @@ mod tests {
     /// Test: INIT a_rwnd uses the configured sctp_receive_window instead of hardcoded 1MB.
     #[tokio::test]
     async fn test_init_uses_configured_receive_window() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -8868,7 +8945,7 @@ mod tests {
             true,
             &config,
         );
-        tokio::spawn(_runner);
+        crate::platform::task::spawn(_runner);
 
         // Verify local_rwnd is set from config
         assert_eq!(
@@ -8881,7 +8958,7 @@ mod tests {
     /// Test: RTO parameters are properly forwarded from config.
     #[tokio::test]
     async fn test_rto_config_forwarding() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -9065,7 +9142,7 @@ mod tests {
     /// a higher limit, the connection survives more heartbeat failures.
     #[tokio::test]
     async fn test_higher_heartbeat_failures_keeps_alive() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -9093,7 +9170,7 @@ mod tests {
             true,
             &config,
         );
-        tokio::spawn(_runner);
+        crate::platform::task::spawn(_runner);
         *sctp.inner.state.lock() = SctpState::Connected;
         sctp.inner
             .remote_verification_tag
@@ -9145,7 +9222,7 @@ mod tests {
     /// Test: ssthresh auto-raise is capped by configurable max_cwnd.
     #[tokio::test]
     async fn test_ssthresh_raise_capped_by_max_cwnd() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -9172,7 +9249,7 @@ mod tests {
             true,
             &config,
         );
-        tokio::spawn(_runner);
+        crate::platform::task::spawn(_runner);
         *sctp.inner.state.lock() = SctpState::Connected;
         sctp.inner
             .remote_verification_tag
@@ -9317,7 +9394,7 @@ mod tests {
     /// The cooldown prevents rapid re-entry into fast recovery
     #[tokio::test]
     async fn test_fast_recovery_cooldown() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -9342,7 +9419,7 @@ mod tests {
             &config,
         );
 
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
         *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
             .remote_verification_tag
@@ -9375,7 +9452,7 @@ mod tests {
     /// Test 5: peer_rwnd=0 blocks new data but allows retransmits
     #[tokio::test]
     async fn test_peer_rwnd_zero_allows_retransmit() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -9400,7 +9477,7 @@ mod tests {
             &config,
         );
 
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
         *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
             .remote_verification_tag
@@ -9473,7 +9550,7 @@ mod tests {
     /// immediately, keeping retransmits fast.
     #[tokio::test]
     async fn test_bug2_rto_decay_is_slow_after_backoff() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -9496,7 +9573,7 @@ mod tests {
             true,
             &config,
         );
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
         *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
             .remote_verification_tag
@@ -9552,7 +9629,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rto_decay_on_sack_progress() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -9577,7 +9654,7 @@ mod tests {
             &config,
         );
 
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
         *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
             .remote_verification_tag
@@ -9672,7 +9749,7 @@ mod tests {
     /// recovery re-entry cooldown).
     #[tokio::test]
     async fn test_b5_cwnd_frozen_during_fast_recovery() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -9694,7 +9771,7 @@ mod tests {
             true,
             &config,
         );
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
         *sctp.inner.state.lock() = SctpState::Connected;
         sctp.inner
             .remote_verification_tag
@@ -9797,7 +9874,7 @@ mod tests {
     /// smaller a_rwnd (down to 0) instead of discarding in-window data.
     #[tokio::test]
     async fn test_c13_no_chunk_backpressure_drops_received_data() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -9819,7 +9896,7 @@ mod tests {
             true,
             &config,
         );
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
         *sctp.inner.state.lock() = SctpState::Connected;
         sctp.inner
             .remote_verification_tag
@@ -9861,7 +9938,7 @@ mod tests {
     /// than 4 MTU-sized new chunks in one burst.
     #[tokio::test]
     async fn test_b8_default_burst_is_4_rfc8261() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -9884,7 +9961,7 @@ mod tests {
             true,
             &config,
         );
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
         *sctp.inner.state.lock() = SctpState::Connected;
         sctp.inner
             .remote_verification_tag
@@ -9932,7 +10009,7 @@ mod tests {
     /// RTO (which is >= rto_min, often 200ms-1s).
     #[tokio::test]
     async fn test_c11_tail_loss_probe_fires() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -9956,7 +10033,7 @@ mod tests {
             true,
             &config,
         );
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
         *sctp.inner.state.lock() = SctpState::Connected;
         sctp.inner
             .remote_verification_tag
@@ -10026,7 +10103,7 @@ mod tests {
     /// strictly shorter than the RTO timer.
     #[tokio::test]
     async fn test_tlp_pto_less_than_rto_at_minimum() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -10050,7 +10127,7 @@ mod tests {
             true,
             &config,
         );
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
         *sctp.inner.state.lock() = SctpState::Connected;
 
         // Small SRTT so RTO == rto_min (=200ms).
@@ -10085,7 +10162,7 @@ mod tests {
     /// light-weight probe rather than waiting for the full RTO timeout.
     #[tokio::test]
     async fn test_tlp_fires_before_t3_when_pto_expired() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -10109,7 +10186,7 @@ mod tests {
             true,
             &config,
         );
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
         *sctp.inner.state.lock() = SctpState::Connected;
         sctp.inner
             .remote_verification_tag
@@ -10192,7 +10269,7 @@ mod tests {
     /// FIRST, then T3. Before the fix (PTO == RTO), TLP never got a chance.
     #[tokio::test]
     async fn test_tlp_and_t3_order_when_both_expired() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -10216,7 +10293,7 @@ mod tests {
             true,
             &config,
         );
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
         *sctp.inner.state.lock() = SctpState::Connected;
         sctp.inner
             .remote_verification_tag
@@ -10281,7 +10358,7 @@ mod tests {
     /// are scarce, so feeding HEARTBEAT RTT keeps RTO accurate.
     #[tokio::test]
     async fn test_b10_heartbeat_rtt_feeds_rto() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -10303,7 +10380,7 @@ mod tests {
             true,
             &config,
         );
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
         *sctp.inner.state.lock() = SctpState::Connected;
         sctp.inner
             .remote_verification_tag
@@ -10369,7 +10446,7 @@ mod tests {
     /// Test 10: advertised_rwnd decreases as used_rwnd increases
     #[tokio::test]
     async fn test_advertised_rwnd_tracking() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -10394,7 +10471,7 @@ mod tests {
             &config,
         );
 
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
 
         // local_rwnd default is 1MB
         let local_rwnd = sctp.inner.local_rwnd;
@@ -10427,7 +10504,7 @@ mod tests {
     /// Test 11: transmit() drains outbound_queue respecting effective window
     #[tokio::test]
     async fn test_transmit_drains_outbound_queue() {
-        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let (socket_tx, _) = crate::platform::sync::watch::channel(None);
         let ice_conn = crate::transports::ice::conn::IceConn::new(
             socket_tx.subscribe(),
             "127.0.0.1:5000".parse().unwrap(),
@@ -10452,7 +10529,7 @@ mod tests {
             &config,
         );
 
-        tokio::spawn(runner);
+        crate::platform::task::spawn(runner);
         *sctp.inner.state.lock() = SctpState::Connecting;
         sctp.inner
             .remote_verification_tag

@@ -105,6 +105,12 @@ impl From<SrtpError> for RtcError {
     }
 }
 
+impl From<alloc::string::FromUtf8Error> for RtcError {
+    fn from(e: alloc::string::FromUtf8Error) -> Self {
+        RtcError::Internal(alloc::format!("utf-8: {e}"))
+    }
+}
+
 impl From<core::num::ParseIntError> for RtcError {
     fn from(e: core::num::ParseIntError) -> Self {
         RtcError::Internal(alloc::format!("int parse: {e}"))
