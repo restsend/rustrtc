@@ -43,14 +43,9 @@ fn webrtc_agent(label: &str, start: u16, end: u16) -> PeerConnection {
     PeerConnection::new(config)
 }
 
-/// WIP: the full-WebRTC integration reaches ICE Connected and starts the
-/// DTLS handshake on the offering side, but the answering PC's monitor loop
-/// stops being polled by the mock driver after its first round (task-queue
-/// fidelity of the test executor, not a library path — the same loops drive
-/// the Srtp e2e and the DTLS e2e to completion). Kept for the ongoing
-/// executor-fidelity work; excluded from the gate until it converges.
+/// Full WebRtc-mode integration: ICE + DTLS-SRTP + media, end to end on the
+/// mock embedded runtime.
 #[test]
-#[ignore = "answering-side monitor stops being polled by the mock driver; see no_std executor fidelity notes"]
 fn two_no_std_pcs_run_full_webrtc_over_the_seams() {
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
@@ -59,6 +54,10 @@ fn two_no_std_pcs_run_full_webrtc_over_the_seams() {
 
     let pc1 = webrtc_agent("pc1", 60_000, 60_020);
     let pc2 = webrtc_agent("pc2", 61_000, 61_020);
+    // The PC-internal monitor task is spawned inside PeerConnection::new via
+    // spawn_rtc (label "task"); tag by creation order instead.
+    let _ = &pc1;
+    let _ = &pc2;
 
     // PC1 sends video; PC2 receives.
     let (source, track, _) =
@@ -153,11 +152,13 @@ fn two_no_std_pcs_run_full_webrtc_over_the_seams() {
                 is_last_packet: true,
                 ..Default::default()
             };
-            if sender_source.send(MediaSample::Video(frame)).is_err() {
+            if let Err(e) = sender_source.send(MediaSample::Video(frame)) {
+                eprintln!("[feed] send failed at seq={seq}: {e}");
                 break;
             }
             rustrtc::platform::task::sleep(std::time::Duration::from_millis(10)).await;
         }
+        eprintln!("[feed] all 40 frames queued");
     }));
 
     let transceivers = pc2.get_transceivers();

@@ -1,26 +1,24 @@
-//! Shared mock runtime for the no_std e2e suites (G1).
+//! Mock embedded runtime for the no_std e2e suites (G1).
 //!
-//! Everything an embedded integration (rtcembed) must provide behind the
-//! rustrtc platform seams, in test form:
-//! - [`LoopNet`] — UDP bind factory over per-port inboxes with waker-aware
-//!   recv (the embassy-net demux shape)
-//! - [`install_mock_platform`] — sleep factory on the crate's logical clock
-//!   (test-side timer wheel), task queue, counter RNG
-//! - [`drive_until`] — the executor: polls every registered task after each
-//!   clock step until `pred` holds or the simulated budget runs out
+//! Everything an embedded integration must provide behind the rustrtc
+//! platform seams, in test form:
+//! - loopback UDP bind factory (`platform::net::set_udp_bind_fn`)
+//! - sleep factory on the crate's logical clock (`task::set_sleep_fn`)
+//! - task queue (`task::set_spawn_fn`) driven by a per-task-waker executor
+//! - counter RNG (`rng::set_fill_fn`)
 //!
-//! Nothing here is linked into the library; rustrtc itself stays
-//! backend-free (zero embassy/std content under `--no-default-features`).
+//! The driver polls only tasks whose own waker fired — true executor
+//! semantics. Nothing here is linked into the library.
 
 #![allow(dead_code)]
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use rustrtc::platform::net::{NetError, UdpSocket};
+use rustrtc::platform::net::{NetError, UdpSocket, set_udp_bind_fn};
 use rustrtc::platform::task::BoxedTask;
 use rustrtc::platform::time::advance_ms;
 
@@ -55,7 +53,10 @@ impl std::future::Future for Sleep {
             std::task::Poll::Ready(())
         } else {
             let mut timers = TIMERS.lock().unwrap();
-            if !timers.iter().any(|(_, w)| w.will_wake(cx.waker())) {
+            if !timers
+                .iter()
+                .any(|(_, w)| w.will_wake(cx.waker()) && same_task(w, cx))
+            {
                 timers.push((self.deadline, cx.waker().clone()));
             }
             std::task::Poll::Pending
@@ -63,8 +64,15 @@ impl std::future::Future for Sleep {
     }
 }
 
-/// rtcembed's embassy-time factory shape: a non-capturing `fn` handing
-/// back a boxed timer (stands in for `embassy_time::Timer::after`).
+/// Identity helper: this mock executor has one driver thread, so any waker
+/// is "the same task" for de-duplication purposes is too coarse — keep the
+/// exact-waker comparison (each task polls with its own task waker).
+fn same_task(_a: &std::task::Waker, _cx: &std::task::Context<'_>) -> bool {
+    false
+}
+
+/// rtcembed's embassy-time factory shape: a non-capturing `fn` handing back
+/// a boxed timer (stands in for `embassy_time::Timer::after`).
 pub fn sleep_factory(
     dur: Duration,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
@@ -95,23 +103,27 @@ fn wake_due_timers() {
 
 // ── task queue (per-task real wakers — true executor semantics) ─────────
 
-struct TaskWoken(std::sync::atomic::AtomicBool);
+struct TaskWoken(AtomicBool);
 
 impl TaskWoken {
     fn new() -> Arc<Self> {
-        Arc::new(Self(std::sync::atomic::AtomicBool::new(true)))
+        Arc::new(Self(AtomicBool::new(true))) // runnable on first poll
     }
     fn wake_by_ref(&self) {
-        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.0.store(true, Ordering::SeqCst);
     }
     fn take(&self) -> bool {
-        self.0.swap(false, std::sync::atomic::Ordering::SeqCst)
+        self.0.swap(false, Ordering::SeqCst)
     }
 }
 
 pub struct Task {
     label: &'static str,
     woken: Arc<TaskWoken>,
+    /// Created once at spawn: a STABLE waker is required so `Waker::will_wake`
+    /// comparisons inside the library (Notify/watch de-duplication) keep
+    /// working across polls — fresh waker allocations defeat them.
+    waker: std::task::Waker,
     fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
 }
 
@@ -124,45 +136,88 @@ impl TaskHandle {
     fn waker(&self) -> std::task::Waker {
         use std::task::{RawWaker, RawWakerVTable, Waker};
         unsafe fn clone_raw(p: *const ()) -> RawWaker {
-            let arc = Arc::from_raw(p as *const TaskWoken);
-            let c = arc.clone();
-            Arc::into_raw(arc);
-            RawWaker::new(Arc::into_raw(c) as *const (), &VTABLE)
+            unsafe {
+                let arc = Arc::from_raw(p as *const TaskWoken);
+                let c = arc.clone();
+                Arc::into_raw(arc);
+                RawWaker::new(Arc::into_raw(c) as *const (), &TASK_WAKER_VTABLE)
+            }
         }
         unsafe fn wake_raw(p: *const ()) {
-            let arc = Arc::from_raw(p as *const TaskWoken);
-            arc.wake_by_ref();
-            Arc::into_raw(arc);
+            unsafe {
+                let arc = Arc::from_raw(p as *const TaskWoken);
+                arc.wake_by_ref();
+                Arc::into_raw(arc);
+            }
         }
         unsafe fn wake_by_ref_raw(p: *const ()) {
-            let arc = Arc::from_raw(p as *const TaskWoken);
-            arc.wake_by_ref();
-            Arc::into_raw(arc);
+            unsafe {
+                let arc = Arc::from_raw(p as *const TaskWoken);
+                arc.wake_by_ref();
+                Arc::into_raw(arc);
+            }
         }
         unsafe fn drop_raw(p: *const ()) {
-            drop(Arc::from_raw(p as *const TaskWoken));
+            unsafe {
+                drop(Arc::from_raw(p as *const TaskWoken));
+            }
         }
-        static VTABLE: RawWakerVTable =
-            RawWakerVTable::new(clone_raw, wake_raw, wake_by_ref_raw, drop_raw);
         unsafe {
             Waker::from_raw(RawWaker::new(
                 Arc::into_raw(self.0.clone()) as *const (),
-                &VTABLE,
+                &TASK_WAKER_VTABLE,
             ))
         }
     }
 }
 
+
+// Shared waker vtable for the mock task wakers (all point at TaskWoken).
+static TASK_WAKER_VTABLE: std::task::RawWakerVTable = build_task_vtable();
+
+const fn build_task_vtable() -> std::task::RawWakerVTable {
+    use std::task::{RawWaker, RawWakerVTable};
+    unsafe fn clone_raw(p: *const ()) -> RawWaker {
+        unsafe {
+            let arc = Arc::from_raw(p as *const TaskWoken);
+            let c = arc.clone();
+            Arc::into_raw(arc);
+            RawWaker::new(Arc::into_raw(c) as *const (), &VTABLE)
+        }
+    }
+    unsafe fn wake_raw(p: *const ()) {
+        unsafe {
+            let arc = Arc::from_raw(p as *const TaskWoken);
+            arc.wake_by_ref();
+            Arc::into_raw(arc);
+        }
+    }
+    unsafe fn wake_by_ref_raw(p: *const ()) {
+        unsafe {
+            let arc = Arc::from_raw(p as *const TaskWoken);
+            arc.wake_by_ref();
+            Arc::into_raw(arc);
+        }
+    }
+    unsafe fn drop_raw(p: *const ()) {
+        unsafe {
+            drop(Arc::from_raw(p as *const TaskWoken));
+        }
+    }
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(clone_raw, wake_raw, wake_by_ref_raw, drop_raw);
+    RawWakerVTable::new(clone_raw, wake_raw, wake_by_ref_raw, drop_raw)
+}
 static TASKS: Mutex<Vec<Task>> = Mutex::new(Vec::new());
 
 /// Parks a spawned future in the queue the driver polls.
 pub fn keep_task_labeled(label: &'static str, fut: BoxedTask) {
     let woken = TaskWoken::new();
-    let handle = TaskHandle(woken.clone());
-    let _waker = handle.waker();
+    let waker = TaskHandle(woken.clone()).waker();
     TASKS.lock().unwrap().push(Task {
         label,
         woken,
+        waker,
         fut: Box::into_pin(fut),
     });
 }
@@ -173,27 +228,6 @@ pub fn keep_task(fut: BoxedTask) {
 
 pub fn task_count() -> usize {
     TASKS.lock().unwrap().len()
-}
-
-// ── platform installation ────────────────────────────────────────────────
-
-/// Installs the four platform seams rtcembed wires at boot. Idempotent.
-pub fn install_mock_platform() {
-    fn counter_fill(buf: &mut [u8]) {
-        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(7);
-        for slot in buf.iter_mut() {
-            *slot = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u8;
-        }
-    }
-    rustrtc::platform::rng::set_fill_fn(counter_fill);
-    rustrtc::platform::task::set_sleep_fn(sleep_factory);
-    rustrtc::platform::task::set_spawn_fn(keep_task);
-    rustrtc::platform::net::set_udp_bind_fn(bind_loop);
-}
-
-/// Test-side debug print (works under the no_std lib's tracing-less build).
-pub fn dbg(msg: &str) {
-    eprintln!("[mock] {msg}");
 }
 
 // ── loopback network ─────────────────────────────────────────────────────
@@ -208,7 +242,7 @@ fn inboxes() -> &'static Mutex<HashMap<u16, Inbox>> {
     INBOXES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-static EPHEMERAL: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(40_000);
+static EPHEMERAL: AtomicU16 = AtomicU16::new(40_000);
 
 pub struct LoopSocket {
     local: SocketAddr,
@@ -223,7 +257,7 @@ impl LoopSocket {
 /// UDP bind factory (the `set_udp_bind_fn` implementation shape).
 pub fn bind_loop(addr: SocketAddr) -> Result<Arc<dyn UdpSocket>, rustrtc::errors::RtcError> {
     let port = if addr.port() == 0 {
-        EPHEMERAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        EPHEMERAL.fetch_add(1, Ordering::Relaxed)
     } else {
         addr.port()
     };
@@ -273,8 +307,12 @@ impl UdpSocket for LoopSocket {
     }
 
     fn try_send_to(&self, buf: &[u8], addr: SocketAddr) -> Result<usize, NetError> {
+        if std::env::var("LOOPNET_TRACE").is_ok() {
+            eprintln!("[net] {} -> {} len={} first={:?}", self.local, addr, buf.len(), buf.first());
+        }
         let mut inboxes = inboxes().lock().unwrap();
         let Some(inbox) = inboxes.get_mut(&addr.port()) else {
+            // UDP semantics: no listener → datagram dropped.
             return Ok(buf.len());
         };
         inbox.queue.push_back((self.local, buf.to_vec()));
@@ -283,6 +321,27 @@ impl UdpSocket for LoopSocket {
         }
         Ok(buf.len())
     }
+}
+
+// ── platform installation ────────────────────────────────────────────────
+
+/// Installs the four platform seams an embedded integration wires at boot.
+/// Idempotent.
+pub fn install_mock_platform() {
+    fn counter_fill(buf: &mut [u8]) {
+        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(7);
+        for slot in buf.iter_mut() {
+            *slot = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u8;
+        }
+    }
+    rustrtc::platform::rng::set_fill_fn(counter_fill);
+    rustrtc::platform::task::set_sleep_fn(sleep_factory);
+    rustrtc::platform::task::set_spawn_fn(keep_task);
+    rustrtc::platform::net::set_udp_bind_fn(bind_loop);
+}
+
+pub fn dbg(msg: &str) {
+    eprintln!("[mock] {msg}");
 }
 
 // ── driver (per-task-waker executor: only woken tasks are polled) ───────
@@ -297,8 +356,7 @@ pub fn drive_until_raw(mut pred: impl FnMut() -> bool, budget_ms: u64) -> bool {
         let mut pending = Vec::with_capacity(tasks.len());
         for mut task in tasks {
             if task.woken.take() {
-                let handle = TaskHandle(task.woken.clone());
-                let waker = handle.waker();
+                let waker = task.waker.clone();
                 let mut cx = std::task::Context::from_waker(&waker);
                 if task.fut.as_mut().poll(&mut cx).is_pending() {
                     // Re-arm: the task stays parked until its own waker
@@ -338,12 +396,12 @@ pub fn drive_until(pred: impl Fn() -> bool, budget_ms: u64) -> bool {
 /// runtime: polls the local future and every runnable task each round,
 /// advancing the logical clock between rounds.
 pub fn drive<F: std::future::Future>(fut: F, budget_ms: u64) -> Option<F::Output> {
-    let local_woken = Arc::new(TaskWoken(std::sync::atomic::AtomicBool::new(true)));
-    let local_waker = TaskHandle(local_woken.clone()).waker();
+    let local_waker = TaskHandle(Arc::new(TaskWoken(std::sync::atomic::AtomicBool::new(true)))).waker();
     let mut fut = Box::pin(fut);
     let mut cx = std::task::Context::from_waker(&local_waker);
     let deadline = clock() + budget_ms;
     loop {
+        // Always poll the driven future.
         if let std::task::Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
             return Some(v);
         }
@@ -352,9 +410,8 @@ pub fn drive<F: std::future::Future>(fut: F, budget_ms: u64) -> Option<F::Output
         let mut pending = Vec::with_capacity(tasks.len());
         for mut task in tasks {
             if task.woken.take() {
-                let handle = TaskHandle(task.woken.clone());
-                let w = handle.waker();
-                let mut tcx = std::task::Context::from_waker(&w);
+                let waker = task_waker_for(&task.woken);
+                let mut tcx = std::task::Context::from_waker(&waker);
                 if task.fut.as_mut().poll(&mut tcx).is_pending() {
                     task.woken.wake_by_ref();
                     pending.push(task);
@@ -380,10 +437,45 @@ pub fn drive<F: std::future::Future>(fut: F, budget_ms: u64) -> Option<F::Output
     }
 }
 
+fn task_waker_for(woken: &Arc<TaskWoken>) -> std::task::Waker {
+    use std::task::{RawWaker, RawWakerVTable, Waker};
+    let ptr = Arc::into_raw(woken.clone()) as *const ();
+    unsafe fn clone_raw(p: *const ()) -> RawWaker {
+        unsafe {
+            let arc = Arc::from_raw(p as *const AtomicBool);
+            let c = arc.clone();
+            Arc::into_raw(arc);
+            RawWaker::new(Arc::into_raw(c) as *const (), &TASK_WAKER_VTABLE)
+        }
+    }
+    unsafe fn wake_raw(p: *const ()) {
+        unsafe {
+            let arc = Arc::from_raw(p as *const AtomicBool);
+            arc.store(true, Ordering::SeqCst);
+            Arc::into_raw(arc);
+        }
+    }
+    unsafe fn wake_by_ref_raw(p: *const ()) {
+        unsafe {
+            let arc = Arc::from_raw(p as *const AtomicBool);
+            arc.store(true, Ordering::SeqCst);
+            Arc::into_raw(arc);
+        }
+    }
+    unsafe fn drop_raw(p: *const ()) {
+        unsafe {
+            drop(Arc::from_raw(p as *const AtomicBool));
+        }
+    }
+    unsafe { Waker::from_raw(RawWaker::new(ptr, &TASK_WAKER_VTABLE)) }
+}
 
+
+/// Spin-poll one future to completion without advancing the clock or
+/// polling tasks (for short futures that only need a few polls).
 pub fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     let mut fut = Box::pin(fut);
-    let waker = noop_waker();
+    let waker = std::task::Waker::noop();
     let mut cx = std::task::Context::from_waker(&waker);
     loop {
         if let std::task::Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
@@ -391,14 +483,4 @@ pub fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         }
         std::thread::yield_now();
     }
-}
-
-pub fn noop_waker() -> std::task::Waker {
-    use std::task::{RawWaker, RawWakerVTable, Waker};
-    unsafe fn clone_raw(_: *const ()) -> RawWaker {
-        RawWaker::new(std::ptr::null(), &VTABLE)
-    }
-    unsafe fn noop_raw(_: *const ()) {}
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_raw, noop_raw, noop_raw, noop_raw);
-    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
 }
