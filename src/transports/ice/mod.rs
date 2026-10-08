@@ -2523,10 +2523,8 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         );
 
         if nominated {
-            debug!("[ice-probe] checks complete: nominated=true");
             let _ = inner.nomination_complete.send(Some(true));
         } else {
-            debug!("[ice-probe] checks complete: all-fail -> Failed");
             let _ = inner.nomination_complete.send(Some(false));
             let _ = inner.set_state(IceTransportState::Failed);
         }
@@ -2561,6 +2559,34 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
             label = inner.config.label.as_deref().unwrap_or("-"),
             "ICE checks complete. Selected pair: {} -> {}", pair.local.address, pair.remote.address
         );
+
+        // Controlled side with a working path but no USE-CANDIDATE yet:
+        // the controlling agent's nomination is still in flight (our checks
+        // complete before its do under asymmetric timing). Keep the selected
+        // pair and wait, bounded by nomination_timeout — a dead controlling
+        // agent still fails the transport via the PC-level timeout.
+        if pair.local.transport != "tcp"
+            && inner.nomination_complete.borrow().is_none()
+        {
+            debug!(
+                label = inner.config.label.as_deref().unwrap_or("-"),
+                "Controlled checks complete without nomination — waiting for USE-CANDIDATE"
+            );
+            let deadline = Instant::now() + inner.config.nomination_timeout;
+            while Instant::now() < deadline
+                && inner.nomination_complete.borrow().is_none()
+                && inner.state.borrow().clone() == IceTransportState::Connected
+            {
+                crate::platform::task::sleep(core::time::Duration::from_millis(20)).await;
+            }
+            if inner.nomination_complete.borrow().is_none() {
+                debug!(
+                    label = inner.config.label.as_deref().unwrap_or("-"),
+                    "Nomination did not arrive in time; keeping best-effort selected pair"
+                );
+                let _ = inner.nomination_complete.send(Some(true));
+            }
+        }
     }
 }
 
@@ -2836,14 +2862,6 @@ async fn bind_direct_rtcp_socket(
     Ok((rtcp, candidate))
 }
 
-async fn handle_packet_probe(packet: &[u8], addr: core::net::SocketAddr, inner: &Arc<IceTransportInner>) {
-    let label = inner.config.label.as_deref().unwrap_or("-");
-    let first = packet.first().copied().unwrap_or(0);
-    if !(first == 22) {
-        // log everything except DTLS retransmit spam
-        tracing::debug!("[pkt-probe {label}] {} bytes={} first={}", addr, packet.len(), first);
-    }
-}
 
 async fn handle_packet(
     packet: &[u8],
@@ -2851,8 +2869,7 @@ async fn handle_packet(
     inner: Arc<IceTransportInner>,
     sender: IceSocketWrapper,
     marshal_buf: &mut Vec<u8>,
-) {
-    handle_packet_probe(packet, addr, &inner).await;    if should_drop_packet() {
+) {    if should_drop_packet() {
         return;
     }
     inner.last_received_nanos.store(
@@ -2874,12 +2891,7 @@ async fn handle_packet(
                     // the incoming source) is a separate concern gated by
                     // `enable_latching` inside handle_stun_request — it is NOT the same
                     // as "should we even reply to this STUN message".
-                    debug!(
-                        "[stun-probe] req from {addr} use_candidate={}",
-                        msg.use_candidate
-                    );
                     handle_stun_request(&sender, &msg, addr, inner).await;
-                    debug!("[stun-probe] handled from {addr}");
                 } else if msg.class == StunClass::SuccessResponse {
                     let mut map = inner.pending_transactions.lock();
                     if let Some(tx) = map.remove(&msg.transaction_id) {
