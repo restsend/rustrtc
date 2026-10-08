@@ -1,7 +1,7 @@
 use crate::errors::{RtcError, RtcResult};
 use crate::media::depacketizer::{Depacketizer, DepacketizerFactory};
 use crate::media::track::{MediaStreamTrack, SampleStreamSource, SampleStreamTrack, sample_track};
-use crate::platform::join::{join2, join3};
+use crate::platform::join::join2;
 use crate::platform::sync::{self, Mutex, Notify, RwLock, broadcast, mpsc, watch};
 use crate::platform::time::Instant;
 use crate::prelude::*;
@@ -1091,10 +1091,9 @@ impl PeerConnection {
                         inner_weak,
                     );
 
-                    let gathering_loop = core::pin::pin!(gathering_loop);
-                    let dtls_loop = core::pin::pin!(dtls_loop);
-                    let ice_runner = core::pin::pin!(ice_runner);
-                    join3(gathering_loop, dtls_loop, ice_runner).await;
+                    crate::platform::task::spawn(gathering_loop);
+                    crate::platform::task::spawn(dtls_loop);
+                    crate::platform::task::spawn(ice_runner);
                 },
             );
             pc.inner.track_task(h);
@@ -4676,7 +4675,7 @@ async fn run_ice_dtls_loop(
     let nomination_complete_rx = ice_transport.subscribe_nomination_complete();
     loop {
         let ice_state = *ice_state_rx.borrow_and_update();
-        debug!("[d-probe] dtls loop wake: {ice_state:?}");
+        debug!("[d-probe {:?}] dtls loop wake: {ice_state:?}", ice_transport.config().label);
 
         let pc_ice_state = match ice_state {
             crate::transports::ice::IceTransportState::New => IceConnectionState::New,

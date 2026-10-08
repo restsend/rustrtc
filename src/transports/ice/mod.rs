@@ -2523,9 +2523,10 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         );
 
         if nominated {
+            debug!("[ice-probe] checks complete: nominated=true");
             let _ = inner.nomination_complete.send(Some(true));
         } else {
-            debug!("All {} nomination attempts failed", successful_pairs.len());
+            debug!("[ice-probe] checks complete: all-fail -> Failed");
             let _ = inner.nomination_complete.send(Some(false));
             let _ = inner.set_state(IceTransportState::Failed);
         }
@@ -2835,6 +2836,15 @@ async fn bind_direct_rtcp_socket(
     Ok((rtcp, candidate))
 }
 
+async fn handle_packet_probe(packet: &[u8], addr: core::net::SocketAddr, inner: &Arc<IceTransportInner>) {
+    let label = inner.config.label.as_deref().unwrap_or("-");
+    let first = packet.first().copied().unwrap_or(0);
+    if !(first == 22) {
+        // log everything except DTLS retransmit spam
+        tracing::debug!("[pkt-probe {label}] {} bytes={} first={}", addr, packet.len(), first);
+    }
+}
+
 async fn handle_packet(
     packet: &[u8],
     addr: SocketAddr,
@@ -2842,7 +2852,7 @@ async fn handle_packet(
     sender: IceSocketWrapper,
     marshal_buf: &mut Vec<u8>,
 ) {
-    if should_drop_packet() {
+    handle_packet_probe(packet, addr, &inner).await;    if should_drop_packet() {
         return;
     }
     inner.last_received_nanos.store(
@@ -2864,7 +2874,12 @@ async fn handle_packet(
                     // the incoming source) is a separate concern gated by
                     // `enable_latching` inside handle_stun_request — it is NOT the same
                     // as "should we even reply to this STUN message".
+                    debug!(
+                        "[stun-probe] req from {addr} use_candidate={}",
+                        msg.use_candidate
+                    );
                     handle_stun_request(&sender, &msg, addr, inner).await;
+                    debug!("[stun-probe] handled from {addr}");
                 } else if msg.class == StunClass::SuccessResponse {
                     let mut map = inner.pending_transactions.lock();
                     if let Some(tx) = map.remove(&msg.transaction_id) {
