@@ -906,7 +906,9 @@ impl IceTransportRunner {
                         }
                     }
                     Err(e) => {
-                        if e.to_string().contains("deadline has elapsed") {
+                        // TurnClient maps an idle UDP receive deadline to this
+                        // sentinel. Hold silence must not terminate the reader.
+                        if matches!(&e, RtcError::Internal(message) if message == "timeout") {
                             continue;
                         }
                         debug!("TURN client recv error: {}", e);
