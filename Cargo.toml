@@ -1,6 +1,6 @@
 [package]
 name = "rustrtc"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 repository = "https://github.com/restsend/rustrtc"
@@ -111,6 +111,11 @@ t38-interop = []
 # mbedtls-backed) — the p256 dependency chain then stays out of the build.
 dtls = []
 crypto-p256 = ["dep:p256"]
+# Test-only instrumentation ([`DTLS_MONITOR_ITERATIONS`]): lets downstream
+# integration tests (e.g. restsend-call's TURN relay e2e) assert that the
+# connected-state DTLS monitor parks instead of busy-looping. Inert (a single
+# relaxed atomic add per monitor iteration) and off by default.
+test-hooks = []
 
 # The T.38 benchmark imports `rustrtc::t38`, which only exists with the
 # feature enabled; without this gate plain `cargo test/build` fails on it.

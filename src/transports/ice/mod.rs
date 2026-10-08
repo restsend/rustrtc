@@ -4898,6 +4898,15 @@ impl IceGatherer {
                     }
                 }
             }
+
+            // no_std (embedded) has no interface enumeration, so use the
+            // embedder's local-IP seam (`platform::net`/`set_local_ip_fn`) to
+            // produce a host candidate — otherwise the WebRTC offer carries no
+            // candidates at all.
+            #[cfg(not(feature = "std"))]
+            if let Ok(ip) = get_local_ip() {
+                bind_ips.push(ip);
+            }
         }
 
         if self.config.ice_udp_mux

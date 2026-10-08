@@ -15,16 +15,12 @@ use crate::rtp::{
 use crate::media::gcc::GccBandwidthEstimator;
 #[cfg(feature = "std")]
 use crate::media::twcc_feedback::TwccFeedbackGenerator;
-use crate::transports::dtls;
+#[cfg(not(feature = "std"))]
+use crate::peer_connection::std_gated::UdtlTransport;
 #[cfg(not(feature = "std"))]
 use crate::peer_connection::std_gated::gcc::GccBandwidthEstimator;
 #[cfg(not(feature = "std"))]
 use crate::peer_connection::std_gated::twcc_feedback::TwccFeedbackGenerator;
-#[cfg(not(feature = "std"))]
-use crate::peer_connection::std_gated::UdtlTransport;
-#[cfg(not(feature = "std"))]
-#[cfg(not(feature = "std"))]
-use crate::transports::sctp::{DataChannel, SctpTransport};
 use crate::platform::atomic64::AtomicU64;
 use crate::sdp::{
     Attribute, Direction, MediaKind, MediaSection, Origin, SdpType, SessionDescription,
@@ -35,6 +31,7 @@ use crate::stats_collector::StatsCollector;
 use crate::t38::endpoint::FaxEndpoint;
 #[cfg(feature = "t38")]
 use crate::t38::t30::{T30FaxConfig, T30Role, T30Session};
+use crate::transports::dtls;
 use crate::transports::dtls::DtlsTransport;
 use crate::transports::get_local_ip;
 use crate::transports::ice::conn::IceConn;
@@ -45,6 +42,9 @@ use crate::transports::rtp::{
 };
 #[cfg(feature = "std")]
 use crate::transports::sctp::{DataChannel, DataChannelConfig, SctpLinkStats, SctpTransport};
+#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "std"))]
+use crate::transports::sctp::{DataChannel, SctpTransport};
 #[cfg(feature = "std")]
 use crate::transports::udptl::UdtlTransport;
 use crate::{AudioCapability, RtcConfiguration, TransportMode, VideoCapability};
@@ -960,9 +960,8 @@ impl PeerConnection {
         } else {
             #[cfg(feature = "std")]
             {
-                let cert = Arc::new(
-                    dtls::generate_certificate().expect("failed to generate certificate"),
-                );
+                let cert =
+                    Arc::new(dtls::generate_certificate().expect("failed to generate certificate"));
                 let fp = dtls::fingerprint(&cert);
                 (cert, fp)
             }
@@ -2721,7 +2720,6 @@ impl PeerConnection {
                 sctp_runner = Box::pin(core::future::pending());
             }
 
-
             // Close any previous DTLS transport so its background handshake/packet
             // task stops instead of being orphaned (which caused a memory leak and
             // the “no selected socket” retransmit log spam every second).
@@ -2805,18 +2803,22 @@ impl PeerConnection {
                 #[cfg(feature = "std")]
                 {
                     use crate::platform::select::select5;
-                    let mut arm_state = core::pin::pin!(state_rx.changed());
-                    let mut pair_arm_rx = pair_rx.clone();
-                    let mut arm_pair = core::pin::pin!(pair_arm_rx.changed());
-                    match select5(
-                        &mut dtls_runner_task,
-                        &mut sctp_runner,
-                        &mut dc_listener,
-                        &mut arm_state,
-                        &mut arm_pair,
-                    )
-                    .await
-                    {
+                    // Same-receiver polling: the notification future borrows
+                    // `pair_rx` for this block only, so the match arms below
+                    // can `pair_rx.borrow()` once the select has resolved.
+                    let __which = {
+                        let mut arm_state = core::pin::pin!(state_rx.changed());
+                        let mut arm_pair = core::pin::pin!(pair_rx.changed());
+                        select5(
+                            &mut dtls_runner_task,
+                            &mut sctp_runner,
+                            &mut dc_listener,
+                            &mut arm_state,
+                            &mut arm_pair,
+                        )
+                        .await
+                    };
+                    match __which {
                         crate::platform::select::Which5::A(res) => {
                             if let Err(e) = res {
                                 return Err(RtcError::Internal(format!(
@@ -2856,17 +2858,18 @@ impl PeerConnection {
                 #[cfg(not(feature = "std"))]
                 {
                     use crate::platform::select::select4;
-                    let mut arm_state = core::pin::pin!(state_rx.changed());
-                    let mut pair_arm_rx = pair_rx.clone();
-                    let mut arm_pair = core::pin::pin!(pair_arm_rx.changed());
-                    match select4(
-                        &mut sctp_runner,
-                        &mut dc_listener,
-                        &mut arm_state,
-                        &mut arm_pair,
-                    )
-                    .await
-                    {
+                    let __which = {
+                        let mut arm_state = core::pin::pin!(state_rx.changed());
+                        let mut arm_pair = core::pin::pin!(pair_rx.changed());
+                        select4(
+                            &mut sctp_runner,
+                            &mut dc_listener,
+                            &mut arm_state,
+                            &mut arm_pair,
+                        )
+                        .await
+                    };
+                    match __which {
                         crate::platform::select::Which4::A(_) => {
                             return Err(RtcError::Internal(
                                 "SCTP runner stopped unexpectedly".into(),
@@ -4675,7 +4678,10 @@ async fn run_ice_dtls_loop(
     let nomination_complete_rx = ice_transport.subscribe_nomination_complete();
     loop {
         let ice_state = *ice_state_rx.borrow_and_update();
-        debug!("[d-probe {:?}] dtls loop wake: {ice_state:?}", ice_transport.config().label);
+        debug!(
+            "[d-probe {:?}] dtls loop wake: {ice_state:?}",
+            ice_transport.config().label
+        );
 
         let pc_ice_state = match ice_state {
             crate::transports::ice::IceTransportState::New => IceConnectionState::New,
@@ -4693,7 +4699,7 @@ async fn run_ice_dtls_loop(
             crate::transports::ice::IceTransportState::Connected
             | crate::transports::ice::IceTransportState::Completed => {
                 ice_transport.nudge_passive_tcp_nomination();
-                        crate::platform::task::yield_now().await;
+                crate::platform::task::yield_now().await;
                 // Wait for ICE nomination to complete before starting DTLS.
                 // This prevents a race where DTLS and the USE-CANDIDATE binding check
                 // compete for the same UDP socket, causing spurious nomination timeouts.
@@ -5002,6 +5008,152 @@ async fn handle_connected_state_no_dtls(
     false
 }
 
+/// Monitors an established DTLS+ICE session until it ends: the RTCP loop
+/// finishing, an ICE Failed/Closed transition, DTLS Closed/Failed, or the ICE
+/// disconnect grace expiring.
+///
+/// Notification discipline: `dtls_rx` is owned here and `changed()` is polled
+/// on that SAME receiver across iterations, so every watch notification is
+/// consumed exactly once. Cloning the receiver per iteration (as the no_std
+/// port of this loop did) leaves the original receiver's version stale, so
+/// every fresh clone observed the last DTLS write immediately and the loop
+/// spun hot — starving the TURN/ICE read tasks joined into the same runner.
+/// `dtls_monitor_parks_when_no_events` guards this.
+async fn monitor_ice_and_dtls(
+    inner: &Arc<PeerConnectionInner>,
+    ice_connection_state_tx: &watch::Sender<IceConnectionState>,
+    ice_state_rx: &mut watch::Receiver<crate::transports::ice::IceTransportState>,
+    mut dtls_rx: watch::Receiver<dtls::DtlsState>,
+    mut rtcp_loop: core::pin::Pin<Box<dyn core::future::Future<Output = ()> + Send>>,
+) -> bool {
+    let grace = inner.config.ice_disconnect_grace;
+    let (grace_tx, mut grace_rx) = mpsc::unbounded_channel::<u64>();
+    let mut disconnect_epoch: u64 = 0;
+    loop {
+        #[cfg(feature = "test-hooks")]
+        crate::DTLS_MONITOR_ITERATIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let mut grace_open = true;
+        let __s0 = core::pin::pin!(&mut rtcp_loop);
+        let __which = {
+            let __s1 = core::pin::pin!(ice_state_rx.changed());
+            let __s2 = core::pin::pin!(dtls_rx.changed());
+            let __s3 = if grace_open {
+                crate::platform::select::Either::A(core::pin::pin!(grace_rx.recv()))
+            } else {
+                crate::platform::select::Either::B(core::future::pending::<Option<u64>>())
+            };
+            crate::platform::select::select4(__s0, __s1, __s2, __s3).await
+        };
+        match __which {
+            crate::platform::select::Which4::A(_) => {
+                propagate_sctp_close_reason(&inner);
+                break;
+            }
+            crate::platform::select::Which4::B(res) => {
+                if res.is_err() {
+                    return false;
+                }
+                let new_state = *ice_state_rx.borrow();
+                if is_ice_failed_or_closed(new_state) {
+                    return true;
+                }
+                match new_state {
+                    crate::transports::ice::IceTransportState::Disconnected => {
+                        let _ = inner.peer_state.send(PeerConnectionState::Disconnected);
+                        let _ = ice_connection_state_tx.send(IceConnectionState::Disconnected);
+                        let epoch = disconnect_epoch;
+                        let tx = grace_tx.clone();
+                        crate::platform::task::spawn(
+                            async move {
+                                crate::platform::task::sleep(grace).await;
+                                let _ = tx.send(epoch);
+                            }
+                            .instrument(tracing::Span::current()),
+                        );
+                        debug!(
+                            "ICE Disconnected, grace timer started ({:.1}s, epoch {})",
+                            grace.as_secs_f64(),
+                            epoch
+                        );
+                    }
+                    crate::transports::ice::IceTransportState::Connected
+                    | crate::transports::ice::IceTransportState::Completed => {
+                        disconnect_epoch += 1;
+                        let _ = inner.peer_state.send(PeerConnectionState::Connected);
+                        let _ = ice_connection_state_tx.send(IceConnectionState::Connected);
+                        debug!(
+                            "ICE recovered (epoch {}), grace cancelled",
+                            disconnect_epoch
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            crate::platform::select::Which4::C(res) => {
+                if res.is_ok() {
+                    let state = dtls_rx.borrow().clone();
+                    if state == dtls::DtlsState::Closed || state == dtls::DtlsState::Failed {
+                        debug!("DTLS closed/failed, disconnecting PC");
+                        let reason = if state == dtls::DtlsState::Failed {
+                            DisconnectReason::DtlsFailed
+                        } else {
+                            DisconnectReason::DtlsClosed
+                        };
+                        let _ = inner.disconnect_reason.send_if_modified(|cur| {
+                            if cur.is_none() {
+                                *cur = Some(reason);
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        let _ = inner.peer_state.send(PeerConnectionState::Disconnected);
+                        let _ = ice_connection_state_tx.send(IceConnectionState::Disconnected);
+                        return false;
+                    }
+                } else {
+                    break;
+                }
+            }
+            crate::platform::select::Which4::D(grace_msg) => {
+                match grace_msg {
+                    Some(epoch) if epoch == disconnect_epoch => {
+                        let _ = inner.disconnect_reason.send_if_modified(|cur| {
+                            if cur.is_none() {
+                                *cur = Some(DisconnectReason::IceDisconnected);
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        let _ = inner.peer_state.send(PeerConnectionState::Disconnected);
+                        let _ = ice_connection_state_tx.send(IceConnectionState::Disconnected);
+                        if let Some(sctp) = inner.sctp_transport.lock().as_ref() {
+                            sctp.close();
+                        }
+                        debug!("ICE disconnect grace expired, cycling transport");
+                        return true;
+                    }
+                    // Stale timer from a previous epoch — ignore.
+                    Some(_) => {}
+                    None => {
+                        // channel closed: stop polling the grace arm
+                        grace_open = false;
+                    }
+                }
+            }
+        }
+    }
+    // RTCP loop finished or the DTLS watch was dropped: fall back to the same
+    // final ICE-state verdict the caller applied before this loop was split
+    // out (Failed/Closed → tear down and let the outer loop reconnect).
+    let state = *ice_state_rx.borrow();
+    if is_ice_failed_or_closed(state) {
+        return true;
+    }
+    false
+}
+
 async fn handle_connected_state(
     inner_weak: &Weak<PeerConnectionInner>,
     ice_connection_state_tx: &watch::Sender<IceConnectionState>,
@@ -5045,139 +5197,14 @@ async fn handle_connected_state(
                         > = None;
 
                         if let Some(dtls_rx) = dtls_state_rx {
-                            let grace = inner.config.ice_disconnect_grace;
-                            let (grace_tx, mut grace_rx) = mpsc::unbounded_channel::<u64>();
-                            let mut disconnect_epoch: u64 = 0;
-                            loop {
-                                let mut grace_open = true;
-                                let __s0 = core::pin::pin!(&mut rtcp_loop);
-                                let mut __dtls2 = dtls_rx.clone();
-                                let __which = {
-                                    let __s1 = core::pin::pin!(ice_state_rx.changed());
-                                    let __s2 = core::pin::pin!(__dtls2.changed());
-                                    let __s3 = if grace_open {
-                                        crate::platform::select::Either::A(core::pin::pin!(
-                                            grace_rx.recv()
-                                        ))
-                                    } else {
-                                        crate::platform::select::Either::B(core::future::pending::<
-                                            Option<u64>,
-                                        >(
-                                        ))
-                                    };
-                                    crate::platform::select::select4(__s0, __s1, __s2, __s3).await
-                                };
-                                match __which {
-                                    crate::platform::select::Which4::A(_) => {
-                                        propagate_sctp_close_reason(&inner);
-                                        break;
-                                    }
-                                    crate::platform::select::Which4::B(res) => {
-                                        if res.is_err() {
-                                            return false;
-                                        }
-                                        let new_state = *ice_state_rx.borrow();
-                                        if is_ice_failed_or_closed(new_state) {
-                                            return true;
-                                        }
-                                        match new_state {
-                                            crate::transports::ice::IceTransportState::Disconnected => {
-                                                let _ = inner.peer_state.send(PeerConnectionState::Disconnected);
-                                                let _ = ice_connection_state_tx.send(IceConnectionState::Disconnected);
-                                                let epoch = disconnect_epoch;
-                                                let tx = grace_tx.clone();
-                                                crate::platform::task::spawn(
-                                                    async move {
-                                                        crate::platform::task::sleep(grace).await;
-                                                        let _ = tx.send(epoch);
-                                                    }
-                                                    .instrument(tracing::Span::current()),
-                                                );
-                                                debug!("ICE Disconnected, grace timer started ({:.1}s, epoch {})", grace.as_secs_f64(), epoch);
-                                            }
-                                            crate::transports::ice::IceTransportState::Connected
-                                            | crate::transports::ice::IceTransportState::Completed => {
-                                                disconnect_epoch += 1;
-                                                let _ = inner.peer_state.send(PeerConnectionState::Connected);
-                                                let _ = ice_connection_state_tx.send(IceConnectionState::Connected);
-                                                debug!("ICE recovered (epoch {}), grace cancelled", disconnect_epoch);
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                    crate::platform::select::Which4::C(res) => {
-                                        if res.is_ok() {
-                                            let state = dtls_rx.borrow().clone();
-                                            if state == dtls::DtlsState::Closed
-                                                || state == dtls::DtlsState::Failed
-                                            {
-                                                debug!("DTLS closed/failed, disconnecting PC");
-                                                let reason = if state == dtls::DtlsState::Failed {
-                                                    DisconnectReason::DtlsFailed
-                                                } else {
-                                                    DisconnectReason::DtlsClosed
-                                                };
-                                                let _ = inner.disconnect_reason.send_if_modified(
-                                                    |cur| {
-                                                        if cur.is_none() {
-                                                            *cur = Some(reason);
-                                                            true
-                                                        } else {
-                                                            false
-                                                        }
-                                                    },
-                                                );
-                                                let _ = inner
-                                                    .peer_state
-                                                    .send(PeerConnectionState::Disconnected);
-                                                let _ = ice_connection_state_tx
-                                                    .send(IceConnectionState::Disconnected);
-                                                return false;
-                                            }
-                                        } else {
-                                            break;
-                                        }
-                                    }
-                                    crate::platform::select::Which4::D(grace_msg) => {
-                                        match grace_msg {
-                                            Some(epoch) if epoch == disconnect_epoch => {
-                                                let _ = inner.disconnect_reason.send_if_modified(
-                                                    |cur| {
-                                                        if cur.is_none() {
-                                                            *cur = Some(
-                                                                DisconnectReason::IceDisconnected,
-                                                            );
-                                                            true
-                                                        } else {
-                                                            false
-                                                        }
-                                                    },
-                                                );
-                                                let _ = inner
-                                                    .peer_state
-                                                    .send(PeerConnectionState::Disconnected);
-                                                let _ = ice_connection_state_tx
-                                                    .send(IceConnectionState::Disconnected);
-                                                if let Some(sctp) =
-                                                    inner.sctp_transport.lock().as_ref()
-                                                {
-                                                    sctp.close();
-                                                }
-                                                debug!(
-                                                    "ICE disconnect grace expired, cycling transport"
-                                                );
-                                                return true;
-                                            }
-                                            // Stale timer from a previous epoch — ignore.
-                                            Some(_) => {}
-                                            None => {
-                                                // channel closed: stop polling the grace arm
-                                                grace_open = false;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            return monitor_ice_and_dtls(
+                                &inner,
+                                ice_connection_state_tx,
+                                &mut *ice_state_rx,
+                                dtls_rx,
+                                rtcp_loop,
+                            )
+                            .await;
                         } else {
                             let grace = inner.config.ice_disconnect_grace;
                             let (grace_tx, mut grace_rx) = mpsc::unbounded_channel::<u64>();
@@ -5684,39 +5711,39 @@ impl PeerConnectionInner {
                 }
                 #[cfg(feature = "std")]
                 {
-                let transport = match transceiver.udtl_transport() {
-                    Some(t) => t,
-                    None => {
-                        let socket =
-                            tokio::net::UdpSocket::bind("0.0.0.0:0")
-                                .await
-                                .map_err(|e| {
-                                    RtcError::Transport(format!("T.38 media bind failed: {e}"))
-                                })?;
-                        let transport = Arc::new(UdtlTransport::new(
-                            Arc::new(socket),
-                            core::net::SocketAddr::new(
-                                core::net::IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED),
-                                0,
-                            ),
-                        ));
-                        transceiver.set_udtl_transport(transport.clone());
-                        transport
-                    }
-                };
-                let local = transport.local_addr()?;
-                section.port = local.port();
-                let ip = self
-                    .config
-                    .external_ip
-                    .clone()
-                    .or_else(|| {
-                        crate::transports::get_local_ip()
-                            .ok()
-                            .map(|i| i.to_string())
-                    })
-                    .unwrap_or_else(|| "127.0.0.1".to_string());
-                section.connection = Some(format!("IN IP4 {}", ip));
+                    let transport = match transceiver.udtl_transport() {
+                        Some(t) => t,
+                        None => {
+                            let socket =
+                                tokio::net::UdpSocket::bind("0.0.0.0:0")
+                                    .await
+                                    .map_err(|e| {
+                                        RtcError::Transport(format!("T.38 media bind failed: {e}"))
+                                    })?;
+                            let transport = Arc::new(UdtlTransport::new(
+                                Arc::new(socket),
+                                core::net::SocketAddr::new(
+                                    core::net::IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED),
+                                    0,
+                                ),
+                            ));
+                            transceiver.set_udtl_transport(transport.clone());
+                            transport
+                        }
+                    };
+                    let local = transport.local_addr()?;
+                    section.port = local.port();
+                    let ip = self
+                        .config
+                        .external_ip
+                        .clone()
+                        .or_else(|| {
+                            crate::transports::get_local_ip()
+                                .ok()
+                                .map(|i| i.to_string())
+                        })
+                        .unwrap_or_else(|| "127.0.0.1".to_string());
+                    section.connection = Some(format!("IN IP4 {}", ip));
                 }
             } else if mode == TransportMode::WebRtc {
                 section.connection = Some("IN IP4 0.0.0.0".to_string());
@@ -5761,7 +5788,7 @@ impl PeerConnectionInner {
                             SdpType::Answer => !remote_offered_rtcp_mux,
                             _ => !local_offers_rtcp_mux,
                         };
-                                if ice_transport.local_candidates().is_empty() {
+                        if ice_transport.local_candidates().is_empty() {
                             ice_transport
                                 .setup_direct_rtp_offer_with_rtcp(needs_rtcp)
                                 .await
@@ -8874,6 +8901,178 @@ mod tests {
     use super::*;
     use crate::transports::ice::IceTransportState;
     use crate::{Direction, MediaKind, RtcConfiguration};
+
+    /// Connected-state DTLS monitor notification discipline (see
+    /// [`monitor_ice_and_dtls`]).
+    mod dtls_monitor {
+        use super::*;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        use core::time::Duration;
+
+        /// Poll-counting wrapper: a parked future is polled a handful of
+        /// times, a busy-loop thousands. This is how the regression below can
+        /// see a CPU spin that no functional assertion can.
+        struct CountPolls<F> {
+            inner: core::pin::Pin<Box<F>>,
+            polls: std::sync::Arc<AtomicUsize>,
+        }
+
+        impl<F: core::future::Future<Output = bool>> core::future::Future for CountPolls<F> {
+            type Output = bool;
+            fn poll(
+                self: core::pin::Pin<&mut Self>,
+                cx: &mut core::task::Context<'_>,
+            ) -> core::task::Poll<bool> {
+                let this = self.get_mut(); // Pin<Box<F>> and Arc are Unpin
+                this.polls.fetch_add(1, Ordering::SeqCst);
+                this.inner.as_mut().poll(cx)
+            }
+        }
+
+        fn pending_rtcp_loop() -> core::pin::Pin<Box<dyn core::future::Future<Output = ()> + Send>>
+        {
+            Box::pin(core::future::pending::<()>())
+        }
+
+        /// Declare the session the way `handle_connected_state` sees it after a
+        /// completed handshake: the DTLS watch has already advanced (New →
+        /// Handshaking) *before* the monitor snapshots it, so the monitor's
+        /// receiver starts out stale and its first `changed()` resolves
+        /// immediately. The RTCP loop stays pending, like the real one while
+        /// the session is up.
+        // Expands to statements so the bindings outlive the macro call.
+        macro_rules! started {
+            ($pc:ident, $ice_tx:ident, $ice_rx:ident, $dtls_tx:ident, $dtls_rx:ident) => {
+                let mut config = RtcConfiguration::default();
+                config.ice_disconnect_grace = Duration::from_millis(30);
+                let $pc = PeerConnection::new(config);
+                let ($ice_tx, mut $ice_rx) = watch::channel(IceTransportState::Connected);
+                let ($dtls_tx, $dtls_rx) = watch::channel(dtls::DtlsState::New);
+                let _ = $dtls_tx.send(dtls::DtlsState::Handshaking);
+            };
+        }
+
+        macro_rules! monitor {
+            ($pc:ident, $ice_rx:ident, $dtls_rx:ident, $polls:ident) => {{
+                CountPolls {
+                    polls: {
+                        let polls = std::sync::Arc::new(AtomicUsize::new(0));
+                        $polls = polls.clone();
+                        polls
+                    },
+                    inner: Box::pin(monitor_ice_and_dtls(
+                        &$pc.inner,
+                        &$pc.inner.ice_connection_state,
+                        &mut $ice_rx,
+                        $dtls_rx,
+                        pending_rtcp_loop(),
+                    )),
+                }
+            }};
+        }
+
+        /// Regression: the monitor must consume the stale snapshot
+        /// notification once and then PARK. The no_std port used to clone the
+        /// DTLS receiver every iteration; each clone inherited the original's
+        /// stale version, so `changed()` resolved immediately on every pass
+        /// and the loop spun hot — starving the TURN/ICE read tasks joined
+        /// into the same runner (seen in the field as dead TURN media).
+        ///
+        /// A healthy monitor is polled 2-3 times in the window; the bug polls
+        /// thousands of times per second (tokio's cooperative budget is the
+        /// only thing that ever yields). The 25-poll budget leaves a >100x
+        /// margin on both sides.
+        #[tokio::test(flavor = "current_thread")]
+        async fn parks_when_no_events_fire() {
+            started!(pc, ice_tx, ice_rx, dtls_tx, dtls_rx);
+            let polls;
+            let monitor = monitor!(pc, ice_rx, dtls_rx, polls);
+
+            let outcome = tokio::time::timeout(Duration::from_millis(300), monitor).await;
+            assert!(
+                outcome.is_err(),
+                "monitor must keep waiting while no event fires"
+            );
+            let p = polls.load(Ordering::SeqCst);
+            assert!(
+                p <= 25,
+                "DTLS monitor busy-looped: {} polls in 300 ms with no events \
+                 (a watch notification must be consumed exactly once)",
+                p
+            );
+        }
+
+        /// The stale-snapshot wake must still be handled: the monitor reads
+        /// the mid-handshake state, keeps watching, and disconnects when DTLS
+        /// reaches Closed (peer_state → Disconnected, reason DtlsClosed,
+        /// monitor returns false).
+        #[tokio::test(flavor = "current_thread")]
+        async fn disconnects_when_dtls_closes() {
+            started!(pc, ice_tx, ice_rx, dtls_tx, dtls_rx);
+            let polls;
+            let monitor = monitor!(pc, ice_rx, dtls_rx, polls);
+
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let _ = dtls_tx.send(dtls::DtlsState::Closed);
+            });
+
+            let outcome = tokio::time::timeout(Duration::from_secs(2), monitor)
+                .await
+                .expect("monitor must react to DTLS Closed");
+            assert!(!outcome, "DTLS Closed must end the monitor");
+            assert_eq!(
+                *pc.inner.disconnect_reason.borrow(),
+                Some(DisconnectReason::DtlsClosed),
+            );
+        }
+
+        /// ICE Failed is a hard failure: the monitor returns true so the outer
+        /// loop tears the transport down, without waiting for grace.
+        #[tokio::test(flavor = "current_thread")]
+        async fn reconnects_when_ice_fails() {
+            started!(pc, ice_tx, ice_rx, dtls_tx, dtls_rx);
+            let polls;
+            let monitor = monitor!(pc, ice_rx, dtls_rx, polls);
+
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let _ = ice_tx.send(IceTransportState::Failed);
+            });
+
+            let outcome = tokio::time::timeout(Duration::from_secs(2), monitor)
+                .await
+                .expect("monitor must react to ICE Failed");
+            assert!(outcome, "ICE Failed must cycle the transport");
+        }
+
+        /// A transient ICE Disconnected starts the grace timer; when it
+        /// expires the monitor cycles the transport (returns true) and marks
+        /// the disconnect reason.
+        #[tokio::test(flavor = "current_thread")]
+        async fn cycles_transport_when_grace_expires() {
+            started!(pc, ice_tx, ice_rx, dtls_tx, dtls_rx);
+            let polls;
+            let monitor = monitor!(pc, ice_rx, dtls_rx, polls);
+
+            // Keep the original senders alive: a dropped ICE sender would end
+            // the watch (`changed()` → Err) before the grace timer expires.
+            let ice_tx2 = ice_tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let _ = ice_tx2.send(IceTransportState::Disconnected);
+            });
+
+            let outcome = tokio::time::timeout(Duration::from_secs(2), monitor)
+                .await
+                .expect("monitor must react to the grace expiry");
+            assert!(outcome, "grace expiry must cycle the transport");
+            assert_eq!(
+                *pc.inner.disconnect_reason.borrow(),
+                Some(DisconnectReason::IceDisconnected),
+            );
+        }
+    }
 
     /// Regression: Receiver/Sender Reports must reach the sender's RTCP
     /// broadcast. Previously the RTCP loop only delivered PLI/FIR/NACK, so

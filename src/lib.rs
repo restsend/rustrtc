@@ -43,6 +43,18 @@ pub mod stats;
 pub mod stats_collector;
 #[cfg(feature = "t38")]
 pub mod t38;
+
+/// doc(hidden) test instrumentation (feature `test-hooks`): how many times
+/// the connected-state DTLS monitor loop has iterated, across all peer
+/// connections. A parked monitor advances a handful of times per session;
+/// the clone-notification busy-loop that starved TURN read tasks advanced
+/// thousands of times per second. Downstream integration tests assert the
+/// delta over an idle hold window (see `monitor_ice_and_dtls`).
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub static DTLS_MONITOR_ITERATIONS: crate::platform::atomic64::AtomicU64 =
+    crate::platform::atomic64::AtomicU64::new(0);
+
 pub mod transports;
 
 pub use config::{
