@@ -11,6 +11,10 @@ impl From<std::io::Error> for RtcError {
     fn from(e: std::io::Error) -> Self {
         if e.kind() == std::io::ErrorKind::AddrInUse {
             RtcError::AddrInUse
+        } else if e.kind() == std::io::ErrorKind::TimedOut {
+            // A real socket timeout must be distinguishable from fatal
+            // transport errors: the TURN read loop tolerates timeouts.
+            RtcError::Timeout(alloc::format!("io: {e}"))
         } else {
             RtcError::Transport(alloc::format!("io: {e}"))
         }
@@ -31,6 +35,11 @@ pub enum RtcError {
     Transport(String),
     #[error("internal error: {0}")]
     Internal(String),
+    /// A wait elapsed without completing: DNS/TCP connect, STUN/TURN
+    /// transaction, idle receive. Distinct variant so callers react to
+    /// timeouts by type instead of string-matching Display text.
+    #[error("operation timed out: {0}")]
+    Timeout(String),
     /// The local address (IP:port) is already bound by another socket.
     /// Distinct variant so port-exhaustion retry loops work on every
     /// backend (std io::Error mapping and future platform sockets).
@@ -42,6 +51,11 @@ impl RtcError {
     /// True when the error reports a busy local port (see [`RtcError::AddrInUse`]).
     pub fn is_addr_in_use(&self) -> bool {
         matches!(self, RtcError::AddrInUse)
+    }
+
+    /// True when the error reports a timed-out wait (see [`RtcError::Timeout`]).
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, RtcError::Timeout(_))
     }
 }
 

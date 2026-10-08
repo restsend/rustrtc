@@ -906,9 +906,10 @@ impl IceTransportRunner {
                         }
                     }
                     Err(e) => {
-                        // TurnClient maps an idle UDP receive deadline to this
-                        // sentinel. Hold silence must not terminate the reader.
-                        if matches!(&e, RtcError::Internal(message) if message == "timeout") {
+                        // TurnClient maps an idle UDP receive deadline to
+                        // RtcError::Timeout. Hold silence must not terminate
+                        // the reader.
+                        if e.is_timeout() {
                             continue;
                         }
                         debug!("TURN client recv error: {}", e);
@@ -3483,7 +3484,7 @@ async fn perform_binding_check(
             _ => {
                 let mut map = inner.pending_transactions.lock();
                 map.remove(&perm_tx_id);
-                return Err(RtcError::Internal(format!("CreatePermission timeout")));
+                return Err(RtcError::Timeout("CreatePermission".into()));
             }
         }
     } else if socket.is_none() && platform_socket.is_none() {
@@ -3553,7 +3554,7 @@ async fn perform_binding_check(
                     )));
                 }
                 Ok(Err(e)) => return Err(e),
-                Err(_) => return Err(RtcError::Internal(format!("TCP binding check timeout"))),
+                Err(_) => return Err(RtcError::Timeout("TCP binding check".into())),
             }
         } else if let Some(platform_socket) = &platform_socket {
             // Platform sockets report NetError without an errno carrier:
@@ -3624,7 +3625,7 @@ async fn perform_binding_check(
                 return Ok(());
             }
             crate::platform::select::Which3::B(_) => {
-                return Err(RtcError::Internal(format!("timeout")));
+                return Err(RtcError::Timeout("STUN binding transaction".into()));
             }
             crate::platform::select::Which3::C(_) => {
                 if start.elapsed() >= max_timeout {
@@ -3758,7 +3759,7 @@ async fn perform_tcp_binding_check(
     let connect_timeout = inner.config.stun_timeout;
     let stream = with_timeout(connect_timeout, TcpStream::connect(remote.address))
         .await
-        .map_err(|_| RtcError::Internal(format!("TCP connect timeout to {}", remote.address)))?
+        .map_err(|_| RtcError::Timeout(format!("TCP connect to {}", remote.address)))?
         .map_err(|e| {
             RtcError::Internal(format!("TCP connect to {} failed: {}", remote.address, e))
         })?;
@@ -3830,7 +3831,7 @@ async fn perform_tcp_binding_check(
                 return Ok(());
             }
             crate::platform::select::Which3::B(_) => {
-                return Err(RtcError::Internal(format!("timeout")));
+                return Err(RtcError::Timeout("STUN binding transaction".into()));
             }
             crate::platform::select::Which3::C(_) => {
                 if start.elapsed() >= max_timeout {
@@ -5398,7 +5399,7 @@ impl IceGatherer {
         let mut buf = [0u8; MAX_STUN_MESSAGE];
         let (len, from) = with_timeout(self.config.stun_timeout, socket.recv_from(&mut buf))
             .await
-            .map_err(|_| RtcError::Internal("stun recv timeout".into()))??;
+            .map_err(|_| RtcError::Timeout("stun recv".into()))??;
         if from.ip() != addr.ip() {
             return Ok(None);
         }

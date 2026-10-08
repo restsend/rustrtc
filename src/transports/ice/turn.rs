@@ -95,7 +95,7 @@ impl TurnClient {
     pub(crate) async fn connect(uri: &IceServerUri, disable_ipv6: bool) -> RtcResult<Self> {
         let addr = timeout(DEFAULT_STUN_TIMEOUT, uri.resolve(disable_ipv6))
             .await
-            .map_err(|_| RtcError::Internal(format!("TURN server DNS resolution timed out")))??;
+            .map_err(|_| RtcError::Timeout("TURN server DNS resolution".into()))??;
         let transport = match uri.transport {
             IceTransportProtocol::Udp => {
                 #[cfg(feature = "std")]
@@ -117,9 +117,7 @@ impl TurnClient {
             IceTransportProtocol::Tcp => {
                 let stream = timeout(DEFAULT_STUN_TIMEOUT, TcpStream::connect(addr))
                     .await
-                    .map_err(|_| {
-                        RtcError::Internal(format!("TURN TCP connect to {} timed out", addr))
-                    })??;
+                    .map_err(|_| RtcError::Timeout(format!("TURN TCP connect to {addr}")))??;
                 let (read, write) = stream.into_split();
                 TurnTransport::Tcp {
                     read: Arc::new(Mutex::new(read)),
@@ -402,7 +400,7 @@ impl TurnClient {
             TurnTransport::Udp { socket, .. } => {
                 let (len, _) = timeout(DEFAULT_STUN_TIMEOUT, socket.recv_from(buf))
                     .await
-                    .map_err(|_| RtcError::Internal("timeout".into()))?
+                    .map_err(|_| RtcError::Timeout("idle udp recv".into()))?
                     .map_err(RtcError::from)?;
                 Ok(len)
             }

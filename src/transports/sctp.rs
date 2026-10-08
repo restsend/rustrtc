@@ -944,7 +944,9 @@ impl SctpTransport {
                 while let Some(packet) = outgoing_packet_rx.recv().await {
                     if let Err(e) = dtls_transport_clone.send(packet).await {
                         trace!("SCTP Failed to send outgoing DTLS packet: {}", e);
-                        if e.to_string().contains("DTLS not connected") {
+                        // DTLS not in Connected state: the session is gone,
+                        // stop pumping. Type-matched, not Display text.
+                        if matches!(e, RtcError::InvalidState(_)) {
                             break;
                         }
                     }

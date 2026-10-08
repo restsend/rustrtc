@@ -350,7 +350,11 @@ impl DtlsTransport {
             if let DtlsState::Connected(crypto, _) = &*state_guard {
                 crypto.clone()
             } else {
-                return Err(dtls_err!("DTLS not connected"));
+                // Typed so consumers (the SCTP pump) can match the variant
+                // instead of Display text.
+                return Err(crate::errors::RtcError::InvalidState(
+                    "DTLS not connected".into(),
+                ));
             }
         };
 
@@ -452,7 +456,9 @@ impl DtlsTransport {
             .concat();
             prf_sha256(&crypto.keys.master_secret, label.as_bytes(), &seed, len)
         } else {
-            Err(dtls_err!("DTLS not connected"))
+            Err(crate::errors::RtcError::InvalidState(
+                "DTLS not connected".into(),
+            ))
         }
     }
 }
