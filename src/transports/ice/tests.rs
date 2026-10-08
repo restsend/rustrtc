@@ -219,12 +219,54 @@ async fn turn_client_can_create_permission() -> Result<()> {
     let uri = IceServerUri::parse(&turn_server.turn_url())?;
     let server =
         IceServer::new(vec![turn_server.turn_url()]).with_credential(TEST_USERNAME, TEST_PASSWORD);
-    let client = TurnClient::connect(&uri, false).await?;
+    let client = Arc::new(TurnClient::connect(&uri, false).await?);
     let creds = TurnCredentials::from_server(&server)?;
-    client.allocate(creds).await?;
-    let peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
-    client.create_permission(peer).await?;
+    let allocation = client.allocate(creds).await?;
+    let peer = UdpSocket::bind("127.0.0.1:0").await?;
+    client.create_permission(peer.local_addr()?).await?;
+
+    // Exercise the real TURN read loop without ICE keepalives masking silence.
+    let (transport, _runner) = IceTransportBuilder::new(RtcConfiguration::default()).build();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    struct TestReceiver(tokio::sync::mpsc::Sender<Bytes>);
+    #[async_trait::async_trait]
+    impl PacketReceiver for TestReceiver {
+        async fn receive(&self, packet: Bytes, _addr: SocketAddr, _buf: &mut Vec<u8>) {
+            let _ = self.0.send(packet).await;
+        }
+    }
+    transport
+        .set_data_receiver(Arc::new(TestReceiver(tx)))
+        .await;
+    let read_loop = tokio::spawn(IceTransportRunner::run_turn_read_loop(
+        client.clone(),
+        allocation.relayed_address,
+        transport.inner.clone(),
+    ));
+    client
+        .send_indication(peer.local_addr()?, b"outbound media")
+        .await?;
+    let mut buf = [0u8; 1500];
+    let (_, relay) = timeout(Duration::from_secs(2), peer.recv_from(&mut buf)).await??;
+    peer.send_to(b"before hold", relay).await?;
+    assert_eq!(
+        timeout(Duration::from_secs(2), rx.recv()).await?.unwrap(),
+        Bytes::from_static(b"before hold")
+    );
+    tokio::time::sleep(Duration::from_millis(3300)).await;
+    peer.send_to(b"after resume", relay).await?;
+    let resumed = timeout(Duration::from_secs(2), rx.recv()).await;
+
+    // Even an idle receive must be cancellable when the transport closes.
+    transport.stop();
+    timeout(Duration::from_secs(2), read_loop).await??;
     turn_server.stop().await?;
+    assert_eq!(
+        resumed
+            .context("TURN read loop lost media after hold silence")?
+            .unwrap(),
+        Bytes::from_static(b"after resume")
+    );
     Ok(())
 }
 
