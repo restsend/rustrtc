@@ -16,6 +16,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -92,20 +93,76 @@ fn wake_due_timers() {
     }
 }
 
-// ── task queue ───────────────────────────────────────────────────────────
+// ── task queue (per-task real wakers — true executor semantics) ─────────
 
-static TASKS: Mutex<Vec<Task>> = Mutex::new(Vec::new());
+struct TaskWoken(std::sync::atomic::AtomicBool);
 
-struct Task {
+impl TaskWoken {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(std::sync::atomic::AtomicBool::new(true)))
+    }
+    fn wake_by_ref(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn take(&self) -> bool {
+        self.0.swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+pub struct Task {
     label: &'static str,
+    woken: Arc<TaskWoken>,
     fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
 }
 
-/// rtcembed's `keep`-style spawner target: parks spawned futures in the
-/// queue the driver polls.
+/// A waker bound to one task: waking marks that task runnable (the driver
+/// re-polls exactly the runnable set — same contract as a real executor).
+#[derive(Clone)]
+struct TaskHandle(Arc<TaskWoken>);
+
+impl TaskHandle {
+    fn waker(&self) -> std::task::Waker {
+        use std::task::{RawWaker, RawWakerVTable, Waker};
+        unsafe fn clone_raw(p: *const ()) -> RawWaker {
+            let arc = Arc::from_raw(p as *const TaskWoken);
+            let c = arc.clone();
+            Arc::into_raw(arc);
+            RawWaker::new(Arc::into_raw(c) as *const (), &VTABLE)
+        }
+        unsafe fn wake_raw(p: *const ()) {
+            let arc = Arc::from_raw(p as *const TaskWoken);
+            arc.wake_by_ref();
+            Arc::into_raw(arc);
+        }
+        unsafe fn wake_by_ref_raw(p: *const ()) {
+            let arc = Arc::from_raw(p as *const TaskWoken);
+            arc.wake_by_ref();
+            Arc::into_raw(arc);
+        }
+        unsafe fn drop_raw(p: *const ()) {
+            drop(Arc::from_raw(p as *const TaskWoken));
+        }
+        static VTABLE: RawWakerVTable =
+            RawWakerVTable::new(clone_raw, wake_raw, wake_by_ref_raw, drop_raw);
+        unsafe {
+            Waker::from_raw(RawWaker::new(
+                Arc::into_raw(self.0.clone()) as *const (),
+                &VTABLE,
+            ))
+        }
+    }
+}
+
+static TASKS: Mutex<Vec<Task>> = Mutex::new(Vec::new());
+
+/// Parks a spawned future in the queue the driver polls.
 pub fn keep_task_labeled(label: &'static str, fut: BoxedTask) {
+    let woken = TaskWoken::new();
+    let handle = TaskHandle(woken.clone());
+    let _waker = handle.waker();
     TASKS.lock().unwrap().push(Task {
         label,
+        woken,
         fut: Box::into_pin(fut),
     });
 }
@@ -116,6 +173,27 @@ pub fn keep_task(fut: BoxedTask) {
 
 pub fn task_count() -> usize {
     TASKS.lock().unwrap().len()
+}
+
+// ── platform installation ────────────────────────────────────────────────
+
+/// Installs the four platform seams rtcembed wires at boot. Idempotent.
+pub fn install_mock_platform() {
+    fn counter_fill(buf: &mut [u8]) {
+        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(7);
+        for slot in buf.iter_mut() {
+            *slot = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u8;
+        }
+    }
+    rustrtc::platform::rng::set_fill_fn(counter_fill);
+    rustrtc::platform::task::set_sleep_fn(sleep_factory);
+    rustrtc::platform::task::set_spawn_fn(keep_task);
+    rustrtc::platform::net::set_udp_bind_fn(bind_loop);
+}
+
+/// Test-side debug print (works under the no_std lib's tracing-less build).
+pub fn dbg(msg: &str) {
+    eprintln!("[mock] {msg}");
 }
 
 // ── loopback network ─────────────────────────────────────────────────────
@@ -142,7 +220,7 @@ impl LoopSocket {
     }
 }
 
-/// UDP bind factory ( rtcembed's `set_udp_bind_fn` implementation shape).
+/// UDP bind factory (the `set_udp_bind_fn` implementation shape).
 pub fn bind_loop(addr: SocketAddr) -> Result<Arc<dyn UdpSocket>, rustrtc::errors::RtcError> {
     let port = if addr.port() == 0 {
         EPHEMERAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -151,8 +229,6 @@ pub fn bind_loop(addr: SocketAddr) -> Result<Arc<dyn UdpSocket>, rustrtc::errors
     };
     let mut inboxes = inboxes().lock().unwrap();
     if inboxes.contains_key(&port) {
-        // Matches io::ErrorKind::AddrInUse on std: bind_one retries the
-        // next port in the configured range.
         return Err(rustrtc::errors::RtcError::AddrInUse);
     }
     inboxes.insert(
@@ -197,18 +273,8 @@ impl UdpSocket for LoopSocket {
     }
 
     fn try_send_to(&self, buf: &[u8], addr: SocketAddr) -> Result<usize, NetError> {
-        if std::env::var("LOOPNET_TRACE").is_ok() {
-            eprintln!(
-                "[net] {} -> {} len={} first={:?}",
-                self.local,
-                addr,
-                buf.len(),
-                buf.first().copied()
-            );
-        }
         let mut inboxes = inboxes().lock().unwrap();
         let Some(inbox) = inboxes.get_mut(&addr.port()) else {
-            // UDP semantics: no listener → datagram dropped.
             return Ok(buf.len());
         };
         inbox.queue.push_back((self.local, buf.to_vec()));
@@ -219,68 +285,32 @@ impl UdpSocket for LoopSocket {
     }
 }
 
-// ── platform installation ────────────────────────────────────────────────
+// ── driver (per-task-waker executor: only woken tasks are polled) ───────
 
-/// Installs the four platform seams rtcembed wires at boot. Idempotent.
-pub fn install_mock_platform() {
-    fn counter_fill(buf: &mut [u8]) {
-        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(7);
-        for slot in buf.iter_mut() {
-            *slot = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u8;
-        }
-    }
-    rustrtc::platform::rng::set_fill_fn(counter_fill);
-    rustrtc::platform::task::set_sleep_fn(sleep_factory);
-    rustrtc::platform::task::set_spawn_fn(keep_task);
-    rustrtc::platform::net::set_udp_bind_fn(bind_loop);
-}
-
-// ── driver ───────────────────────────────────────────────────────────────
-
-/// Polls every registered task after each clock step until `pred` holds or
-/// the simulated budget (ms of logical time) runs out. Returns the final
-/// predicate value.
-pub fn drive_until_raw(pred: impl FnMut() -> bool, budget_ms: u64) -> bool {
-    drive_until_raw_inner(pred, budget_ms)
-}
-
-pub fn drive_until(pred: impl Fn() -> bool, budget_ms: u64) -> bool {
-    drive_until_raw_inner(pred, budget_ms)
-}
-
-fn drive_until_raw_inner(mut pred: impl FnMut() -> bool, budget_ms: u64) -> bool {
-    let waker = noop_waker();
-    let mut cx = std::task::Context::from_waker(&waker);
+/// Polls runnable tasks after each clock step until `pred` holds or the
+/// simulated budget runs out. Only tasks whose own waker fired are polled —
+/// true executor semantics.
+pub fn drive_until_raw(mut pred: impl FnMut() -> bool, budget_ms: u64) -> bool {
     let deadline = clock() + budget_ms;
-    let mut round = 0u32;
     loop {
-        round += 1;
-        let trace = std::env::var("TASK_TRACE").is_ok() && round <= 8;
         let tasks: Vec<_> = std::mem::take(&mut *TASKS.lock().unwrap());
         let mut pending = Vec::with_capacity(tasks.len());
-        let mut addrs = Vec::new();
         for mut task in tasks {
-            let label = task.label;
-            let completed = task.fut.as_mut().poll(&mut cx).is_ready();
-            if trace {
-                if completed {
-                    eprintln!("[task-trace r{round}] {label} COMPLETED");
-                } else {
-                    addrs.push(label);
+            if task.woken.take() {
+                let handle = TaskHandle(task.woken.clone());
+                let waker = handle.waker();
+                let mut cx = std::task::Context::from_waker(&waker);
+                if task.fut.as_mut().poll(&mut cx).is_pending() {
+                    // Re-arm: the task stays parked until its own waker
+                    // fires again.
+                    task.woken.0.store(true, Ordering::SeqCst);
+                    pending.push(task);
                 }
-            }
-            if !completed {
+            } else {
                 pending.push(task);
             }
         }
-        let alive = pending.len();
         TASKS.lock().unwrap().extend(pending);
-        if trace {
-            eprintln!("[task-trace r{round}] alive={alive}");
-            for a in &addrs {
-                eprintln!("[task-trace r{round}]   alive {a}");
-            }
-        }
 
         if pred() {
             return true;
@@ -288,8 +318,6 @@ fn drive_until_raw_inner(mut pred: impl FnMut() -> bool, budget_ms: u64) -> bool
         if clock() >= deadline {
             return pred();
         }
-        // Step the clock to the next interesting moment (timer due, else a
-        // fixed 10ms tick) and wake whoever is waiting on it.
         let now = clock();
         let next_due = TIMERS.lock().unwrap().iter().map(|(d, _)| *d).min();
         let step = next_due
@@ -302,14 +330,18 @@ fn drive_until_raw_inner(mut pred: impl FnMut() -> bool, budget_ms: u64) -> bool
     }
 }
 
+pub fn drive_until(pred: impl Fn() -> bool, budget_ms: u64) -> bool {
+    drive_until_raw(pred, budget_ms)
+}
+
 /// Drives one (borrowed-ok) future to completion against the shared
-/// runtime: polls the future AND the registered tasks each round, advancing
-/// the logical clock between rounds. Returns `None` if it never completes
-/// within the budget.
+/// runtime: polls the local future and every runnable task each round,
+/// advancing the logical clock between rounds.
 pub fn drive<F: std::future::Future>(fut: F, budget_ms: u64) -> Option<F::Output> {
+    let local_woken = Arc::new(TaskWoken(std::sync::atomic::AtomicBool::new(true)));
+    let local_waker = TaskHandle(local_woken.clone()).waker();
     let mut fut = Box::pin(fut);
-    let waker = noop_waker();
-    let mut cx = std::task::Context::from_waker(&waker);
+    let mut cx = std::task::Context::from_waker(&local_waker);
     let deadline = clock() + budget_ms;
     loop {
         if let std::task::Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
@@ -319,7 +351,15 @@ pub fn drive<F: std::future::Future>(fut: F, budget_ms: u64) -> Option<F::Output
         let tasks: Vec<_> = std::mem::take(&mut *TASKS.lock().unwrap());
         let mut pending = Vec::with_capacity(tasks.len());
         for mut task in tasks {
-            if task.fut.as_mut().poll(&mut cx).is_pending() {
+            if task.woken.take() {
+                let handle = TaskHandle(task.woken.clone());
+                let w = handle.waker();
+                let mut tcx = std::task::Context::from_waker(&w);
+                if task.fut.as_mut().poll(&mut tcx).is_pending() {
+                    task.woken.wake_by_ref();
+                    pending.push(task);
+                }
+            } else {
                 pending.push(task);
             }
         }
@@ -340,8 +380,7 @@ pub fn drive<F: std::future::Future>(fut: F, budget_ms: u64) -> Option<F::Output
     }
 }
 
-/// Spin-poll one future to completion without advancing the clock or
-/// polling tasks (for short futures that only need a few polls).
+
 pub fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     let mut fut = Box::pin(fut);
     let waker = noop_waker();

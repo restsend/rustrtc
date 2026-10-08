@@ -28,8 +28,9 @@ use rustrtc::transports::dtls::Certificate;
 const CERT_DER: &[u8] = include_bytes!("fixtures/dtls_cert.der");
 const KEY_DER: &[u8] = include_bytes!("fixtures/dtls_key.der");
 
-fn webrtc_agent(start: u16, end: u16) -> PeerConnection {
+fn webrtc_agent(label: &str, start: u16, end: u16) -> PeerConnection {
     let mut config = RtcConfiguration::default();
+    config.label = Some(label.to_string());
     config.bind_ip = Some("127.0.0.1".to_string());
     config.rtp_start_port = Some(start);
     config.rtp_end_port = Some(end);
@@ -56,8 +57,8 @@ fn two_no_std_pcs_run_full_webrtc_over_the_seams() {
         .try_init();
     install_mock_platform();
 
-    let pc1 = webrtc_agent(60_000, 60_020);
-    let pc2 = webrtc_agent(61_000, 61_020);
+    let pc1 = webrtc_agent("pc1", 60_000, 60_020);
+    let pc2 = webrtc_agent("pc2", 61_000, 61_020);
 
     // PC1 sends video; PC2 receives.
     let (source, track, _) =
