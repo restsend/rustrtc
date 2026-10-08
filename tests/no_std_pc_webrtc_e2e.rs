@@ -144,7 +144,7 @@ fn two_no_std_pcs_run_full_webrtc_over_the_seams() {
 
     // Media over the DTLS-SRTP channel, payload order verified.
     let sender_source = source.clone();
-    common::keep_task(Box::new(async move {
+    common::keep_task_labeled("media-feed", Box::new(async move {
         for seq in 0..40u8 {
             let frame = VideoFrame {
                 rtp_timestamp: seq as u32 * 3000,
@@ -164,7 +164,7 @@ fn two_no_std_pcs_run_full_webrtc_over_the_seams() {
     let track_remote = receiver.track();
     let received: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = received.clone();
-    common::keep_task(Box::new(async move {
+    common::keep_task_labeled("media-recv", Box::new(async move {
         while let Ok(sample) = track_remote.recv().await {
             if let MediaSample::Video(frame) = sample {
                 let marker = frame.data.first().copied().unwrap_or(0xFF);

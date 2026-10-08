@@ -94,13 +94,24 @@ fn wake_due_timers() {
 
 // ── task queue ───────────────────────────────────────────────────────────
 
-static TASKS: Mutex<Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>> =
-    Mutex::new(Vec::new());
+static TASKS: Mutex<Vec<Task>> = Mutex::new(Vec::new());
+
+struct Task {
+    label: &'static str,
+    fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+}
 
 /// rtcembed's `keep`-style spawner target: parks spawned futures in the
 /// queue the driver polls.
+pub fn keep_task_labeled(label: &'static str, fut: BoxedTask) {
+    TASKS.lock().unwrap().push(Task {
+        label,
+        fut: Box::into_pin(fut),
+    });
+}
+
 pub fn keep_task(fut: BoxedTask) {
-    TASKS.lock().unwrap().push(Box::into_pin(fut));
+    keep_task_labeled("task", fut);
 }
 
 pub fn task_count() -> usize {
@@ -241,15 +252,35 @@ fn drive_until_raw_inner(mut pred: impl FnMut() -> bool, budget_ms: u64) -> bool
     let waker = noop_waker();
     let mut cx = std::task::Context::from_waker(&waker);
     let deadline = clock() + budget_ms;
+    let mut round = 0u32;
     loop {
+        round += 1;
+        let trace = std::env::var("TASK_TRACE").is_ok() && round <= 8;
         let tasks: Vec<_> = std::mem::take(&mut *TASKS.lock().unwrap());
         let mut pending = Vec::with_capacity(tasks.len());
+        let mut addrs = Vec::new();
         for mut task in tasks {
-            if task.as_mut().poll(&mut cx).is_pending() {
+            let label = task.label;
+            let completed = task.fut.as_mut().poll(&mut cx).is_ready();
+            if trace {
+                if completed {
+                    eprintln!("[task-trace r{round}] {label} COMPLETED");
+                } else {
+                    addrs.push(label);
+                }
+            }
+            if !completed {
                 pending.push(task);
             }
         }
+        let alive = pending.len();
         TASKS.lock().unwrap().extend(pending);
+        if trace {
+            eprintln!("[task-trace r{round}] alive={alive}");
+            for a in &addrs {
+                eprintln!("[task-trace r{round}]   alive {a}");
+            }
+        }
 
         if pred() {
             return true;
@@ -288,7 +319,7 @@ pub fn drive<F: std::future::Future>(fut: F, budget_ms: u64) -> Option<F::Output
         let tasks: Vec<_> = std::mem::take(&mut *TASKS.lock().unwrap());
         let mut pending = Vec::with_capacity(tasks.len());
         for mut task in tasks {
-            if task.as_mut().poll(&mut cx).is_pending() {
+            if task.fut.as_mut().poll(&mut cx).is_pending() {
                 pending.push(task);
             }
         }

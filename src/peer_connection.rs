@@ -1982,6 +1982,7 @@ impl PeerConnection {
                     ice_lite: false,
                     tie_breaker: 0,
                 };
+                debug!("[pc-probe] answerer ICE start(params) called");
                 self.inner
                     .ice_transport
                     .start(params)
@@ -4526,8 +4527,10 @@ async fn run_gathering_loop(
             && !update_local_description_on_gather(&inner, &ice_transport)
         {
             let mut sig_rx = inner.signaling_state.subscribe();
+            debug!("[g-probe] Complete but update failed - waiting for signaling");
             loop {
                 if update_local_description_on_gather(&inner, &ice_transport) {
+                    debug!("[g-probe] update succeeded after wait");
                     break;
                 }
                 if sig_rx.changed().await.is_err() {
@@ -4546,6 +4549,7 @@ async fn run_gathering_loop(
             break;
         }
         if state == crate::transports::ice::IceGathererState::Complete {
+            debug!("[g-probe] gathering_loop returning (Complete)");
             break;
         }
         let __which = {
@@ -4672,6 +4676,7 @@ async fn run_ice_dtls_loop(
     let nomination_complete_rx = ice_transport.subscribe_nomination_complete();
     loop {
         let ice_state = *ice_state_rx.borrow_and_update();
+        debug!("[d-probe] dtls loop wake: {ice_state:?}");
 
         let pc_ice_state = match ice_state {
             crate::transports::ice::IceTransportState::New => IceConnectionState::New,

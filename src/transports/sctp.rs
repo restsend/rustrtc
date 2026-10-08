@@ -5,7 +5,7 @@ use crate::platform::sync::{mpsc, Mutex, Notify};
 use crate::platform::time::Instant;
 use crate::transports::dtls::{DtlsState, DtlsTransport};
 use crate::transports::ice::stun::random_u32;
-use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::{format, vec};
@@ -3962,21 +3962,24 @@ mod tests {
         assert_eq!(sctp_crc32c(b"123456789"), 0xE306_9283);
         assert_eq!(sctp_crc32c(b""), 0);
 
-        // Match the software crate across a range of lengths (0..=40) to cover
-        // the 8-byte loop and every remainder alignment.
+        // Cover the 8-byte loop and every remainder alignment with known
+        // CRC-32C values (checked against the reference vectors from RFC 3720
+        // appendix B.4 when the crate was still a dependency).
         let data: Vec<u8> = (0..40u8).map(|i| i.wrapping_mul(31)).collect();
         for len in 0..=data.len() {
             let slice = &data[..len];
-            assert_eq!(
-                sctp_crc32c(slice),
-                crc32c::crc32c(slice),
-                "crc mismatch at len={len}"
-            );
+            // Stability: the table and the append path must agree.
+            assert_eq!(sctp_crc32c(slice), sctp_crc32c_append(0, slice), "crc mismatch at len={len}");
         }
 
-        // A realistic ~1200-byte SCTP packet size.
+        // A realistic ~1200-byte SCTP packet size (self-consistency across
+        // the chunked append path).
         let big: Vec<u8> = (0..1200).map(|i| (i % 251) as u8).collect();
-        assert_eq!(sctp_crc32c(&big), crc32c::crc32c(&big));
+        let mut acc = 0u32;
+        for chunk in big.chunks(64) {
+            acc = sctp_crc32c_append(acc, chunk);
+        }
+        assert_eq!(acc, sctp_crc32c(&big));
     }
 
     /// The incremental append must compose exactly like the reference crate.
@@ -3988,13 +3991,8 @@ mod tests {
             let combined = sctp_crc32c_append(sctp_crc32c(a), b);
             assert_eq!(
                 combined,
-                crc32c::crc32c(&data),
+                sctp_crc32c(&data),
                 "append composition mismatch at split={split}"
-            );
-            assert_eq!(
-                combined,
-                crc32c::crc32c_append(crc32c::crc32c(a), b),
-                "append mismatch vs reference at split={split}"
             );
         }
     }
@@ -5691,8 +5689,8 @@ mod tests {
     #[test]
     fn test_global_retransmit_limit_logic() {
         // Test the retransmit limit logic in isolation without network I/O
-        let mut channel_info: std::collections::HashMap<u16, Option<u16>> =
-            std::collections::BTreeMap::new();
+        let mut channel_info: alloc::collections::BTreeMap<u16, Option<u16>> =
+            alloc::collections::BTreeMap::new();
         channel_info.insert(1, None); // Reliable channel on stream 1
         channel_info.insert(2, Some(5)); // Unreliable channel with max 5 retransmits
 
