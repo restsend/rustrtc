@@ -278,11 +278,14 @@ impl TwccFeedbackGenerator {
         })
     }
 
-    /// Periodic flush loop; spawn per receiver transport.
+    /// Periodic flush loop; spawn per receiver transport. The loop holds the
+    /// transport weakly and returns once every other `Arc` to it is dropped.
     pub async fn run_flush_loop(
         self: std::sync::Arc<Self>,
         transport: std::sync::Arc<RtpTransport>,
     ) {
+        let weak_transport = std::sync::Arc::downgrade(&transport);
+        drop(transport);
         let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -291,6 +294,9 @@ impl TwccFeedbackGenerator {
                 // The tick handles bursts well enough; this branch just keeps
                 // the constant honest about intent.
             }
+            let Some(transport) = weak_transport.upgrade() else {
+                return;
+            };
             if self.flush(&transport).await == 0 {
                 continue;
             }

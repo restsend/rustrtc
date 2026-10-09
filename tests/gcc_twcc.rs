@@ -174,3 +174,47 @@ async fn gcc_disabled_skips_transport_cc_extmap() -> Result<()> {
     );
     Ok(())
 }
+
+/// The per-receiver TWCC feedback flush loop ends with its transport: once
+/// both peers are closed and dropped, no task is left on the runtime.
+#[tokio::test]
+async fn twcc_flush_loop_ends_with_the_connection() -> Result<()> {
+    let metrics = tokio::runtime::Handle::current().metrics();
+    for enable_gcc in [true, false] {
+        let config = || RtcConfiguration {
+            enable_gcc,
+            ..Default::default()
+        };
+        let (pc1, pc2) = (PeerConnection::new(config()), PeerConnection::new(config()));
+        pc1.add_transceiver(MediaKind::Audio, rustrtc::TransceiverDirection::SendRecv);
+        pc1.add_transceiver(MediaKind::Video, rustrtc::TransceiverDirection::SendRecv);
+
+        let _ = pc1.create_offer().await?;
+        wait_gather_complete(&pc1).await;
+        let offer = pc1.create_offer().await?;
+        pc1.set_local_description(offer.clone())?;
+        pc2.set_remote_description(offer).await?;
+        let _ = pc2.create_answer().await?;
+        wait_gather_complete(&pc2).await;
+        let answer = pc2.create_answer().await?;
+        pc2.set_local_description(answer.clone())?;
+        pc1.set_remote_description(answer).await?;
+        tokio::try_join!(pc1.wait_for_connected(), pc2.wait_for_connected())?;
+
+        pc1.close();
+        pc2.close();
+        drop((pc1, pc2));
+        let drained = timeout(Duration::from_secs(3), async {
+            while metrics.num_alive_tasks() > 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "enable_gcc={enable_gcc}: {} tasks still alive after close and drop",
+            metrics.num_alive_tasks()
+        );
+    }
+    Ok(())
+}
