@@ -99,28 +99,74 @@ pub mod rng {
     }
 }
 
-/// DNS resolver seam. std: tokio's `lookup_host`. no_std (WP3): the
-/// embedder injects an embassy-net DNS resolver (or a static map).
+/// DNS resolver seam. std: tokio's `lookup_host`. no_std: IP literals resolve
+/// locally and hostnames go through the embedder's [`DnsResolver`]
+/// implementation (e.g. embassy-net DNS) so ICE STUN/TURN server hostnames
+/// (`stun:stun.l.google.com:19302`) can be resolved on-device.
 pub mod dns {
-    use crate::errors::RtcResult;
+    use crate::errors::{RtcError, RtcResult};
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
     use alloc::vec::Vec;
     use core::net::SocketAddr;
+    use core::sync::atomic::{AtomicPtr, Ordering};
 
-    /// Resolves `host:port` to a list of socket addresses.
-    #[cfg(feature = "std")]
-    pub async fn lookup_host(host: &str) -> RtcResult<Vec<SocketAddr>> {
-        let addrs = tokio::net::lookup_host(host)
-            .await
-            .map_err(|e| crate::errors::RtcError::Internal(alloc::format!("dns: {e}")))?;
-        Ok(addrs.collect())
+    /// Backend for resolving ICE STUN/TURN server hostnames.
+    ///
+    /// Mirrors the other platform seams ([`crate::platform::crypto::DtlsCrypto`],
+    /// [`crate::platform::net::UdpSocket`]): the trait lives here and the
+    /// embedder implements it — e.g. rtcembed over embassy-net DNS — then
+    /// installs it with [`set_resolver`]. std falls back to tokio when none is
+    /// installed.
+    #[async_trait::async_trait]
+    pub trait DnsResolver: Send + Sync {
+        /// Resolves `host:port` (e.g. `stun.l.google.com:19302`) to one or
+        /// more socket addresses.
+        async fn resolve(&self, target: &str) -> RtcResult<Vec<SocketAddr>>;
     }
 
-    /// no_std placeholder (WP3 wires the embedder's resolver).
-    #[cfg(not(feature = "std"))]
-    pub async fn lookup_host(_host: &str) -> RtcResult<Vec<SocketAddr>> {
-        Err(crate::errors::RtcError::Internal(
-            alloc::string::String::from("dns: no resolver wired (WP3)"),
-        ))
+    static RESOLVER: AtomicPtr<Arc<dyn DnsResolver>> = AtomicPtr::new(core::ptr::null_mut());
+
+    /// Injects the DNS resolver (thread-safe, leak-once). Call once during
+    /// startup, before any ICE gathering that uses STUN/TURN hostnames.
+    pub fn set_resolver(resolver: Arc<dyn DnsResolver>) {
+        let leaked = Box::leak(Box::new(resolver));
+        RESOLVER.store(leaked as *mut Arc<dyn DnsResolver>, Ordering::Release);
+    }
+
+    /// The injected resolver, if any.
+    pub fn resolver() -> Option<&'static dyn DnsResolver> {
+        let ptr = RESOLVER.load(Ordering::Acquire);
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: only `set_resolver` writes, and it leaks the value, so the
+        // pointer stays valid for the lifetime of the process.
+        Some(unsafe { &**ptr })
+    }
+
+    /// Resolves `host:port` to a list of socket addresses.
+    pub async fn lookup_host(host: &str) -> RtcResult<Vec<SocketAddr>> {
+        // An IP literal needs no resolver on any backend.
+        if let Ok(addr) = host.parse::<SocketAddr>() {
+            return Ok(alloc::vec![addr]);
+        }
+        if let Some(resolver) = resolver() {
+            return resolver.resolve(host).await;
+        }
+        #[cfg(feature = "std")]
+        {
+            let addrs = tokio::net::lookup_host(host)
+                .await
+                .map_err(|e| RtcError::Internal(alloc::format!("dns: {e}")))?;
+            Ok(addrs.collect())
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            Err(RtcError::Internal(alloc::string::String::from(
+                "dns: no resolver wired (platform::dns::set_resolver)",
+            )))
+        }
     }
 }
 
@@ -666,20 +712,42 @@ pub mod task {
     /// Sequential ticker over the injected sleep factory: the first tick
     /// waits `delay`, later ticks wait `period` after the previous tick
     /// completes — so ticks never bunch up (implicit `Skip`).
+    ///
+    /// The in-flight sleep is **retained** across calls to [`tick`]. Callers
+    /// (the DTLS/ICE/RTCP loops) create a fresh `tick()` future every
+    /// `select!` iteration; without this retention an interleaved packet would
+    /// drop the sleep and restart it, so a peer that sends faster than `period`
+    /// would starve the tick forever (e.g. DTLS retransmission never firing,
+    /// stalling the handshake).
     pub struct Interval {
         first: Option<core::time::Duration>,
         period: core::time::Duration,
+        pending: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     }
 
     impl Interval {
         pub async fn tick(&mut self) {
-            let dur = self.first.take().unwrap_or(self.period);
-            sleep(dur).await;
+            if self.pending.is_none() {
+                let dur = self.first.take().unwrap_or(self.period);
+                self.pending = Some(sleep_boxed(dur));
+            }
+            if let Some(fut) = self.pending.as_mut() {
+                fut.as_mut().await;
+            }
+            self.pending = None;
         }
 
         /// Accepted for tokio parity; sequential ticks already skip missed
         /// intervals by construction.
         pub fn set_missed_tick_behavior(&mut self, _behavior: MissedTickBehavior) {}
+    }
+
+    /// A boxed sleep from the injected timer factory.
+    fn sleep_boxed(dur: core::time::Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let f = SLEEP_FN
+            .lock()
+            .expect("platform::task::set_sleep_fn not called");
+        f(dur)
     }
 
     /// Missed-tick policy (tokio parity enum; the sequential ticker
@@ -696,6 +764,7 @@ pub mod task {
         Interval {
             first: Some(delay),
             period,
+            pending: None,
         }
     }
 }

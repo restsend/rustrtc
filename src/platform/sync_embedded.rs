@@ -26,6 +26,20 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 
+/// Registers `waker` in `wakers` unless a waker for the same task is already
+/// present (`Waker::will_wake`).
+///
+/// The ICE/DTLS/RTCP drive loops poll a `poll_fn` closure / recreate their
+/// future arms on every wake. Each poll of a `changed()`/`recv()` future
+/// registers a waker; without this dedup the waiter list grows on every wake
+/// (thousands during a call) and eventually OOMs the device. Keeping at most
+/// one waker per task bounds it regardless of how often the arm is polled.
+fn push_waker_unique(wakers: &mut Vec<Waker>, waker: &Waker) {
+    if !wakers.iter().any(|existing| existing.will_wake(waker)) {
+        wakers.push(waker.clone());
+    }
+}
+
 // ── spin primitives ──────────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -290,7 +304,10 @@ impl<'a, T> Future for AsyncLockFuture<'a, T> {
                 value: self.mutex,
             });
         }
-        self.mutex.state.waiters.lock().push(cx.waker().clone());
+        {
+            let mut waiters = self.mutex.state.waiters.lock();
+            push_waker_unique(&mut waiters, cx.waker());
+        }
         Poll::Pending
     }
 }
@@ -364,11 +381,7 @@ impl Notify {
             }
             // Mark the first waiter not yet notified (fairness); several
             // entries may already carry the flag after notify_waiters.
-            let idx = state
-                .waiters
-                .iter()
-                .position(|w| !w.notified)
-                .unwrap_or(0);
+            let idx = state.waiters.iter().position(|w| !w.notified).unwrap_or(0);
             state.waiters[idx].notified = true;
             woken = Some(state.waiters[idx].waker.clone());
         }
@@ -454,7 +467,6 @@ struct WatchState<T> {
 struct WatchInner<T> {
     state: Mutex<WatchState<T>>,
     version: AtomicU64,
-    seen: AtomicU64,
 }
 
 pub struct watch_Sender<T> {
@@ -476,12 +488,20 @@ impl<T> Clone for watch_Sender<T> {
 
 pub struct watch_Receiver<T> {
     inner: Arc<WatchInner<T>>,
+    /// This receiver's own cursor into `inner.version`. Per-receiver (not
+    /// shared): otherwise one receiver's `borrow_and_update`/`changed` would
+    /// advance the cursor for every other receiver, silently skipping a
+    /// transition (e.g. the PeerConnection's DTLS loop missing ICE `Connected`
+    /// because the ICE-state monitor consumed the version bump first).
+    seen: crate::platform::atomic64::AtomicU64,
 }
 
 impl<T> Clone for watch_Receiver<T> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            // A clone observes from the current version (tokio parity).
+            seen: crate::platform::atomic64::AtomicU64::new(self.seen.load(Ordering::Acquire)),
         }
     }
 }
@@ -518,14 +538,18 @@ pub mod watch {
                 sender_gone: false,
             }),
             version: crate::platform::atomic64::AtomicU64::new(0),
-            seen: crate::platform::atomic64::AtomicU64::new(0),
         });
         (
             Sender {
                 inner: inner.clone(),
                 senders: Arc::new(core::sync::atomic::AtomicUsize::new(1)),
             },
-            Receiver { inner },
+            Receiver {
+                inner,
+                // Per-receiver cursor: receivers must not steal each other's
+                // version updates (see `borrow_and_update`).
+                seen: crate::platform::atomic64::AtomicU64::new(0),
+            },
         )
     }
 }
@@ -554,6 +578,11 @@ impl<T> watch_Sender<T> {
     pub fn subscribe(&self) -> watch_Receiver<T> {
         watch_Receiver {
             inner: self.inner.clone(),
+            // A fresh receiver starts "caught up": it only observes changes
+            // after subscription (tokio parity).
+            seen: crate::platform::atomic64::AtomicU64::new(
+                self.inner.version.load(Ordering::Acquire),
+            ),
         }
     }
 
@@ -595,7 +624,7 @@ impl<T> watch_Receiver<T> {
     pub fn borrow_and_update(&self) -> watch_Ref<'_, T> {
         let r = self.borrow();
         let v = self.inner.version.load(Ordering::Acquire);
-        self.inner.seen.store(v, Ordering::Release);
+        self.seen.store(v, Ordering::Release);
         r
     }
 
@@ -620,9 +649,9 @@ impl<'a, T> Future for watch_Changed<'a, T> {
         let i = &self.rx.inner;
         let mut state = i.state.lock();
         let version = i.version.load(Ordering::Acquire);
-        let seen = i.seen.load(Ordering::Acquire);
+        let seen = self.rx.seen.load(Ordering::Acquire);
         if version != seen {
-            i.seen.store(version, Ordering::Release);
+            self.rx.seen.store(version, Ordering::Release);
             drop(state);
             return Poll::Ready(Ok(()));
         }
@@ -630,7 +659,7 @@ impl<'a, T> Future for watch_Changed<'a, T> {
             drop(state);
             return Poll::Ready(Err(watch::RecvError::Closed));
         }
-        state.wakers.push(cx.waker().clone());
+        push_waker_unique(&mut state.wakers, cx.waker());
         drop(state);
         Poll::Pending
     }
@@ -734,7 +763,7 @@ impl<T> Future for oneshot_Receiver<T> {
             Poll::Pending => {
                 let mut state = self.inner.lock();
                 if state.value.is_none() && !state.sender_gone {
-                    state.wakers.push(cx.waker().clone());
+                    push_waker_unique(&mut state.wakers, cx.waker());
                 }
                 drop(state);
                 Poll::Pending
@@ -879,7 +908,7 @@ impl<'a, T> Future for MpscRecvFuture<'a, T> {
             drop(state);
             return Poll::Ready(None);
         }
-        state.wakers.push(cx.waker().clone());
+        push_waker_unique(&mut state.wakers, cx.waker());
         drop(state);
         Poll::Pending
     }
@@ -1097,7 +1126,7 @@ impl<'a, T: Clone> Future for BroadcastRecvFuture<'a, T> {
             drop(state);
             return Poll::Ready(Err(broadcast_RecvError::Closed));
         }
-        state.wakers.push(cx.waker().clone());
+        push_waker_unique(&mut state.wakers, cx.waker());
         drop(state);
         Poll::Pending
     }
@@ -1293,7 +1322,7 @@ impl<'a, T> Future for BoundedSendFuture<'a, T> {
             return Poll::Ready(Err(mpsc_SendError(v)));
         }
         if state.queue.len() >= state.capacity {
-            state.wakers.push(cx.waker().clone());
+            push_waker_unique(&mut state.wakers, cx.waker());
             drop(state);
             return Poll::Pending;
         }
@@ -1348,7 +1377,7 @@ impl<'a, T> Future for BoundedRecvFuture<'a, T> {
             drop(state);
             return Poll::Ready(None);
         }
-        state.wakers.push(cx.waker().clone());
+        push_waker_unique(&mut state.wakers, cx.waker());
         drop(state);
         Poll::Pending
     }

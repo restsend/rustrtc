@@ -2977,6 +2977,7 @@ impl PeerConnection {
         }
 
         rtp_transport.start_srtp(session);
+        Self::spawn_srtp_replay(rtp_transport);
 
         let transceivers = self.inner.transceivers.lock();
         for t in transceivers.iter() {
@@ -3006,14 +3007,25 @@ impl PeerConnection {
         Ok(())
     }
 
+    /// Kicks a one-shot replay of RTP buffered before DTLS/SRTP completed.
+    ///
+    /// The peer's early media can start during our handshake, so those packets
+    /// are buffered (not dropped); draining must not wait for a further
+    /// inbound packet that may never come.
+    fn spawn_srtp_replay(rtp_transport: &Arc<RtpTransport>) {
+        let transport = rtp_transport.clone();
+        crate::platform::task::spawn(async move {
+            transport.flush_pending_srtp().await;
+        });
+    }
+
     fn setup_srtp(
         &self,
         dtls: &DtlsTransport,
         is_client: bool,
         profile_opt: Option<u16>,
         rtp_transport: &Arc<RtpTransport>,
-    ) {
-        // Default to Aes128Sha1_80 if not specified or unknown
+    ) {        // Default to Aes128Sha1_80 if not specified or unknown
         let profile = match profile_opt {
             Some(0x0001) => crate::srtp::SrtpProfile::Aes128Sha1_80,
             Some(0x0002) => crate::srtp::SrtpProfile::Aes128Sha1_32,
@@ -3050,6 +3062,7 @@ impl PeerConnection {
             match crate::srtp::SrtpSession::new(profile, tx_keying, rx_keying) {
                 Ok(session) => {
                     rtp_transport.start_srtp(session);
+                    Self::spawn_srtp_replay(rtp_transport);
                     self.inner.pc_span.in_scope(|| {
                         debug!(
                             "setup_srtp: SRTP session ready (is_client={}, profile={:?})",

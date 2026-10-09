@@ -476,8 +476,7 @@ impl DtlsInner {
         }
         if let Some(records) = &ctx.last_flight_records
             && let Err(e) = self.conn.send_dtls_record_batch(records).await
-        {
-            let msg = e.to_string();
+        {            let msg = e.to_string();
             if msg.contains("No selected socket") || msg.contains("Remote address not set") {
                 debug!("Retransmission skipped — ICE socket unavailable");
             } else {
@@ -1692,14 +1691,17 @@ impl DtlsInner {
         handshake_msg.encode(&mut buf);
         ctx.handshake_messages.extend_from_slice(&buf);
 
-        self.send_handshake_message(
+        // Build (but don't send yet) the ClientKeyExchange record: it is sent
+        // as part of the client's CCS+Finished flight and kept in
+        // `last_flight_records`, so a lost CKE is recovered by retransmission
+        // instead of stalling the handshake forever.
+        let client_key_exchange_record = self.build_handshake_record(
             handshake_msg,
             ctx.epoch,
             &mut ctx.sequence_number,
             None,
             is_client,
-        )
-        .await?;
+        )?;
         ctx.message_seq += 1;
 
         // Compute shared secret
@@ -1761,6 +1763,10 @@ impl DtlsInner {
         ctx.session_keys = Some(keys);
 
         let mut flight_records: Vec<Vec<u8>> = Vec::new();
+
+        // ClientKeyExchange first (plaintext), then CCS, then Finished — the
+        // whole flight is retransmitted together.
+        flight_records.push(client_key_exchange_record);
 
         // Send ChangeCipherSpec
         let record = DtlsRecord {

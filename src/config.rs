@@ -518,6 +518,12 @@ pub struct RtcConfiguration {
     pub disable_ipv6: bool,
     pub ssrc_start: u32,
     pub stun_timeout: core::time::Duration,
+    /// Upper bound on STUN/TURN *server* candidate gathering. A slow or hung
+    /// server must not delay the offer past this: candidates that arrived in
+    /// time are advertised, the rest are dropped. `ZERO` (the default) means
+    /// unbounded — the historical behaviour; embedders with tight call-setup
+    /// windows (rtcembed's WebRTC profile) set a small bound.
+    pub ice_gather_timeout: core::time::Duration,
     /// Timeout for the ICE nomination binding check (USE-CANDIDATE).
     /// This should be larger than `stun_timeout` to allow more retransmissions
     /// and reduce the probability of nomination failures under packet loss.
@@ -684,6 +690,7 @@ impl PartialEq for RtcConfiguration {
             && self.disable_ipv6 == other.disable_ipv6
             && self.ssrc_start == other.ssrc_start
             && self.stun_timeout == other.stun_timeout
+            && self.ice_gather_timeout == other.ice_gather_timeout
             && self.nomination_timeout == other.nomination_timeout
             && self.ice_connection_timeout == other.ice_connection_timeout
             && self.ice_disconnect_threshold == other.ice_disconnect_threshold
@@ -750,6 +757,7 @@ impl Default for RtcConfiguration {
             disable_ipv6: false,
             ssrc_start: 10000,
             stun_timeout: core::time::Duration::from_secs(5),
+            ice_gather_timeout: core::time::Duration::ZERO,
             nomination_timeout: core::time::Duration::from_secs(10),
             ice_connection_timeout: core::time::Duration::from_secs(120),
             ice_disconnect_threshold: core::time::Duration::from_secs(30),
@@ -980,6 +988,11 @@ impl RtcConfigurationBuilder {
         self
     }
 
+    pub fn ice_gather_timeout(mut self, timeout: core::time::Duration) -> Self {
+        self.inner.ice_gather_timeout = timeout;
+        self
+    }
+
     pub fn nomination_timeout(mut self, timeout: core::time::Duration) -> Self {
         self.inner.nomination_timeout = timeout;
         self
@@ -1017,10 +1030,7 @@ impl RtcConfigurationBuilder {
     /// Pre-provisioned DTLS certificate (DER leaf + PKCS#8 key). Required
     /// for WebRtc mode on no_std; on std a self-signed certificate is
     /// generated when this is unset.
-    pub fn dtls_certificate(
-        mut self,
-        cert: Arc<crate::transports::dtls::Certificate>,
-    ) -> Self {
+    pub fn dtls_certificate(mut self, cert: Arc<crate::transports::dtls::Certificate>) -> Self {
         self.inner.dtls_certificate = Some(cert);
         self
     }

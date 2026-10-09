@@ -4763,8 +4763,24 @@ impl IceGatherer {
                 None
             })
         } else {
-            if let Err(e) = self.gather_servers().await {
-                debug!("Server gathering failed: {}", e);
+            // Unbounded by default (preserves historical behaviour, incl. the
+            // std build). When `ice_gather_timeout` is set, bound server
+            // gathering so a slow/hung STUN/TURN server cannot delay the offer
+            // (and the call setup): candidates that arrived in time are
+            // advertised, the rest dropped.
+            if self.config.ice_gather_timeout.is_zero() {
+                if let Err(e) = self.gather_servers().await {
+                    debug!("Server gathering failed: {}", e);
+                }
+            } else {
+                match with_timeout(self.config.ice_gather_timeout, self.gather_servers()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => debug!("Server gathering failed: {}", e),
+                    Err(_) => debug!(
+                        "Server gathering timed out after {:?}",
+                        self.config.ice_gather_timeout
+                    ),
+                }
             }
             None
         };

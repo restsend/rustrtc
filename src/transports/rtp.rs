@@ -9,10 +9,11 @@ use crate::transports::PacketReceiver;
 use crate::transports::ice::conn::IceConn;
 use crate::transports::ice::stun::random_u32;
 use async_trait::async_trait;
+use alloc::collections::VecDeque;
 use bytes::{Bytes, BytesMut};
 use core::cell::RefCell;
 use core::net::SocketAddr;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use tracing::{debug, trace};
 
 const EXT_ID_NONE: u8 = 0;
@@ -568,7 +569,24 @@ pub struct RtpTransport {
     blocked_ssrcs: RwLock<Vec<u32>>,
     /// Keeps the `blocked_ssrcs` check a single atomic load when empty.
     has_blocked_ssrcs: AtomicBool,
+    /// Inbound RTP packets that arrived *before* the SRTP session was ready
+    /// (the peer's early media can start during our DTLS handshake) and were
+    /// buffered instead of dropped. Bounded by count and bytes so a malicious
+    /// or very fast peer cannot exhaust memory; drained on the next inbound
+    /// packet or when the session becomes ready. See [`Self::flush_pending_srtp`].
+    srtp_pending: Mutex<VecDeque<(Bytes, SocketAddr)>>,
+    srtp_pending_count: AtomicUsize,
+    srtp_pending_bytes: AtomicUsize,
 }
+
+/// Hard caps for the pre-DTLS SRTP replay buffer. It only needs to bridge the
+/// gap between the peer starting to send SRTP and our DTLS session becoming
+/// ready — measured at ~10–18 packets on-device (well under a second of audio).
+/// 32 packets (~0.64 s of G.711) leaves headroom; the byte cap bounds
+/// worst-case memory to 32 KiB regardless of packet size, and overflow drops
+/// the oldest packets.
+const SRTP_PENDING_MAX_PACKETS: usize = 32;
+const SRTP_PENDING_MAX_BYTES: usize = 32 * 1024;
 
 impl RtpTransport {
     pub fn new(transport: Arc<IceConn>, srtp_required: bool) -> Self {
@@ -603,6 +621,9 @@ impl RtpTransport {
             rtp_send_allowed: AtomicBool::new(true),
             blocked_ssrcs: RwLock::new(Vec::new()),
             has_blocked_ssrcs: AtomicBool::new(false),
+            srtp_pending: Mutex::new(VecDeque::new()),
+            srtp_pending_count: AtomicUsize::new(0),
+            srtp_pending_bytes: AtomicUsize::new(0),
         }
     }
 
@@ -650,6 +671,60 @@ impl RtpTransport {
     pub fn start_srtp(&self, srtp_session: SrtpSession) {
         let mut session = self.srtp_session.lock();
         *session = Some(Arc::new(Mutex::new(srtp_session)));
+    }
+
+    /// Buffers an inbound RTP packet that arrived before the SRTP session was
+    /// ready. Bounded by [`SRTP_PENDING_MAX_PACKETS`] and
+    /// [`SRTP_PENDING_MAX_BYTES`], dropping the oldest first — early media must
+    /// never become an OOM vector.
+    fn buffer_pending_srtp(&self, packet: Bytes, addr: SocketAddr) {
+        let len = packet.len();
+        let mut queue = self.srtp_pending.lock();
+        while queue.len() >= SRTP_PENDING_MAX_PACKETS
+            || self.srtp_pending_bytes.load(Ordering::Relaxed) + len > SRTP_PENDING_MAX_BYTES
+        {
+            let Some(old) = queue.pop_front() else {
+                break;
+            };
+            self.srtp_pending_bytes
+                .fetch_sub(old.0.len(), Ordering::Relaxed);
+            self.srtp_pending_count.fetch_sub(1, Ordering::Relaxed);
+            self.srtp_dropped_no_session
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        queue.push_back((packet, addr));
+        self.srtp_pending_bytes.fetch_add(len, Ordering::Relaxed);
+        self.srtp_pending_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Removes and returns the buffered pre-SRTP packets, but only once the
+    /// session is ready (so they can be decrypted). Otherwise returns empty and
+    /// leaves them queued.
+    fn drain_pending_srtp(&self) -> VecDeque<(Bytes, SocketAddr)> {
+        if !self.srtp_required || self.srtp_session.lock().is_none() {
+            return VecDeque::new();
+        }
+        self.srtp_pending_count.store(0, Ordering::Relaxed);
+        self.srtp_pending_bytes.store(0, Ordering::Relaxed);
+        core::mem::take(&mut *self.srtp_pending.lock())
+    }
+
+    /// Decrypts and delivers packets buffered before DTLS/SRTP completed.
+    /// Public so the PeerConnection can kick it right after `start_srtp` (the
+    /// peer's early media would otherwise be dropped and, with no further
+    /// inbound packet, never replayed). Also drained lazily from `receive`.
+    pub async fn flush_pending_srtp(&self) {
+        let mut marshal_buf = Vec::new();
+        loop {
+            let pending = self.drain_pending_srtp();
+            if pending.is_empty() {
+                break;
+            }
+            debug!("flush_pending_srtp: replaying {} packet(s)", pending.len());
+            for (packet, addr) in pending {
+                self.process_rtp_packet(packet, addr, &mut marshal_buf).await;
+            }
+        }
     }
 
     pub fn register_listener_sync(&self, ssrc: u32, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
@@ -1191,6 +1266,21 @@ impl PacketReceiver for RtpTransport {
                 );
             }
         } else {
+            // Replay any early-media packets that arrived before the SRTP
+            // session was ready, then handle this one.
+            if self.srtp_pending_count.load(Ordering::Relaxed) != 0 {
+                self.flush_pending_srtp().await;
+            }
+            self.process_rtp_packet(packet, addr, marshal_buf).await;
+        }
+    }
+}
+
+impl RtpTransport {
+    /// Decrypts (if SRTP) and delivers one inbound RTP packet. When SRTP is
+    /// required but the session is not ready yet, the packet is buffered for
+    /// replay instead of dropped (see [`Self::buffer_pending_srtp`]).
+    async fn process_rtp_packet(&self, packet: Bytes, addr: SocketAddr, marshal_buf: &mut Vec<u8>) {
             let rtp_packet = {
                 // Parse outside both session guards. The inner SRTP lock is
                 // held only while authenticating and decrypting the packet.
@@ -1237,9 +1327,11 @@ impl PacketReceiver for RtpTransport {
                     }
                     None => {
                         if self.srtp_required {
-                            trace!(
-                                "Dropping packet because SRTP is required but session is not ready"
-                            );
+                            // Early media can arrive before our DTLS/SRTP is
+                            // ready (peer greeting during our handshake):
+                            // buffer it (bounded) for replay instead of
+                            // dropping it.
+                            self.buffer_pending_srtp(packet, addr);
                             return;
                         }
                         match RtpPacket::parse_bytes(packet) {
@@ -1354,7 +1446,6 @@ impl PacketReceiver for RtpTransport {
                     ssrc, pt, addr
                 );
             }
-        }
     }
 }
 
@@ -1413,6 +1504,93 @@ mod tests {
 
         // Verify new SSRC is not automatically bound
         assert!(!transport.has_listener(200));
+    }
+
+    #[tokio::test]
+    async fn early_srtp_packets_are_buffered_and_replayed() {
+        use crate::srtp::{SrtpKeyingMaterial, SrtpProfile, SrtpSession};
+        use crate::transports::ice::IceSocketWrapper;
+        use bytes::Bytes;
+        use tokio::sync::watch;
+
+        let (_ice_tx, ice_rx) = watch::channel(None::<IceSocketWrapper>);
+        let ice_conn = IceConn::new(ice_rx, "127.0.0.1:1234".parse().unwrap(), None);
+
+        // Identical keying both ways (mirrors the two endpoints of a call).
+        let key = || SrtpKeyingMaterial::new(vec![7u8; 16], vec![9u8; 14]);
+        let mut tx_session = SrtpSession::new(SrtpProfile::Aes128Sha1_80, key(), key()).unwrap();
+
+        let header = crate::rtp::RtpHeader::new(0, 1, 160, 4242);
+        let plain = crate::rtp::RtpPacket::new(header, vec![0xAB; 160]);
+        let mut protected = vec![0u8; tx_session.protected_rtp_len(&plain)];
+        tx_session.protect_rtp(&plain, &mut protected).unwrap();
+
+        // SRTP required, session not ready yet → buffer, never deliver.
+        let transport = RtpTransport::new(ice_conn, true);
+        let (tx, mut rx) = mpsc::channel(10);
+        transport.register_listener_sync(4242, tx);
+        let mut marshal_buf = Vec::new();
+        transport
+            .receive(
+                Bytes::from(protected),
+                "127.0.0.1:5000".parse().unwrap(),
+                &mut marshal_buf,
+            )
+            .await;
+        assert!(
+            tokio::time::timeout(tokio::time::Duration::from_millis(30), rx.recv())
+                .await
+                .is_err(),
+            "packet must not be delivered before the SRTP session is ready"
+        );
+
+        // Session ready → the buffered early media replays and decrypts.
+        let rx_session = SrtpSession::new(SrtpProfile::Aes128Sha1_80, key(), key()).unwrap();
+        transport.start_srtp(rx_session);
+        transport.flush_pending_srtp().await;
+
+        let got = tokio::time::timeout(tokio::time::Duration::from_millis(100), rx.recv())
+            .await
+            .expect("buffered packet must be replayed after start_srtp")
+            .expect("listener alive");
+        assert_eq!(got.0.header.ssrc, 4242);
+        assert_eq!(&got.0.payload[..], &[0xAB; 160][..]);
+    }
+
+    #[tokio::test]
+    async fn srtp_pending_buffer_is_bounded() {
+        use crate::transports::ice::IceSocketWrapper;
+        use bytes::Bytes;
+        use tokio::sync::watch;
+
+        let (_ice_tx, ice_rx) = watch::channel(None::<IceSocketWrapper>);
+        let ice_conn = IceConn::new(ice_rx, "127.0.0.1:1234".parse().unwrap(), None);
+        let transport = RtpTransport::new(ice_conn, true);
+        let addr = "127.0.0.1:5000".parse().unwrap();
+        let mut marshal_buf = Vec::new();
+
+        // Push three times the packet cap with no session: the buffer must stay
+        // within both caps (drop-oldest) — the OOM guard.
+        for seq in 0..(SRTP_PENDING_MAX_PACKETS as u16 * 3) {
+            let header = crate::rtp::RtpHeader::new(0, seq, seq as u32 * 160, 7);
+            let packet = crate::rtp::RtpPacket::new(header, vec![0u8; 160]);
+            transport
+                .receive(
+                    Bytes::from(packet.marshal().unwrap()),
+                    addr,
+                    &mut marshal_buf,
+                )
+                .await;
+        }
+
+        assert!(
+            transport.srtp_pending_count.load(Ordering::Relaxed) <= SRTP_PENDING_MAX_PACKETS,
+            "packet count exceeded the cap"
+        );
+        assert!(
+            transport.srtp_pending_bytes.load(Ordering::Relaxed) <= SRTP_PENDING_MAX_BYTES,
+            "byte count exceeded the cap"
+        );
     }
 
     #[tokio::test]

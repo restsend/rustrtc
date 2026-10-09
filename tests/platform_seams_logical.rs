@@ -90,9 +90,7 @@ impl UdpSocket for LoopSock {
 
 #[test]
 fn udp_bind_factory_installs_and_the_trait_round_trips() {
-    fn factory(
-        addr: SocketAddr,
-    ) -> Result<Arc<dyn UdpSocket>, rustrtc::errors::RtcError> {
+    fn factory(addr: SocketAddr) -> Result<Arc<dyn UdpSocket>, rustrtc::errors::RtcError> {
         use rustrtc::errors::RtcError;
         LoopSock::bind(addr)
             .map_err(RtcError::from)
@@ -159,4 +157,51 @@ fn noop_waker() -> std::task::Waker {
     unsafe fn noop_raw(_: *const ()) {}
     static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_raw, noop_raw, noop_raw, noop_raw);
     unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+}
+
+// ── watch: per-receiver cursor ───────────────────────────────────────────
+
+/// Regression: `seen` used to live on the *shared* inner, so with two
+/// receivers whichever polled `changed()` first consumed the version bump and
+/// the second silently missed the update. In the PeerConnection that meant the
+/// DTLS loop could miss ICE `Connected` (the ICE-state monitor consumed it
+/// first) and therefore never call `start_dtls` — the intermittent
+/// "ICE connects but no media" failure. Every receiver must observe every
+/// update on its own cursor.
+#[test]
+fn watch_every_receiver_observes_each_update() {
+    use rustrtc::platform::sync::watch;
+
+    let (tx, _rx0) = watch::channel(0u8);
+    let r1 = tx.subscribe();
+    let r2 = tx.subscribe();
+    tx.send(1).unwrap();
+
+    assert!(
+        poll_once(r1.changed()).is_ready(),
+        "receiver 1 must observe the update"
+    );
+    assert!(
+        poll_once(r2.changed()).is_ready(),
+        "receiver 2 must also observe it (shared-`seen` regression)"
+    );
+
+    // A freshly subscribed receiver starts caught up and only sees later writes.
+    let r3 = tx.subscribe();
+    assert!(
+        poll_once(r3.changed()).is_pending(),
+        "a fresh receiver must not replay the current value"
+    );
+    tx.send(2).unwrap();
+    assert!(
+        poll_once(r3.changed()).is_ready(),
+        "a fresh receiver must observe subsequent updates"
+    );
+}
+
+fn poll_once<F: core::future::Future>(fut: F) -> core::task::Poll<F::Output> {
+    let waker = noop_waker();
+    let mut cx = core::task::Context::from_waker(&waker);
+    let mut fut = core::pin::pin!(fut);
+    fut.as_mut().poll(&mut cx)
 }
