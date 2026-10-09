@@ -4900,6 +4900,7 @@ async fn handle_connected_state_no_dtls(
                 let _ = inner.peer_state.send(PeerConnectionState::Connected);
                 let grace = inner.config.ice_disconnect_grace;
                 drop(inner);
+                drop(pc_temp);
 
                 let (grace_tx, mut grace_rx) = mpsc::unbounded_channel::<u64>();
                 let mut disconnect_epoch: u64 = 0;
@@ -5020,13 +5021,15 @@ async fn handle_connected_state_no_dtls(
 /// spun hot — starving the TURN/ICE read tasks joined into the same runner.
 /// `dtls_monitor_parks_when_no_events` guards this.
 async fn monitor_ice_and_dtls(
-    inner: &Arc<PeerConnectionInner>,
+    inner_weak: Weak<PeerConnectionInner>,
     ice_connection_state_tx: &watch::Sender<IceConnectionState>,
     ice_state_rx: &mut watch::Receiver<crate::transports::ice::IceTransportState>,
     mut dtls_rx: watch::Receiver<dtls::DtlsState>,
     mut rtcp_loop: core::pin::Pin<Box<dyn core::future::Future<Output = ()> + Send>>,
 ) -> bool {
-    let grace = inner.config.ice_disconnect_grace;
+    let Some(grace) = inner_weak.upgrade().map(|i| i.config.ice_disconnect_grace) else {
+        return false;
+    };
     let (grace_tx, mut grace_rx) = mpsc::unbounded_channel::<u64>();
     let mut disconnect_epoch: u64 = 0;
     loop {
@@ -5043,6 +5046,10 @@ async fn monitor_ice_and_dtls(
                 crate::platform::select::Either::B(core::future::pending::<Option<u64>>())
             };
             crate::platform::select::select4(__s0, __s1, __s2, __s3).await
+        };
+        // The PeerConnection is gone (its Drop closes the transports).
+        let Some(inner) = inner_weak.upgrade() else {
+            return false;
         };
         match __which {
             crate::platform::select::Which4::A(_) => {
@@ -5196,9 +5203,14 @@ async fn handle_connected_state(
                             crate::platform::sync::watch::Receiver<dtls::DtlsState>,
                         > = None;
 
+                        // Hold only the Weak while connected, so dropping the
+                        // last PeerConnection still runs Drop (and closes it).
+                        let grace = inner.config.ice_disconnect_grace;
+                        drop(pc_temp);
+                        drop(inner);
                         if let Some(dtls_rx) = dtls_state_rx {
                             return monitor_ice_and_dtls(
-                                &inner,
+                                inner_weak.clone(),
                                 ice_connection_state_tx,
                                 &mut *ice_state_rx,
                                 dtls_rx,
@@ -5206,7 +5218,6 @@ async fn handle_connected_state(
                             )
                             .await;
                         } else {
-                            let grace = inner.config.ice_disconnect_grace;
                             let (grace_tx, mut grace_rx) = mpsc::unbounded_channel::<u64>();
                             let mut disconnect_epoch: u64 = 0;
                             loop {
@@ -5225,6 +5236,9 @@ async fn handle_connected_state(
                                         ))
                                     };
                                     crate::platform::select::select3(__s0, __s1, __s2).await
+                                };
+                                let Some(inner) = inner_weak.upgrade() else {
+                                    return false;
                                 };
                                 match __which {
                                     crate::platform::select::Which3::A(_) => {
@@ -8961,7 +8975,7 @@ mod tests {
                         polls
                     },
                     inner: Box::pin(monitor_ice_and_dtls(
-                        &$pc.inner,
+                        Arc::downgrade(&$pc.inner),
                         &$pc.inner.ice_connection_state,
                         &mut $ice_rx,
                         $dtls_rx,
