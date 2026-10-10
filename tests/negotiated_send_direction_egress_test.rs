@@ -225,7 +225,7 @@ async fn remote_hold_stops_raw_and_relayed_rtp_until_resumed() -> Result<()> {
         sink,
         feed,
         ingress,
-        ..
+        _pcs,
     } = relay(TransportMode::WebRtc, Direction::SendRecv).await?;
     let raw_and_relayed = || async {
         let before = ingress.count();
