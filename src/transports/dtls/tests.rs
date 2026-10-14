@@ -1303,7 +1303,7 @@ async fn client_processes_reordered_server_flight() -> Result<()> {
 
     let mut ctx = HandshakeContext::new(None).unwrap();
     dtls.inner
-        .process_handshake_payload(payload.freeze(), &mut ctx, &own_cert, true)
+        .process_handshake_payload(payload.freeze(), 0, &mut ctx, &own_cert, true)
         .await?;
 
     assert!(ctx.server_random.is_some(), "ServerHello processed");
@@ -1312,5 +1312,90 @@ async fn client_processes_reordered_server_flight() -> Result<()> {
         "buffered Certificate drained after the gap closed"
     );
     assert_eq!(ctx.recv_message_seq, 2);
+    Ok(())
+}
+
+/// Deliver each datagram `copies(datagram)` times to `conn` (0 drops it).
+fn spawn_lossy_socket_pump(
+    socket: Arc<UdpSocket>,
+    conn: Arc<IceConn>,
+    mut copies: impl FnMut(&[u8]) -> usize + Send + 'static,
+) {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        let mut marshal_buf = Vec::new();
+        while let Ok((len, addr)) = socket.recv_from(&mut buf).await {
+            for _ in 0..copies(&buf[..len]) {
+                let packet = Bytes::copy_from_slice(&buf[..len]);
+                conn.receive(packet, addr, &mut marshal_buf).await;
+            }
+        }
+    });
+}
+
+/// RFC 6347 §4.2.4: the server sends the last flight (CCS + Finished), so it
+/// must resend it once for every retransmission of the client's last flight.
+#[tokio::test]
+#[serial]
+async fn server_resends_final_flight_once_per_client_flight() -> Result<()> {
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    // (case, drop first server CCS + epoch-1 record, drop first server
+    // datagram, copies of each client datagram, server CCS seen by client)
+    let cases = [
+        ("lost final flight", true, false, 1, 2),
+        ("lost flight 2 (control)", false, true, 1, 1),
+        ("client datagrams tripled", false, false, 3, 3),
+        ("client datagrams x20 (resend cap)", false, false, 20, 13),
+    ];
+    for (case, drop_final, drop_first, copies, want_ccs) in cases {
+        let client_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        let server_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        let (client_tx, _) = watch::channel(Some(IceSocketWrapper::Udp(client_socket.clone())));
+        let (server_tx, _) = watch::channel(Some(IceSocketWrapper::Udp(server_socket.clone())));
+        let client_conn = IceConn::new(client_tx.subscribe(), server_socket.local_addr()?, None);
+        let server_conn = IceConn::new(server_tx.subscribe(), client_socket.local_addr()?, None);
+        let server_cert = generate_certificate()?;
+        let expected = Some(fingerprint(&server_cert));
+        let (client, _client_rx, client_runner) = DtlsTransport::new(
+            client_conn.clone(),
+            generate_certificate()?,
+            true,
+            1500,
+            expected,
+        )
+        .await?;
+        let (server, _server_rx, server_runner) =
+            DtlsTransport::new(server_conn.clone(), server_cert, false, 1500, None).await?;
+        tokio::spawn(client_runner);
+        tokio::spawn(server_runner);
+
+        let ccs = Arc::new(AtomicUsize::new(0));
+        let seen = ccs.clone();
+        let (fin_sent, first_sent) = (AtomicBool::new(!drop_final), AtomicBool::new(!drop_first));
+        spawn_lossy_socket_pump(client_socket, client_conn, move |p| {
+            let first_ccs = p[0] == 20 && seen.fetch_add(1, SeqCst) == 0;
+            let epoch1_handshake = p[0] == 22 && p[3..5] == [0, 1];
+            let drop = (first_ccs && drop_final)
+                || (epoch1_handshake && !fin_sent.swap(true, SeqCst))
+                || !first_sent.swap(true, SeqCst);
+            usize::from(!drop)
+        });
+        spawn_lossy_socket_pump(server_socket, server_conn, move |_| copies);
+
+        let client_state = wait_for_terminal_state(&client)
+            .await
+            .map(|s| s.to_string());
+        let server_state = wait_for_terminal_state(&server)
+            .await
+            .map(|s| s.to_string());
+        assert!(
+            matches!(client.get_state(), DtlsState::Connected(..))
+                && matches!(server.get_state(), DtlsState::Connected(..)),
+            "{case}: client={client_state:?} server={server_state:?}"
+        );
+        // Past the next client retransmit tick: no further resends.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert_eq!(ccs.load(SeqCst), want_ccs, "{case}: server CCS records");
+    }
     Ok(())
 }

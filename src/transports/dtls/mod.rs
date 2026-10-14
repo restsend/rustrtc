@@ -511,6 +511,7 @@ impl DtlsInner {
 
                     self.handle_decrypted_record(
                         record.content_type,
+                        record.epoch,
                         payload,
                         ctx,
                         incoming_data_tx,
@@ -605,6 +606,7 @@ impl DtlsInner {
     async fn handle_decrypted_record(
         &self,
         content_type: ContentType,
+        epoch: u16,
         payload: Bytes,
         ctx: &mut HandshakeContext,
         incoming_data_tx: &mpsc::UnboundedSender<Bytes>,
@@ -624,7 +626,7 @@ impl DtlsInner {
                 let _ = incoming_data_tx.send(payload);
             }
             ContentType::Handshake => {
-                self.process_handshake_payload(payload, ctx, certificate, is_client)
+                self.process_handshake_payload(payload, epoch, ctx, certificate, is_client)
                     .await?;
             }
             ContentType::Alert => {
@@ -646,6 +648,7 @@ impl DtlsInner {
     async fn process_handshake_payload(
         &self,
         mut body: Bytes,
+        epoch: u16,
         ctx: &mut HandshakeContext,
         certificate: &Certificate,
         is_client: bool,
@@ -683,6 +686,31 @@ impl DtlsInner {
                                     is_client,
                                 )
                                 .await?;
+                            } else if msg.msg_type == HandshakeType::Finished
+                                && !is_client
+                                && epoch > 0
+                                && msg.fragment_offset == 0
+                                && ctx.final_flight_resends < MAX_FINAL_FLIGHT_RESENDS
+                                && matches!(*self.state.lock(), DtlsState::Connected(..))
+                            {
+                                // RFC 6347 §4.2.4: the client retransmitted its
+                                // last flight, so it lost ours (CCS + Finished).
+                                // Resend it once per client flight (a flight has
+                                // one Finished, and only its first fragment
+                                // counts), at most MAX_FINAL_FLIGHT_RESENDS
+                                // times. Only the server sends the last flight
+                                // (no session resumption), so a client never
+                                // answers a repeated server Finished.
+                                ctx.final_flight_resends += 1;
+                                debug!(
+                                    label = self.conn.label.as_deref().unwrap_or("-"),
+                                    "Finished retransmission received — resending final flight"
+                                );
+                                if let Some(records) = &ctx.last_flight_records
+                                    && let Err(e) = self.conn.send_dtls_record_batch(records).await
+                                {
+                                    debug!("Failed to retransmit final flight: {}", e);
+                                }
                             }
                             continue;
                         }
@@ -2328,6 +2356,11 @@ const MAX_HANDSHAKE_MESSAGE_LEN: usize = 65_536;
 /// must not be able to grow memory unbounded.
 const MAX_PENDING_HANDSHAKE_MESSAGES: usize = 16;
 
+/// Upper bound on final-flight resends: a replayed client Finished must not
+/// trigger resends forever, but a client still retransmitting through a long
+/// outage is answered.
+const MAX_FINAL_FLIGHT_RESENDS: u8 = 12;
+
 /// The only cipher suite this DTLS stack implements:
 /// TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 (P-256 ECDHE, ECDSA auth,
 /// AES-128-GCM record layer).
@@ -2447,6 +2480,8 @@ struct HandshakeContext {
     /// implementations (e.g. webrtc-dtls) continue from the HVR seq + 1.
     post_hvr: bool,
     last_flight_records: Option<Vec<Vec<u8>>>,
+    /// Final-flight resends so far, capped at [`MAX_FINAL_FLIGHT_RESENDS`].
+    final_flight_resends: u8,
     incomplete_fragments: HandshakeReassembly,
     /// Complete handshake messages received ahead of their turn
     /// (message_seq > expected), buffered per RFC 6347 §4.2.4 so reordered
@@ -2481,6 +2516,7 @@ impl HandshakeContext {
             recv_message_seq: 0,
             post_hvr: false,
             last_flight_records: None,
+            final_flight_resends: 0,
             incomplete_fragments: HandshakeReassembly::default(),
             pending_messages: BTreeMap::new(),
             local_secret: Some(local_secret),
