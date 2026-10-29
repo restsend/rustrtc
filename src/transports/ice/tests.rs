@@ -6668,3 +6668,126 @@ async fn test_healthy_connect_latency_bound() -> Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn turn_allocate_recovers_lost_unauthenticated_response() -> Result<()> {
+    allocate_after_lost_response(stun::StunClass::ErrorResponse).await
+}
+
+#[tokio::test]
+async fn turn_allocate_recovers_lost_authenticated_response() -> Result<()> {
+    allocate_after_lost_response(stun::StunClass::SuccessResponse).await
+}
+
+async fn allocate_after_lost_response(drop_class: stun::StunClass) -> Result<()> {
+    let mut server = TestTurnServer::start().await?;
+    let socket = UdpSocket::bind("127.0.0.1:0").await?;
+    let uri = IceServerUri::parse(&format!("turn:{}", socket.local_addr()?))?;
+    let target = server.addr;
+    let worker = tokio::spawn(async move {
+        let mut buffer = [0; MAX_STUN_MESSAGE];
+        let mut client = None;
+        let mut dropped = false;
+        let mut held_response: Option<Vec<u8>> = None;
+        let mut requests = std::collections::BTreeMap::<[u8; 12], Vec<Vec<u8>>>::new();
+        loop {
+            let (length, from) = socket.recv_from(&mut buffer).await?;
+            let packet = &buffer[..length];
+            let message = stun::StunMessage::decode(packet)?;
+            if from == target {
+                if !dropped && message.class == drop_class {
+                    dropped = true;
+                    held_response = Some(packet.to_vec());
+                    continue;
+                }
+                socket.send_to(packet, client.unwrap()).await?;
+                if message.class == stun::StunClass::SuccessResponse {
+                    assert!(dropped, "the controlled response loss must occur");
+                    assert!(requests.values().any(|packets| packets.len() > 1));
+                    for packets in requests.values() {
+                        assert!(packets.windows(2).all(|pair| pair[0] == pair[1]));
+                    }
+                    return Ok::<(), anyhow::Error>(());
+                }
+            } else {
+                client = Some(from);
+                let packets = requests.entry(message.transaction_id).or_default();
+                packets.push(packet.to_vec());
+                if let Some(response) = held_response.take() {
+                    // RFC 8489 7.3.1: retransmit the cached response for the same
+                    // transaction. The existing TURN fixture returns 437 instead.
+                    let cached = stun::StunMessage::decode(&response)?;
+                    assert_eq!(cached.transaction_id, message.transaction_id);
+                    assert!(packets.len() > 1);
+                    assert!(packets.windows(2).all(|pair| pair[0] == pair[1]));
+                    socket.send_to(&response, from).await?;
+                    if cached.class == stun::StunClass::SuccessResponse {
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                } else {
+                    socket.send_to(packet, target).await?;
+                }
+            }
+        }
+    });
+    let client = turn::TurnClient::connect(&uri, false).await?;
+    let started = tokio::time::Instant::now();
+    let result = client
+        .allocate(turn::TurnCredentials {
+            username: TEST_USERNAME.into(),
+            password: TEST_PASSWORD.into(),
+        })
+        .await;
+    let elapsed = started.elapsed();
+    if result.is_err() {
+        worker.abort();
+    } else {
+        worker.await??;
+    }
+    server.stop().await?;
+    assert!(
+        result.is_ok(),
+        "lost {drop_class:?} must recover: {:?}",
+        result.as_ref().err()
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "recovery exceeded original transaction budget"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn turn_allocate_packet_loss_keeps_original_deadline() -> Result<()> {
+    let socket = UdpSocket::bind("127.0.0.1:0").await?;
+    let uri = IceServerUri::parse(&format!("turn:{}", socket.local_addr()?))?;
+    let client = turn::TurnClient::connect(&uri, false).await?;
+    let started = tokio::time::Instant::now();
+    let result = client
+        .allocate(turn::TurnCredentials {
+            username: TEST_USERNAME.into(),
+            password: TEST_PASSWORD.into(),
+        })
+        .await;
+    let elapsed = started.elapsed();
+    assert!(matches!(result, Err(RtcError::Timeout(_))));
+    assert!(elapsed >= Duration::from_secs(3));
+    assert!(
+        elapsed < Duration::from_millis(3500),
+        "allocation deadline grew: {elapsed:?}"
+    );
+    let mut packets = Vec::new();
+    let mut buffer = [0; MAX_STUN_MESSAGE];
+    while let Ok((length, _)) = socket.try_recv_from(&mut buffer) {
+        packets.push(buffer[..length].to_vec());
+    }
+    assert!(
+        packets.len() > 1,
+        "packet loss must trigger a protocol retransmission"
+    );
+    assert!(
+        packets.windows(2).all(|pair| pair[0] == pair[1]),
+        "retransmissions must retain the original request and transaction ID"
+    );
+    Ok(())
+}

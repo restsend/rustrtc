@@ -14,12 +14,14 @@ use tokio::net::TcpStream;
 #[cfg(feature = "std")]
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
-use super::stun::{StunAttribute, StunClass, StunMessage, StunMethod, random_bytes};
+use super::stun::{StunAttribute, StunClass, StunDecoded, StunMessage, StunMethod, random_bytes};
 use super::{IceServerUri, IceTransportProtocol, MAX_STUN_MESSAGE};
 use crate::{IceCredentialType, IceServer};
 
 pub const DEFAULT_TURN_LIFETIME: u32 = 600;
 pub const DEFAULT_STUN_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(3);
+// RFC 8489 section 6.2.1: retransmit UDP requests with an initial 500 ms RTO.
+const TURN_UDP_INITIAL_RTO: core::time::Duration = core::time::Duration::from_millis(500);
 
 #[derive(Debug, Clone)]
 pub(crate) struct TurnCredentials {
@@ -167,10 +169,7 @@ impl TurnClient {
             };
             let used_key = key_option.clone();
             let bytes = message.encode(key_option.as_deref(), true)?;
-            self.send(&bytes).await?;
-            let mut buf = [0u8; MAX_STUN_MESSAGE];
-            let len = self.recv(&mut buf).await?;
-            let parsed = StunMessage::decode(&buf[..len])?;
+            let parsed = self.request(&bytes, tx_id).await?;
             if parsed.transaction_id != tx_id {
                 continue;
             }
@@ -252,10 +251,7 @@ impl TurnClient {
                 };
                 msg.encode(Some(&auth.key), true)?
             };
-            self.send(&bytes).await?;
-            let mut buf = [0u8; MAX_STUN_MESSAGE];
-            let len = self.recv(&mut buf).await?;
-            let parsed = StunMessage::decode(&buf[..len])?;
+            let parsed = self.request(&bytes, tx_id).await?;
             if parsed.transaction_id != tx_id {
                 continue;
             }
@@ -421,6 +417,41 @@ impl TurnClient {
                 Ok(len)
             }
         }
+    }
+
+    async fn request(&self, bytes: &[u8], tx_id: [u8; 12]) -> RtcResult<StunDecoded> {
+        if self.transport.protocol() != IceTransportProtocol::Udp {
+            self.send(bytes).await?;
+            let mut buffer = [0; MAX_STUN_MESSAGE];
+            let length = self.recv(&mut buffer).await?;
+            return StunMessage::decode(&buffer[..length]);
+        }
+
+        // Keep the existing transaction deadline, including sends and unrelated
+        // replies. Authentication challenges still start separate transactions.
+        timeout(DEFAULT_STUN_TIMEOUT, async {
+            let mut rto = TURN_UDP_INITIAL_RTO;
+            let mut buffer = [0; MAX_STUN_MESSAGE];
+            loop {
+                self.send(bytes).await?;
+                let response = timeout(rto, async {
+                    loop {
+                        let length = self.recv(&mut buffer).await?;
+                        let parsed = StunMessage::decode(&buffer[..length])?;
+                        if parsed.transaction_id == tx_id {
+                            return Ok(parsed);
+                        }
+                    }
+                })
+                .await;
+                if let Ok(response) = response {
+                    return response;
+                }
+                rto *= 2;
+            }
+        })
+        .await
+        .map_err(|_| RtcError::Timeout("idle udp recv".into()))?
     }
 
     pub(crate) async fn send_indication(&self, peer: SocketAddr, data: &[u8]) -> RtcResult<()> {
