@@ -100,8 +100,45 @@ async fn close_releases_all_tasks_while_transceivers_held_rtp_and_srtp() {
         let t2 = pc2.get_transceivers()[0].clone();
         let track2 = t2.receiver().map(|r| r.track());
 
+        let packet = rustrtc::rtp::RtpPacket::new(
+            rustrtc::rtp::RtpHeader::new(0, 1, 0, 0x12345678),
+            vec![0; 160],
+        );
+        pc1.wait_for_rtp_transport_ready(Duration::from_secs(3)).await.unwrap();
+        pc2.wait_for_rtp_transport_ready(Duration::from_secs(3)).await.unwrap();
+        pc1.send_raw_rtp(packet).await.unwrap();
+        timeout(Duration::from_secs(3), async {
+            while pc2.received_rtp_packets() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the peer must receive actual UDP media before closing");
+        let received = pc2.received_rtp_packets();
+        let reading = pc2.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = stop.clone();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let ready = barrier.clone();
+        let reader = std::thread::spawn(move || {
+            let mut previous = received;
+            ready.wait();
+            loop {
+                let current = reading.received_rtp_packets();
+                assert!(current >= previous, "closing must not reset the received packet count");
+                previous = current;
+                if done.load(std::sync::atomic::Ordering::Acquire) {
+                    return current;
+                }
+            }
+        });
+        barrier.wait();
         pc1.close();
         pc2.close();
+        pc2.close();
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(reader.join().unwrap(), received);
+        assert_eq!(pc2.received_rtp_packets(), received);
         drop((pc1, pc2));
 
         assert!(

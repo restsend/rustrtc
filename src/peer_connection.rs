@@ -786,6 +786,8 @@ struct PeerConnectionInner {
     remote_dtls_fingerprint: Mutex<Option<String>>,
     dtls_transport: Mutex<Option<Arc<DtlsTransport>>>,
     rtp_transport: Mutex<Option<Arc<RtpTransport>>>,
+    /// Receive counters retained after closing releases the RTP transports.
+    retired_received_rtp_packets: AtomicU64,
     /// Observers registered via [`PeerConnection::add_observer`] before any
     /// RTP transport exists. The RtpTransport is created asynchronously for
     /// WebRTC (after ICE selects a pair) and during remote-SDP application for
@@ -1027,6 +1029,7 @@ impl PeerConnection {
             remote_dtls_fingerprint: Mutex::new(None),
             dtls_transport: Mutex::new(None),
             rtp_transport: Mutex::new(None),
+            retired_received_rtp_packets: AtomicU64::new(0),
             rtp_observers: Mutex::new(Vec::new()),
             rtp_media_ice_transports: Mutex::new(BTreeMap::new()),
             rtp_media_transports: Mutex::new(BTreeMap::new()),
@@ -1306,11 +1309,15 @@ impl PeerConnection {
     /// inactivity (e.g. media-proxy rtp-timeout) regardless of the active
     /// forwarding mode (rewrite-bridge fast-path or depacketize chain).
     pub fn received_rtp_packets(&self) -> u64 {
-        let mut total = 0u64;
-        if let Some(transport) = self.inner.rtp_transport.lock().clone() {
+        // Close retires counters while holding the same transport guards, so
+        // concurrent readers see each transport either live or retired once.
+        let primary = self.inner.rtp_transport.lock();
+        let media = self.inner.rtp_media_transports.lock();
+        let mut total = self.inner.retired_received_rtp_packets.load(Ordering::Relaxed);
+        if let Some(transport) = primary.as_ref() {
             total += transport.received_rtp_packets();
         }
-        for transport in self.inner.rtp_media_transports.lock().values() {
+        for transport in media.values() {
             total += transport.received_rtp_packets();
         }
         total
@@ -6668,10 +6675,7 @@ impl PeerConnectionInner {
             }
         }
 
-        let extra_transports = core::mem::take(&mut *self.rtp_media_transports.lock())
-            .into_iter()
-            .map(|(_, transport)| transport)
-            .collect::<Vec<_>>();
+        let extra_transports = self.rtp_media_transports.lock().values().cloned().collect::<Vec<_>>();
         for transport in extra_transports {
             let count = transport.clear_listeners();
             if count > 0 {
@@ -6703,7 +6707,16 @@ impl PeerConnectionInner {
         // Release the primary RTP transport reference so it (and the tasks that
         // hold it weakly, e.g. the TWCC flush loops) can be freed even if the
         // application keeps this `PeerConnection` handle after `close()`.
-        *self.rtp_transport.lock() = None;
+        {
+            let mut media = self.rtp_media_transports.lock();
+            let received = media.values().map(|transport| transport.received_rtp_packets()).sum();
+            self.retired_received_rtp_packets.fetch_add(received, Ordering::Relaxed);
+            media.clear();
+        }
+        let mut primary = self.rtp_transport.lock();
+        if let Some(transport) = primary.take() {
+            self.retired_received_rtp_packets.fetch_add(transport.received_rtp_packets(), Ordering::Relaxed);
+        }
     }
 }
 
