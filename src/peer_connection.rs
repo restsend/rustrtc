@@ -1481,7 +1481,6 @@ impl PeerConnection {
         };
         let ssrc = (*transceiver.sender_ssrc.lock())
             .unwrap_or_else(|| self.inner.ssrc_generator.fetch_add(1, Ordering::Relaxed));
-        self.inner.stats_collector.add_local_source(ssrc);
 
         let mut builder = RtpSenderBuilder::new(track, ssrc)
             .stream_id(stream_id)
@@ -1526,6 +1525,9 @@ impl PeerConnection {
         }
 
         let sender = builder.build();
+        self.inner
+            .stats_collector
+            .add_local_source(sender.ssrc(), sender.cname().into());
 
         // Update transceiver's pre-allocated info to match the actual sender
         *transceiver.sender_ssrc.lock() = Some(sender.ssrc());
@@ -7682,6 +7684,7 @@ impl RtpSender {
         let track_id = self.track_id.clone();
         let track = self.track.clone();
         let ssrc = self.ssrc;
+        let cname = self.cname.clone();
         self.pc_span.in_scope(|| {
             debug!(
                 "RtpSender: spawning send loop track_id={} ssrc={}",
@@ -7779,8 +7782,13 @@ impl RtpSender {
                         );
 
                         let compact_ntp = report.compact_ntp();
+                        // A compound packet: the SR, then our CNAME (RFC 3550 §6.1).
+                        let sdes = crate::rtp::SourceDescription::cname(ssrc, &cname);
                         if let Err(e) = transport
-                            .send_rtcp(&[RtcpPacket::SenderReport(report)])
+                            .send_rtcp(&[
+                                RtcpPacket::SenderReport(report),
+                                RtcpPacket::SourceDescription(sdes),
+                            ])
                             .await
                         {
                             trace!("Failed to send Sender Report: {}", e);
@@ -8362,7 +8370,9 @@ impl RtpReceiver {
         rate
     }
 
-    pub(crate) fn observe_reception(&self, packet: &RtpPacket) -> Option<RtcpPacket> {
+    /// Count a received packet; returns a compound RTCP packet (RR + SDES)
+    /// when a receiver report is due.
+    pub(crate) fn observe_reception(&self, packet: &RtpPacket) -> Option<Vec<RtcpPacket>> {
         let stats = self.reception_stats.as_ref()?;
         // Only negotiated input clock rates can turn RTP timestamps into reception jitter.
         let clock_rate = self
@@ -8373,7 +8383,8 @@ impl RtpReceiver {
         if clock_rate == 0 {
             return None;
         }
-        stats.observe_packet(packet, clock_rate)
+        let report = stats.observe_packet(packet, clock_rate)?;
+        Some(stats.compound(report))
     }
 
     pub fn rtx_ssrc(&self) -> Option<u32> {

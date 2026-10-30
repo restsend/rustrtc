@@ -3,7 +3,9 @@ use crate::peer_connection::{RtpReceiverInterceptor, RtpSenderInterceptor};
 use crate::platform::atomic64::AtomicU64;
 use crate::platform::{sync::Mutex, time::Instant};
 use crate::prelude::*;
-use crate::rtp::{ReceiverReport, ReportBlock, RtcpPacket, RtpPacket, SenderReport};
+use crate::rtp::{
+    ReceiverReport, ReportBlock, RtcpPacket, RtpPacket, SenderReport, SourceDescription,
+};
 use crate::stats::{StatsEntry, StatsId, StatsKind, StatsProvider};
 use async_trait::async_trait;
 use core::sync::atomic::Ordering;
@@ -285,9 +287,10 @@ pub struct StatsCollector {
     last_rr_sent: Mutex<Option<Instant>>,
     /// Monotonic counter used only to pace RR emission.
     packets_since_rr: AtomicU64,
-    /// The SSRC of our first sender, known before it sends anything: the
-    /// SSRC an RR carries as its sender's (see `add_local_source`).
-    local_ssrc: Mutex<Option<u32>>,
+    /// The SSRC and CNAME of our first sender, known before it sends
+    /// anything: the SSRC an RR carries as its sender's, and the CNAME of
+    /// the SDES that goes with it (see `add_local_source`).
+    local_source: Mutex<Option<(u32, Arc<str>)>>,
 }
 
 /// Bound a per-SSRC stats map so long-lived SSRC churn (re-INVITE, simulcast
@@ -333,12 +336,29 @@ impl StatsCollector {
         dlsr as f64 / 65536.0
     }
 
-    /// A sender of ours exists with this SSRC. The RRs we send carry the
-    /// SSRC of their sender (RFC 3550 §6.4.2), also before we send any RTP:
-    /// early media comes in before the call is answered. Without this they
-    /// said 0 until our first packet went out.
-    pub(crate) fn add_local_source(&self, ssrc: u32) {
-        self.local_ssrc.lock().get_or_insert(ssrc);
+    /// A sender of ours exists with this SSRC and CNAME. The RRs we send
+    /// carry the SSRC of their sender (RFC 3550 §6.4.2), also before we send
+    /// any RTP: early media comes in before the call is answered. Without
+    /// this they said 0 until our first packet went out.
+    pub(crate) fn add_local_source(&self, ssrc: u32, cname: Arc<str>) {
+        self.local_source.lock().get_or_insert((ssrc, cname));
+    }
+
+    /// `report` (an RR from `observe_packet`) as a compound RTCP packet: the
+    /// report, then the SDES with our CNAME (RFC 3550 §6.1). Without a
+    /// sender of ours there is no CNAME to send: the report goes alone.
+    pub(crate) fn compound(&self, report: RtcpPacket) -> Vec<RtcpPacket> {
+        let sdes = match (&report, &*self.local_source.lock()) {
+            (RtcpPacket::ReceiverReport(rr), Some((ssrc, cname))) if rr.sender_ssrc == *ssrc => {
+                Some(RtcpPacket::SourceDescription(SourceDescription::cname(
+                    *ssrc, cname,
+                )))
+            }
+            _ => None,
+        };
+        let mut packets = vec![report];
+        packets.extend(sdes);
+        packets
     }
 
     pub fn record_sr_sent(&self, _ssrc: u32, compact_ntp: u32) {
@@ -472,7 +492,7 @@ impl StatsCollector {
             return None;
         }
         // 0 only for a peer connection with no sender at all.
-        let sender_ssrc = (*self.local_ssrc.lock())
+        let sender_ssrc = (self.local_source.lock().as_ref().map(|(ssrc, _)| *ssrc))
             .or_else(|| self.local_outbound.lock().keys().next().copied())
             .unwrap_or(0);
         *self.last_rr_sent.lock() = Some(Instant::now());
@@ -736,7 +756,7 @@ mod tests {
     fn early_rr_carries_our_ssrc() {
         // Early media: 50 packets come in before we send anything.
         let collector = StatsCollector::new();
-        collector.add_local_source(4242);
+        collector.add_local_source(4242, "our-cname".into());
         let mut header = crate::rtp::RtpHeader::new(8, 1, 0, 77);
         let mut report = None;
         for seq in 1u16..=50 {
@@ -745,10 +765,18 @@ mod tests {
             let packet = RtpPacket::new(header.clone(), vec![0u8; 160]);
             report = report.or(collector.observe_packet(&packet, 8000));
         }
-        match report {
-            Some(RtcpPacket::ReceiverReport(rr)) => assert_eq!(rr.sender_ssrc, 4242),
+        let report = report.expect("an RR");
+        match &report {
+            RtcpPacket::ReceiverReport(rr) => assert_eq!(rr.sender_ssrc, 4242),
             other => panic!("expected an RR, got {other:?}"),
         }
+        // It goes out as a compound packet: the RR, then our CNAME.
+        let compound = collector.compound(report);
+        assert_eq!(compound.len(), 2);
+        assert_eq!(
+            compound[1],
+            RtcpPacket::SourceDescription(SourceDescription::cname(4242, "our-cname"))
+        );
     }
 
     /// A peer connection with senders but no `add_local_source` call site
