@@ -9597,7 +9597,7 @@ mod tests {
         let (pair_tx, pair_rx) = watch::channel(Some(pair));
         drop(pair_tx);
 
-        PeerConnection::create_pair_monitor(pair_rx, conn.clone()).await;
+        PeerConnection::create_pair_monitor(pair_rx, Arc::downgrade(&conn)).await;
 
         assert_eq!(
             *conn.remote_addr.read(),
