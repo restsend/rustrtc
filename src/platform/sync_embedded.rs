@@ -1225,6 +1225,28 @@ impl<T> Clone for mpsc_BoundedSender<T> {
     }
 }
 
+impl<T> Drop for mpsc_BoundedSender<T> {
+    fn drop(&mut self) {
+        // Only the LAST live clone closes the channel: mark `sender_gone`
+        // and wake the parked receiver so it observes `recv() -> None`.
+        // (leak-fix, local patch): this Drop was missing — a bounded
+        // channel's receiver parked forever once the sender went out of
+        // scope (sender_gone never set, receiver never woken), which
+        // retained every task blocked in `recv()` — one ~9 KB parked
+        // future per RTP call on the embedded backend.
+        if self.senders.fetch_sub(1, Ordering::AcqRel) > 1 {
+            return;
+        }
+        let mut state = self.inner.lock();
+        state.sender_gone = true;
+        let woken = core::mem::take(&mut state.wakers);
+        drop(state);
+        for w in woken {
+            w.wake();
+        }
+    }
+}
+
 pub struct mpsc_BoundedReceiver<T> {
     inner: Arc<Mutex<BoundedState<T>>>,
 }

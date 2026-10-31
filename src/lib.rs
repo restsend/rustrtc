@@ -126,6 +126,7 @@ where
 /// used; the optional runtime handle and tracing span are ignored.
 #[cfg(not(feature = "std"))]
 #[inline]
+#[track_caller]
 pub(crate) fn spawn_rtc<F>(
     _handle: Option<&crate::config::RuntimeHandle>,
     _span: tracing::Span,

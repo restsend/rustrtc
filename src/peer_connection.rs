@@ -1245,6 +1245,13 @@ impl PeerConnection {
     /// Attach every registered observer to a freshly created RTP transport.
     /// Idempotent: `RtpTransport::add_observer` dedups by pointer.
     fn attach_registered_observers(&self, transport: &Arc<RtpTransport>) {
+        #[cfg(feature = "std")]
+        let _ = transport;
+        #[cfg(not(feature = "std"))]
+        {
+            let mut probe = RTP_TRANSPORT_PROBE.lock();
+            *probe = Some(alloc::sync::Arc::downgrade(transport));
+        }
         for observer in self.inner.rtp_observers.lock().iter() {
             transport.add_observer(observer.clone());
         }
@@ -2484,14 +2491,17 @@ impl PeerConnection {
         }
         #[cfg(not(feature = "std"))]
         {
-            for fut in loops {
+            for (idx, fut) in loops.into_iter().enumerate() {
                 let done = done.clone();
                 crate::spawn_rtc(
                     self.inner.config.runtime_handle.as_ref(),
                     self.inner.pc_span.clone(),
                     async move {
+                        // leak-diag (local patch): per-index liveness
+                        TRANSPORT_LOOP_LIVE[idx].fetch_add(1, Ordering::Relaxed);
                         let _done = TransportLoopDone(done);
                         fut.await;
+                        TRANSPORT_LOOP_LIVE[idx].fetch_sub(1, Ordering::Relaxed);
                     },
                 );
             }
@@ -2668,7 +2678,7 @@ impl PeerConnection {
                 );
                 self.attach_rtp_transport_to_transceiver(t, selected_transport);
             }
-            let pair_monitor = Self::create_pair_monitor(pair_rx.clone(), ice_conn_monitor.clone());
+            let pair_monitor = Self::create_pair_monitor(pair_rx.clone(), Arc::downgrade(&ice_conn_monitor));
             return Ok(
                 self.spawn_transport_loops(vec![Box::pin(rtcp_loop), Box::pin(pair_monitor)])
             );
@@ -2808,7 +2818,7 @@ impl PeerConnection {
                         );
 
                         let pair_monitor =
-                            Self::create_pair_monitor(pair_rx.clone(), ice_conn_monitor.clone());
+                            Self::create_pair_monitor(pair_rx.clone(), Arc::downgrade(&ice_conn_monitor));
 
                         return Ok(self.spawn_transport_loops(vec![
                             Box::pin(rtcp_loop),
@@ -3530,7 +3540,7 @@ impl PeerConnection {
             self.inner.stats_collector.clone(),
         );
         let pair_monitor =
-            Self::create_pair_monitor(ice_transport.subscribe_selected_pair(), ice_conn);
+            Self::create_pair_monitor(ice_transport.subscribe_selected_pair(), Arc::downgrade(&ice_conn));
         let h = crate::spawn_rtc(
             self.inner.config.runtime_handle.as_ref(),
             self.inner.pc_span.clone(),
@@ -3737,20 +3747,36 @@ impl PeerConnection {
 
     async fn create_pair_monitor(
         mut pair_rx: watch::Receiver<Option<crate::transports::ice::IceCandidatePair>>,
-        ice_conn_monitor: Arc<IceConn>,
+        ice_conn_monitor: Weak<IceConn>,
     ) {
+        // NOTE(leak-fix, local patch): this monitor previously held a strong
+        // `Arc<IceConn>` — a self-retaining cycle: the IceConn owns the watch
+        // channel's sender, so `changed()` never errors while the monitor
+        // keeps the IceConn alive, and the monitor (plus the whole ICE agent
+        // graph, ~9 KB/call measured) never gets freed. On std the
+        // `LoopsGuard` abort masks this; on no_std there is no abort. Hold a
+        // Weak and upgrade per update instead: when the PeerConnection (the
+        // last strong owner) drops, the sender drops, `changed()` errors and
+        // the monitor exits.
+        let Some(initial_conn) = ice_conn_monitor.upgrade() else {
+            return;
+        };
         if let Some(pair) = pair_rx.borrow().clone() {
-            let old_addr = *ice_conn_monitor.remote_addr.read();
+            let old_addr = *initial_conn.remote_addr.read();
             trace!(
                 "PeerConnection: pair_monitor initial update: {} -> {}",
                 old_addr, pair.remote.address
             );
-            ice_conn_monitor.set_remote_addr_from_selected_pair(
+            initial_conn.set_remote_addr_from_selected_pair(
                 pair.remote.address,
                 "pair monitor initial update",
             );
         }
+        drop(initial_conn);
         while pair_rx.changed().await.is_ok() {
+            let Some(ice_conn_monitor) = ice_conn_monitor.upgrade() else {
+                return;
+            };
             if let Some(pair) = pair_rx.borrow().clone() {
                 let old_addr = *ice_conn_monitor.remote_addr.read();
                 trace!(
@@ -15926,3 +15952,39 @@ a=mid:0
         assert!(!extmap_value(crate::sdp::ABS_SEND_TIME_URI).starts_with("3 "));
     }
 }
+
+    /// leak-diag (local patch): live count per transport loop index
+    /// (0 = rtcp loop, 1 = pair monitor, 2/3 = sctp variants). A count stuck
+    /// > 0 after teardown means that loop parked forever (no abort on
+    /// no_std).
+    static TRANSPORT_LOOP_LIVE: [core::sync::atomic::AtomicUsize; 4] = [
+        core::sync::atomic::AtomicUsize::new(0),
+        core::sync::atomic::AtomicUsize::new(0),
+        core::sync::atomic::AtomicUsize::new(0),
+        core::sync::atomic::AtomicUsize::new(0),
+    ];
+
+    /// leak-diag (local patch): see [`TRANSPORT_LOOP_LIVE`].
+    /// leak-diag (local patch): Weak view of the primary RtpTransport —
+    /// `rtp_transport_alive()` reports `Some(strong_count)` while something
+    /// still holds it after teardown.
+    static RTP_TRANSPORT_PROBE: crate::platform::sync::Mutex<Option<alloc::sync::Weak<RtpTransport>>> =
+        crate::platform::sync::Mutex::new(None);
+
+    /// leak-diag (local patch): see [`RTP_TRANSPORT_PROBE`].
+    pub fn rtp_transport_alive() -> Option<usize> {
+        let probe = RTP_TRANSPORT_PROBE.lock();
+        let w = probe.as_ref()?;
+        let a = w.upgrade()?;
+        Some(alloc::sync::Arc::strong_count(&a))
+    }
+
+    pub fn transport_loop_live() -> [usize; 4] {
+        [
+            TRANSPORT_LOOP_LIVE[0].load(Ordering::Relaxed),
+            TRANSPORT_LOOP_LIVE[1].load(Ordering::Relaxed),
+            TRANSPORT_LOOP_LIVE[2].load(Ordering::Relaxed),
+            TRANSPORT_LOOP_LIVE[3].load(Ordering::Relaxed),
+        ]
+    }
+
