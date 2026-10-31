@@ -795,6 +795,9 @@ struct PeerConnectionInner {
     /// first inbound packets (e.g. RFC 4733 telephone-event / DTMF) until a
     /// caller-side poll attached them. New transports re-attach this list.
     rtp_observers: Mutex<Vec<Arc<dyn RtpObserver>>>,
+    #[cfg(feature = "diagnostics")]
+    deferred_send_observer:
+        crate::platform::sync::OnceLock<Arc<crate::diagnostics::DeferredSendObserver>>,
     rtp_media_ice_transports: Mutex<BTreeMap<u64, IceTransport>>,
     rtp_media_transports: Mutex<BTreeMap<u64, Arc<RtpTransport>>>,
     /// SDES: the `a=crypto` (local, remote) that keyed the direct transport of
@@ -959,6 +962,46 @@ pub(crate) fn negotiate_sdes_mki(
 }
 
 impl PeerConnection {
+    /// Cumulative packet-stage observations without reading payloads or credentials.
+    /// Empty transports means the media transport has not been created yet.
+    pub fn packet_diagnostics(&self) -> crate::diagnostics::PacketDiagnostics {
+        let mut transports = Vec::new();
+        if let Some(transport) = self.inner.rtp_transport.lock().clone() {
+            transports.push(transport);
+        }
+        for transport in self.inner.rtp_media_transports.lock().values() {
+            if !transports
+                .iter()
+                .any(|existing| Arc::ptr_eq(existing, transport))
+            {
+                transports.push(transport.clone());
+            }
+        }
+        // Release all owner locks before collecting the child snapshots.
+        let dtls = self.inner.dtls_transport.lock().clone();
+        let media_ice: Vec<_> = self
+            .inner
+            .rtp_media_ice_transports
+            .lock()
+            .values()
+            .cloned()
+            .collect();
+        crate::diagnostics::PacketDiagnostics {
+            enabled: cfg!(feature = "diagnostics"),
+            dtls_state: dtls.map(|dtls| dtls.get_state().to_string()),
+            dtls_error_observation_supported: false,
+            ice: self.inner.ice_transport.packet_diagnostics(),
+            media_ice: media_ice
+                .iter()
+                .map(|ice| ice.packet_diagnostics())
+                .collect(),
+            transports: transports
+                .iter()
+                .map(|transport| transport.packet_diagnostics())
+                .collect(),
+        }
+    }
+
     pub fn new(config: RtcConfiguration) -> Self {
         let is_direct = config.connectivity().is_direct();
         let (ice_transport, ice_runner) = IceTransport::new(config.clone());
@@ -1031,6 +1074,8 @@ impl PeerConnection {
             rtp_transport: Mutex::new(None),
             retired_received_rtp_packets: AtomicU64::new(0),
             rtp_observers: Mutex::new(Vec::new()),
+            #[cfg(feature = "diagnostics")]
+            deferred_send_observer: crate::platform::sync::OnceLock::new(),
             rtp_media_ice_transports: Mutex::new(BTreeMap::new()),
             rtp_media_transports: Mutex::new(BTreeMap::new()),
             sdes_keys: Mutex::new(BTreeMap::new()),
@@ -1245,6 +1290,34 @@ impl PeerConnection {
         }
     }
 
+    /// Remember the observer before media transports exist, and attach it to
+    /// existing transports too. Only the first registration is retained.
+    pub fn set_deferred_send_observer(
+        &self,
+        observer: Arc<crate::diagnostics::DeferredSendObserver>,
+    ) {
+        #[cfg(not(feature = "diagnostics"))]
+        {
+            let _ = observer;
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            self.inner.deferred_send_observer.get_or_init(|| observer);
+            if let Some(observer) = self.inner.deferred_send_observer.get() {
+                if let Some(transport) = self.inner.rtp_transport.lock().as_ref() {
+                    transport
+                        .ice_conn()
+                        .set_deferred_send_observer(observer.clone());
+                }
+                for transport in self.inner.rtp_media_transports.lock().values() {
+                    transport
+                        .ice_conn()
+                        .set_deferred_send_observer(observer.clone());
+                }
+            }
+        }
+    }
+
     /// Attach every registered observer to a freshly created RTP transport.
     /// Idempotent: `RtpTransport::add_observer` dedups by pointer.
     fn attach_registered_observers(&self, transport: &Arc<RtpTransport>) {
@@ -1311,8 +1384,10 @@ impl PeerConnection {
     pub fn received_rtp_packets(&self) -> u64 {
         // Close retires counters while holding the same transport guards, so
         // concurrent readers see each transport either live or retired once.
-        let primary = self.inner.rtp_transport.lock();
+        // Media registration also resolves its primary fallback under the
+        // media-map guard. Preserve that lock order for concurrent readers.
         let media = self.inner.rtp_media_transports.lock();
+        let primary = self.inner.rtp_transport.lock();
         let mut total = self.inner.retired_received_rtp_packets.load(Ordering::Relaxed);
         if let Some(transport) = primary.as_ref() {
             total += transport.received_rtp_packets();
@@ -2629,6 +2704,10 @@ impl PeerConnection {
                 Some(Arc::downgrade(&rtp_transport) as Weak<dyn crate::transports::PacketReceiver>);
         }
         *self.inner.rtp_transport.lock() = Some(rtp_transport.clone());
+        #[cfg(feature = "diagnostics")]
+        if let Some(observer) = self.inner.deferred_send_observer.get() {
+            ice_conn.set_deferred_send_observer(observer.clone());
+        }
         self.attach_registered_observers(&rtp_transport);
         self.sync_transport_send_gates();
 
@@ -3539,6 +3618,10 @@ impl PeerConnection {
             .rtp_media_transports
             .lock()
             .insert(transceiver.id(), rtp_transport.clone());
+        #[cfg(feature = "diagnostics")]
+        if let Some(observer) = self.inner.deferred_send_observer.get() {
+            ice_conn.set_deferred_send_observer(observer.clone());
+        }
         self.sync_transport_send_gates();
 
         let rtcp_loop = Self::create_rtcp_loop(
@@ -4133,6 +4216,15 @@ impl PeerConnection {
         // `Arc<dyn StatsProvider>` unsizing coercion into the slice; from_ref
         // would not coerce.
         gather_once(&[self.inner.stats_collector.clone()])
+    }
+
+    /// Display-only DTLS state; key material is never returned in diagnostic output.
+    pub fn diagnostic_dtls_state(&self) -> Option<String> {
+        self.inner
+            .dtls_transport
+            .lock()
+            .as_ref()
+            .map(|dtls| dtls.get_state().to_string())
     }
 
     /// Collect transport-level (UDP tx/rx) stats from all active IceConn instances.
@@ -9314,6 +9406,51 @@ mod tests {
     /// no transport yet and callers had to poll-and-reattach — any packet
     /// arriving in that window (notably the first RFC 4733 telephone-event /
     /// DTMF right after answer) was silently invisible to stats/DTMF/recording.
+    #[tokio::test]
+    async fn received_rtp_stats_complete_during_media_registration() {
+        // Media registration resolves its fallback transport while owning the
+        // media map. Reproduce that ordering while a public stats read runs.
+        let pc = PeerConnection::new(RtcConfiguration::default());
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let registry_pc = pc.clone();
+        let registry_finished = finished_tx.clone();
+        let registry = std::thread::spawn(move || {
+            let _media = registry_pc.inner.rtp_media_transports.lock();
+            held_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            let _fallback = registry_pc.inner.rtp_transport.lock();
+            registry_finished.send(()).unwrap();
+        });
+        held_rx
+            .recv_timeout(core::time::Duration::from_secs(1))
+            .unwrap();
+        let reader_pc = pc.clone();
+        let reader = std::thread::spawn(move || {
+            let _ = reader_pc.received_rtp_packets();
+            finished_tx.send(()).unwrap();
+        });
+        // Allow the old implementation to acquire primary before it blocks on
+        // media. Correct readers block on media without holding primary.
+        let until = std::time::Instant::now() + core::time::Duration::from_millis(100);
+        while std::time::Instant::now() < until {
+            if pc.inner.rtp_transport.try_lock().is_none() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        resume_tx.send(()).unwrap();
+        for _ in 0..2 {
+            finished_rx
+                .recv_timeout(core::time::Duration::from_secs(1))
+                .expect("RTP statistics must complete alongside media registration");
+        }
+        registry.join().unwrap();
+        reader.join().unwrap();
+        pc.close();
+    }
+
     #[tokio::test]
     async fn rtp_observer_registered_before_transport_sees_first_packets() {
         use crate::platform::atomic64::AtomicU64;

@@ -86,6 +86,8 @@ tower-http = { version = "0.6", features = ["fs"] }
 
 [features]
 default = ["std"]
+# Optional packet-stage timing/counters. Never prints packets or credentials.
+diagnostics = []
 # Host std support; the no_std build (WP2) currently exposes the RTP/SRTP/RTX
 # data plane only — more modules graduate as their platform seams land.
 std = [
