@@ -500,6 +500,25 @@ pub struct SourceDescription {
     pub chunks: Vec<SdesChunk>,
 }
 
+/// SDES item type of the canonical name, CNAME (RFC 3550 §6.5.1).
+pub const SDES_CNAME: u8 = 1;
+
+impl SourceDescription {
+    /// One chunk: the CNAME of `ssrc`. Every compound RTCP packet must
+    /// carry it after its SR or RR (RFC 3550 §6.1).
+    pub fn cname(ssrc: u32, cname: &str) -> Self {
+        SourceDescription {
+            chunks: vec![SdesChunk {
+                ssrc,
+                items: vec![SdesItem {
+                    ty: SDES_CNAME,
+                    text: cname.to_string(),
+                }],
+            }],
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Goodbye {
     pub sources: Vec<u32>,

@@ -1419,7 +1419,7 @@ impl RtpTransport {
         // Account on the original SSRC before either forwarding or depacketization.
         if let Some(receiver) = receiver
             && let Some(report) = receiver.observe_reception(&rtp_packet)
-            && let Err(error) = self.send_rtcp(&[report]).await
+            && let Err(error) = self.send_rtcp(&report).await
         {
             trace!(%error, "Failed to send reception report");
         }
