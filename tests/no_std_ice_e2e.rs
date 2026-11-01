@@ -20,7 +20,7 @@ fn two_ice_agents_connect_over_the_loopback_seams() {
     // different ports (AddrInUse retry exercised if a port collides).
     fn agent(start: u16, end: u16) -> IceTransport {
         let mut cfg = rustrtc::config::RtcConfiguration::default();
-        cfg.bind_ip = Some("127.0.0.1".to_string());
+        cfg.bind_ips = vec!["127.0.0.1".parse().unwrap()];
         cfg.rtp_start_port = Some(start);
         cfg.rtp_end_port = Some(end);
         let (transport, runner) = IceTransport::new(cfg);

@@ -22,7 +22,7 @@ async fn test_rtp_mode_no_default_extensions() -> Result<()> {
     // 1. Setup PeerConnection (PC) with RTP Mode
     let mut config = RtcConfiguration::default();
     config.transport_mode = TransportMode::Rtp;
-    config.bind_ip = Some("127.0.0.1".to_string());
+    config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
     config.rtp_start_port = Some(40200);
     config.rtp_end_port = Some(40300);
 

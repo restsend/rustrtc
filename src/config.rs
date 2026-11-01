@@ -13,6 +13,7 @@ pub type RuntimeHandle = tokio::runtime::Handle;
 pub struct RuntimeHandle;
 use alloc::sync::Arc;
 use core::fmt::{Debug, Formatter};
+use core::net::IpAddr;
 use serde::{Deserialize, Serialize};
 
 /// Describes how credentials are conveyed for a given ICE server.
@@ -150,15 +151,16 @@ pub enum BufferDropStrategy {
     DropOldest,
 }
 
-/// How `external_ip` is advertised in ICE candidates.
+/// How `external_ips` are advertised in ICE candidates.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum ExternalIpCandidateType {
-    /// Replace each non-loopback host candidate's address with `external_ip`.
+    /// Replace each non-loopback host candidate's address with the external
+    /// address of its family.
     #[default]
     Host,
-    /// Keep the host candidate on the bind address and advertise
-    /// `external_ip` alongside it as a server-reflexive candidate
-    /// (1:1 NAT, RFC 8445 §5.1.1.2). WebRTC mode only.
+    /// Keep the host candidate on the bind address and advertise the
+    /// external address of its family alongside it as a server-reflexive
+    /// candidate (1:1 NAT, RFC 8445 §5.1.1.2). WebRTC mode only.
     ServerReflexive,
 }
 
@@ -528,12 +530,13 @@ pub struct RtcConfiguration {
     #[serde(default = "default_enable_gcc")]
     pub enable_gcc: bool,
     pub media_capabilities: Option<MediaCapabilities>,
-    /// Override the advertised IP address in SDP (for NAT traversal).
-    /// When set, the `c=`, `o=`, and candidate addresses in the SDP will
-    /// use this IP instead of the local bind IP. The local bind address is
-    /// stored in `related_address` on the candidate.
-    pub external_ip: Option<String>,
-    /// How ICE candidates advertise `external_ip`.
+    /// Public addresses to advertise instead of the local ones (1:1 NAT, a
+    /// router that forwards the RTP ports), at most one per family. A
+    /// candidate takes the external address of its family, and so do `c=`
+    /// and `o=`; a family with none advertises the local address. The local
+    /// address is the candidate's `related_address` (its base).
+    pub external_ips: Vec<IpAddr>,
+    /// How ICE candidates advertise `external_ips`.
     #[serde(default)]
     pub external_ip_candidate_type: ExternalIpCandidateType,
     /// Override the advertised port in SDP `m=` line and candidates
@@ -544,11 +547,17 @@ pub struct RtcConfiguration {
     /// forwarding (e.g. external port 30000 → local port 20000) and need
     /// the remote peer to send RTP to the external port.
     ///
-    /// Works independently or combined with `external_ip`.
+    /// Works independently or combined with `external_ips`.
     /// Only applies in RTP/SRTP direct mode (`TransportMode::Rtp` /
     /// `TransportMode::Srtp`). Not used in WebRTC mode.
     pub external_port: Option<u16>,
-    pub bind_ip: Option<String>,
+    /// Local addresses to bind media sockets on: one socket on each. Empty:
+    /// chosen for us (WebRTC: every interface; RTP and SRTP: the address of
+    /// the default route). A socket on `::` serves IPv4 and IPv6
+    /// (`IPV6_V6ONLY` off), and has a candidate for each family: the
+    /// external address of the family, else the local address of its
+    /// default route. A socket on a given address serves its family only.
+    pub bind_ips: Vec<IpAddr>,
     pub disable_ipv6: bool,
     /// The SSRC of the first sender; later senders count up from it. Random
     /// by default, as RFC 3550 §8.1 asks: a fixed start gives every peer
@@ -625,14 +634,14 @@ pub struct RtcConfiguration {
     pub rtp_end_port: Option<u16>,
     pub ice_gather_udp_hosts: bool,
     /// Whether to gather and advertise loopback (127.0.0.1 / ::1) host
-    /// candidates when no explicit `bind_ip` is configured.
+    /// candidates when no explicit `bind_ips` are configured.
     ///
     /// Default: false — loopback candidates are unreachable by any remote
     /// peer: they leak host internals in SDP and make remote agents waste
     /// TURN permissions and connectivity checks on dead candidates (a same-
     /// host TURN relay can even forward them back to itself). Set to `true`
     /// for same-host testing where no non-loopback interface exists. An
-    /// explicit `bind_ip = "127.0.0.1"` is unaffected by this flag.
+    /// explicit `bind_ips = [127.0.0.1]` is unaffected by this flag.
     #[serde(default)]
     pub ice_include_loopback_candidates: bool,
     pub tcp_port_range_start: Option<u16>,
@@ -729,10 +738,10 @@ impl PartialEq for RtcConfiguration {
             && self.nack_buffer_size == other.nack_buffer_size
             && self.enable_gcc == other.enable_gcc
             && self.media_capabilities == other.media_capabilities
-            && self.external_ip == other.external_ip
+            && self.external_ips == other.external_ips
             && self.external_ip_candidate_type == other.external_ip_candidate_type
             && self.external_port == other.external_port
-            && self.bind_ip == other.bind_ip
+            && self.bind_ips == other.bind_ips
             && self.disable_ipv6 == other.disable_ipv6
             && self.ssrc_start == other.ssrc_start
             && self.stun_timeout == other.stun_timeout
@@ -820,10 +829,10 @@ impl Default for RtcConfiguration {
             nack_buffer_size: 200,
             enable_gcc: default_enable_gcc(),
             media_capabilities: None,
-            external_ip: None,
+            external_ips: Vec::new(),
             external_ip_candidate_type: ExternalIpCandidateType::default(),
             external_port: None,
-            bind_ip: None,
+            bind_ips: Vec::new(),
             disable_ipv6: false,
             ssrc_start: crate::transports::ice::stun::random_u32(),
             stun_timeout: core::time::Duration::from_secs(5),
@@ -1025,8 +1034,8 @@ impl RtcConfigurationBuilder {
         self
     }
 
-    pub fn external_ip(mut self, ip: String) -> Self {
-        self.inner.external_ip = Some(ip);
+    pub fn external_ips(mut self, ips: Vec<IpAddr>) -> Self {
+        self.inner.external_ips = ips;
         self
     }
 
@@ -1040,8 +1049,8 @@ impl RtcConfigurationBuilder {
         self
     }
 
-    pub fn bind_ip(mut self, ip: String) -> Self {
-        self.inner.bind_ip = Some(ip);
+    pub fn bind_ips(mut self, ips: Vec<IpAddr>) -> Self {
+        self.inner.bind_ips = ips;
         self
     }
 
@@ -1392,10 +1401,13 @@ mod tests {
     #[test]
     fn test_external_port_with_external_ip_builder() {
         let config = RtcConfigurationBuilder::new()
-            .external_ip("203.0.113.5".to_string())
+            .external_ips(vec!["203.0.113.5".parse().unwrap()])
             .external_port(30000)
             .build();
-        assert_eq!(config.external_ip, Some("203.0.113.5".to_string()));
+        assert_eq!(
+            config.external_ips,
+            vec!["203.0.113.5".parse::<IpAddr>().unwrap()]
+        );
         assert_eq!(config.external_port, Some(30000));
     }
 

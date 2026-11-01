@@ -156,7 +156,7 @@ async fn the_first_description_gets_a_fresh_origin() -> Result<()> {
 async fn reoffers_keep_the_configured_external_ip() -> Result<()> {
     let pc1 = PeerConnection::new(RtcConfiguration {
         transport_mode: TransportMode::Rtp,
-        external_ip: Some("203.0.113.10".to_string()),
+        external_ips: vec!["203.0.113.10".parse().unwrap()],
         ..RtcConfiguration::default()
     });
     let pc2 = rtp_pc();

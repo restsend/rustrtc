@@ -606,7 +606,7 @@ async fn test_ice_lite_stun_response() -> Result<()> {
     let mut config = RtcConfiguration::default();
     config.transport_mode = TransportMode::Rtp;
     config.enable_ice_lite = true;
-    config.bind_ip = Some("127.0.0.1".to_string());
+    config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
 
     let (ice_lite, runner) = IceTransport::new(config);
     tokio::spawn(runner);
@@ -738,7 +738,7 @@ async fn test_ice_lite_connectivity_establishment() -> Result<()> {
     let mut lite_config = RtcConfiguration::default();
     lite_config.transport_mode = TransportMode::Rtp;
     lite_config.enable_ice_lite = true;
-    lite_config.bind_ip = Some("127.0.0.1".to_string());
+    lite_config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
 
     let (ice_lite, lite_runner) = IceTransport::new(lite_config);
     tokio::spawn(lite_runner);
@@ -1893,11 +1893,11 @@ async fn test_ice_connection_with_external_ip() -> Result<()> {
     // the same-host raw loopback pair is what actually carries checks here.
     let mut config1 = RtcConfiguration::default();
     config1.ice_include_loopback_candidates = true;
-    config1.external_ip = Some("203.0.113.10".to_string());
+    config1.external_ips = vec!["203.0.113.10".parse().unwrap()];
 
     let mut config2 = RtcConfiguration::default();
     config2.ice_include_loopback_candidates = true;
-    config2.external_ip = Some("203.0.113.20".to_string());
+    config2.external_ips = vec!["203.0.113.20".parse().unwrap()];
 
     let (controlling, controlled) = setup_host_pair(config1, config2).await;
 
@@ -1954,11 +1954,11 @@ async fn test_ice_connection_with_external_ip() -> Result<()> {
 async fn test_nomination_with_external_ip() -> Result<()> {
     let mut config1 = RtcConfiguration::default();
     config1.ice_include_loopback_candidates = true;
-    config1.external_ip = Some("203.0.113.10".to_string());
+    config1.external_ips = vec!["203.0.113.10".parse().unwrap()];
 
     let mut config2 = RtcConfiguration::default();
     config2.ice_include_loopback_candidates = true;
-    config2.external_ip = Some("203.0.113.20".to_string());
+    config2.external_ips = vec!["203.0.113.20".parse().unwrap()];
 
     let (controlling, controlled) = setup_host_pair(config1, config2).await;
 
@@ -4637,10 +4637,10 @@ async fn ice_udp_mux_connects_through_shared_port() -> Result<()> {
     let mut controlled_cfg = RtcConfiguration::default();
     controlled_cfg.ice_udp_mux = true;
     controlled_cfg.ice_udp_mux_port = Some(port);
-    controlled_cfg.bind_ip = Some("127.0.0.1".into());
+    controlled_cfg.bind_ips = vec!["127.0.0.1".parse().unwrap()];
 
     let mut controlling_cfg = RtcConfiguration::default();
-    controlling_cfg.bind_ip = Some("127.0.0.1".into());
+    controlling_cfg.bind_ips = vec!["127.0.0.1".parse().unwrap()];
 
     let (controlled, runner_d) = IceTransportBuilder::new(controlled_cfg)
         .role(IceRole::Controlled)
@@ -4742,7 +4742,7 @@ async fn ice_udp_mux_two_sessions_share_one_port() -> Result<()> {
         let mut cfg = RtcConfiguration::default();
         cfg.ice_udp_mux = true;
         cfg.ice_udp_mux_port = Some(port);
-        cfg.bind_ip = Some("127.0.0.1".into());
+        cfg.bind_ips = vec!["127.0.0.1".parse().unwrap()];
         cfg
     }
 
@@ -5413,7 +5413,7 @@ async fn silent_remote_relay_candidate_still_gets_probed_and_connects() -> Resul
 
     let mut config = RtcConfiguration::default();
     config.ice_include_loopback_candidates = true;
-    config.bind_ip = Some("127.0.0.1".to_string());
+    config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
 
     let (agent, runner) = IceTransportBuilder::new(config)
         .role(IceRole::Controlled)
@@ -5792,7 +5792,7 @@ async fn controlled_late_check_round_keeps_first_selection() -> Result<()> {
     use tokio::net::UdpSocket;
 
     let mut cfg = RtcConfiguration::default();
-    cfg.bind_ip = Some("127.0.0.1".into());
+    cfg.bind_ips = vec!["127.0.0.1".parse().unwrap()];
     let (t, runner) = IceTransportBuilder::new(cfg)
         .role(IceRole::Controlled)
         .build();
@@ -5860,7 +5860,7 @@ async fn stale_check_round_after_restart_does_not_commit() -> Result<()> {
     use tokio::net::UdpSocket;
 
     let mut cfg = RtcConfiguration::default();
-    cfg.bind_ip = Some("127.0.0.1".into());
+    cfg.bind_ips = vec!["127.0.0.1".parse().unwrap()];
     let (t, runner) = IceTransportBuilder::new(cfg)
         .role(IceRole::Controlled)
         .build();
@@ -5946,7 +5946,7 @@ async fn stale_check_round_after_restart_does_not_commit() -> Result<()> {
 #[tokio::test]
 async fn select_pair_refuses_unresolvable_local() -> Result<()> {
     let mut cfg = RtcConfiguration::default();
-    cfg.bind_ip = Some("127.0.0.1".into());
+    cfg.bind_ips = vec!["127.0.0.1".parse().unwrap()];
     let (t, runner) = IceTransportBuilder::new(cfg).build();
     tokio::spawn(runner);
     timeout(Duration::from_secs(5), async {

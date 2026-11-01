@@ -19,7 +19,7 @@ fn external() -> IpAddr {
 
 fn config(typ: Option<ExternalIpCandidateType>) -> RtcConfiguration {
     let mut config = RtcConfiguration {
-        external_ip: Some(EXTERNAL.to_string()),
+        external_ips: vec![EXTERNAL.parse().unwrap()],
         ..RtcConfiguration::default()
     };
     if let Some(typ) = typ {
@@ -174,7 +174,7 @@ fn assert_host_and_srflx(candidates: Vec<IceCandidate>) {
 #[tokio::test]
 async fn peers_connect_over_the_host_candidate() -> Result<()> {
     let pc1 = PeerConnection::new(RtcConfiguration {
-        external_ip: Some(EXTERNAL.to_string()),
+        external_ips: vec![EXTERNAL.parse().unwrap()],
         external_ip_candidate_type: ExternalIpCandidateType::ServerReflexive,
         ..RtcConfiguration::default()
     });
@@ -224,7 +224,7 @@ async fn server_reflexive_with_mdns_obfuscates_only_the_host() -> Result<()> {
 #[tokio::test]
 async fn server_reflexive_skips_an_external_ip_of_the_other_family() -> Result<()> {
     let config = RtcConfiguration {
-        external_ip: Some("2001:db8::5".to_string()),
+        external_ips: vec!["2001:db8::5".parse().unwrap()],
         external_ip_candidate_type: ExternalIpCandidateType::ServerReflexive,
         ..RtcConfiguration::default()
     };

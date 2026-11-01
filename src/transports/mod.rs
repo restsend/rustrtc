@@ -191,6 +191,33 @@ fn resolve_local_ip_uncached() -> Result<IpAddr, anyhow::Error> {
     Err(anyhow::anyhow!("No suitable network interface found"))
 }
 
+/// An IPv6 address of this host that peers can reach: a global one, else a
+/// unique local one (`fc00::/7`). Never loopback or link-local (`fe80::/10`:
+/// it needs a scope). None: no IPv6 here.
+#[cfg(feature = "std")]
+pub fn get_local_ipv6() -> Option<core::net::Ipv6Addr> {
+    let interfaces = local_ip_address::list_afinet_netifas().ok()?;
+    let usable = interfaces.into_iter().filter_map(|(_, addr)| match addr {
+        IpAddr::V6(ip)
+            if !ip.is_loopback()
+                && !ip.is_unspecified()
+                && !ip.is_unicast_link_local()
+                && !ip.is_multicast() =>
+        {
+            Some(ip)
+        }
+        _ => None,
+    });
+    // Global before unique local.
+    usable.min_by_key(|ip| ip.is_unique_local())
+}
+
+/// No interface enumeration on the embedded target.
+#[cfg(not(feature = "std"))]
+pub fn get_local_ipv6() -> Option<core::net::Ipv6Addr> {
+    None
+}
+
 #[cfg(feature = "std")]
 fn interface_priority(name: &str, ip: &std::net::Ipv4Addr) -> i32 {
     let mut score = 0;
