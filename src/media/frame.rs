@@ -2,6 +2,7 @@ use crate::prelude::*;
 use bytes::Bytes;
 use core::net::SocketAddr;
 #[cfg_attr(feature = "std", allow(unused_imports))]
+#[cfg_attr(not(feature = "std"), allow(unused_imports))]
 use serde::{Deserialize, Serialize};
 
 use crate::rtp::{RtpHeader, RtpHeaderExtension, RtpPacket};

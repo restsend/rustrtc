@@ -1135,6 +1135,7 @@ impl SctpInner {
         let _guard = SctpCleanupGuard { inner: self };
 
         // Wait for DTLS to be connected
+        #[allow(unused_mut)]
         let mut dtls_state_rx = self.dtls_transport.subscribe_state();
         loop {
             let state = dtls_state_rx.borrow_and_update().clone();
@@ -1293,6 +1294,7 @@ impl SctpInner {
 
             {
                 let close_fut = close_rx.notified();
+                #[allow(unused_mut)]
                 let mut dtls_state_arm = dtls_state_rx.clone();
                 let dtls_fut = dtls_state_arm.changed();
                 let timer_fut = self.timer_notify.notified();

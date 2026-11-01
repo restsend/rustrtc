@@ -1,5 +1,5 @@
 use super::*;
-use super::{bail, dtls_err};
+use super::dtls_err;
 use crate::platform::crypto;
 use crate::transports::PacketReceiver;
 use crate::transports::ice::IceSocketWrapper;

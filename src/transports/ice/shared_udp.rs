@@ -68,6 +68,8 @@ struct SharedUdpPort {
 }
 
 impl SharedUdpPort {
+    /// std-only: no_std embedders inject their adapter via WP3 (never built).
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     fn new(socket: Arc<dyn UdpSocket>) -> Self {
         Self {
             socket,
@@ -316,8 +318,17 @@ pub(crate) async fn acquire(
             Arc::new(tokio_impl::TokioUdpSocket::new(sock))
         };
         #[cfg(not(feature = "std"))]
-        let socket: Arc<dyn UdpSocket> =
-            unimplemented!("no_std: pass an adapter implementing platform::net::UdpSocket (WP3)");
+        {
+            let _ = bind_addr;
+            unimplemented!(
+                "no_std: pass an adapter implementing platform::net::UdpSocket (WP3)"
+            );
+        }
+        // Unreachable on no_std: the block above diverges before this runs.
+        #[cfg(not(feature = "std"))]
+        #[allow(unreachable_code)]
+        let port: Arc<SharedUdpPort> = unimplemented!();
+        #[cfg(feature = "std")]
         let port = Arc::new(SharedUdpPort::new(socket));
         let mut reg = registry().lock();
         if let Some(existing) = reg.get(&bind_addr) {

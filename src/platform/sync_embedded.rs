@@ -14,6 +14,7 @@
 //! - `broadcast` keeps a bounded history; receivers that fall further
 //!   behind than the history get `Lagged`.
 
+#[cfg_attr(not(feature = "std"), allow(unused_imports))]
 use crate::prelude::*;
 
 use crate::platform::atomic64::AtomicU64;
@@ -1079,6 +1080,7 @@ impl<T: Clone> broadcast_Receiver<T> {
     /// and the history is drained. Advances `next_seq` on `Ok`/`Lagged`,
     /// matching tokio.
     pub fn try_recv(&self) -> Result<T, broadcast_TryRecvError> {
+        #[allow(unused_mut)]
         let mut state = self.inner.lock();
         let want = self.next_seq.load(Ordering::Acquire);
         if let Some(&(oldest, _)) = state.history.front()

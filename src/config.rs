@@ -916,6 +916,7 @@ impl Debug for RecorderInterceptors {
 }
 
 impl PartialEq for RecorderInterceptors {
+    #[cfg_attr(not(feature = "std"), allow(unused_variables))]
     fn eq(&self, other: &Self) -> bool {
         #[cfg(feature = "std")]
         {

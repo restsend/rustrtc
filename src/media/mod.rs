@@ -1,4 +1,5 @@
 #[cfg_attr(feature = "std", allow(unused_imports))]
+#[cfg_attr(not(feature = "std"), allow(unused_imports))]
 use crate::prelude::*;
 pub mod depacketizer;
 pub mod error;

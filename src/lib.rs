@@ -31,7 +31,6 @@ pub mod prelude {
 // struct literal, especially in tests. Pervasive here, so allowed crate-wide.
 
 pub mod config;
-pub mod diagnostics;
 pub mod errors;
 pub mod media;
 pub mod peer_connection;

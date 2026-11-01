@@ -7,6 +7,7 @@
 
 use crate::prelude::*;
 #[cfg_attr(feature = "std", allow(unused_imports))]
+#[cfg_attr(not(feature = "std"), allow(unused_imports))]
 use alloc::string::String;
 use core::net::SocketAddr;
 
@@ -135,7 +136,7 @@ pub mod tokio_impl {
             // writable, so this completes immediately).
             {
                 use core::future::Future;
-                use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+                use core::task::{Context, RawWaker, RawWakerVTable, Waker};
                 unsafe fn clone_raw(_: *const ()) -> RawWaker {
                     RawWaker::new(core::ptr::null(), &VTABLE)
                 }
@@ -144,7 +145,7 @@ pub mod tokio_impl {
                     RawWakerVTable::new(clone_raw, noop_raw, noop_raw, noop_raw);
                 let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
                 let mut cx = Context::from_waker(&waker);
-                let mut fut = self.0.writable();
+                let fut = self.0.writable();
                 let _ = core::pin::pin!(fut).poll(&mut cx);
             }
             self.0.try_send_to(buf, addr).map_err(|_| NetError::Other)

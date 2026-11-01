@@ -32,7 +32,6 @@ fn rtp_packet(ssrc: u32, seq: u16, ts: u32, payload: &[u8], marker: bool) -> Vec
 }
 
 fn ulaw_encode(sample: i16) -> u8 {
-    const BIAS: i32 = 0x84;
     let mut x = sample as i32;
     let sign = if x < 0 { 0x80 } else { 0x00 };
     if x < 0 {

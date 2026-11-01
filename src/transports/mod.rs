@@ -14,6 +14,7 @@ use async_trait::async_trait;
 #[cfg_attr(feature = "std", allow(unused_imports))]
 use bytes::Bytes;
 use core::net::{IpAddr, SocketAddr};
+#[cfg_attr(not(feature = "std"), allow(unused_imports))]
 use core::time::Duration;
 #[cfg(feature = "std")]
 use parking_lot::Mutex;

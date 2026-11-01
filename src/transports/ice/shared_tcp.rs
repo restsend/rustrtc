@@ -5,7 +5,7 @@
 //! server ufrag in the first STUN Binding request USERNAME attribute.
 
 use super::{IceTransportInner, MAX_STUN_MESSAGE, attach_demuxed_tcp_stream};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;

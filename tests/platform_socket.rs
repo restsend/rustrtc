@@ -7,7 +7,6 @@
 use std::sync::Arc;
 
 use core::net::SocketAddr;
-use rustrtc::platform::net::TokioUdpSocket;
 use rustrtc::platform::net::{NetError, UdpSocket};
 use rustrtc::transports::ice::IceSocketWrapper;
 

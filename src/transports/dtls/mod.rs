@@ -27,7 +27,7 @@ use self::handshake::{
 };
 use self::record::{ContentType, DtlsRecord, ProtocolVersion};
 use crate::platform::atomic64::AtomicU64;
-use crate::platform::crypto::{self, EcdhSecret, SigningKey};
+use crate::platform::crypto::{self, EcdhSecret};
 use crate::platform::sync::{Mutex, Notify, mpsc, watch};
 use crate::transports::ice::conn::IceConn;
 use tracing::{debug, trace, warn};
@@ -46,6 +46,7 @@ macro_rules! dtls_err {
         crate::errors::RtcError::Internal(alloc::format!($($arg)*))
     };
 }
+#[cfg(test)]
 pub(crate) use dtls_err;
 
 /// Generate a fresh self-signed DTLS certificate (EC keypair + PEM round-trip).

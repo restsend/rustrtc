@@ -741,8 +741,6 @@ mod fec_tests {
         assert!(mid.is_none(), "seq 3 arrives early, must buffer");
         let first = buf.take_ready();
         assert_eq!(first.as_ref(), Some(&f2), "recovered missing f2");
-        let mut buf = buf;
-        let _ = buf;
     }
 
     #[tokio::test]

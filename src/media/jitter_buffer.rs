@@ -1,6 +1,7 @@
 use crate::media::frame::MediaSample;
 use crate::platform::time::Instant;
 #[cfg_attr(feature = "std", allow(unused_imports))]
+#[cfg_attr(not(feature = "std"), allow(unused_imports))]
 use crate::prelude::*;
 use alloc::collections::BTreeMap;
 use core::time::Duration;

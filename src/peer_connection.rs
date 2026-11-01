@@ -74,9 +74,13 @@ pub(crate) mod std_gated {
     // dtls: the real transports::dtls module is no_std-ready and is used
     // directly (see the `use crate::transports::dtls` import above).
 
+    // The no_std stubs below mirror the std API surface so call sites compile
+    // unchanged; on no_std the wiring that constructs them is std-gated.
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     #[derive(Debug)]
     pub struct SctpTransport;
 
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     impl SctpTransport {
         /// Shared close path: no SCTP transport → no close reason.
         pub fn close_reason(&self) -> Option<String> {
@@ -92,6 +96,7 @@ pub(crate) mod std_gated {
         }
     }
 
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     #[derive(Debug)]
     pub struct DataChannel;
 
@@ -102,6 +107,7 @@ pub(crate) mod std_gated {
     pub struct UdtlTransport;
 
     /// Inert stand-in for the datachannel setup API (std only).
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     #[derive(Debug, Default)]
     pub struct DataChannelConfig;
 
@@ -795,9 +801,6 @@ struct PeerConnectionInner {
     /// first inbound packets (e.g. RFC 4733 telephone-event / DTMF) until a
     /// caller-side poll attached them. New transports re-attach this list.
     rtp_observers: Mutex<Vec<Arc<dyn RtpObserver>>>,
-    #[cfg(feature = "diagnostics")]
-    deferred_send_observer:
-        crate::platform::sync::OnceLock<Arc<crate::diagnostics::DeferredSendObserver>>,
     rtp_media_ice_transports: Mutex<BTreeMap<u64, IceTransport>>,
     rtp_media_transports: Mutex<BTreeMap<u64, Arc<RtpTransport>>>,
     /// SDES: the `a=crypto` (local, remote) that keyed the direct transport of
@@ -824,7 +827,10 @@ struct PeerConnectionInner {
     /// captured (tracks, transports, etc.).
     #[cfg(feature = "std")]
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Inert stand-in: task tracking is std-only; nothing registers tasks on
+    /// no_std, so this field is only written at construction.
     #[cfg(not(feature = "std"))]
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     tasks: Mutex<()>,
     /// Root span for this PeerConnection. Carries the configured `label` (set
     /// by the application, e.g. rustpbx's `{session_id}-{leg}`) and is
@@ -962,46 +968,6 @@ pub(crate) fn negotiate_sdes_mki(
 }
 
 impl PeerConnection {
-    /// Cumulative packet-stage observations without reading payloads or credentials.
-    /// Empty transports means the media transport has not been created yet.
-    pub fn packet_diagnostics(&self) -> crate::diagnostics::PacketDiagnostics {
-        let mut transports = Vec::new();
-        if let Some(transport) = self.inner.rtp_transport.lock().clone() {
-            transports.push(transport);
-        }
-        for transport in self.inner.rtp_media_transports.lock().values() {
-            if !transports
-                .iter()
-                .any(|existing| Arc::ptr_eq(existing, transport))
-            {
-                transports.push(transport.clone());
-            }
-        }
-        // Release all owner locks before collecting the child snapshots.
-        let dtls = self.inner.dtls_transport.lock().clone();
-        let media_ice: Vec<_> = self
-            .inner
-            .rtp_media_ice_transports
-            .lock()
-            .values()
-            .cloned()
-            .collect();
-        crate::diagnostics::PacketDiagnostics {
-            enabled: cfg!(feature = "diagnostics"),
-            dtls_state: dtls.map(|dtls| dtls.get_state().to_string()),
-            dtls_error_observation_supported: false,
-            ice: self.inner.ice_transport.packet_diagnostics(),
-            media_ice: media_ice
-                .iter()
-                .map(|ice| ice.packet_diagnostics())
-                .collect(),
-            transports: transports
-                .iter()
-                .map(|transport| transport.packet_diagnostics())
-                .collect(),
-        }
-    }
-
     pub fn new(config: RtcConfiguration) -> Self {
         let is_direct = config.connectivity().is_direct();
         let (ice_transport, ice_runner) = IceTransport::new(config.clone());
@@ -1074,8 +1040,6 @@ impl PeerConnection {
             rtp_transport: Mutex::new(None),
             retired_received_rtp_packets: AtomicU64::new(0),
             rtp_observers: Mutex::new(Vec::new()),
-            #[cfg(feature = "diagnostics")]
-            deferred_send_observer: crate::platform::sync::OnceLock::new(),
             rtp_media_ice_transports: Mutex::new(BTreeMap::new()),
             rtp_media_transports: Mutex::new(BTreeMap::new()),
             sdes_keys: Mutex::new(BTreeMap::new()),
@@ -1287,34 +1251,6 @@ impl PeerConnection {
         }
         for transport in self.inner.rtp_media_transports.lock().values() {
             transport.add_observer(observer.clone());
-        }
-    }
-
-    /// Remember the observer before media transports exist, and attach it to
-    /// existing transports too. Only the first registration is retained.
-    pub fn set_deferred_send_observer(
-        &self,
-        observer: Arc<crate::diagnostics::DeferredSendObserver>,
-    ) {
-        #[cfg(not(feature = "diagnostics"))]
-        {
-            let _ = observer;
-        }
-        #[cfg(feature = "diagnostics")]
-        {
-            self.inner.deferred_send_observer.get_or_init(|| observer);
-            if let Some(observer) = self.inner.deferred_send_observer.get() {
-                if let Some(transport) = self.inner.rtp_transport.lock().as_ref() {
-                    transport
-                        .ice_conn()
-                        .set_deferred_send_observer(observer.clone());
-                }
-                for transport in self.inner.rtp_media_transports.lock().values() {
-                    transport
-                        .ice_conn()
-                        .set_deferred_send_observer(observer.clone());
-                }
-            }
         }
     }
 
@@ -2674,6 +2610,7 @@ impl PeerConnection {
         }
 
         // Monitor selected pair changes to update remote address
+        #[allow(unused_mut)]
         let mut pair_rx = self.inner.ice_transport.subscribe_selected_pair();
         let ice_conn_monitor = ice_conn.clone();
 
@@ -2706,10 +2643,6 @@ impl PeerConnection {
                 Some(Arc::downgrade(&rtp_transport) as Weak<dyn crate::transports::PacketReceiver>);
         }
         *self.inner.rtp_transport.lock() = Some(rtp_transport.clone());
-        #[cfg(feature = "diagnostics")]
-        if let Some(observer) = self.inner.deferred_send_observer.get() {
-            ice_conn.set_deferred_send_observer(observer.clone());
-        }
         self.attach_registered_observers(&rtp_transport);
         self.sync_transport_send_gates();
 
@@ -2809,6 +2742,7 @@ impl PeerConnection {
             // Once the runner task completes we must not poll its JoinHandle again
             // (tokio panics with "JoinHandle polled after completion"). This flag
             // guards the select! branch below so the handle is only ever polled once.
+            #[allow(unused_mut)]
             let mut dtls_runner_done = false;
 
             // DTLS receiver is now registered (inside DtlsTransport::new),
@@ -2892,6 +2826,7 @@ impl PeerConnection {
                 Box::pin(core::future::pending())
             };
 
+            #[allow(unused_mut)]
             let mut state_rx = dtls_clone.subscribe_state();
             loop {
                 let state = state_rx.borrow().clone();
@@ -3620,10 +3555,6 @@ impl PeerConnection {
             .rtp_media_transports
             .lock()
             .insert(transceiver.id(), rtp_transport.clone());
-        #[cfg(feature = "diagnostics")]
-        if let Some(observer) = self.inner.deferred_send_observer.get() {
-            ice_conn.set_deferred_send_observer(observer.clone());
-        }
         self.sync_transport_send_gates();
 
         let rtcp_loop = Self::create_rtcp_loop(
@@ -3838,6 +3769,7 @@ impl PeerConnection {
     }
 
     async fn create_pair_monitor(
+        #[allow(unused_mut)]
         mut pair_rx: watch::Receiver<Option<crate::transports::ice::IceCandidatePair>>,
         ice_conn_monitor: Weak<IceConn>,
     ) {
@@ -3894,6 +3826,7 @@ impl PeerConnection {
     }
 
     pub async fn wait_for_connected(&self) -> RtcResult<()> {
+        #[allow(unused_mut)]
         let mut peer_state_rx = self.subscribe_peer_state();
         loop {
             let state = *peer_state_rx.borrow_and_update();
@@ -4221,14 +4154,6 @@ impl PeerConnection {
     }
 
     /// Display-only DTLS state; key material is never returned in diagnostic output.
-    pub fn diagnostic_dtls_state(&self) -> Option<String> {
-        self.inner
-            .dtls_transport
-            .lock()
-            .as_ref()
-            .map(|dtls| dtls.get_state().to_string())
-    }
-
     /// Collect transport-level (UDP tx/rx) stats from all active IceConn instances.
     pub async fn get_transport_stats(&self) -> RtcResult<StatsReport> {
         use crate::stats::DynProvider;
@@ -4252,6 +4177,7 @@ impl PeerConnection {
             return;
         }
         let _ = self.inner.ice_transport.start_gathering();
+        #[allow(unused_mut)]
         let mut rx = self.subscribe_ice_gathering_state();
         loop {
             if *rx.borrow_and_update() == IceGatheringState::Complete {
@@ -4727,7 +4653,9 @@ async fn run_gathering_loop(
     ice_gathering_state_tx: watch::Sender<IceGatheringState>,
     inner_weak: Weak<PeerConnectionInner>,
 ) {
+    #[allow(unused_mut)]
     let mut rx = ice_transport.subscribe_gathering_state();
+    #[allow(unused_mut)]
     let mut ice_state_rx = ice_transport.subscribe_state();
     let mut cand_rx = ice_transport.subscribe_candidates();
     loop {
@@ -4736,6 +4664,7 @@ async fn run_gathering_loop(
             && let Some(inner) = inner_weak.upgrade()
             && !update_local_description_on_gather(&inner, &ice_transport)
         {
+            #[allow(unused_mut)]
             let mut sig_rx = inner.signaling_state.subscribe();
             debug!("[g-probe] Complete but update failed - waiting for signaling");
             loop {
@@ -5232,6 +5161,7 @@ async fn monitor_ice_and_dtls(
     inner_weak: Weak<PeerConnectionInner>,
     ice_connection_state_tx: &watch::Sender<IceConnectionState>,
     ice_state_rx: &mut watch::Receiver<crate::transports::ice::IceTransportState>,
+    #[allow(unused_mut)]
     mut dtls_rx: watch::Receiver<dtls::DtlsState>,
     mut rtcp_loop: core::pin::Pin<Box<dyn core::future::Future<Output = ()> + Send>>,
 ) -> bool {
@@ -5243,7 +5173,7 @@ async fn monitor_ice_and_dtls(
     loop {
         #[cfg(feature = "test-hooks")]
         crate::DTLS_MONITOR_ITERATIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        let mut grace_open = true;
+        let grace_open = true;
         let __s0 = core::pin::pin!(&mut rtcp_loop);
         let __which = {
             let __s1 = core::pin::pin!(ice_state_rx.changed());
@@ -5353,7 +5283,6 @@ async fn monitor_ice_and_dtls(
                     Some(_) => {}
                     None => {
                         // channel closed: stop polling the grace arm
-                        grace_open = false;
                     }
                 }
             }
@@ -5429,7 +5358,7 @@ async fn handle_connected_state(
                             let (grace_tx, mut grace_rx) = mpsc::unbounded_channel::<u64>();
                             let mut disconnect_epoch: u64 = 0;
                             loop {
-                                let mut grace_open = true;
+                                let grace_open = true;
                                 let __s0 = core::pin::pin!(&mut rtcp_loop);
                                 let __which = {
                                     let __s1 = core::pin::pin!(ice_state_rx.changed());
@@ -5520,7 +5449,6 @@ async fn handle_connected_state(
                                             Some(_) => {}
                                             None => {
                                                 // channel closed: stop polling the grace arm
-                                                grace_open = false;
                                             }
                                         }
                                     }
@@ -6117,7 +6045,14 @@ impl PeerConnectionInner {
             } else if direction.sends()
                 && let Some(ssrc) = *transceiver.sender_ssrc.lock()
             {
-                let cname = self.config.cname.clone().unwrap_or_else(random_rtc_id);
+                // Match `RtpSenderBuilder::build`'s default so the CNAME
+                // advertised here equals the one later sent in RTCP SDES
+                // (RFC 3550 §6.5: one stable canonical name per source).
+                let cname = self
+                    .config
+                    .cname
+                    .clone()
+                    .unwrap_or_else(|| format!("rustrtc-cname-{ssrc}"));
                 let stream_id = transceiver
                     .sender_stream_id
                     .lock()
@@ -9231,6 +9166,7 @@ mod tests {
                 let mut config = RtcConfiguration::default();
                 config.ice_disconnect_grace = Duration::from_millis(30);
                 let $pc = PeerConnection::new(config);
+                #[allow(unused_variables)]
                 let ($ice_tx, mut $ice_rx) = watch::channel(IceTransportState::Connected);
                 let ($dtls_tx, $dtls_rx) = watch::channel(dtls::DtlsState::New);
                 let _ = $dtls_tx.send(dtls::DtlsState::Handshaking);
@@ -9294,8 +9230,8 @@ mod tests {
         #[tokio::test(flavor = "current_thread")]
         async fn disconnects_when_dtls_closes() {
             started!(pc, ice_tx, ice_rx, dtls_tx, dtls_rx);
-            let polls;
-            let monitor = monitor!(pc, ice_rx, dtls_rx, polls);
+            let _polls;
+            let monitor = monitor!(pc, ice_rx, dtls_rx, _polls);
 
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -9317,8 +9253,8 @@ mod tests {
         #[tokio::test(flavor = "current_thread")]
         async fn reconnects_when_ice_fails() {
             started!(pc, ice_tx, ice_rx, dtls_tx, dtls_rx);
-            let polls;
-            let monitor = monitor!(pc, ice_rx, dtls_rx, polls);
+            let _polls;
+            let monitor = monitor!(pc, ice_rx, dtls_rx, _polls);
 
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -9337,8 +9273,8 @@ mod tests {
         #[tokio::test(flavor = "current_thread")]
         async fn cycles_transport_when_grace_expires() {
             started!(pc, ice_tx, ice_rx, dtls_tx, dtls_rx);
-            let polls;
-            let monitor = monitor!(pc, ice_rx, dtls_rx, polls);
+            let _polls;
+            let monitor = monitor!(pc, ice_rx, dtls_rx, _polls);
 
             // Keep the original senders alive: a dropped ICE sender would end
             // the watch (`changed()` → Err) before the grace timer expires.
@@ -9464,7 +9400,6 @@ mod tests {
 
     #[tokio::test]
     async fn rtp_observer_registered_before_transport_sees_first_packets() {
-        use crate::platform::atomic64::AtomicU64;
         use core::sync::atomic::{AtomicUsize, Ordering};
         use tokio::net::UdpSocket;
 

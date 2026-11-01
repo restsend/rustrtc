@@ -3,6 +3,7 @@ use crate::prelude::*;
 use bytes::{Buf, BufMut, Bytes};
 use core::net::SocketAddr;
 #[cfg_attr(feature = "std", allow(unused_imports))]
+#[cfg_attr(not(feature = "std"), allow(unused_imports))]
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "std")]
 use std::time::SystemTime;
@@ -1278,6 +1279,55 @@ mod tests {
             })])
             .unwrap();
         assert!(is_rtcp(&pli));
+    }
+
+    #[test]
+    fn cname_constructor_builds_canonical_sdes() {
+        let sdes = SourceDescription::cname(0x12345678, "rustrtc-cname-1");
+        assert_eq!(sdes.chunks.len(), 1);
+        assert_eq!(sdes.chunks[0].ssrc, 0x12345678);
+        assert_eq!(sdes.chunks[0].items.len(), 1);
+        assert_eq!(sdes.chunks[0].items[0].ty, SDES_CNAME);
+        assert_eq!(sdes.chunks[0].items[0].text, "rustrtc-cname-1");
+
+        // It round-trips through the RTCP marshal/parse pair unchanged.
+        let bytes = marshal_rtcp_packets(&[RtcpPacket::SourceDescription(sdes.clone())]).unwrap();
+        let parsed = parse_rtcp_packets(&bytes, None).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0], RtcpPacket::SourceDescription(sdes));
+    }
+
+    #[test]
+    fn compound_sr_with_sdes_roundtrip() {
+        // Exactly what the sender-report loop emits since sending compound
+        // RTCP (RFC 3550 §6.1): an SR first, then the CNAME SDES.
+        let report = SenderReport {
+            sender_ssrc: 0x11111111,
+            ntp_most: 0x2222_3333,
+            ntp_least: 0x4444_5555,
+            rtp_timestamp: 666,
+            packet_count: 7,
+            octet_count: 8,
+            report_blocks: vec![],
+        };
+        let sdes = SourceDescription::cname(0x11111111, "cname-42");
+        let bytes = marshal_rtcp_packets(&[
+            RtcpPacket::SenderReport(report.clone()),
+            RtcpPacket::SourceDescription(sdes.clone()),
+        ])
+        .unwrap();
+
+        // The whole compound buffer is recognised as one RTCP datagram.
+        assert!(is_rtcp(&bytes));
+        let parsed = parse_rtcp_packets(&bytes, None).unwrap();
+        assert_eq!(parsed.len(), 2, "SR and SDES must stay two packets");
+        match (&parsed[0], &parsed[1]) {
+            (RtcpPacket::SenderReport(out), RtcpPacket::SourceDescription(out_sdes)) => {
+                assert_eq!(*out, report);
+                assert_eq!(*out_sdes, sdes);
+            }
+            other => panic!("unexpected compound packets: {other:?}"),
+        }
     }
 
     #[test]
