@@ -427,3 +427,26 @@ Streams a video file (`examples/static/output.ivf`) via RTP to a UDP port, which
 ## License
 
 This project is licensed under the MIT License.
+
+### Optional packet-stage diagnostics
+
+Enable the `diagnostics` Cargo feature to record packet-stage counts, bytes and
+monotonic first/last observation ages. `PeerConnection::packet_diagnostics()`
+returns typed ICE, TURN, DTLS-state, RTP/SRTP, listener and send observations.
+`IceTransport::diagnostic_snapshot()` and `RtpTransport::diagnostic_snapshot()`
+provide JSON views of the same counters for existing consumers.
+
+Detailed recording is off by default: stage counters have no clock or atomic
+updates, TURN history is empty, and deferred-send observation is inactive.
+Snapshots report `enabled: false`; existing transport totals remain available.
+When enabled, recording adds clock reads and relaxed atomic updates at packet
+boundaries. Snapshots are cumulative observations, not atomic transactions across
+stages. They do not include payloads, keys, ICE credentials or TURN auth data.
+TURN history retains at most eight request attempts.
+
+Diagnostics never emit logs or run a polling task. Consumers choose when to read
+and must rate-limit their own output. The optional deferred-send observer is
+invoked only after `mark_stopping()` and must remain nonblocking, rate-limit any
+output and avoid retaining its owning connection or transport. It observes
+completion without delaying, draining or cancelling sends. Recording is independent
+of codec, application, call-center policy and deployment environment.
