@@ -6814,3 +6814,25 @@ async fn dual_stack_socket_reads_ipv4_sources_as_ipv4() -> Result<()> {
     assert_eq!(from, v6.local_addr()?);
     Ok(())
 }
+
+/// `IPV6_V6ONLY` is set on every IPv6 media socket, whatever the
+/// `net.ipv6.bindv6only` sysctl says: off on `::` (one socket for both
+/// families), on for a given IPv6 address.
+#[tokio::test]
+async fn ipv6_media_sockets_set_v6only_explicitly() -> Result<()> {
+    let any = crate::transports::bind_udp("[::]:0".parse()?)?;
+    assert!(
+        !socket2::SockRef::from(&any).only_v6()?,
+        "`::` is dual-stack"
+    );
+    let port = any.local_addr()?.port();
+    let v4 = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    v4.send_to(b"v4", ("127.0.0.1", port)).await?;
+    let mut buf = [0u8; 8];
+    let (_, from) = timeout(Duration::from_secs(1), any.recv_from(&mut buf)).await??;
+    assert_eq!(from.ip().to_canonical(), v4.local_addr()?.ip());
+
+    let one = crate::transports::bind_udp("[::1]:0".parse()?)?;
+    assert!(socket2::SockRef::from(&one).only_v6()?);
+    Ok(())
+}

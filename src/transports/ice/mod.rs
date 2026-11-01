@@ -5285,8 +5285,7 @@ impl IceGatherer {
 
         #[cfg(feature = "std")]
         {
-            let socket = UdpSocket::bind(addr).await?;
-            let socket = Arc::new(socket);
+            let socket = Arc::new(crate::transports::bind_udp(addr)?);
             self.sockets.lock().push(socket.clone());
             Ok(IceSocketWrapper::Udp(socket))
         }

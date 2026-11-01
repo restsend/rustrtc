@@ -46,6 +46,27 @@ pub fn canonical_addr(addr: SocketAddr) -> SocketAddr {
     SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
 
+/// Bind a UDP socket on `addr`. An IPv6 socket has `IPV6_V6ONLY` set
+/// explicitly, so the `net.ipv6.bindv6only` sysctl (or the OS default, on
+/// in BSD and Windows) does not decide it: one on `::` is dual-stack and
+/// serves IPv4 too, one on a given IPv6 address serves only IPv6.
+#[cfg(feature = "std")]
+pub fn bind_udp(addr: SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(!addr.ip().is_unspecified())?;
+    }
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    tokio::net::UdpSocket::from_std(socket.into())
+}
+
 #[async_trait]
 pub trait PacketReceiver: Send + Sync {
     async fn receive(&self, packet: Bytes, addr: SocketAddr, marshal_buf: &mut Vec<u8>);
