@@ -558,6 +558,12 @@ pub struct RtcConfiguration {
     /// external address of the family, else the local address of its
     /// default route. A socket on a given address serves its family only.
     pub bind_ips: Vec<IpAddr>,
+    /// Our offers on a direct transport (RTP, SRTP) put an IPv6 candidate in
+    /// `c=` and the `m=` port when there is one; else IPv4 goes first. An
+    /// answer takes the family of the offer (RFC 6157 §4.1), and once a pair
+    /// is selected, later descriptions keep its family. Default: false.
+    #[serde(default)]
+    pub prefer_ipv6: bool,
     pub disable_ipv6: bool,
     /// The SSRC of the first sender; later senders count up from it. Random
     /// by default, as RFC 3550 §8.1 asks: a fixed start gives every peer
@@ -742,6 +748,7 @@ impl PartialEq for RtcConfiguration {
             && self.external_ip_candidate_type == other.external_ip_candidate_type
             && self.external_port == other.external_port
             && self.bind_ips == other.bind_ips
+            && self.prefer_ipv6 == other.prefer_ipv6
             && self.disable_ipv6 == other.disable_ipv6
             && self.ssrc_start == other.ssrc_start
             && self.stun_timeout == other.stun_timeout
@@ -833,6 +840,7 @@ impl Default for RtcConfiguration {
             external_ip_candidate_type: ExternalIpCandidateType::default(),
             external_port: None,
             bind_ips: Vec::new(),
+            prefer_ipv6: false,
             disable_ipv6: false,
             ssrc_start: crate::transports::ice::stun::random_u32(),
             stun_timeout: core::time::Duration::from_secs(5),
@@ -1051,6 +1059,11 @@ impl RtcConfigurationBuilder {
 
     pub fn bind_ips(mut self, ips: Vec<IpAddr>) -> Self {
         self.inner.bind_ips = ips;
+        self
+    }
+
+    pub fn prefer_ipv6(mut self, prefer: bool) -> Self {
+        self.inner.prefer_ipv6 = prefer;
         self
     }
 

@@ -1573,13 +1573,49 @@ impl IceTransport {
         self.inner.gatherer.local_candidates()
     }
 
-    pub(crate) fn local_rtcp_addr(&self) -> Option<SocketAddr> {
-        self.inner
+    /// The RTCP address that goes with the RTP candidate `rtp`: the RTCP
+    /// candidate on its address (from the socket next to its own).
+    pub(crate) fn local_rtcp_addr(&self, rtp: &IceCandidate) -> Option<SocketAddr> {
+        let rtcp: Vec<_> = self
+            .inner
             .gatherer
             .local_candidates()
             .into_iter()
-            .find(|candidate| candidate.component == 2)
+            .filter(|candidate| candidate.component == 2)
+            .collect();
+        rtcp.iter()
+            .find(|candidate| candidate.address.ip() == rtp.address.ip())
+            .or_else(|| rtcp.first())
             .map(|candidate| candidate.address)
+    }
+
+    /// The candidate a direct transport puts in `c=` and the `m=` port: the
+    /// local side of the selected pair (the family the peer uses: the offer's
+    /// when we answer), else one of the family `prefer_ipv6` asks for, not
+    /// loopback when there is another.
+    pub(crate) fn default_candidate(&self) -> Option<IceCandidate> {
+        let locals: Vec<_> = self
+            .inner
+            .gatherer
+            .local_candidates()
+            .into_iter()
+            .filter(|candidate| candidate.component == 1)
+            .collect();
+        if let Some(pair) = self.inner.selected_pair.lock().as_ref()
+            && let Some(local) = locals.iter().find(|c| c.address == pair.local.address)
+        {
+            return Some(local.clone());
+        }
+        let ipv6 = self.inner.config.prefer_ipv6;
+        let not_loopback = |c: &&IceCandidate| !c.address.ip().is_loopback();
+        locals
+            .iter()
+            .filter(not_loopback)
+            .find(|c| c.address.is_ipv6() == ipv6)
+            .or_else(|| locals.iter().find(|c| c.address.is_ipv6() == ipv6))
+            .or_else(|| locals.iter().find(not_loopback))
+            .or_else(|| locals.first())
+            .cloned()
     }
 
     pub fn remote_candidates(&self) -> Vec<IceCandidate> {
@@ -1881,8 +1917,10 @@ impl IceTransport {
         bind_rtcp: bool,
     ) -> RtcResult<SocketAddr> {
         let bound = self.bind_direct_sockets(bind_rtcp).await?;
-        let direct = &bound[0];
-        let local_candidate = direct.candidates[0].clone();
+        // A candidate of the peer's family: an IPv4 socket can't reach an
+        // IPv6 peer (RFC 6157 §4.1: the answer is in the offer's family).
+        let (direct, local_candidate) = DirectSocket::pick(&bound, remote_addr.is_ipv4());
+        let local_candidate = local_candidate.clone();
 
         // Set up the selected pair. The RTP socket is the one just bound, and
         // the RTCP socket is the dedicated one when bound (else the RTP
@@ -1915,14 +1953,14 @@ impl IceTransport {
         bind_rtcp: bool,
     ) -> RtcResult<SocketAddr> {
         let bound = self.bind_direct_sockets(bind_rtcp).await?;
-        let direct = &bound[0];
+        let (direct, local_candidate) = DirectSocket::pick(&bound, !self.inner.config.prefer_ipv6);
         if let Some(rtcp_socket) = &direct.rtcp {
             let _ = self
                 .inner
                 .selected_rtcp_socket
                 .send(Some(rtcp_socket.clone()));
         }
-        Ok(direct.candidates[0].address)
+        Ok(local_candidate.address)
     }
 
     /// Bind the sockets of a direct transport (no ICE gathering, STUN or
@@ -2022,12 +2060,19 @@ impl IceTransport {
     /// Call after setup_direct_rtp_offer when the answer arrives with the remote address.
     pub fn complete_direct_rtp(&self, remote_addr: SocketAddr) {
         let remote_candidate = IceCandidate::host(remote_addr, 1);
-        let local_candidate = self
+        // Of the peer's family when we have one (a re-INVITE can change it).
+        let locals: Vec<_> = self
             .inner
             .gatherer
             .local_candidates()
             .into_iter()
-            .find(|candidate| candidate.component == 1)
+            .filter(|candidate| candidate.component == 1)
+            .collect();
+        let local_candidate = locals
+            .iter()
+            .find(|candidate| candidate.address.is_ipv4() == remote_addr.is_ipv4())
+            .or_else(|| locals.first())
+            .cloned()
             .unwrap_or_else(|| {
                 IceCandidate::host(
                     SocketAddr::new(IpAddr::V4(core::net::Ipv4Addr::LOCALHOST), 0),
@@ -3378,6 +3423,18 @@ struct DirectSocket {
     rtcp: Option<IceSocketWrapper>,
     /// Its RTP (component 1) candidates, one per family it serves.
     candidates: Vec<IceCandidate>,
+}
+
+impl DirectSocket {
+    /// The socket and RTP candidate for a family: the first candidate of it,
+    /// else the first one (a peer of a family we don't have).
+    fn pick(bound: &[DirectSocket], ipv4: bool) -> (&DirectSocket, &IceCandidate) {
+        bound
+            .iter()
+            .flat_map(|d| d.candidates.iter().map(move |c| (d, c)))
+            .find(|(_, c)| c.address.is_ipv4() == ipv4)
+            .unwrap_or((&bound[0], &bound[0].candidates[0]))
+    }
 }
 
 /// Bind the RTCP socket of a direct transport next to its RTP socket

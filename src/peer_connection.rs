@@ -5948,13 +5948,8 @@ impl PeerConnectionInner {
                 // direct socket setup publishes candidates synchronously.
                 let _ = self.ice_gathering_state.send(IceGatheringState::Complete);
                 let candidates = section_ice_transport.local_candidates();
-                local_rtcp_addr = section_ice_transport.local_rtcp_addr();
-                if let Some(cand) = candidates
-                    .iter()
-                    .filter(|c| c.component == 1)
-                    .find(|c| !c.address.ip().is_loopback())
-                    .or_else(|| candidates.iter().find(|c| c.component == 1))
-                {
+                if let Some(cand) = section_ice_transport.default_candidate() {
+                    local_rtcp_addr = section_ice_transport.local_rtcp_addr(&cand);
                     section.port = cand.address.port();
                     let conn = crate::sdp::connection_address(cand.address.ip());
                     if desc.session.connection.is_none() {

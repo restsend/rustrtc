@@ -217,3 +217,171 @@ async fn direct_transport_lists_both_families_with_ice_lite() {
         assert!(rtp.contains(&ip("2001:db8::1")), "{mode:?}:\n{sdp}");
     }
 }
+
+/// A peer's offer: audio to `addr`, `rtcp_mux` or a separate RTCP port, and
+/// for SRTP a key.
+fn peer_offer(
+    mode: &TransportMode,
+    addr: core::net::SocketAddr,
+    version: u32,
+    rtcp_mux: bool,
+) -> String {
+    let (family, ip) = match addr.ip() {
+        core::net::IpAddr::V4(ip) => ("IP4", ip.to_string()),
+        core::net::IpAddr::V6(ip) => ("IP6", ip.to_string()),
+    };
+    let profile = if *mode == TransportMode::Srtp {
+        "RTP/SAVP"
+    } else {
+        "RTP/AVP"
+    };
+    let mut sdp = format!(
+        "v=0\r\no=- 1 {version} IN {family} {ip}\r\ns=-\r\nc=IN {family} {ip}\r\nt=0 0\r\n\
+         m=audio {} {profile} 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n",
+        addr.port()
+    );
+    if *mode == TransportMode::Srtp {
+        sdp += "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:a976SJLwniPcMiUP27gdcLYYcPm0bHZcghV84DsK\r\n";
+    }
+    if rtcp_mux {
+        sdp += "a=rtcp-mux\r\n";
+    }
+    sdp
+}
+
+/// Apply the peer's offer, return our answer as text.
+async fn answer(pc: &PeerConnection, offer: &str) -> String {
+    let offer = SessionDescription::parse(SdpType::Offer, offer).unwrap();
+    pc.set_remote_description(offer).await.unwrap();
+    let answer = pc.create_answer().await.unwrap();
+    pc.set_local_description(answer.clone()).unwrap();
+    answer.to_sdp_string()
+}
+
+/// The `c=` of the audio section (else the session's) and the `m=` port.
+fn media_addr(sdp: &str) -> core::net::SocketAddr {
+    let desc = SessionDescription::parse(SdpType::Answer, sdp).unwrap();
+    let audio = &desc.media_sections[0];
+    let conn = audio
+        .connection
+        .clone()
+        .or(desc.session.connection.clone())
+        .unwrap();
+    let ip: core::net::IpAddr = conn.split_whitespace().last().unwrap().parse().unwrap();
+    core::net::SocketAddr::new(ip, audio.port)
+}
+
+fn rtcp_port(sdp: &str) -> Option<u16> {
+    sdp.lines()
+        .find_map(|l| l.strip_prefix("a=rtcp:"))
+        .map(|p| p.split_whitespace().next().unwrap().parse().unwrap())
+}
+
+/// The direct transport configurations to try: one dual-stack socket with
+/// external addresses, and two sockets of one family each.
+fn direct_setups() -> Vec<(&'static str, Vec<core::net::IpAddr>, Vec<core::net::IpAddr>)> {
+    vec![
+        (
+            "one dual-stack socket",
+            vec![ip("::")],
+            vec![ip("127.0.0.1"), ip("::1")],
+        ),
+        ("two sockets", vec![ip("127.0.0.1"), ip("::1")], vec![]),
+    ]
+}
+
+/// Our answer is in the offer's family (RFC 6157 §4.1), with and without
+/// ICE-lite, with and without rtcp-mux, from a socket of that family.
+#[tokio::test]
+async fn answer_takes_the_family_of_the_offer() {
+    for (setup, bind_ips, external_ips) in direct_setups() {
+        for mode in [TransportMode::Rtp, TransportMode::Srtp] {
+            for ice_lite in [false, true] {
+                for rtcp_mux in [true, false] {
+                    for remote in ["127.0.0.1:4000", "[::1]:4000"] {
+                        let remote: core::net::SocketAddr = remote.parse().unwrap();
+                        let mut cfg = config(mode.clone());
+                        cfg.enable_ice_lite = ice_lite;
+                        cfg.bind_ips = bind_ips.clone();
+                        cfg.external_ips = external_ips.clone();
+                        let pc = PeerConnection::new(cfg);
+                        let sdp = answer(&pc, &peer_offer(&mode, remote, 1, rtcp_mux)).await;
+                        let what = format!(
+                            "{setup}, {mode:?}, lite {ice_lite}, mux {rtcp_mux}, offer from {remote}"
+                        );
+                        let ours = media_addr(&sdp);
+                        assert_eq!(ours.is_ipv4(), remote.is_ipv4(), "{what}:\n{sdp}");
+                        let pair = pc.ice_transport().get_selected_pair().unwrap();
+                        assert_eq!(pair.local.address, ours, "{what}: media leaves from c=");
+                        if !rtcp_mux {
+                            let rtcp = rtcp_port(&sdp).expect("a=rtcp");
+                            let cands = pc.ice_transport().local_candidates();
+                            assert!(
+                                cands.iter().any(|c| c.component == 2
+                                    && c.address == core::net::SocketAddr::new(ours.ip(), rtcp)),
+                                "{what}: a=rtcp is the RTCP socket of the c= family:\n{sdp}"
+                            );
+                        }
+                        pc.close();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Our offers on a direct transport put IPv6 in `c=` with `prefer_ipv6`,
+/// IPv4 without.
+#[tokio::test]
+async fn offer_family_follows_prefer_ipv6() {
+    for (setup, bind_ips, external_ips) in direct_setups() {
+        for mode in [TransportMode::Rtp, TransportMode::Srtp] {
+            for prefer_ipv6 in [false, true] {
+                let mut cfg = config(mode.clone());
+                cfg.bind_ips = bind_ips.clone();
+                cfg.external_ips = external_ips.clone();
+                cfg.prefer_ipv6 = prefer_ipv6;
+                let sdp = offer(cfg).await;
+                let ours = media_addr(&sdp);
+                assert_eq!(
+                    ours.is_ipv6(),
+                    prefer_ipv6,
+                    "{setup}, {mode:?}, prefer_ipv6 {prefer_ipv6}:\n{sdp}"
+                );
+            }
+        }
+    }
+}
+
+/// A re-INVITE that moves the peer to the other family (a phone from Wi-Fi
+/// to mobile data) moves our answer and our media socket with it.
+#[tokio::test]
+async fn reinvite_changes_family() {
+    for (setup, bind_ips, external_ips) in direct_setups() {
+        for mode in [TransportMode::Rtp, TransportMode::Srtp] {
+            let mut cfg = config(mode.clone());
+            cfg.bind_ips = bind_ips.clone();
+            cfg.external_ips = external_ips.clone();
+            let pc = PeerConnection::new(cfg);
+            let v4: core::net::SocketAddr = "127.0.0.1:4000".parse().unwrap();
+            let v6: core::net::SocketAddr = "[::1]:4002".parse().unwrap();
+            let sdp = answer(&pc, &peer_offer(&mode, v4, 1, true)).await;
+            assert!(media_addr(&sdp).is_ipv4(), "{setup} {mode:?}:\n{sdp}");
+            let sdp = answer(&pc, &peer_offer(&mode, v6, 2, true)).await;
+            let ours = media_addr(&sdp);
+            assert!(ours.is_ipv6(), "{setup} {mode:?}:\n{sdp}");
+            let pair = pc.ice_transport().get_selected_pair().unwrap();
+            assert_eq!(
+                (pair.local.address, pair.remote.address),
+                (ours, v6),
+                "{setup} {mode:?}"
+            );
+            let sdp = answer(&pc, &peer_offer(&mode, v4, 3, true)).await;
+            assert!(
+                media_addr(&sdp).is_ipv4(),
+                "{setup} {mode:?} back to IPv4:\n{sdp}"
+            );
+            pc.close();
+        }
+    }
+}
