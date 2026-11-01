@@ -525,6 +525,7 @@ impl ListenerRegistry {
 }
 
 pub struct RtpTransport {
+    diagnostics: crate::stats::packet::RtpObservations,
     transport: Arc<IceConn>,
     srtp_session: Mutex<Option<Arc<Mutex<SrtpSession>>>>,
     listeners: Mutex<ListenerRegistry>,
@@ -592,6 +593,7 @@ impl RtpTransport {
         _allow_ssrc_change: bool,
     ) -> Self {
         Self {
+            diagnostics: Default::default(),
             transport,
             srtp_session: Mutex::new(None),
             listeners: Mutex::new(ListenerRegistry::default()),
@@ -649,6 +651,65 @@ impl RtpTransport {
     pub async fn feed_packet(&self, packet: Bytes, addr: SocketAddr) {
         let mut buf = Vec::new();
         self.receive(packet, addr, &mut buf).await;
+    }
+
+    /// JSON view backed by the same typed observations; never records or logs packets.
+    pub fn diagnostic_snapshot(&self) -> serde_json::Value {
+        let stages = self.packet_diagnostics();
+        serde_json::json!({
+            "enabled": true,
+            "accepted_rtp_packets": stages.rtp_accepted.packets,
+            "accepted_rtp_activity": stages.rtp_accepted,
+            "accepted_byte_scope": "accepted_ingress_datagram_including_srtp_overhead",
+            "normal_rtp_send_activity": stages.rtp_sent,
+            "srtp_unprotect_failures": stages.srtp_unprotect_errors.packets,
+            "srtcp_unprotect_failures": stages.srtcp_unprotect_errors.packets,
+            "rtcp_parse_failures": stages.rtcp_parse_errors.packets,
+            "srtp_protect_failures": stages.srtp_protect_errors.packets,
+            "send_failures": stages.rtp_send_errors.packets,
+            "srtp_parse_failures": stages.srtp_parse_errors.packets,
+            "rtp_parse_failures": stages.rtp_parse_errors.packets,
+            "relay_send_failures": stages.bridge_send_errors.packets,
+            "pending_srtp_packets": stages.pending_srtp_packets,
+            "remote_addr": stages.remote_addr,
+            "local_addr": stages.local_addr,
+        })
+    }
+
+    /// Read-only observations at the actual receive, decrypt, demux and send boundaries.
+    pub fn packet_diagnostics(&self) -> crate::stats::packet::RtpPacketDiagnostics {
+        let mut snapshot = self.diagnostics.snapshot();
+        snapshot.local_addr = self.transport.local_addr().to_string();
+        snapshot.remote_addr = self.transport.remote_addr.read().to_string();
+        snapshot.srtp_required = self.srtp_required;
+        snapshot.srtp_session_ready = self.srtp_session.lock().is_some();
+        snapshot.conn = self.transport.packet_diagnostics();
+        snapshot.pending_srtp_packets = self.srtp_pending_count.load(Ordering::Relaxed);
+        snapshot.rtp_accepted = self
+            .diagnostics
+            .rtp_accepted
+            .snapshot_count(self.received_rtp_packets.load(Ordering::Relaxed));
+        snapshot.srtp_unprotect_errors = self
+            .diagnostics
+            .srtp_unprotect_errors
+            .snapshot_count(self.srtp_unprotect_failures.load(Ordering::Relaxed));
+        snapshot.bridge_relayed = self
+            .diagnostics
+            .bridge_relayed
+            .snapshot_count(self.bridge_relayed_packets.load(Ordering::Relaxed));
+        snapshot.bridge_send_errors = self
+            .diagnostics
+            .bridge_send_errors
+            .snapshot_count(self.relay_send_failures.load(Ordering::Relaxed));
+        snapshot.srtp_protect_errors = self
+            .diagnostics
+            .srtp_protect_errors
+            .snapshot_count(self.srtp_protect_failures.load(Ordering::Relaxed));
+        snapshot.srtp_send_no_session = self
+            .diagnostics
+            .srtp_send_no_session
+            .snapshot_count(self.srtp_dropped_no_session.load(Ordering::Relaxed));
+        snapshot
     }
 
     /// Cumulative accepted inbound RTP packets, before relay or depacketization.
@@ -919,11 +980,13 @@ impl RtpTransport {
             .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
             .unwrap_or_default();
         if !self.rtp_send_allowed_for(ssrc) {
+            self.diagnostics.send_direction_dropped.record(buf.len());
             return Ok(0);
         }
         let session = self.srtp_session.lock().as_ref().cloned();
         let Some(session) = session else {
             if self.srtp_required {
+                self.diagnostics.srtp_send_no_session.mark(buf.len());
                 self.srtp_dropped_no_session.fetch_add(1, Ordering::Relaxed);
                 return Err(RtcError::InvalidState(
                     "SRTP required but session not ready".into(),
@@ -953,6 +1016,9 @@ impl RtpTransport {
             let mut protected = vec![0; srtp.protected_rtp_len(&packet)];
             srtp.protect_rtp(&packet, &mut protected).inspect_err(|_| {
                 self.srtp_protect_failures.fetch_add(1, Ordering::Relaxed);
+                self.diagnostics
+                    .srtp_protect_errors
+                    .mark(packet.encoded_len());
             })?;
             protected
         };
@@ -962,6 +1028,9 @@ impl RtpTransport {
     /// Returns `Ok(0)` without sending while the direction stops this SSRC.
     pub async fn send_rtp(&self, mut packet: RtpPacket) -> RtcResult<usize> {
         if !self.rtp_send_allowed_for(packet.header.ssrc) {
+            self.diagnostics
+                .send_direction_dropped
+                .record(packet.encoded_len());
             return Ok(0);
         }
         // Egress observation: fire on the plaintext packet BEFORE SRTP protect
@@ -996,11 +1065,17 @@ impl RtpTransport {
                     let mut protected = vec![0; srtp.protected_rtp_len(&packet)];
                     srtp.protect_rtp(&packet, &mut protected).inspect_err(|_| {
                         self.srtp_protect_failures.fetch_add(1, Ordering::Relaxed);
+                        self.diagnostics
+                            .srtp_protect_errors
+                            .mark(packet.encoded_len());
                     })?;
                     protected
                 }
                 None => {
                     if self.srtp_required {
+                        self.diagnostics
+                            .srtp_send_no_session
+                            .mark(packet.encoded_len());
                         self.srtp_dropped_no_session.fetch_add(1, Ordering::Relaxed);
                         debug!(
                             "RtpTransport: SRTP required but session not ready, dropping RTP send"
@@ -1017,6 +1092,7 @@ impl RtpTransport {
         match self.transport.send(&protected).await {
             Ok(n) => {
                 if n > 0 {
+                    self.diagnostics.rtp_sent.record(n);
                 }
                 if is_first {
                     self.transport.mark_first_outbound();
@@ -1028,6 +1104,7 @@ impl RtpTransport {
                 Ok(n)
             }
             Err(e) => {
+                self.diagnostics.rtp_send_errors.record(protected.len());
                 debug!(
                     "RtpTransport: failed to send SRTP packet ({} bytes): {}",
                     protected.len(),
@@ -1044,13 +1121,15 @@ impl RtpTransport {
             let session_guard = self.srtp_session.lock();
             if let Some(session) = &*session_guard {
                 let mut srtp = session.lock();
-                let _len = raw.len();
+                let len = raw.len();
                 srtp.protect_rtcp(&mut raw).inspect_err(|_| {
                     self.srtp_protect_failures.fetch_add(1, Ordering::Relaxed);
+                    self.diagnostics.srtp_protect_errors.mark(len);
                 })?;
                 raw
             } else {
                 if self.srtp_required {
+                    self.diagnostics.srtp_send_no_session.mark(raw.len());
                     self.srtp_dropped_no_session.fetch_add(1, Ordering::Relaxed);
                     debug!("Failed to send PLI: SRTP required but session not ready");
                     return Err(RtcError::InvalidState(
@@ -1074,13 +1153,15 @@ impl RtpTransport {
         {
             let session_guard = self.srtp_session.lock();
             if let Some(session) = &*session_guard {
-                let _len = raw.len();
+                let len = raw.len();
                 if session.lock().protect_rtcp(&mut raw).is_err() {
                     self.srtp_protect_failures.fetch_add(1, Ordering::Relaxed);
+                    self.diagnostics.srtp_protect_errors.mark(len);
                     return;
                 }
             } else if self.srtp_required {
                 self.srtp_dropped_no_session.fetch_add(1, Ordering::Relaxed);
+                self.diagnostics.srtp_send_no_session.mark(raw.len());
                 return;
             }
         }
@@ -1095,7 +1176,7 @@ impl RtpTransport {
         if !self.has_bridge.load(Ordering::Acquire) {
             return Some(packet);
         }
-        let _packet_len = packet.encoded_len();
+        let packet_len = packet.encoded_len();
         // Select the destination from the original PT and rewrite under the
         // bridge lock, then release it before SRTP protection and sending.
         let target = {
@@ -1109,6 +1190,8 @@ impl RtpTransport {
         };
         if !target.rtp_send_allowed_for(packet.header.ssrc) {
             // Relayed, but the destination stream may not send: drop.
+            self.diagnostics.bridge_direction_dropped.record(packet_len);
+            target.diagnostics.send_direction_dropped.record(packet_len);
             return None;
         }
 
@@ -1125,6 +1208,8 @@ impl RtpTransport {
                 let protected_len = srtp.protected_rtp_len(&packet);
                 marshal_buf.resize(protected_len, 0);
                 if srtp.protect_rtp(&packet, &mut marshal_buf[..]).is_err() {
+                    self.diagnostics.bridge_dropped.record(packet_len);
+                    target.diagnostics.srtp_protect_errors.mark(packet_len);
                     let failures = target.srtp_protect_failures.fetch_add(1, Ordering::Relaxed) + 1;
                     if failures <= 3 || failures.is_multiple_of(100) {
                         tracing::warn!(
@@ -1136,6 +1221,8 @@ impl RtpTransport {
                     return None; // drop on protect error
                 }
             } else if target.srtp_required {
+                self.diagnostics.bridge_dropped.record(packet_len);
+                target.diagnostics.srtp_send_no_session.mark(packet_len);
                 let failures = target
                     .srtp_dropped_no_session
                     .fetch_add(1, Ordering::Relaxed)
@@ -1155,6 +1242,7 @@ impl RtpTransport {
         if let Err(e) = target.ice_conn().try_send(marshal_buf) {
             // A failed relay push is the #1 cause of "call connected but no
             // audio" — surface it instead of dropping silently.
+            self.diagnostics.bridge_send_errors.mark(marshal_buf.len());
             let relay_failures = self.relay_send_failures.fetch_add(1, Ordering::Relaxed) + 1;
             if relay_failures <= 5 || relay_failures.is_multiple_of(100) {
                 tracing::warn!(
@@ -1166,6 +1254,7 @@ impl RtpTransport {
                 );
             }
         } else {
+            self.diagnostics.bridge_relayed.mark(marshal_buf.len());
             let relayed = self.bridge_relayed_packets.fetch_add(1, Ordering::Relaxed) + 1;
             if relayed <= 5 {
                 tracing::debug!(
@@ -1211,7 +1300,7 @@ impl RtpTransport {
 #[async_trait]
 impl PacketReceiver for RtpTransport {
     async fn receive(&self, packet: Bytes, addr: SocketAddr, marshal_buf: &mut Vec<u8>) {
-        let _packet_len = packet.len();
+        let packet_len = packet.len();
         let is_rtcp_packet = is_rtcp(&packet);
 
         if is_rtcp_packet {
@@ -1240,6 +1329,7 @@ impl PacketReceiver for RtpTransport {
                                 Bytes::from(buf)
                             }
                             Err(e) => {
+                                self.diagnostics.srtcp_unprotect_errors.record(packet_len);
                                 debug!("SRTP unprotect RTCP failed: {}", e);
                                 return;
                             }
@@ -1247,6 +1337,7 @@ impl PacketReceiver for RtpTransport {
                     }
                     None => {
                         if self.srtp_required {
+                            self.diagnostics.srtcp_no_session.record(packet_len);
                             trace!(
                                 "Dropping packet because SRTP is required but session is not ready"
                             );
@@ -1264,17 +1355,26 @@ impl PacketReceiver for RtpTransport {
             if let Some(tx) = listener {
                 match parse_rtcp_packets(&unprotected, Some(addr)) {
                     Ok(packets) => {
+                        self.diagnostics.rtcp_accepted.record(unprotected.len());
                         if try_send_with_fallback(&tx, packets).await.is_err() {
+                            self.diagnostics
+                                .rtcp_listener_closed
+                                .record(unprotected.len());
                             let mut guard = self.rtcp_listener.lock();
                             *guard = None;
                         } else {
+                            self.diagnostics
+                                .rtcp_listener_delivered
+                                .record(unprotected.len());
                         }
                     }
                     Err(e) => {
+                        self.diagnostics.rtcp_parse_errors.record(unprotected.len());
                         trace!("RTCP parse failed: {}", e);
                     }
                 }
             } else {
+                self.diagnostics.rtcp_no_listener.record(unprotected.len());
                 trace!(
                     "No RTCP listener, dropping {} bytes from {}",
                     unprotected.len(),
@@ -1297,7 +1397,7 @@ impl RtpTransport {
     /// required but the session is not ready yet, the packet is buffered for
     /// replay instead of dropped (see [`Self::buffer_pending_srtp`]).
     async fn process_rtp_packet(&self, packet: Bytes, addr: SocketAddr, marshal_buf: &mut Vec<u8>) {
-        let _packet_len = packet.len();
+        let packet_len = packet.len();
         let rtp_packet = {
             // Parse outside both session guards. The inner SRTP lock is
             // held only while authenticating and decrypting the packet.
@@ -1317,6 +1417,7 @@ impl RtpTransport {
                             match srtp.unprotect_rtp(srtp_packet) {
                                 Ok(rtp_packet) => rtp_packet,
                                 Err(error) => {
+                                    self.diagnostics.srtp_unprotect_errors.mark(packet_len);
                                     let failures = self
                                         .srtp_unprotect_failures
                                         .fetch_add(1, Ordering::Relaxed)
@@ -1337,6 +1438,7 @@ impl RtpTransport {
                             }
                         }
                         Err(e) => {
+                            self.diagnostics.srtp_parse_errors.record(packet_len);
                             trace!("SRTP parse failed: {}", e);
                             return;
                         }
@@ -1344,6 +1446,7 @@ impl RtpTransport {
                 }
                 None => {
                     if self.srtp_required {
+                        self.diagnostics.srtp_no_session.record(packet_len);
                         // Early media can arrive before our DTLS/SRTP is
                         // ready (peer greeting during our handshake):
                         // buffer it (bounded) for replay instead of
@@ -1354,6 +1457,7 @@ impl RtpTransport {
                     match RtpPacket::parse_bytes(packet) {
                         Ok(rtp_packet) => rtp_packet,
                         Err(e) => {
+                            self.diagnostics.rtp_parse_errors.record(packet_len);
                             trace!("RTP parse failed: {}", e);
                             return;
                         }
@@ -1365,6 +1469,7 @@ impl RtpTransport {
         // Count every accepted inbound RTP packet at the transport layer.
         // This runs before the rewrite-bridge fast-path early-return, so
         // the counter advances for both relayed and depacketized packets.
+        self.diagnostics.rtp_accepted.mark(packet_len);
         self.received_rtp_packets.fetch_add(1, Ordering::Relaxed);
 
         // Ingress observation: fire on the plaintext packet BEFORE the
@@ -1450,16 +1555,20 @@ impl RtpTransport {
         if let Some(tx) = listener {
             match try_send_dropping(&tx, (rtp_packet, addr)) {
                 Ok(()) => {
+                    self.diagnostics.listener_delivered.record(packet_len);
                 }
                 Err(mpsc::TrySendError::Full(_)) => {
+                    self.diagnostics.listener_full.record(packet_len);
                 }
                 Err(mpsc::TrySendError::Closed(_)) => {
+                    self.diagnostics.listener_closed.record(packet_len);
                     let mut listeners = self.listeners.lock();
                     listeners.by_ssrc.remove(&ssrc);
                     listeners.remove_sender(&tx);
                 }
             }
         } else {
+            self.diagnostics.no_listener.record(packet_len);
             trace!(
                 "No listener found for packet SSRC: {} PT: {} from {}",
                 ssrc, pt, addr
@@ -3146,6 +3255,15 @@ mod tests {
             0,
             "egress observer saw the sent payload type"
         );
+        let diagnostics = transport.packet_diagnostics();
+        if true {
+            assert_eq!(diagnostics.rtp_sent.packets, 2);
+            assert!(diagnostics.rtp_sent.last_age_ms.is_some());
+        } else {
+            assert_eq!(diagnostics.rtp_sent.packets, 0);
+            assert!(diagnostics.rtp_sent.first_age_ms.is_none());
+            assert!(diagnostics.rtp_sent.last_age_ms.is_none());
+        }
     }
 
     /// When no observer is registered, the hot path is a single atomic load —
@@ -3200,5 +3318,124 @@ mod tests {
             )
             .await;
         assert_eq!(src_transport.received_rtp_packets(), 1);
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod packet_diagnostics_tests {
+    use super::*;
+    use crate::{SrtpKeyingMaterial, SrtpProfile};
+    #[tokio::test]
+    async fn packet_diagnostics_distinguishes_srtp_failures_and_listener_outcomes() {
+        let (_tx, rx) = crate::platform::sync::watch::channel(None);
+        let transport =
+            RtpTransport::new(IceConn::new(rx, "127.0.0.1:9".parse().unwrap(), None), true);
+        let addr = "127.0.0.1:1234".parse().unwrap();
+        let raw = RtpPacket::new(crate::rtp::RtpHeader::new(0, 1, 160, 42), vec![0; 160])
+            .marshal()
+            .unwrap();
+        transport.feed_packet(Bytes::from(raw.clone()), addr).await;
+        assert_eq!(
+            serde_json::to_value(transport.packet_diagnostics()).unwrap()["pending_srtp_packets"],
+            1
+        );
+        let key = SrtpKeyingMaterial::new(vec![0x5a; 16], vec![0xa5; 14]);
+        transport.start_srtp(
+            SrtpSession::new(SrtpProfile::Aes128Sha1_80, key.clone(), key.clone()).unwrap(),
+        );
+        transport
+            .feed_packet(Bytes::from_static(&[0x80]), addr)
+            .await;
+        transport.feed_packet(Bytes::from(raw), addr).await;
+        let diag = transport.packet_diagnostics();
+        assert_eq!(diag.srtp_no_session.packets, 1);
+        assert_eq!(diag.srtp_parse_errors.packets, 1);
+        // The 0.4.14 path replays the pre-session packet before the current packet.
+        assert_eq!(diag.srtp_unprotect_errors.packets, 2);
+        assert_eq!(diag.rtp_accepted.packets, 0);
+        assert_eq!(diag.listener_delivered.packets, 0);
+        assert!(diag.srtp_unprotect_errors.last_age_ms.is_some());
+        assert!(diag.srtp_unprotect_errors.first_age_ms.is_some());
+        let json = serde_json::to_value(&diag).unwrap();
+        assert_eq!(json["srtp_unprotect_errors"]["packets"], 2);
+        assert!(json["rtp_accepted"]["first_age_ms"].is_null());
+        assert!(json["rtp_accepted"]["last_age_ms"].is_null());
+        assert!(
+            json.get("listener_full").is_none(),
+            "never-seen error stages are omitted"
+        );
+        // The plaintext listener path distinguishes successful enqueue, bounded
+        // queue pressure, closed receiver, and no route without changing delivery.
+        let (_tx, rx) = crate::platform::sync::watch::channel(None);
+        let plain = RtpTransport::new(IceConn::new(rx, addr, None), false);
+        let (tx, receiver) = mpsc::channel(1);
+        plain.register_listener_sync(42, tx);
+        let raw = RtpPacket::new(crate::rtp::RtpHeader::new(0, 1, 160, 42), vec![1; 160])
+            .marshal()
+            .unwrap();
+        plain.feed_packet(Bytes::from(raw.clone()), addr).await;
+        plain.feed_packet(Bytes::from(raw.clone()), addr).await;
+        drop(receiver);
+        plain.feed_packet(Bytes::from(raw.clone()), addr).await;
+        plain.feed_packet(Bytes::from(raw.clone()), addr).await;
+        let diag = plain.packet_diagnostics();
+        assert_eq!(diag.rtp_accepted.packets, 4);
+        assert_eq!(diag.listener_delivered.packets, 1);
+        assert_eq!(diag.listener_full.packets, 1);
+        assert_eq!(diag.listener_closed.packets, 1);
+        assert_eq!(diag.no_listener.packets, 1);
+        assert_eq!(diag.listener_delivered.bytes, raw.len() as u64);
+        // SRTCP failures follow a distinct production branch from SRTP.
+        let rtcp = Bytes::from_static(&[0x80, 201, 0, 1, 0, 0, 0, 42]);
+        transport.feed_packet(rtcp.clone(), addr).await;
+        let diag = transport.packet_diagnostics();
+        assert_eq!(diag.srtcp_unprotect_errors.packets, 1);
+        // The 0.4.14 path replays the pre-session packet before the current packet.
+        assert_eq!(diag.srtp_unprotect_errors.packets, 2);
+        let (tx, mut receiver) = mpsc::channel(2);
+        plain.register_rtcp_listener(tx);
+        plain.feed_packet(rtcp, addr).await;
+        assert_eq!(receiver.recv().await.unwrap().len(), 1);
+        plain
+            .feed_packet(Bytes::from_static(&[0x80, 201, 0, 10, 0, 0, 0, 42]), addr)
+            .await;
+        assert_eq!(plain.packet_diagnostics().rtcp_accepted.packets, 1);
+        assert_eq!(plain.packet_diagnostics().rtcp_parse_errors.packets, 1);
+
+        // Count completed normal RTP sends independently of relay/DTLS writes.
+        let packet = RtpPacket::new(crate::rtp::RtpHeader::new(0, 2, 320, 42), vec![1; 160]);
+        assert!(plain.send_rtp(packet.clone()).await.is_err());
+        assert_eq!(
+            serde_json::to_value(plain.packet_diagnostics()).unwrap()["rtp_send_errors"]["packets"],
+            1
+        );
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_sender, rx) = crate::platform::sync::watch::channel(Some(
+            crate::transports::ice::IceSocketWrapper::Udp(Arc::new(socket)),
+        ));
+        let sender = RtpTransport::new(IceConn::new(rx, peer.local_addr().unwrap(), None), false);
+        sender.send_rtp(packet).await.unwrap();
+        let mut wire = [0; 1500];
+        let (bytes, _) = tokio::time::timeout(
+            core::time::Duration::from_secs(1),
+            peer.recv_from(&mut wire),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(RtpPacket::parse(&wire[..bytes]).unwrap().payload.len(), 160);
+        let json = serde_json::to_value(sender.packet_diagnostics()).unwrap();
+        assert_eq!(json["rtp_sent"]["packets"], 1);
+        assert_eq!(json["rtp_sent"]["bytes"], bytes);
+        assert_eq!(
+            sender.diagnostic_snapshot()["normal_rtp_send_activity"]["packets"],
+            1
+        );
+        assert_eq!(plain.diagnostic_snapshot()["send_failures"], 1);
+        assert_eq!(
+            serde_json::to_value(transport.packet_diagnostics()).unwrap()["pending_srtp_packets"],
+            0
+        );
     }
 }

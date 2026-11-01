@@ -6793,3 +6793,296 @@ async fn turn_allocate_packet_loss_keeps_original_deadline() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn packet_diagnostics_counts_actual_udp_reads_and_exit() {
+    let (transport, _runner) = IceTransportBuilder::new(RtcConfiguration::default()).build();
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = socket.local_addr().unwrap();
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let read_loop = tokio::spawn(IceTransportRunner::run_udp_read_loop(
+        socket,
+        transport.inner.clone(),
+    ));
+    assert!(
+        transport
+            .packet_diagnostics()
+            .udp_read
+            .last_age_ms
+            .is_none()
+    );
+    sender.send_to(&[0x80, 0, 0, 1], addr).await.unwrap();
+    timeout(Duration::from_secs(1), async {
+        while transport
+            .inner
+            .buffer_stats
+            .packets_received
+            .load(Ordering::Relaxed)
+            < 1
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        transport
+            .packet_diagnostics()
+            .udp_read
+            .first_age_ms
+            .is_some()
+    );
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    sender.send_to(&[0x80, 0, 0, 2], addr).await.unwrap();
+    timeout(Duration::from_secs(1), async {
+        while transport
+            .inner
+            .buffer_stats
+            .packets_received
+            .load(Ordering::Relaxed)
+            < 2
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    transport
+        .inner
+        .state
+        .send(IceTransportState::Closed)
+        .unwrap();
+    timeout(Duration::from_secs(1), read_loop)
+        .await
+        .unwrap()
+        .unwrap();
+    let diag = transport.packet_diagnostics();
+    assert_eq!(
+        diag.udp_read.packets, 2,
+        "real socket read must be observable before parsing"
+    );
+    assert_eq!(diag.udp_read.bytes, 8);
+    assert!(diag.udp_read.first_age_ms.unwrap() >= diag.udp_read.last_age_ms.unwrap() + 5);
+    assert!(diag.udp_read.last_age_ms.is_some());
+    assert_eq!(diag.udp_read_exits.packets, 1);
+    assert_eq!(diag.udp_read_errors.packets, 0);
+}
+
+#[tokio::test]
+async fn packet_diagnostics_counts_turn_udp_unwrap_outcomes() {
+    let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    let uri = IceServerUri::parse(&format!("turn:{relay_addr}")).unwrap();
+    let client = Arc::new(TurnClient::connect(&uri, false).await.unwrap());
+    let peer: SocketAddr = "127.0.0.1:4242".parse().unwrap();
+    client.add_channel(peer, 0x4000).await;
+    // Discover the actual client UDP source through a real Send Indication.
+    client.send_indication(peer, b"probe").await.unwrap();
+    let mut buf = [0u8; 1500];
+    let (_, client_addr) = timeout(Duration::from_secs(1), relay.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let (transport, _runner) = IceTransportBuilder::new(RtcConfiguration::default()).build();
+    let reader = tokio::spawn(IceTransportRunner::run_turn_read_loop(
+        client,
+        relay_addr,
+        transport.inner.clone(),
+    ));
+    use super::stun::StunAttribute;
+    let data = StunMessage {
+        class: StunClass::Indication,
+        method: StunMethod::Data,
+        transaction_id: [1; 12],
+        attributes: vec![
+            StunAttribute::XorPeerAddress(peer),
+            StunAttribute::Data(vec![0x80, 0]),
+        ],
+    }
+    .encode(None, false)
+    .unwrap();
+    let malformed_data = StunMessage {
+        class: StunClass::Indication,
+        method: StunMethod::Data,
+        transaction_id: [2; 12],
+        attributes: vec![],
+    }
+    .encode(None, false)
+    .unwrap();
+    let control = StunMessage::binding_success_response([3; 12], peer)
+        .encode(None, false)
+        .unwrap();
+    let incoming = [
+        vec![0x40, 0, 0, 2, 0x80, 0],
+        vec![0x40, 1, 0, 2, 0x80, 0],
+        vec![0x40, 0, 0, 3, 0x80],
+        control,
+        data,
+        malformed_data,
+    ];
+    for packet in &incoming {
+        relay.send_to(packet, client_addr).await.unwrap();
+    }
+    timeout(Duration::from_secs(1), async {
+        while transport.packet_diagnostics().turn_malformed.packets < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    transport
+        .inner
+        .state
+        .send(IceTransportState::Closed)
+        .unwrap();
+    timeout(Duration::from_secs(1), reader)
+        .await
+        .unwrap()
+        .unwrap();
+    let diag = transport.packet_diagnostics();
+    assert_eq!(diag.udp_read.packets, 6);
+    let json = serde_json::to_value(&diag).unwrap();
+    assert_eq!(json["turn_wire_read"]["packets"], 6);
+    assert_eq!(json["turn_wire_read"]["bytes"], diag.udp_read.bytes);
+    let json = transport.diagnostic_snapshot();
+    assert_eq!(json["turn_wire_packets"]["packets"], 6);
+    assert_eq!(json["socket_packets"]["packets"], 0);
+    assert_eq!(json["turn_unwrapped_packets"]["packets"], 2);
+    assert_eq!(json["turn_unwrap_errors"], 3);
+    assert_eq!(
+        diag.udp_read.bytes,
+        incoming
+            .iter()
+            .map(|packet| packet.len() as u64)
+            .sum::<u64>()
+    );
+    assert_eq!(
+        diag.turn_channel_data.packets, 1,
+        "unknown channels must not count as successfully unwrapped media"
+    );
+    assert_eq!(diag.turn_channel_data.bytes, 2);
+    assert_eq!(diag.turn_unknown_channel.packets, 1);
+    assert_eq!(diag.turn_data_indication.packets, 1);
+    assert_eq!(diag.turn_malformed.packets, 2);
+    assert_eq!(diag.turn_control.packets, 1);
+    assert_eq!(diag.buffered_received, 2);
+    assert_eq!(diag.last_turn_control.unwrap().class, "SuccessResponse");
+    assert_eq!(diag.udp_read_exits.packets, 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn packet_diagnostics_tracks_real_turn_control_history() -> Result<()> {
+    let mut server = TestTurnServer::start().await?;
+    let config =
+        IceServer::new(vec![server.turn_url()]).with_credential(TEST_USERNAME, TEST_PASSWORD);
+    let uri = IceServerUri::parse(&server.turn_url())?;
+    let (transport, _runner) = IceTransportBuilder::new(RtcConfiguration::default()).build();
+    let candidate = transport
+        .inner
+        .gatherer
+        .probe_turn(&uri, &config)
+        .await?
+        .unwrap();
+    let history = transport.packet_diagnostics().turn_control_history;
+    assert!(
+        history.len() >= 2,
+        "Allocate challenge and authenticated response must both survive"
+    );
+    assert_eq!(history[0].method, "Allocate");
+    assert_eq!(history[0].error_code, Some(401));
+    assert_eq!(history.last().unwrap().outcome, "success");
+    assert!(history.iter().all(|attempt| attempt.duration_ms.is_some()));
+    let client = transport
+        .inner
+        .gatherer
+        .turn_clients
+        .lock()
+        .get(&candidate.address)
+        .unwrap()
+        .clone();
+    let peer = UdpSocket::bind("127.0.0.1:0").await?;
+    client.create_permission(peer.local_addr()?).await?;
+    client.add_channel(peer.local_addr()?, 0x4000).await;
+    let reader = tokio::spawn(IceTransportRunner::run_turn_read_loop(
+        client.clone(),
+        candidate.address,
+        transport.inner.clone(),
+    ));
+    IceTransportRunner::refresh_one_turn_client(
+        &transport.inner,
+        candidate.address,
+        &client,
+        Some(peer.local_addr()?),
+    )
+    .await;
+    let history = transport.packet_diagnostics().turn_control_history;
+    for method in ["Allocate", "Refresh", "CreatePermission", "ChannelBind"] {
+        assert!(
+            history
+                .iter()
+                .any(|attempt| attempt.method == method && attempt.outcome == "success"),
+            "missing {method}: {history:?}"
+        );
+    }
+    assert!(history.len() <= 8);
+    transport
+        .inner
+        .state
+        .send(IceTransportState::Closed)
+        .unwrap();
+    timeout(Duration::from_secs(1), reader).await??;
+    server.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn packet_diagnostics_turn_history_records_real_timeout_cancel_and_bound() {
+    let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    let (transport, _runner) = IceTransportBuilder::new(RtcConfiguration::default()).build();
+    let spawn_probe = || {
+        let inner = transport.inner.clone();
+        tokio::spawn(async move {
+            let uri = IceServerUri::parse(&format!("turn:{relay_addr}")).unwrap();
+            let config = IceServer::new(vec![format!("turn:{relay_addr}")])
+                .with_credential("diagnostic-test", "fixture-only");
+            inner.gatherer.probe_turn(&uri, &config).await
+        })
+    };
+    let task = spawn_probe();
+    let mut buf = [0u8; 1500];
+    timeout(Duration::from_secs(1), relay.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let pending = transport.packet_diagnostics().turn_control_history;
+    assert_eq!(pending.last().unwrap().outcome, "pending");
+    assert_eq!(pending.last().unwrap().duration_ms, None);
+    let error = timeout(Duration::from_secs(6), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.is_timeout());
+    let finished = transport.packet_diagnostics().turn_control_history;
+    assert_eq!(finished.last().unwrap().outcome, "timeout");
+    assert!(finished.last().unwrap().duration_ms.unwrap() >= 2900);
+    // Drain the 0.4.14 UDP retransmissions before observing new probes.
+    while relay.try_recv_from(&mut buf).is_ok() {}
+    for _ in 0..9 {
+        let task = spawn_probe();
+        timeout(Duration::from_secs(1), relay.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+    let finished = transport.packet_diagnostics().turn_control_history;
+    assert_eq!(finished.len(), 8);
+    assert!(
+        finished
+            .iter()
+            .all(|entry| entry.outcome == "cancelled" && entry.duration_ms.is_some())
+    );
+}

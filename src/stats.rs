@@ -1,3 +1,6 @@
+/// Packet-stage observations shared by typed snapshots and stats reports.
+pub mod packet;
+
 use crate::platform::time::Instant;
 use crate::prelude::*;
 use alloc::collections::BTreeMap;

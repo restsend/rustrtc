@@ -50,6 +50,7 @@ impl TurnCredentials {
 
 #[derive(Debug)]
 pub struct TurnClient {
+    control_history: Arc<crate::stats::packet::TurnControlHistory>,
     transport: TurnTransport,
     auth: SyncMutex<Option<TurnAuthState>>,
     channels: Mutex<BTreeMap<SocketAddr, u16>>,
@@ -136,12 +137,27 @@ impl TurnClient {
             }
         };
         Ok(Self {
+            control_history: Arc::new(Default::default()),
             transport,
             auth: SyncMutex::new(None),
             channels: Mutex::new(BTreeMap::new()),
             channel_map: Mutex::new(BTreeMap::new()),
             next_channel: Mutex::new(0x4000),
         })
+    }
+
+    pub(crate) fn set_control_history(
+        &mut self,
+        history: Arc<crate::stats::packet::TurnControlHistory>,
+    ) {
+        self.control_history = history;
+    }
+    pub(crate) fn observe_control(
+        &self,
+        transaction_id: [u8; 12],
+        method: &'static str,
+    ) -> crate::stats::packet::TurnControlGuard {
+        self.control_history.begin(transaction_id, method)
     }
 
     pub(crate) async fn allocate(&self, creds: TurnCredentials) -> RtcResult<TurnAllocation> {
@@ -173,10 +189,16 @@ impl TurnClient {
             };
             let used_key = key_option.clone();
             let bytes = message.encode(key_option.as_deref(), true)?;
-            let parsed = self.request(&bytes, tx_id).await?;
+            let mut observation = self.observe_control(tx_id, "Allocate");
+            let parsed = self
+                .request(&bytes, tx_id)
+                .await
+                .inspect_err(|error| observation.error(error, "request_error"))?;
             if parsed.transaction_id != tx_id {
+                observation.failure("unmatched_response");
                 continue;
             }
+            observation.response(&parsed);
             if parsed.method != StunMethod::Allocate {
                 return Err(RtcError::Internal(format!(
                     "unexpected STUN method in allocate response"
@@ -204,6 +226,7 @@ impl TurnClient {
                             lifetime_secs: granted_lifetime,
                         });
                     }
+                    observation.failure("invalid_success_response");
                     return Err(RtcError::Internal(format!(
                         "TURN success without relayed address"
                     )));
@@ -255,10 +278,16 @@ impl TurnClient {
                 };
                 msg.encode(Some(&auth.key), true)?
             };
-            let parsed = self.request(&bytes, tx_id).await?;
+            let mut observation = self.observe_control(tx_id, "CreatePermission");
+            let parsed = self
+                .request(&bytes, tx_id)
+                .await
+                .inspect_err(|error| observation.error(error, "request_error"))?;
             if parsed.transaction_id != tx_id {
+                observation.failure("unmatched_response");
                 continue;
             }
+            observation.response(&parsed);
             if parsed.method != StunMethod::CreatePermission {
                 return Err(RtcError::Internal(format!(
                     "unexpected STUN method in create-permission response"

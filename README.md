@@ -428,25 +428,28 @@ Streams a video file (`examples/static/output.ivf`) via RTP to a UDP port, which
 
 This project is licensed under the MIT License.
 
-### Optional packet-stage diagnostics
+### Packet-stage transport stats
 
-Enable the `diagnostics` Cargo feature to record packet-stage counts, bytes and
-monotonic first/last observation ages. `PeerConnection::packet_diagnostics()`
-returns typed ICE, TURN, DTLS-state, RTP/SRTP, listener and send observations.
-`IceTransport::diagnostic_snapshot()` and `RtpTransport::diagnostic_snapshot()`
-provide JSON views of the same counters for existing consumers.
+`PeerConnection::get_transport_stats()` includes one
+`Custom("packet-stages")` entry whose `packetStages` value contains the complete
+ICE, TURN, DTLS-state, RTP/SRTP, listener and send observations. These stats are
+available before media transport creation and require no feature flag.
+`get_stats()` keeps its lightweight RTP-quality report and does not serialize
+the detailed transport snapshot on each quality poll.
 
-Detailed recording is off by default: stage counters have no clock or atomic
-updates, TURN history is empty, and deferred-send observation is inactive.
-Snapshots report `enabled: false`; existing transport totals remain available.
-When enabled, recording adds clock reads and relaxed atomic updates at packet
-boundaries. Snapshots are cumulative observations, not atomic transactions across
-stages. They do not include payloads, keys, ICE credentials or TURN auth data.
-TURN history retains at most eight request attempts.
+The transport-owned counters are shared with the compatibility APIs
+`PeerConnection::packet_diagnostics()`, `IceTransport::diagnostic_snapshot()` and
+`RtpTransport::diagnostic_snapshot()`; reading either view never records traffic.
+Existing UDP and accepted-RTP totals remain authoritative for those stages.
+Counts, bytes and monotonic first/last ages are cumulative observations, not an
+atomic transaction across stages. A missing age means never observed. Snapshots
+exclude payloads, keys, ICE credentials and TURN authentication data. TURN history
+retains at most eight request attempts. Detailed DTLS error observation remains
+unsupported and is explicitly reported as such.
 
-Diagnostics never emit logs or run a polling task. Consumers choose when to read
-and must rate-limit their own output. The optional deferred-send observer is
-invoked only after `mark_stopping()` and must remain nonblocking, rate-limit any
-output and avoid retaining its owning connection or transport. It observes
-completion without delaying, draining or cancelling sends. Recording is independent
-of codec, application, call-center policy and deployment environment.
+Stats never emit logs or run a polling task. Consumers choose when to read and
+rate-limit their output. The optional deferred-send observer is invoked only
+after `mark_stopping()` and must remain nonblocking, rate-limit output and avoid
+retaining its owning connection or transport. It observes completion without
+delaying, draining or cancelling sends. Stats collection is independent of codec,
+application, call-center policy and deployment environment.

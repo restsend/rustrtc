@@ -136,3 +136,9 @@ pub(crate) fn spawn_rtc<F>(
 {
     crate::platform::task::spawn(fut);
 }
+
+/// Compatibility types for consumers of the former diagnostics API.
+/// Packet-stage data is collected by the stats pipeline.
+pub mod diagnostics {
+    pub use crate::stats::packet::*;
+}

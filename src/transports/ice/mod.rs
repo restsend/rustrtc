@@ -50,7 +50,6 @@ use std::time::Instant;
 
 use crate::errors::{RtcError, RtcResult};
 #[cfg(feature = "std")]
-#[cfg(feature = "std")]
 use tokio::net::UdpSocket;
 #[cfg(feature = "std")]
 use tokio::net::{TcpListener, TcpStream};
@@ -292,6 +291,11 @@ pub struct IceTransport {
 }
 
 pub(crate) struct IceTransportInner {
+    diagnostics: crate::stats::packet::IceObservations,
+    turn_udp_read: crate::stats::packet::Counter,
+    turn_control_history: Arc<crate::stats::packet::TurnControlHistory>,
+    last_turn_control:
+        crate::platform::sync::Mutex<Option<crate::stats::packet::TurnControlDiagnostics>>,
     state: watch::Sender<IceTransportState>,
     _state_rx_keeper: watch::Receiver<IceTransportState>,
     gathering_state: watch::Sender<IceGathererState>,
@@ -736,6 +740,7 @@ impl IceTransportRunner {
 
     #[cfg(feature = "std")]
     async fn run_udp_read_loop(socket: Arc<UdpSocket>, inner: Arc<IceTransportInner>) {
+        let _exit = crate::stats::packet::ReadExitGuard(&inner.diagnostics.udp_read_exits);
         let mut buf = [0u8; 1500];
         let mut marshal_buf = Vec::with_capacity(1500);
         let mut state_rx = inner.state.subscribe();
@@ -750,6 +755,7 @@ impl IceTransportRunner {
             match which {
                 crate::platform::select::Either::A(res) => {
                     if let Err(e) = res {
+                        inner.diagnostics.udp_read_errors.record(0);
                         debug!("Socket readable wait error: {}", e);
                         break;
                     }
@@ -768,15 +774,18 @@ impl IceTransportRunner {
                                 // socket (same class of fix as tokio-rs/tokio#2017 and
                                 // aws/s2n-quic#1448; matches the tolerant handling already
                                 // used by the shared-UDP recv loop).
+                                inner.diagnostics.udp_read_errors.record(0);
                                 debug!("Socket recv error (connection reset, continuing): {}", e);
                                 break;
                             }
                             Err(e) => {
+                                inner.diagnostics.udp_read_errors.record(0);
                                 debug!("Socket recv error: {}", e);
                                 return;
                             }
                         };
 
+                        inner.diagnostics.udp_read.record(len);
                         let packet = &buf[..len];
                         if len > 0 {
                             handle_packet(
@@ -810,6 +819,7 @@ impl IceTransportRunner {
         socket: Arc<dyn crate::platform::net::UdpSocket>,
         inner: Arc<IceTransportInner>,
     ) {
+        let _exit = crate::stats::packet::ReadExitGuard(&inner.diagnostics.udp_read_exits);
         let mut buf = vec![0u8; 1500];
         let mut marshal_buf = Vec::with_capacity(1500);
         let sender = IceSocketWrapper::Platform(socket.clone());
@@ -822,10 +832,12 @@ impl IceTransportRunner {
             let (len, addr) = match result {
                 Err(_) => continue,
                 Ok(Err(_)) => {
+                    inner.diagnostics.udp_read_errors.record(0);
                     break;
                 }
                 Ok(Ok(v)) => v,
             };
+            inner.diagnostics.udp_read.record(len);
             let packet = &buf[..len];
             if len > 0 {
                 handle_packet(
@@ -878,6 +890,7 @@ impl IceTransportRunner {
             };
             match packet_opt {
                 Some((packet, addr)) => {
+                    inner.diagnostics.shared_udp_read.record(packet.len());
                     handle_packet(
                         &packet,
                         addr,
@@ -897,9 +910,11 @@ impl IceTransportRunner {
         relayed_addr: SocketAddr,
         inner: Arc<IceTransportInner>,
     ) {
+        let _exit = client
+            .is_udp()
+            .then(|| crate::stats::packet::ReadExitGuard(&inner.diagnostics.udp_read_exits));
         let mut buf = [0u8; 1500];
         let mut marshal_buf = Vec::with_capacity(1500);
-        #[allow(unused_mut)]
         let mut state_rx = inner.state.subscribe();
         trace!("Read loop started for TURN client {}", relayed_addr);
         loop {
@@ -911,7 +926,9 @@ impl IceTransportRunner {
             match which {
                 crate::platform::select::Either::A(result) => match result {
                     Ok(len) => {
+                        inner.diagnostics.turn_wire_read.record(len);
                         if client.is_udp() {
+                            inner.turn_udp_read.record(len);
                         }
                         if len > 0 {
                             IceTransport::handle_turn_packet(
@@ -932,6 +949,7 @@ impl IceTransportRunner {
                             continue;
                         }
                         if client.is_udp() {
+                            inner.diagnostics.udp_read_errors.record(0);
                         }
                         debug!("TURN client recv error: {}", e);
                         break;
@@ -1247,18 +1265,28 @@ impl IceTransportRunner {
             inner: &Arc<IceTransportInner>,
             bytes: Vec<u8>,
             tx_id: [u8; 12],
-            _method: &'static str,
+            method: &'static str,
         ) -> Option<StunDecoded> {
+            let mut observation = client.observe_control(tx_id, method);
             let (tx, rx) = oneshot::channel();
             inner.pending_transactions.lock().insert(tx_id, tx);
             if let Err(e) = client.send(&bytes).await {
+                observation.error(&e, "send_error");
                 debug!("TURN refresh send failed: {}", e);
                 inner.pending_transactions.lock().remove(&tx_id);
                 return None;
             }
             match with_timeout(Duration::from_secs(5), rx).await {
-                Ok(Ok(msg)) => Some(msg),
-                _result => {
+                Ok(Ok(msg)) => {
+                    observation.response(&msg);
+                    Some(msg)
+                }
+                result => {
+                    observation.failure(if result.is_err() {
+                        "timeout"
+                    } else {
+                        "response_channel_closed"
+                    });
                     inner.pending_transactions.lock().remove(&tx_id);
                     None
                 }
@@ -1424,6 +1452,10 @@ impl IceTransport {
         let (nomination_complete_tx, nomination_complete_rx) = watch::channel(None);
 
         let inner = IceTransportInner {
+            diagnostics: Default::default(),
+            turn_udp_read: Default::default(),
+            turn_control_history: Arc::new(Default::default()),
+            last_turn_control: crate::platform::sync::Mutex::new(None),
             state: state_tx,
             _state_rx_keeper: state_rx,
             gathering_state: gathering_state_tx,
@@ -1485,6 +1517,61 @@ impl IceTransport {
         };
 
         (Self { inner }, runner.run())
+    }
+
+    pub fn packet_diagnostics(&self) -> crate::stats::packet::IcePacketDiagnostics {
+        let mut snapshot = self.inner.diagnostics.snapshot();
+        snapshot.direct_udp_read = snapshot.udp_read.clone();
+        snapshot.udp_read = snapshot
+            .udp_read
+            .combined(&self.inner.turn_udp_read.snapshot());
+        snapshot.state = format!("{:?}", *self.inner.state.borrow());
+        snapshot.gathering_state = format!("{:?}", *self.inner.gathering_state.borrow());
+        snapshot.role = format!("{:?}", *self.inner.role.lock());
+        snapshot.local_candidates = self.inner.gatherer.local_candidates().len();
+        snapshot.remote_candidates = self.inner.remote_candidates.lock().len();
+        snapshot.buffered_pending = self.inner.buffered_packets.lock().len();
+        snapshot.buffered_received = self
+            .inner
+            .buffer_stats
+            .packets_received
+            .load(Ordering::Relaxed);
+        snapshot.buffered_dropped = self
+            .inner
+            .buffer_stats
+            .packets_dropped
+            .load(Ordering::Relaxed);
+        snapshot.last_turn_control = self.inner.last_turn_control.lock().clone();
+        snapshot.turn_control_history = self.inner.turn_control_history.snapshot();
+        snapshot.selected_pair = self.inner.selected_pair.lock().as_ref().map(|pair| {
+            crate::stats::packet::SelectedPairDiagnostics {
+                local_addr: pair.local.address.to_string(),
+                remote_addr: pair.remote.address.to_string(),
+                local_type: format!("{:?}", pair.local.typ),
+                remote_type: format!("{:?}", pair.remote.typ),
+                transport: pair.local.transport.clone(),
+            }
+        });
+        snapshot
+    }
+
+    /// JSON view of the same packet-stage counters for existing diagnostic consumers.
+    pub fn diagnostic_snapshot(&self) -> serde_json::Value {
+        let stages = self.packet_diagnostics();
+        serde_json::json!({
+            "enabled": true,
+            "socket_boundary": "direct_read_or_shared_dispatch",
+            "turn_wire_boundary": "allocated_turn_reader",
+            "socket_packets": stages.direct_udp_read.combined(&stages.shared_udp_read),
+            "turn_wire_packets": stages.turn_wire_read,
+            "turn_unwrapped_packets": stages.turn_channel_data.combined(&stages.turn_data_indication),
+            "turn_unwrap_errors": stages.turn_unknown_channel.packets + stages.turn_malformed.packets,
+            "turn_unknown_channel": stages.turn_unknown_channel.packets,
+            "turn_malformed": stages.turn_malformed.packets,
+            "socket_recv_errors": stages.udp_read_errors.packets,
+            "turn_last_control": stages.last_turn_control,
+            "turn_control_history": stages.turn_control_history,
+        })
     }
 
     pub fn state(&self) -> IceTransportState {
@@ -2279,6 +2366,7 @@ impl IceTransport {
                 if packet.len() >= 4 + len {
                     let data = &packet[4..4 + len];
                     if let Some(peer_addr) = client.get_peer(channel_num).await {
+                        inner.diagnostics.turn_channel_data.record(len);
                         handle_packet(
                             data,
                             peer_addr,
@@ -2288,8 +2376,10 @@ impl IceTransport {
                         )
                         .await;
                     } else {
+                        inner.diagnostics.turn_unknown_channel.record(len);
                     }
                 } else {
+                    inner.diagnostics.turn_malformed.record(packet.len());
                 }
                 return;
             }
@@ -2300,6 +2390,7 @@ impl IceTransport {
                 if let Some(data) = &msg.data
                     && let Some(peer_addr) = msg.xor_peer_address
                 {
+                    inner.diagnostics.turn_data_indication.record(data.len());
                     handle_packet(
                         data,
                         peer_addr,
@@ -2308,8 +2399,19 @@ impl IceTransport {
                         marshal_buf,
                     )
                     .await;
+                } else {
+                    inner.diagnostics.turn_malformed.record(packet.len());
                 }
             } else {
+                {
+                    *inner.last_turn_control.lock() =
+                        Some(crate::stats::packet::TurnControlDiagnostics {
+                            method: format!("{:?}", msg.method),
+                            class: format!("{:?}", msg.class),
+                            error_code: msg.error_code,
+                        });
+                }
+                inner.diagnostics.turn_control.record(packet.len());
                 // Handle other TURN messages (e.g. CreatePermission response)
                 handle_packet(
                     packet,
@@ -2320,6 +2422,8 @@ impl IceTransport {
                 )
                 .await;
             }
+        } else {
+            inner.diagnostics.turn_malformed.record(packet.len());
         }
     }
 }
@@ -4123,14 +4227,17 @@ async fn perform_binding_check(
             map.insert(perm_tx_id, perm_tx);
         }
 
+        let mut permission_observation = client.observe_control(perm_tx_id, "CreatePermission");
         trace!("Sending CreatePermission to TURN server");
         if let Err(e) = client.send(&perm_bytes).await {
+            permission_observation.error(&e, "send_error");
             debug!("CreatePermission send failed: {}", e);
             return Err(e);
         }
 
         match with_timeout(inner.config.stun_timeout, perm_rx).await {
             Ok(Ok(msg)) => {
+                permission_observation.response(&msg);
                 if msg.class == StunClass::ErrorResponse {
                     return Err(RtcError::Internal(format!(
                         "CreatePermission failed: {:?}",
@@ -4149,7 +4256,13 @@ async fn perform_binding_check(
                         map.insert(bind_tx_id, bind_tx);
                     }
 
-                    if client.send(&bind_bytes).await.is_ok() {
+                    let mut binding_observation = client.observe_control(bind_tx_id, "ChannelBind");
+                    if client
+                        .send(&bind_bytes)
+                        .await
+                        .inspect_err(|error| binding_observation.error(error, "send_error"))
+                        .is_ok()
+                    {
                         let client_clone = client.clone();
                         let remote_addr = remote.address;
                         let inner_weak = Arc::downgrade(inner);
@@ -4157,12 +4270,17 @@ async fn perform_binding_check(
 
                         match with_timeout(timeout_dur, bind_rx).await {
                             Ok(Ok(msg)) => {
+                                binding_observation.response(&msg);
                                 if msg.class == StunClass::SuccessResponse {
                                     client_clone.add_channel(remote_addr, channel_num).await;
                                 }
                             }
                             result => {
-                                let _ = result;
+                                binding_observation.failure(if result.is_err() {
+                                    "timeout"
+                                } else {
+                                    "response_channel_closed"
+                                });
                                 // Timeout or error: clean up pending transaction
                                 if let Some(inner) = inner_weak.upgrade() {
                                     let mut map = inner.pending_transactions.lock();
@@ -4174,7 +4292,11 @@ async fn perform_binding_check(
                 }
             }
             result => {
-                let _ = result;
+                permission_observation.failure(if result.is_err() {
+                    "timeout"
+                } else {
+                    "response_channel_closed"
+                });
                 let mut map = inner.pending_transactions.lock();
                 map.remove(&perm_tx_id);
                 return Err(RtcError::Timeout("CreatePermission".into()));
@@ -6129,7 +6251,15 @@ impl IceGatherer {
         server: &IceServer,
     ) -> RtcResult<Option<IceCandidate>> {
         let credentials = TurnCredentials::from_server(server)?;
-        let client = TurnClient::connect(uri, self.config.disable_ipv6).await?;
+        let mut client = TurnClient::connect(uri, self.config.disable_ipv6).await?;
+        if let Some(inner) = self
+            .transport_inner
+            .lock()
+            .as_ref()
+            .and_then(alloc::sync::Weak::upgrade)
+        {
+            client.set_control_history(inner.turn_control_history.clone());
+        }
         let allocation = client.allocate(credentials).await?;
         let relayed_addr = allocation.relayed_address;
         debug!(

@@ -104,8 +104,12 @@ async fn close_releases_all_tasks_while_transceivers_held_rtp_and_srtp() {
             rustrtc::rtp::RtpHeader::new(0, 1, 0, 0x12345678),
             vec![0; 160],
         );
-        pc1.wait_for_rtp_transport_ready(Duration::from_secs(3)).await.unwrap();
-        pc2.wait_for_rtp_transport_ready(Duration::from_secs(3)).await.unwrap();
+        pc1.wait_for_rtp_transport_ready(Duration::from_secs(3))
+            .await
+            .unwrap();
+        pc2.wait_for_rtp_transport_ready(Duration::from_secs(3))
+            .await
+            .unwrap();
         pc1.send_raw_rtp(packet).await.unwrap();
         timeout(Duration::from_secs(3), async {
             while pc2.received_rtp_packets() == 0 {
@@ -115,6 +119,31 @@ async fn close_releases_all_tasks_while_transceivers_held_rtp_and_srtp() {
         .await
         .expect("the peer must receive actual UDP media before closing");
         let received = pc2.received_rtp_packets();
+        {
+            let report = pc2.get_transport_stats().await.unwrap();
+            let stages = report
+                .entries
+                .iter()
+                .find_map(|entry| entry.values.get("packetStages"))
+                .expect("real UDP ingress must be visible through transport stats");
+            assert_eq!(stages["enabled"], true);
+            let transports = stages["transports"].as_array().unwrap();
+            let accepted: u64 = transports
+                .iter()
+                .map(|transport| transport["rtp_accepted"]["packets"].as_u64().unwrap())
+                .sum();
+            assert_eq!(accepted, 1);
+            let transport = transports
+                .iter()
+                .find(|transport| transport["rtp_accepted"]["packets"] == 1)
+                .unwrap();
+            assert!(transport["rtp_accepted"]["last_age_ms"].is_u64());
+            assert!(transport["conn"]["received"]["packets"].as_u64().unwrap() >= 1);
+            assert!(transport["conn"]["received"]["bytes"].as_u64().unwrap() >= 172);
+            assert_eq!(transport["srtp_required"], mode == TransportMode::Srtp);
+            assert!(transport["conn"]["selected_socket"].is_string());
+        }
+
         let reading = pc2.clone();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let done = stop.clone();
@@ -125,7 +154,10 @@ async fn close_releases_all_tasks_while_transceivers_held_rtp_and_srtp() {
             ready.wait();
             loop {
                 let current = reading.received_rtp_packets();
-                assert!(current >= previous, "closing must not reset the received packet count");
+                assert!(
+                    current >= previous,
+                    "closing must not reset the received packet count"
+                );
                 previous = current;
                 if done.load(std::sync::atomic::Ordering::Acquire) {
                     return current;
