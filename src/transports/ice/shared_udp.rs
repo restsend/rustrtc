@@ -102,7 +102,10 @@ impl SharedUdpPort {
                             if len == 0 {
                                 continue;
                             }
-                            port.dispatch(&buf[..len], peer_addr);
+                            port.dispatch(
+                                &buf[..len],
+                                crate::transports::canonical_addr(peer_addr),
+                            );
                         }
                         Err(e) => {
                             if port.shutting_down.load(Ordering::Relaxed) {

@@ -38,6 +38,14 @@ struct LocalIpCacheEntry {
 #[cfg(feature = "std")]
 static LOCAL_IP_CACHE: OnceLock<Mutex<Option<LocalIpCacheEntry>>> = OnceLock::new();
 
+/// `addr` with an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) turned into
+/// the IPv4 address. A dual-stack socket (bound to `::`) reports its IPv4
+/// peers in the mapped form; everything above the socket compares them with
+/// addresses from SDP, candidates and STUN, where they are IPv4.
+pub fn canonical_addr(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
+}
+
 #[async_trait]
 pub trait PacketReceiver: Send + Sync {
     async fn receive(&self, packet: Bytes, addr: SocketAddr, marshal_buf: &mut Vec<u8>);

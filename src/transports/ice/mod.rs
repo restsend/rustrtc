@@ -972,6 +972,7 @@ impl IceTransportRunner {
             match which {
                 crate::platform::select::Either::A(accept_res) => match accept_res {
                     Ok((stream, peer_addr)) => {
+                        let peer_addr = crate::transports::canonical_addr(peer_addr);
                         trace!("TCP accepted connection from {}", peer_addr);
                         let wrapper = split_tcp_stream(stream, peer_addr);
                         inner.gatherer.store_tcp_stream(local_addr, wrapper.clone());
@@ -3495,6 +3496,7 @@ async fn handle_packet(
     if should_drop_packet() {
         return;
     }
+    let addr = crate::transports::canonical_addr(addr);
     inner.last_received_nanos.store(
         inner.created_at.elapsed().as_nanos() as u64,
         Ordering::Relaxed,
@@ -6541,7 +6543,15 @@ impl IceSocketWrapper {
         }
     }
 
+    /// Receive one packet. IPv4 sources of a dual-stack socket come as IPv4
+    /// (see [`crate::transports::canonical_addr`]).
     pub async fn recv_from(&self, buf: &mut [u8]) -> RtcResult<(usize, SocketAddr)> {
+        self.recv_from_raw(buf)
+            .await
+            .map(|(len, addr)| (len, crate::transports::canonical_addr(addr)))
+    }
+
+    async fn recv_from_raw(&self, buf: &mut [u8]) -> RtcResult<(usize, SocketAddr)> {
         match self {
             IceSocketWrapper::Platform(s) => s.recv_from(buf).await.map_err(|e| e.into()),
             IceSocketWrapper::Udp(s) => s.recv_from(buf).await.map_err(|e| e.into()),

@@ -6793,3 +6793,24 @@ async fn turn_allocate_packet_loss_keeps_original_deadline() -> Result<()> {
     Ok(())
 }
 
+/// A socket bound to `::` (dual-stack) gets IPv4 packets with an
+/// IPv4-mapped source; the wrapper hands them on as IPv4, the form they
+/// have in SDP, candidates and STUN.
+#[tokio::test]
+async fn dual_stack_socket_reads_ipv4_sources_as_ipv4() -> Result<()> {
+    let socket = Arc::new(tokio::net::UdpSocket::bind("[::]:0").await?);
+    let port = socket.local_addr()?.port();
+    let wrapper = IceSocketWrapper::Udp(socket);
+    let mut buf = [0u8; 64];
+
+    let v4 = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    v4.send_to(b"v4", ("127.0.0.1", port)).await?;
+    let (_, from) = wrapper.recv_from(&mut buf).await?;
+    assert_eq!(from, v4.local_addr()?);
+
+    let v6 = tokio::net::UdpSocket::bind("[::1]:0").await?;
+    v6.send_to(b"v6", ("::1", port)).await?;
+    let (_, from) = wrapper.recv_from(&mut buf).await?;
+    assert_eq!(from, v6.local_addr()?);
+    Ok(())
+}

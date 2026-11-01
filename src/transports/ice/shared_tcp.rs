@@ -49,6 +49,7 @@ impl SharedTcpPort {
                 let accept = listener.accept().await;
                 match accept {
                     Ok((stream, peer)) => {
+                        let peer = crate::transports::canonical_addr(peer);
                         let port = Arc::clone(&port);
                         tokio::spawn(async move {
                             if let Err(e) = dispatch_incoming(stream, peer, port).await {
