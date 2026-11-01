@@ -471,6 +471,19 @@ impl Origin {
     }
 }
 
+impl Origin {
+    /// Set the address, and the address type that goes with it.
+    pub fn set_unicast_ip(&mut self, ip: core::net::IpAddr) {
+        self.address_type = AddressType::of(&ip);
+        self.unicast_address = ip.to_string();
+    }
+}
+
+/// The value of a `c=` line for `ip`: `IN IP4 192.0.2.1`, `IN IP6 2001:db8::1`.
+pub fn connection_address(ip: core::net::IpAddr) -> String {
+    format!("IN {} {}", AddressType::of(&ip).as_str(), ip)
+}
+
 impl Default for Origin {
     fn default() -> Self {
         Self {
@@ -638,6 +651,15 @@ pub enum AddressType {
 }
 
 impl AddressType {
+    /// The address type of `ip`.
+    pub fn of(ip: &core::net::IpAddr) -> Self {
+        if ip.is_ipv4() {
+            AddressType::Ipv4
+        } else {
+            AddressType::Ipv6
+        }
+    }
+
     fn as_str(&self) -> &'static str {
         match self {
             AddressType::Ipv4 => "IP4",

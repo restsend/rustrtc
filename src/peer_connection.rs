@@ -5750,7 +5750,10 @@ impl PeerConnectionInner {
         } else {
             desc.session.origin = default_origin();
             if let Some(ext_ip) = &self.config.external_ip {
-                desc.session.origin.unicast_address = ext_ip.clone();
+                match ext_ip.parse::<IpAddr>() {
+                    Ok(ip) => desc.session.origin.set_unicast_ip(ip),
+                    Err(_) => desc.session.origin.unicast_address = ext_ip.clone(),
+                }
             }
             desc.session.origin.session_version += 1;
         }
@@ -5769,7 +5772,10 @@ impl PeerConnectionInner {
         if connectivity.is_direct()
             && let Some(ext_ip) = &self.config.external_ip
         {
-            desc.session.connection = Some(format!("IN IP4 {}", ext_ip));
+            desc.session.connection = Some(match ext_ip.parse::<IpAddr>() {
+                Ok(ip) => crate::sdp::connection_address(ip),
+                Err(_) => format!("IN IP4 {}", ext_ip),
+            });
         }
 
         for (
@@ -5901,7 +5907,10 @@ impl PeerConnectionInner {
                                 .map(|i| i.to_string())
                         })
                         .unwrap_or_else(|| "127.0.0.1".to_string());
-                    section.connection = Some(format!("IN IP4 {}", ip));
+                    section.connection = Some(match ip.parse::<IpAddr>() {
+                        Ok(ip) => crate::sdp::connection_address(ip),
+                        Err(_) => format!("IN IP4 {}", ip),
+                    });
                 }
             } else if connectivity == Connectivity::Ice {
                 section.connection = Some("IN IP4 0.0.0.0".to_string());
@@ -5963,7 +5972,7 @@ impl PeerConnectionInner {
                     .or_else(|| candidates.iter().find(|c| c.component == 1))
                 {
                     section.port = cand.address.port();
-                    let conn = format!("IN IP4 {}", cand.address.ip());
+                    let conn = crate::sdp::connection_address(cand.address.ip());
                     if desc.session.connection.is_none() {
                         desc.session.connection = Some(conn.clone());
                     }
@@ -6840,7 +6849,7 @@ fn default_origin() -> Origin {
     origin.session_id = now;
     origin.session_version = now;
     if let Ok(ip) = get_local_ip() {
-        origin.unicast_address = ip.to_string();
+        origin.set_unicast_ip(ip);
     }
     origin
 }
