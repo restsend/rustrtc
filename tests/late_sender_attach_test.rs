@@ -15,8 +15,8 @@ use rustrtc::media::track::{SampleStreamSource, sample_track};
 use rustrtc::peer_connection::{RtpSender, RtpTransceiver};
 use rustrtc::sdp::Direction;
 use rustrtc::{
-    MediaKind, PeerConnection, RtcConfiguration, RtpCodecParameters, TransceiverDirection,
-    TransportMode,
+    Connectivity, Keying, MediaKind, PeerConnection, RtcConfiguration, RtpCodecParameters,
+    TransceiverDirection,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -83,9 +83,11 @@ async fn assert_media_flows(
     );
 }
 
-async fn sender_installed_before_transport_up(mode: TransportMode) -> Result<()> {
+async fn sender_installed_before_transport_up(mode: (Connectivity, Keying)) -> Result<()> {
     let config = || RtcConfiguration {
-        transport_mode: mode.clone(),
+        connectivity: mode.0,
+        keying: mode.1,
+        webrtc_extensions: mode.0 == Connectivity::Ice,
         ..RtcConfiguration::default()
     };
     let pc1 = PeerConnection::new(config());
@@ -104,12 +106,12 @@ async fn sender_installed_before_transport_up(mode: TransportMode) -> Result<()>
 
 #[tokio::test]
 async fn sender_installed_before_transport_up_webrtc() -> Result<()> {
-    sender_installed_before_transport_up(TransportMode::WebRtc).await
+    sender_installed_before_transport_up((Connectivity::Ice, Keying::Dtls)).await
 }
 
 #[tokio::test]
 async fn sender_installed_before_transport_up_rtp() -> Result<()> {
-    sender_installed_before_transport_up(TransportMode::Rtp).await
+    sender_installed_before_transport_up((Connectivity::Sdp, Keying::None)).await
 }
 
 #[tokio::test]
@@ -135,9 +137,11 @@ async fn sender_replaced_after_transport_up() -> Result<()> {
 /// A remote re-offer adds an m-line while the transport is already up. The
 /// answerer installs its sender on the transceiver created from that offer
 /// (echo/SFU style) — it must be connected to the running transport.
-async fn sender_installed_on_transceiver_from_reoffer(mode: TransportMode) -> Result<()> {
+async fn sender_installed_on_transceiver_from_reoffer(mode: (Connectivity, Keying)) -> Result<()> {
     let config = || RtcConfiguration {
-        transport_mode: mode.clone(),
+        connectivity: mode.0,
+        keying: mode.1,
+        webrtc_extensions: mode.0 == Connectivity::Ice,
         ..RtcConfiguration::default()
     };
     let pc1 = PeerConnection::new(config());
@@ -173,24 +177,28 @@ async fn sender_installed_on_transceiver_from_reoffer(mode: TransportMode) -> Re
 
 #[tokio::test]
 async fn sender_installed_on_transceiver_from_reoffer_webrtc() -> Result<()> {
-    sender_installed_on_transceiver_from_reoffer(TransportMode::WebRtc).await
+    sender_installed_on_transceiver_from_reoffer((Connectivity::Ice, Keying::Dtls)).await
 }
 
 #[tokio::test]
 async fn sender_installed_on_transceiver_from_reoffer_srtp() -> Result<()> {
-    sender_installed_on_transceiver_from_reoffer(TransportMode::Srtp).await
+    sender_installed_on_transceiver_from_reoffer((Connectivity::Sdp, Keying::Sdes)).await
 }
 
 #[tokio::test]
 async fn sender_installed_on_transceiver_from_reoffer_rtp() -> Result<()> {
-    sender_installed_on_transceiver_from_reoffer(TransportMode::Rtp).await
+    sender_installed_on_transceiver_from_reoffer((Connectivity::Sdp, Keying::None)).await
 }
 
 /// The local side adds a transceiver after the transport is up and installs
 /// its sender via `set_sender` before re-offering.
-async fn sender_installed_on_transceiver_added_after_connect(mode: TransportMode) -> Result<()> {
+async fn sender_installed_on_transceiver_added_after_connect(
+    mode: (Connectivity, Keying),
+) -> Result<()> {
     let config = || RtcConfiguration {
-        transport_mode: mode.clone(),
+        connectivity: mode.0,
+        keying: mode.1,
+        webrtc_extensions: mode.0 == Connectivity::Ice,
         ..RtcConfiguration::default()
     };
     let pc1 = PeerConnection::new(config());
@@ -223,25 +231,29 @@ async fn sender_installed_on_transceiver_added_after_connect(mode: TransportMode
 
 #[tokio::test]
 async fn sender_installed_on_transceiver_added_after_connect_webrtc() -> Result<()> {
-    sender_installed_on_transceiver_added_after_connect(TransportMode::WebRtc).await
+    sender_installed_on_transceiver_added_after_connect((Connectivity::Ice, Keying::Dtls)).await
 }
 
 #[tokio::test]
 async fn sender_installed_on_transceiver_added_after_connect_srtp() -> Result<()> {
-    sender_installed_on_transceiver_added_after_connect(TransportMode::Srtp).await
+    sender_installed_on_transceiver_added_after_connect((Connectivity::Sdp, Keying::Sdes)).await
 }
 
 #[tokio::test]
 async fn sender_installed_on_transceiver_added_after_connect_rtp() -> Result<()> {
-    sender_installed_on_transceiver_added_after_connect(TransportMode::Rtp).await
+    sender_installed_on_transceiver_added_after_connect((Connectivity::Sdp, Keying::None)).await
 }
 
 /// The answerer's transceiver from the initial offer has no sender. Once the
 /// application sets it sendrecv, its re-offer says so, and a sender installed
 /// after that negotiation reaches the wire without another offer/answer.
-async fn sender_installed_after_senderless_sendrecv_reoffer(mode: TransportMode) -> Result<()> {
+async fn sender_installed_after_senderless_sendrecv_reoffer(
+    mode: (Connectivity, Keying),
+) -> Result<()> {
     let config = || RtcConfiguration {
-        transport_mode: mode.clone(),
+        connectivity: mode.0,
+        keying: mode.1,
+        webrtc_extensions: mode.0 == Connectivity::Ice,
         ..RtcConfiguration::default()
     };
     let pc1 = PeerConnection::new(config());
@@ -268,10 +280,10 @@ async fn sender_installed_after_senderless_sendrecv_reoffer(mode: TransportMode)
 
 #[tokio::test]
 async fn sender_installed_after_senderless_sendrecv_reoffer_webrtc() -> Result<()> {
-    sender_installed_after_senderless_sendrecv_reoffer(TransportMode::WebRtc).await
+    sender_installed_after_senderless_sendrecv_reoffer((Connectivity::Ice, Keying::Dtls)).await
 }
 
 #[tokio::test]
 async fn sender_installed_after_senderless_sendrecv_reoffer_rtp() -> Result<()> {
-    sender_installed_after_senderless_sendrecv_reoffer(TransportMode::Rtp).await
+    sender_installed_after_senderless_sendrecv_reoffer((Connectivity::Sdp, Keying::None)).await
 }

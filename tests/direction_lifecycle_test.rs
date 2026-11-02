@@ -16,7 +16,9 @@
 use rustrtc::sdp::{
     Attribute, Direction, MediaSection, SdpType, SessionDescription, SessionSection,
 };
-use rustrtc::{MediaKind, PeerConnection, RtcConfiguration, TransceiverDirection, TransportMode};
+use rustrtc::{
+    Connectivity, Keying, MediaKind, PeerConnection, RtcConfiguration, TransceiverDirection,
+};
 
 fn dir_str(direction: Direction) -> &'static str {
     match direction {
@@ -74,7 +76,9 @@ fn session_level_sdp(session_direction: Direction) -> String {
 
 fn rtp_pc_with_audio_sender() -> PeerConnection {
     let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Rtp;
+    config.connectivity = Connectivity::Sdp;
+    config.keying = Keying::None;
+    config.webrtc_extensions = false;
     let pc = PeerConnection::new(config);
     let (_source, track, _) =
         rustrtc::media::track::sample_track(rustrtc::media::MediaKind::Audio, 10);
@@ -305,13 +309,15 @@ async fn restart_ice_preserves_direction_intent() {
 /// The direction a fresh senderless transceiver offers: created by a remote
 /// offer (and answered) or locally as recvonly, then `set` if given.
 async fn senderless_offer(
-    mode: TransportMode,
+    mode: (Connectivity, Keying),
     kind: MediaKind,
     from_remote: bool,
     set: Option<TransceiverDirection>,
 ) -> Direction {
     let config = || RtcConfiguration {
-        transport_mode: mode.clone(),
+        connectivity: mode.0,
+        keying: mode.1,
+        webrtc_extensions: mode.0 == Connectivity::Ice,
         ..RtcConfiguration::default()
     };
     let pc = PeerConnection::new(config());
@@ -342,9 +348,9 @@ async fn senderless_offer(
 async fn set_direction_is_offered_without_a_sender() {
     use TransceiverDirection as TD;
     for mode in [
-        TransportMode::Rtp,
-        TransportMode::Srtp,
-        TransportMode::WebRtc,
+        (Connectivity::Sdp, Keying::None),
+        (Connectivity::Sdp, Keying::Sdes),
+        (Connectivity::Ice, Keying::Dtls),
     ] {
         for kind in [MediaKind::Audio, MediaKind::Video] {
             for (from_remote, set, expected) in [
@@ -369,7 +375,9 @@ async fn set_direction_is_offered_without_a_sender() {
 #[tokio::test]
 async fn rewritten_offer_direction_is_adopted_without_a_sender() {
     let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Rtp;
+    config.connectivity = Connectivity::Sdp;
+    config.keying = Keying::None;
+    config.webrtc_extensions = false;
     let pc = PeerConnection::new(config);
     let t = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::RecvOnly);
     t.set_direction(TransceiverDirection::SendRecv);

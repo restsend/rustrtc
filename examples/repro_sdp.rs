@@ -7,12 +7,11 @@
 #![allow(clippy::explicit_counter_loop)]
 #![allow(clippy::cloned_ref_to_slice_refs)]
 #![allow(clippy::zombie_processes)]
-use rustrtc::{MediaKind, PeerConnection, RtcConfiguration, TransceiverDirection, TransportMode};
+use rustrtc::{MediaKind, PeerConnection, RtcConfiguration, TransceiverDirection};
 
 #[tokio::main]
 async fn main() {
-    let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::WebRtc;
+    let config = RtcConfiguration::default();
 
     let pc = PeerConnection::new(config);
     pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);

@@ -5,8 +5,8 @@
 use anyhow::Result;
 use rustrtc::transports::ice::{IceCandidate, IceCandidateType};
 use rustrtc::{
-    ExternalIpCandidateType, IceTcpPolicy, IceTransportPolicy, MediaKind, PeerConnection,
-    RtcConfiguration, TransceiverDirection, TransportMode,
+    Connectivity, ExternalIpCandidateType, IceTcpPolicy, IceTransportPolicy, Keying, MediaKind,
+    PeerConnection, RtcConfiguration, TransceiverDirection,
 };
 use std::net::IpAddr;
 use std::time::Duration;
@@ -134,7 +134,9 @@ async fn server_reflexive_keeps_the_passive_tcp_host_candidate() -> Result<()> {
 #[tokio::test]
 async fn srtp_mode_still_advertises_the_external_ip() -> Result<()> {
     let pc = PeerConnection::new(RtcConfiguration {
-        transport_mode: TransportMode::Srtp,
+        connectivity: Connectivity::Sdp,
+        keying: Keying::Sdes,
+        webrtc_extensions: false,
         ..config(Some(ExternalIpCandidateType::ServerReflexive))
     });
     pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);

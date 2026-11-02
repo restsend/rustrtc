@@ -28,14 +28,14 @@ surface entirely on top of platform seams that the embedder implements
 **Embedded delivery surface:**
 
 - Full **ICE/STUN/TURN** stack, RTP/RTX, **SDP**
-- `PeerConnection` in **`WebRtc` mode** (ICE + DTLS-SRTP) and in
-  **`Rtp`/`Srtp` mode** (SDES-SRTP over a direct transport):
+- `PeerConnection` with **full ICE + DTLS-SRTP** and with
+  **SDES-SRTP or plain RTP over a direct transport**:
   offer/answer, media send/receive
 - Self-contained **DTLS 1.2** implementation behind the crypto seam
   (ECDSA-P256 + ECDH), with a pure-Rust `crypto-p256` reference backend
 - Media pipeline: packetizers/depacketizers, jitter buffer, NACK/RTX
 
-WebRtc mode on no_std requires a pre-provisioned DTLS certificate
+DTLS keying on no_std requires a pre-provisioned DTLS certificate
 (`RtcConfiguration::dtls_certificate` — DER leaf + PKCS#8 key, e.g.
 factory-provisioned); there is no certificate generation without `std`.
 
@@ -207,20 +207,30 @@ async fn main() {
 All configuration goes through `RtcConfiguration` (or its builder `RtcConfigurationBuilder`):
 
 ### Transport & Network
-- **`transport_mode`** — `TransportMode::WebRtc` (default), `TransportMode::Srtp`, or `TransportMode::Rtp`.
+- **`connectivity`** — How the media path is found: `Connectivity::Ice` (full ICE, default), `Connectivity::IceLite` (ICE-lite, RFC 8445 §2.5), or `Connectivity::Sdp` (the `c=`/`m=` address of the peer's SDP, no ICE).
+- **`keying`** — How the SRTP keys are exchanged: `Keying::Dtls` (DTLS-SRTP, default), `Keying::Sdes` (`a=crypto`, RFC 4568), or `Keying::None` (plain RTP).
+- **`webrtc_extensions`** — The peer is a WebRTC endpoint: offers claim rid, abs-send-time, sdes:mid (and with `enable_gcc`, transport-cc) header extensions, and descriptions carry `msid`. Default: `true`. Set it to `false` for SIP peers.
+
+| Peer | `connectivity` | `keying` | `webrtc_extensions` |
+|---|---|---|---|
+| Browser (WebRTC, the default) | `Ice` | `Dtls` | `true` |
+| SIP trunk, plain RTP | `Sdp` | `None` | `false` |
+| SIP trunk, SDES-SRTP | `Sdp` | `Sdes` | `false` |
+| SIP phone with ICE (e.g. Linphone) | `IceLite` | `Sdes` | `false` |
+
+Migration from `TransportMode`: `WebRtc` is the default; `Rtp` is `Sdp` + `None`; `Srtp` is `Sdp` + `Sdes`; both with `webrtc_extensions = false`. `enable_ice_lite = true` is `Connectivity::IceLite`.
 - **`ice_servers`** — STUN/TURN server list.
 - **`ice_transport_policy`** — `All` or `Relay`.
 - **`rtp_start_port` / `rtp_end_port`** — Restrict RTP/ICE to a port range.
 - **`external_ips`** — Public addresses to advertise instead of the local ones (1:1 NAT, a router that forwards the RTP ports), at most one per family (IPv4 + IPv6). A candidate takes the external address of its family, and so do `c=` and `o=`; a family with none advertises the local address.
-- **`external_ip_candidate_type`** — How ICE advertises `external_ips`: `Host` (default) replaces the host candidate's address; `ServerReflexive` keeps the host candidate and adds the external address as a srflx candidate on the same socket (1:1 NAT, RFC 8445 §5.1.1.2). WebRTC mode only.
+- **`external_ip_candidate_type`** — How ICE advertises `external_ips`: `Host` (default) replaces the host candidate's address; `ServerReflexive` keeps the host candidate and adds the external address as a srflx candidate on the same socket (1:1 NAT, RFC 8445 §5.1.1.2). Full ICE only.
 - **`bind_ips`** — Local addresses to bind media sockets on, one socket each (e.g. `["::"]` for one dual-stack socket, or `["127.0.0.1", "::1"]` for one socket per family). Empty: chosen automatically (WebRTC: every interface; RTP and SRTP: the default route's address).
 - **`disable_ipv6`** — Disable IPv6 candidate gathering.
-- **`enable_ice_lite`** — Enable ICE Lite mode.
 - **`ice_tcp_policy`** — `IceTcpPolicy::Disabled` (default), `IceTcpPolicy::Enabled`, or `IceTcpPolicy::PassiveOnly`. Controls ICE TCP candidate support per RFC 6544.
 - **`ice_udp_mux`** / **`ice_udp_mux_port`** — Share a single UDP socket across many `PeerConnection`s (single-port multiplexing for SFU/WHEP). Set `ice_udp_mux = true` and `ice_udp_mux_port = <port>`; incoming packets are demuxed by the server ufrag in the STUN Binding Request, then by remote source address.
 - **`enable_mdns`** — Advertise host candidates via mDNS (`<random>.local` hostnames instead of local IPs, draft-ietf-rtcweb-mdns). A built-in mDNS responder answers A/AAAA lookups; real addresses are kept internally so connectivity is unaffected. Default: `false`.
 
-### SDES Keying (Srtp mode)
+### SDES Keying (`Keying::Sdes`)
 Re-INVITE renegotiation keeps the call keyed without restarting media:
 - **Answers keep our key** — a re-INVITE answer reuses the key we are already sending with, so the peer does not drop our audio mid-call. A new key is generated only when the crypto suite changes.
 - **Peer key changes are applied** — if the peer offers a new key at the same suite, the SRTP/SRTCP sessions are re-keyed once the offer/answer exchange completes (signaling back at `Stable`); packets in flight under the old key may be dropped during the switchover.
@@ -247,18 +257,17 @@ Remote-initiated restarts (peer offers new credentials) are detected and mirrore
 - **`upnp_lease_duration`** — UPnP port mapping lease duration in seconds (default: 3600).
 
 ### DTLS
-- **`dtls_certificate`** — Pre-provisioned DTLS certificate (DER leaf + PKCS#8 key) for WebRtc mode. Optional on `std` (a self-signed certificate is generated per connection); **required on no_std**, where certificates cannot be generated. `Debug` output is redacted; the field is `serde`-skipped so key material never enters serialized configs.
+- **`dtls_certificate`** — Pre-provisioned DTLS certificate (DER leaf + PKCS#8 key) for DTLS keying. Optional on `std` (a self-signed certificate is generated per connection); **required on no_std**, where certificates cannot be generated. `Debug` output is redacted; the field is `serde`-skipped so key material never enters serialized configs.
 
 ```rust,ignore
 let cert = rustrtc::transports::dtls::Certificate::from_pkcs8_der(cert_der, key_der)?;
 let config = RtcConfigurationBuilder::new()
-    .transport_mode(TransportMode::WebRtc)
     .dtls_certificate(Arc::new(cert))
     .build();
 ```
 
 ### RTP Latching
-- **`enable_latching`** — Enable dynamic remote address detection for RTP-only mode.
+- **`enable_latching`** — Enable dynamic remote address detection on direct transports (`Connectivity::Sdp` / `Connectivity::IceLite`).
 - **`probation_max_packets`** — Number of packets to observe before committing a latched address. A single packet (marker or not) never moves the egress address: candidates win by consecutive sequence numbers with a consistent SSRC, or by the observation-budget fallback.
 
 After the initial latch, the connection supports **competitive re-latch** for NAT rebinding (the peer switching networks without a re-INVITE): a new source takes over the egress path only after 4 consecutive-sequence packets carrying one SSRC within a 2 s window. Switches are rate-limited (10 s cooldown, max 4 per session, frozen afterwards until a new SDP retargets). Two RTCP packets are required to move a non-mux RTCP destination.
@@ -285,12 +294,14 @@ Note: persistence-based latching is accident-robustness (stale NAT bindings, por
 ```rust
 use rustrtc::{
     PeerConnection, RtcConfiguration, RtcConfigurationBuilder,
-    IceServer, TransportMode, config::T38Capability,
+    Connectivity, IceServer, Keying, config::T38Capability,
 };
 
 // Using builder
 let config = RtcConfigurationBuilder::new()
-    .transport_mode(TransportMode::Rtp)
+    .connectivity(Connectivity::Sdp)
+    .keying(Keying::None)
+    .webrtc_extensions(false)
     .enable_latching(true)
     .probation_max_packets(Some(5))
     .rtp_port_range(50000, 50100)
@@ -305,7 +316,9 @@ let pc = PeerConnection::new(config);
 ```rust
 // Direct field access
 let mut config = RtcConfiguration::default();
-config.transport_mode = TransportMode::WebRtc;
+config.connectivity = Connectivity::Sdp;
+config.keying = Keying::Sdes;
+config.webrtc_extensions = false;
 config.enable_latching = true;
 config.rtp_start_port = Some(50000);
 config.rtp_end_port = Some(50100);

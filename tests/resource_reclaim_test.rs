@@ -10,7 +10,9 @@
 //! `Arc<PeerConnectionInner>`, and the flush loop a strong `Arc<RtpTransport>`,
 //! so a connected connection (or just its handles) could outlive `close()`.
 
-use rustrtc::{MediaKind, PeerConnection, RtcConfiguration, TransceiverDirection, TransportMode};
+use rustrtc::{
+    Connectivity, Keying, MediaKind, PeerConnection, RtcConfiguration, TransceiverDirection,
+};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -31,9 +33,14 @@ async fn wait_no_tasks(secs: u64) -> bool {
     .is_ok()
 }
 
-async fn connected_pair(mode: TransportMode, with_video: bool) -> (PeerConnection, PeerConnection) {
+async fn connected_pair(
+    mode: (Connectivity, Keying),
+    with_video: bool,
+) -> (PeerConnection, PeerConnection) {
     let config = || RtcConfiguration {
-        transport_mode: mode.clone(),
+        connectivity: mode.0,
+        keying: mode.1,
+        webrtc_extensions: mode.0 == Connectivity::Ice,
         ..RtcConfiguration::default()
     };
     let (pc1, pc2) = (PeerConnection::new(config()), PeerConnection::new(config()));
@@ -57,7 +64,7 @@ async fn connected_pair(mode: TransportMode, with_video: bool) -> (PeerConnectio
 
 #[tokio::test]
 async fn close_without_held_handles_releases_all_tasks() {
-    let (pc1, pc2) = connected_pair(TransportMode::WebRtc, true).await;
+    let (pc1, pc2) = connected_pair((Connectivity::Ice, Keying::Dtls), true).await;
     pc1.close();
     pc2.close();
     drop((pc1, pc2));
@@ -70,7 +77,7 @@ async fn close_without_held_handles_releases_all_tasks() {
 
 #[tokio::test]
 async fn close_releases_all_tasks_while_transceivers_held() {
-    let (pc1, pc2) = connected_pair(TransportMode::WebRtc, true).await;
+    let (pc1, pc2) = connected_pair((Connectivity::Ice, Keying::Dtls), true).await;
 
     // Keep handles the application is entitled to hold after closing.
     let t1 = pc1.get_transceivers()[0].clone();
@@ -93,7 +100,10 @@ async fn close_releases_all_tasks_while_transceivers_held() {
 
 #[tokio::test]
 async fn close_releases_all_tasks_while_transceivers_held_rtp_and_srtp() {
-    for mode in [TransportMode::Rtp, TransportMode::Srtp] {
+    for mode in [
+        (Connectivity::Sdp, Keying::None),
+        (Connectivity::Sdp, Keying::Sdes),
+    ] {
         let (pc1, pc2) = connected_pair(mode.clone(), false).await;
         let t1 = pc1.get_transceivers()[0].clone();
         let track1 = t1.receiver().map(|r| r.track());

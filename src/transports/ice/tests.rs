@@ -600,12 +600,14 @@ fn ice_candidate_foundation_compliance() {
 #[tokio::test]
 #[serial]
 async fn test_ice_lite_stun_response() -> Result<()> {
-    use crate::TransportMode;
+    use crate::{Connectivity, Keying};
 
     // Create ICE-lite transport (RTP mode)
     let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Rtp;
-    config.enable_ice_lite = true;
+    config.connectivity = Connectivity::Sdp;
+    config.keying = Keying::None;
+    config.webrtc_extensions = false;
+    config.connectivity = Connectivity::IceLite;
     config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
 
     let (ice_lite, runner) = IceTransport::new(config);
@@ -732,12 +734,14 @@ async fn test_ice_lite_stun_response() -> Result<()> {
 #[tokio::test]
 #[serial]
 async fn test_ice_lite_connectivity_establishment() -> Result<()> {
-    use crate::TransportMode;
+    use crate::{Connectivity, Keying};
 
     // Set up ICE-lite agent
     let mut lite_config = RtcConfiguration::default();
-    lite_config.transport_mode = TransportMode::Rtp;
-    lite_config.enable_ice_lite = true;
+    lite_config.connectivity = Connectivity::Sdp;
+    lite_config.keying = Keying::None;
+    lite_config.webrtc_extensions = false;
+    lite_config.connectivity = Connectivity::IceLite;
     lite_config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
 
     let (ice_lite, lite_runner) = IceTransport::new(lite_config);
@@ -930,13 +934,14 @@ async fn check_in_role(
 /// The same peer checking as controlling gets a success response.
 #[tokio::test]
 async fn test_ice_lite_answers_a_controlled_check_with_487() -> Result<()> {
-    use crate::TransportMode;
     use crate::transports::ice::stun::StunClass;
+    use crate::{Connectivity, Keying};
 
-    for mode in [TransportMode::Rtp, TransportMode::Srtp] {
+    for keying in [Keying::None, Keying::Sdes] {
         let mut config = RtcConfiguration::default();
-        config.transport_mode = mode.clone();
-        config.enable_ice_lite = true;
+        config.connectivity = Connectivity::IceLite;
+        config.keying = keying;
+        config.webrtc_extensions = false;
         let (ice_lite, runner) = IceTransport::new(config);
         tokio::spawn(runner);
         let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
@@ -950,15 +955,15 @@ async fn test_ice_lite_answers_a_controlled_check_with_487() -> Result<()> {
 
         let response =
             check_in_role(&ice_lite, &local, &peer, StunAttribute::IceControlled(42)).await?;
-        assert_eq!(response.class, StunClass::ErrorResponse, "{mode:?}");
-        assert_eq!(response.error_code, Some(487), "{mode:?}");
-        assert!(!knows_peer(&ice_lite), "{mode:?}: a 487 changes nothing");
+        assert_eq!(response.class, StunClass::ErrorResponse, "{keying:?}");
+        assert_eq!(response.error_code, Some(487), "{keying:?}");
+        assert!(!knows_peer(&ice_lite), "{keying:?}: a 487 changes nothing");
 
         let response =
             check_in_role(&ice_lite, &local, &peer, StunAttribute::IceControlling(42)).await?;
-        assert_eq!(response.class, StunClass::SuccessResponse, "{mode:?}");
-        assert_eq!(response.xor_mapped_address, Some(peer_addr), "{mode:?}");
-        assert!(knows_peer(&ice_lite), "{mode:?}");
+        assert_eq!(response.class, StunClass::SuccessResponse, "{keying:?}");
+        assert_eq!(response.xor_mapped_address, Some(peer_addr), "{keying:?}");
+        assert!(knows_peer(&ice_lite), "{keying:?}");
     }
     Ok(())
 }
@@ -967,11 +972,13 @@ async fn test_ice_lite_answers_a_controlled_check_with_487() -> Result<()> {
 /// answered with success, also one sent as controlled.
 #[tokio::test]
 async fn test_no_ice_answers_a_controlled_check() -> Result<()> {
-    use crate::TransportMode;
     use crate::transports::ice::stun::StunClass;
+    use crate::{Connectivity, Keying};
 
     let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Srtp;
+    config.connectivity = Connectivity::Sdp;
+    config.keying = Keying::Sdes;
+    config.webrtc_extensions = false;
     let (transport, runner) = IceTransport::new(config);
     tokio::spawn(runner);
     let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
@@ -1285,7 +1292,9 @@ async fn test_keepalive_tick_repairs_stranded_checking_with_selected_pair() -> R
 #[tokio::test]
 async fn test_keepalive_only_to_ice_peers() -> Result<()> {
     let mut config = RtcConfiguration::default();
-    config.transport_mode = crate::TransportMode::Rtp;
+    config.connectivity = crate::Connectivity::Sdp;
+    config.keying = crate::Keying::None;
+    config.webrtc_extensions = false;
     let (transport, runner) = IceTransportBuilder::new(config).build();
     tokio::spawn(runner);
 
@@ -3465,10 +3474,12 @@ fn test_upnp_library_exports() {
 /// Test that RTP mode respects UPnP enable flag
 #[tokio::test]
 async fn test_rtp_mode_upnp_disabled() {
-    use crate::TransportMode;
+    use crate::{Connectivity, Keying};
 
     let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Rtp;
+    config.connectivity = Connectivity::Sdp;
+    config.keying = Keying::None;
+    config.webrtc_extensions = false;
     config.enable_upnp = false;
 
     let (transport, _runner) = IceTransport::new(config);
@@ -3495,10 +3506,12 @@ async fn test_rtp_mode_upnp_disabled() {
 /// Test that RTP mode attempts UPnP when enabled (will fail in test env but shouldn't panic)
 #[tokio::test]
 async fn test_rtp_mode_upnp_enabled_graceful() {
-    use crate::TransportMode;
+    use crate::{Connectivity, Keying};
 
     let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Rtp;
+    config.connectivity = Connectivity::Sdp;
+    config.keying = Keying::None;
+    config.webrtc_extensions = false;
     config.enable_upnp = true;
 
     let (transport, _runner) = IceTransport::new(config);
@@ -3905,11 +3918,11 @@ async fn use_candidate_verification_is_retransmitted() -> Result<()> {
 /// WebRTC transports: the SRTP media path stays pinned to the nominated pair.
 /// In RTP mode the retarget remains enabled (legacy trunk behaviour).
 async fn latching_retarget_setup(
-    mode: crate::TransportMode,
+    connectivity: crate::Connectivity,
 ) -> Result<(IceTransport, IceCandidatePair, std::net::SocketAddr)> {
     let (t1, t2) = setup_host_pair(RtcConfiguration::default(), {
         let mut cfg = RtcConfiguration::default();
-        cfg.transport_mode = mode;
+        cfg.connectivity = connectivity;
         cfg.enable_latching = true;
         cfg
     })
@@ -3964,7 +3977,7 @@ async fn latching_retarget_setup(
 #[tokio::test]
 async fn webrtc_mode_ignores_ice_latching_retarget() -> Result<()> {
     let (t2, nominated_pair, _spoof_addr) =
-        latching_retarget_setup(crate::TransportMode::WebRtc).await?;
+        latching_retarget_setup(crate::Connectivity::Ice).await?;
 
     let final_pair = t2
         .get_selected_pair()
@@ -3979,7 +3992,7 @@ async fn webrtc_mode_ignores_ice_latching_retarget() -> Result<()> {
 #[tokio::test]
 async fn rtp_mode_still_applies_ice_latching_retarget() -> Result<()> {
     let (t2, _nominated_pair, spoof_addr) =
-        latching_retarget_setup(crate::TransportMode::Rtp).await?;
+        latching_retarget_setup(crate::Connectivity::Sdp).await?;
 
     let final_pair = t2
         .get_selected_pair()

@@ -12,11 +12,13 @@ use rustrtc::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode, 
 use rustrtc::media::MediaKind;
 use rustrtc::media::track::sample_track;
 use rustrtc::peer_connection::RtpCodecParameters;
-use rustrtc::{PeerConnection, RtcConfiguration, TransportMode};
+use rustrtc::{Connectivity, Keying, PeerConnection, RtcConfiguration};
 
 fn av_config() -> RtcConfiguration {
     let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Rtp;
+    config.connectivity = Connectivity::Sdp;
+    config.keying = Keying::None;
+    config.webrtc_extensions = false;
     config.sdp_compatibility = SdpCompatibilityMode::LegacySip;
     config.rtp_start_port = Some(20000);
     config.rtp_end_port = Some(20100);

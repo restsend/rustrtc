@@ -101,19 +101,9 @@ pub enum RtcpMuxPolicy {
     Negotiate,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub enum TransportMode {
-    #[default]
-    WebRtc,
-    Srtp,
-    Rtp,
-}
-
-/// How the media path to the peer is found. Derived from
-/// [`TransportMode`] and `enable_ice_lite` by
-/// [`RtcConfiguration::connectivity`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Connectivity {
+/// How the media path to the peer is found.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum Connectivity {
     /// The c=/m= address of the peer's SDP (corrected by latching, when on).
     /// A direct transport: no ICE agent.
     Sdp,
@@ -121,6 +111,7 @@ pub(crate) enum Connectivity {
     /// peer's checks and follows its nomination.
     IceLite,
     /// Full ICE: gathering, connectivity checks, nomination.
+    #[default]
     Ice,
 }
 
@@ -131,15 +122,15 @@ impl Connectivity {
     }
 }
 
-/// How the SRTP keys are exchanged. Derived from [`TransportMode`] by
-/// [`RtcConfiguration::keying`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Keying {
+/// How the SRTP keys are exchanged.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum Keying {
     /// Plain RTP (RTP/AVP).
     None,
     /// SDES, `a=crypto` (RFC 4568), RTP/SAVP.
     Sdes,
     /// DTLS-SRTP, `a=fingerprint` (RFC 5763/5764), UDP/TLS/RTP/SAVPF.
+    #[default]
     Dtls,
 }
 
@@ -476,6 +467,10 @@ fn default_enable_gcc() -> bool {
     true
 }
 
+fn default_webrtc_extensions() -> bool {
+    true
+}
+
 fn default_rtp_buffer_capacity() -> usize {
     100
 }
@@ -520,11 +515,25 @@ pub struct RtcConfiguration {
     pub bundle_policy: BundlePolicy,
     pub rtcp_mux_policy: RtcpMuxPolicy,
     pub certificates: Vec<CertificateConfig>,
-    pub transport_mode: TransportMode,
+    /// How the media path is found. Default: full ICE.
+    #[serde(default)]
+    pub connectivity: Connectivity,
+    /// How the SRTP keys are exchanged. Default: DTLS.
+    #[serde(default)]
+    pub keying: Keying,
+    /// The peer is a WebRTC endpoint (a browser, an SFU): offers claim
+    /// header extension ids for rid, repaired-rid, abs-send-time and
+    /// sdes:mid; with `enable_gcc`, descriptions carry transport-cc and we
+    /// send TWCC feedback; descriptions carry `msid`. Answers echo the rid,
+    /// abs-send-time and sdes:mid ids the remote offered either way. SIP
+    /// peers do not use these: set it to false for them. Default: true.
+    #[serde(default = "default_webrtc_extensions")]
+    pub webrtc_extensions: bool,
     pub nack_buffer_size: usize,
     /// Enable the TWCC + GCC bandwidth-adaptation loop: stamp outgoing RTP
     /// with the transport-cc sequence-number extension, generate TWCC feedback
     /// for inbound streams, and expose a sender `target_bitrate` estimate.
+    /// Only with `webrtc_extensions`.
     /// Default: true (no in-library send-rate limiting; apps opt in via
     /// `RtpSender::subscribe_target_bitrate`).
     #[serde(default = "default_enable_gcc")]
@@ -548,8 +557,8 @@ pub struct RtcConfiguration {
     /// the remote peer to send RTP to the external port.
     ///
     /// Works independently or combined with `external_ips`.
-    /// Only applies in RTP/SRTP direct mode (`TransportMode::Rtp` /
-    /// `TransportMode::Srtp`). Not used in WebRTC mode.
+    /// Only applies to direct transports (`Connectivity::Sdp` /
+    /// `Connectivity::IceLite`). Not used with full ICE.
     pub external_port: Option<u16>,
     /// Local addresses to bind media sockets on: one socket on each. Empty:
     /// chosen for us (WebRTC: every interface; RTP and SRTP: the address of
@@ -631,8 +640,8 @@ pub struct RtcConfiguration {
     pub sctp_max_buffered_amount: usize,
     pub dtls_buffer_size: usize,
     /// Pre-provisioned DTLS leaf certificate (DER) + PKCS#8 private key.
-    /// Required for WebRtc mode without `std` (no certificate generation
-    /// on embedded); ignored in `Rtp` mode. When unset on `std`, a fresh
+    /// Required for DTLS keying without `std` (no certificate generation
+    /// on embedded); ignored with other keying. When unset on `std`, a fresh
     /// self-signed certificate is generated per connection.
     #[serde(skip)]
     pub dtls_certificate: Option<Arc<crate::transports::dtls::Certificate>>,
@@ -654,7 +663,6 @@ pub struct RtcConfiguration {
     pub tcp_port_range_end: Option<u16>,
     pub enable_latching: bool,
     pub probation_max_packets: Option<u8>,
-    pub enable_ice_lite: bool,
     /// When true, demote host candidates with private (RFC 1918) local IPs
     /// below server-reflexive candidates in the connectivity check ordering.
     /// This avoids DTLS handshake failures behind NATs where a host candidate
@@ -740,7 +748,9 @@ impl PartialEq for RtcConfiguration {
             && self.bundle_policy == other.bundle_policy
             && self.rtcp_mux_policy == other.rtcp_mux_policy
             && self.certificates == other.certificates
-            && self.transport_mode == other.transport_mode
+            && self.connectivity == other.connectivity
+            && self.keying == other.keying
+            && self.webrtc_extensions == other.webrtc_extensions
             && self.nack_buffer_size == other.nack_buffer_size
             && self.enable_gcc == other.enable_gcc
             && self.media_capabilities == other.media_capabilities
@@ -779,7 +789,6 @@ impl PartialEq for RtcConfiguration {
             && self.tcp_port_range_end == other.tcp_port_range_end
             && self.enable_latching == other.enable_latching
             && self.probation_max_packets == other.probation_max_packets
-            && self.enable_ice_lite == other.enable_ice_lite
             && self.prefer_srflx_over_natted_host == other.prefer_srflx_over_natted_host
             && self.enable_upnp == other.enable_upnp
             && self.upnp_lease_duration == other.upnp_lease_duration
@@ -801,29 +810,6 @@ impl PartialEq for RtcConfiguration {
 
 impl Eq for RtcConfiguration {}
 
-impl RtcConfiguration {
-    /// How the media path is found. `enable_ice_lite` applies to the direct
-    /// modes (RTP, SRTP); WebRTC always runs full ICE.
-    pub(crate) fn connectivity(&self) -> Connectivity {
-        match self.transport_mode {
-            TransportMode::WebRtc => Connectivity::Ice,
-            TransportMode::Rtp | TransportMode::Srtp if self.enable_ice_lite => {
-                Connectivity::IceLite
-            }
-            TransportMode::Rtp | TransportMode::Srtp => Connectivity::Sdp,
-        }
-    }
-
-    /// How the SRTP keys are exchanged.
-    pub(crate) fn keying(&self) -> Keying {
-        match self.transport_mode {
-            TransportMode::Rtp => Keying::None,
-            TransportMode::Srtp => Keying::Sdes,
-            TransportMode::WebRtc => Keying::Dtls,
-        }
-    }
-}
-
 impl Default for RtcConfiguration {
     fn default() -> Self {
         Self {
@@ -832,7 +818,9 @@ impl Default for RtcConfiguration {
             bundle_policy: BundlePolicy::default(),
             rtcp_mux_policy: RtcpMuxPolicy::default(),
             certificates: Vec::new(),
-            transport_mode: TransportMode::default(),
+            connectivity: Connectivity::default(),
+            keying: Keying::default(),
+            webrtc_extensions: default_webrtc_extensions(),
             nack_buffer_size: 200,
             enable_gcc: default_enable_gcc(),
             media_capabilities: None,
@@ -871,7 +859,6 @@ impl Default for RtcConfiguration {
             tcp_port_range_end: None,
             enable_latching: false,
             probation_max_packets: None,
-            enable_ice_lite: false,
             prefer_srflx_over_natted_host: false,
             enable_upnp: default_enable_upnp(),
             enable_mdns: false,
@@ -966,11 +953,6 @@ impl RtcConfigurationBuilder {
         self
     }
 
-    pub fn enable_ice_lite(mut self, enable: bool) -> Self {
-        self.inner.enable_ice_lite = enable;
-        self
-    }
-
     pub fn prefer_srflx_over_natted_host(mut self, enable: bool) -> Self {
         self.inner.prefer_srflx_over_natted_host = enable;
         self
@@ -1032,8 +1014,18 @@ impl RtcConfigurationBuilder {
         self
     }
 
-    pub fn transport_mode(mut self, mode: TransportMode) -> Self {
-        self.inner.transport_mode = mode;
+    pub fn connectivity(mut self, connectivity: Connectivity) -> Self {
+        self.inner.connectivity = connectivity;
+        self
+    }
+
+    pub fn keying(mut self, keying: Keying) -> Self {
+        self.inner.keying = keying;
+        self
+    }
+
+    pub fn webrtc_extensions(mut self, enable: bool) -> Self {
+        self.inner.webrtc_extensions = enable;
         self
     }
 
@@ -1129,7 +1121,7 @@ impl RtcConfigurationBuilder {
     }
 
     /// Pre-provisioned DTLS certificate (DER leaf + PKCS#8 key). Required
-    /// for WebRtc mode on no_std; on std a self-signed certificate is
+    /// for DTLS keying on no_std; on std a self-signed certificate is
     /// generated when this is unset.
     pub fn dtls_certificate(mut self, cert: Arc<crate::transports::dtls::Certificate>) -> Self {
         self.inner.dtls_certificate = Some(cert);

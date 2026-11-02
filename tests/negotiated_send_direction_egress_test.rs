@@ -11,7 +11,8 @@ use rustrtc::rtp::{RtpHeader, RtpPacket};
 use rustrtc::sdp::Direction;
 use rustrtc::transports::rtp::RtpRewriteBridgeParams;
 use rustrtc::{
-    PeerConnection, RtcConfiguration, RtpCodecParameters, TransceiverDirection, TransportMode,
+    Connectivity, Keying, PeerConnection, RtcConfiguration, RtpCodecParameters,
+    TransceiverDirection,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -26,9 +27,11 @@ fn pcmu() -> RtpCodecParameters {
     }
 }
 
-fn pc(mode: TransportMode) -> PeerConnection {
+fn pc(mode: (Connectivity, Keying)) -> PeerConnection {
     PeerConnection::new(RtcConfiguration {
-        transport_mode: mode,
+        connectivity: mode.0,
+        keying: mode.1,
+        webrtc_extensions: mode.0 == Connectivity::Ice,
         ..RtcConfiguration::default()
     })
 }
@@ -72,7 +75,7 @@ async fn negotiate(
 /// A connected pair: `local` sends audio, `remote` answered `direction` and
 /// counts the RTP it receives.
 async fn pair(
-    mode: TransportMode,
+    mode: (Connectivity, Keying),
     direction: Direction,
 ) -> Result<(PeerConnection, PeerConnection, Arc<Ingress>)> {
     let local = pc(mode.clone());
@@ -98,9 +101,9 @@ async fn send_dtmf_like_packets(pc: &PeerConnection) {
 #[tokio::test]
 async fn send_raw_rtp_follows_the_negotiated_direction() -> Result<()> {
     for mode in [
-        TransportMode::Rtp,
-        TransportMode::Srtp,
-        TransportMode::WebRtc,
+        (Connectivity::Sdp, Keying::None),
+        (Connectivity::Sdp, Keying::Sdes),
+        (Connectivity::Ice, Keying::Dtls),
     ] {
         for (direction, delivered) in [
             (Direction::SendRecv, true),
@@ -131,8 +134,11 @@ struct Relay {
     ingress: Arc<Ingress>,
 }
 
-async fn relay(out_mode: TransportMode, sink_direction: Direction) -> Result<Relay> {
-    let (source, relay_in) = (pc(TransportMode::Rtp), pc(TransportMode::Rtp));
+async fn relay(out_mode: (Connectivity, Keying), sink_direction: Direction) -> Result<Relay> {
+    let (source, relay_in) = (
+        pc((Connectivity::Sdp, Keying::None)),
+        pc((Connectivity::Sdp, Keying::None)),
+    );
     let (feed, track, _) = sample_track(rustrtc::media::MediaKind::Audio, 100);
     source.add_track(track, pcmu())?;
     negotiate(&source, &relay_in, Direction::SendRecv).await?;
@@ -164,7 +170,7 @@ async fn relay(out_mode: TransportMode, sink_direction: Direction) -> Result<Rel
 }
 
 async fn relayed_packets(sink_direction: Direction) -> Result<usize> {
-    let relay = relay(TransportMode::Rtp, sink_direction).await?;
+    let relay = relay((Connectivity::Sdp, Keying::None), sink_direction).await?;
     feed_frames(&relay.feed).await;
     Ok(relay.ingress.count())
 }
@@ -202,7 +208,8 @@ async fn relay_stops_when_the_sink_does_not_receive() -> Result<()> {
 /// The gate lifts again when a later answer allows sending.
 #[tokio::test]
 async fn send_raw_rtp_resumes_after_the_hold_is_released() -> Result<()> {
-    let (local, remote, ingress) = pair(TransportMode::Rtp, Direction::Inactive).await?;
+    let (local, remote, ingress) =
+        pair((Connectivity::Sdp, Keying::None), Direction::Inactive).await?;
     send_dtmf_like_packets(&local).await;
     assert_eq!(ingress.count(), 0);
 
@@ -226,7 +233,7 @@ async fn remote_hold_stops_raw_and_relayed_rtp_until_resumed() -> Result<()> {
         feed,
         ingress,
         _pcs,
-    } = relay(TransportMode::WebRtc, Direction::SendRecv).await?;
+    } = relay((Connectivity::Ice, Keying::Dtls), Direction::SendRecv).await?;
     let raw_and_relayed = || async {
         let before = ingress.count();
         send_dtmf_like_packets(&out).await;
@@ -265,7 +272,9 @@ async fn a_held_stream_inside_a_bundle_is_gated_by_ssrc() -> Result<()> {
 #[tokio::test]
 async fn a_held_stream_is_gated_on_every_transport_without_bundle() -> Result<()> {
     let config = RtcConfiguration {
-        transport_mode: TransportMode::Rtp,
+        connectivity: Connectivity::Sdp,
+        keying: Keying::None,
+        webrtc_extensions: false,
         sdp_compatibility: rustrtc::SdpCompatibilityMode::LegacySip,
         ..RtcConfiguration::default()
     };

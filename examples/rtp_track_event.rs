@@ -30,7 +30,9 @@ async fn main() {
 
     // Configure PeerConnection for RTP mode (like SIP)
     let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Rtp;
+    config.connectivity = Connectivity::Sdp;
+    config.keying = Keying::None;
+    config.webrtc_extensions = false;
 
     let pc = Arc::new(PeerConnection::new(config));
     println!("✓ Created PeerConnection in RTP mode");

@@ -7,8 +7,8 @@ use anyhow::Result;
 use rustrtc::media::track::sample_track;
 use rustrtc::sdp::{Origin, SessionDescription};
 use rustrtc::{
-    MediaKind, PeerConnection, RtcConfiguration, RtpCodecParameters, TransceiverDirection,
-    TransportMode,
+    Connectivity, Keying, MediaKind, PeerConnection, RtcConfiguration, RtpCodecParameters,
+    TransceiverDirection,
 };
 
 fn opus() -> RtpCodecParameters {
@@ -22,7 +22,9 @@ fn opus() -> RtpCodecParameters {
 
 fn rtp_pc() -> PeerConnection {
     PeerConnection::new(RtcConfiguration {
-        transport_mode: TransportMode::Rtp,
+        connectivity: Connectivity::Sdp,
+        keying: Keying::None,
+        webrtc_extensions: false,
         ..RtcConfiguration::default()
     })
 }
@@ -155,7 +157,9 @@ async fn the_first_description_gets_a_fresh_origin() -> Result<()> {
 #[tokio::test]
 async fn reoffers_keep_the_configured_external_ip() -> Result<()> {
     let pc1 = PeerConnection::new(RtcConfiguration {
-        transport_mode: TransportMode::Rtp,
+        connectivity: Connectivity::Sdp,
+        keying: Keying::None,
+        webrtc_extensions: false,
         external_ips: vec!["203.0.113.10".parse().unwrap()],
         ..RtcConfiguration::default()
     });

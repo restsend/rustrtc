@@ -1,6 +1,6 @@
 #![cfg(not(feature = "std"))]
 
-//! G1 capstone: full WebRTC transport mode (`TransportMode::WebRtc` —
+//! G1 capstone: full WebRTC (`Connectivity::Ice` + `Keying::Dtls` —
 //! ICE + DTLS-SRTP) under no_std. Two no_std `PeerConnection`s, each with a
 //! pre-provisioned DTLS certificate, run the complete flow against the mock
 //! runtime: offer/answer (fingerprint + full ICE candidates), STUN
