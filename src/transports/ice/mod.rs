@@ -3244,7 +3244,7 @@ fn publish_selected_socket(
         "ICE: published selected socket"
     );
     let _ = inner.selected_socket.send(Some(socket.clone()));
-    publish_selected_rtcp_socket(inner, Some(socket));
+    publish_selected_rtcp_socket(inner, Some(pair), Some(socket));
 }
 
 /// Apply a verified controlled-side nomination only if it is still the most
@@ -3360,7 +3360,7 @@ async fn complete_controlled_inbound_tcp_nomination(
             // cannot interleave with a concurrent pair+socket commit.
             let _selection = inner.selection_lock.lock();
             let _ = inner.selected_socket.send(Some(sender.clone()));
-            publish_selected_rtcp_socket(&inner, Some(sender.clone()));
+            publish_selected_rtcp_socket(&inner, None, Some(sender.clone()));
         }
     }
     let _ = inner.nomination_complete.send(Some(true));
@@ -3379,12 +3379,28 @@ async fn complete_controlled_inbound_tcp_nomination(
     );
 }
 
-fn resolve_rtcp_socket(inner: &IceTransportInner) -> Option<IceSocketWrapper> {
-    let candidate = inner
+/// The RTCP socket that goes with the media `pair`: the one of the RTCP
+/// candidate on its local address (the socket next to the media socket, of
+/// its family), else the first RTCP candidate's.
+fn resolve_rtcp_socket(
+    inner: &IceTransportInner,
+    pair: Option<&IceCandidatePair>,
+) -> Option<IceSocketWrapper> {
+    let rtcp: Vec<_> = inner
         .gatherer
         .local_candidates()
         .into_iter()
-        .find(|candidate| candidate.component == 2)?;
+        .filter(|candidate| candidate.component == 2)
+        .collect();
+    let candidate = pair
+        .map(|p| p.local.address)
+        .and_then(|local| {
+            rtcp.iter()
+                .find(|c| c.address.ip() == local.ip())
+                .or_else(|| rtcp.iter().find(|c| c.address.is_ipv4() == local.is_ipv4()))
+        })
+        .or_else(|| rtcp.first())?
+        .clone();
 
     if candidate.typ == IceCandidateType::Relay {
         let clients = inner.gatherer.turn_clients.lock();
@@ -3409,8 +3425,12 @@ fn resolve_rtcp_socket(inner: &IceTransportInner) -> Option<IceSocketWrapper> {
     }
 }
 
-fn publish_selected_rtcp_socket(inner: &IceTransportInner, fallback: Option<IceSocketWrapper>) {
-    if let Some(socket) = resolve_rtcp_socket(inner).or(fallback) {
+fn publish_selected_rtcp_socket(
+    inner: &IceTransportInner,
+    pair: Option<&IceCandidatePair>,
+    fallback: Option<IceSocketWrapper>,
+) {
+    if let Some(socket) = resolve_rtcp_socket(inner, pair).or(fallback) {
         let _ = inner.selected_rtcp_socket.send(Some(socket));
     }
 }
@@ -3822,6 +3842,9 @@ async fn handle_stun_request(
         if let Some(pair) = current_pair
             && pair.remote.address.port() == addr.port()
             && pair.remote.address.ip() != addr.ip()
+            // The other family is another path, not a NAT rebinding: only a
+            // nomination moves the pair there.
+            && pair.remote.address.is_ipv4() == addr.is_ipv4()
         {
             debug!(
                 "RTP latching: updating remote address from {} to {}",
@@ -3903,8 +3926,13 @@ async fn handle_stun_request(
                 IceSocketWrapper::Turn(_, addr) => *addr,
             };
 
+            // The socket's candidate of the peer's family: a dual-stack socket
+            // has one per family.
             let locals = inner.gatherer.local_candidates();
-            let local_cand = locals.iter().find(|c| c.base_address() == local_addr);
+            let on_socket = || locals.iter().filter(|c| c.base_address() == local_addr);
+            let local_cand = on_socket()
+                .find(|c| c.address.is_ipv4() == addr.is_ipv4())
+                .or_else(|| on_socket().next());
 
             let pair = {
                 let remotes = inner.remote_candidates.lock();

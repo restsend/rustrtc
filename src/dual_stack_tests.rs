@@ -385,3 +385,354 @@ async fn reinvite_changes_family() {
         }
     }
 }
+
+use crate::transports::ice::stun::{StunAttribute, StunClass, StunDecoded, StunMessage};
+use core::net::SocketAddr;
+use core::time::Duration;
+use tokio::net::UdpSocket;
+
+const PEER_PWD: &str = "phonepasswordphonepassword";
+
+/// A full-ICE peer (like Linphone) on a direct transport: its sockets,
+/// one RTP (and RTCP without rtcp-mux) per family.
+struct IcePeer {
+    v4: UdpSocket,
+    v6: UdpSocket,
+    v4_rtcp: Option<UdpSocket>,
+    v6_rtcp: Option<UdpSocket>,
+}
+
+impl IcePeer {
+    async fn new(rtcp_mux: bool) -> Self {
+        let rtcp = |ip: &'static str| async move {
+            if rtcp_mux {
+                None
+            } else {
+                Some(UdpSocket::bind((ip, 0)).await.unwrap())
+            }
+        };
+        IcePeer {
+            v4: UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            v6: UdpSocket::bind("[::1]:0").await.unwrap(),
+            v4_rtcp: rtcp("127.0.0.1").await,
+            v6_rtcp: rtcp("::1").await,
+        }
+    }
+
+    fn addr(s: &UdpSocket) -> SocketAddr {
+        s.local_addr().unwrap()
+    }
+
+    /// Its offer: `c=` of `default` (true: IPv4), candidates of both
+    /// families.
+    fn offer(&self, mode: &TransportMode, default_v4: bool, version: u32) -> String {
+        let default = if default_v4 { &self.v4 } else { &self.v6 };
+        let mut sdp = peer_offer(mode, Self::addr(default), version, self.v4_rtcp.is_none());
+        let rtcp_default = if default_v4 {
+            &self.v4_rtcp
+        } else {
+            &self.v6_rtcp
+        };
+        if let Some(rtcp) = rtcp_default {
+            sdp += &format!("a=rtcp:{}\r\n", Self::addr(rtcp).port());
+        }
+        sdp += &format!("a=ice-ufrag:phon\r\na=ice-pwd:{PEER_PWD}\r\n");
+        for (n, s) in [(1, &self.v6), (2, &self.v4)] {
+            let a = Self::addr(s);
+            sdp += &format!(
+                "a=candidate:{n} 1 UDP {} {} {} typ host\r\n",
+                2130706431 - n,
+                a.ip(),
+                a.port()
+            );
+        }
+        for (n, s) in [(3, &self.v6_rtcp), (4, &self.v4_rtcp)] {
+            if let Some(s) = s {
+                let a = Self::addr(s);
+                sdp += &format!(
+                    "a=candidate:{n} 2 UDP {} {} {} typ host\r\n",
+                    2130706431 - n,
+                    a.ip(),
+                    a.port()
+                );
+            }
+        }
+        sdp
+    }
+}
+
+/// Our ICE credentials and candidates (component, address) in a description.
+fn our_ice(sdp: &str) -> (String, String, Vec<(u16, SocketAddr)>) {
+    let attr = |k: &str| {
+        sdp.lines()
+            .find_map(|l| l.strip_prefix(&format!("a={k}:")))
+            .unwrap_or_else(|| panic!("no a={k}:\n{sdp}"))
+            .to_string()
+    };
+    let cands = sdp
+        .lines()
+        .filter_map(|l| l.strip_prefix("a=candidate:"))
+        .map(|c| {
+            let p: Vec<&str> = c.split_whitespace().collect();
+            let ip: core::net::IpAddr = p[4].parse().unwrap();
+            (
+                p[1].parse().unwrap(),
+                SocketAddr::new(ip, p[5].parse().unwrap()),
+            )
+        })
+        .collect();
+    (attr("ice-ufrag"), attr("ice-pwd"), cands)
+}
+
+/// Send a connectivity check as controlling from `from` to `to`
+/// (USE-CANDIDATE when `nominate`), and wait for the answer: other packets
+/// are skipped.
+async fn check(
+    from: &UdpSocket,
+    to: SocketAddr,
+    ice: &(String, String, Vec<(u16, SocketAddr)>),
+    nominate: bool,
+) -> Option<StunDecoded> {
+    let mut msg = StunMessage::binding_request(rand::random(), None);
+    msg.attributes = vec![
+        StunAttribute::Username(format!("{}:phon", ice.0)),
+        StunAttribute::Priority(2130706431),
+        StunAttribute::IceControlling(42),
+    ];
+    if nominate {
+        msg.attributes.push(StunAttribute::UseCandidate);
+    }
+    let id = msg.transaction_id;
+    from.send_to(&msg.encode(Some(ice.1.as_bytes()), true).unwrap(), to)
+        .await
+        .unwrap();
+    let mut buf = [0u8; 1500];
+    loop {
+        let Ok(Ok((n, src))) =
+            tokio::time::timeout(Duration::from_millis(500), from.recv_from(&mut buf)).await
+        else {
+            return None;
+        };
+        let Ok(msg) = StunMessage::decode(&buf[..n]) else {
+            continue;
+        };
+        if msg.transaction_id == id {
+            return Some(msg);
+        }
+        answer_check(from, &msg, src).await;
+    }
+}
+
+/// Answer the node's connectivity check, as a full agent does.
+async fn answer_check(socket: &UdpSocket, msg: &StunDecoded, from: SocketAddr) {
+    if msg.class == StunClass::Request {
+        let resp = StunMessage::binding_success_response(msg.transaction_id, from);
+        let bytes = resp.encode(Some(PEER_PWD.as_bytes()), true).unwrap();
+        socket.send_to(&bytes, from).await.unwrap();
+    }
+}
+
+/// Answer the node's checks on `socket` for a while (it verifies a new
+/// nominated path with a round trip before it moves media there).
+async fn serve_checks(socket: &UdpSocket) {
+    let mut buf = [0u8; 1500];
+    while let Ok(Ok((n, from))) =
+        tokio::time::timeout(Duration::from_millis(300), socket.recv_from(&mut buf)).await
+    {
+        if let Ok(msg) = StunMessage::decode(&buf[..n]) {
+            answer_check(socket, &msg, from).await;
+        }
+    }
+}
+
+/// A clear RTP header (SSRC 7): latching reads only that.
+fn rtp(seq: u16) -> Vec<u8> {
+    let mut p = vec![0x80, 0x00, 0, 0, 0, 0, 0, 1, 0, 0, 0, 7];
+    p[2..4].copy_from_slice(&seq.to_be_bytes());
+    p.extend_from_slice(&[0u8; 20]);
+    p
+}
+
+/// Wait until `socket` gets a packet that is not STUN, sending `send` again
+/// until then: the media path is the pair's.
+async fn receives_media(socket: &UdpSocket, mut send: impl FnMut()) -> bool {
+    let mut buf = [0u8; 1500];
+    for _ in 0..20 {
+        send();
+        if let Ok(Ok((n, _))) =
+            tokio::time::timeout(Duration::from_millis(100), socket.recv_from(&mut buf)).await
+            && n > 0
+            && buf[0] >= 2
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// ICE-lite with a full-ICE peer: media starts on the `c=` family (and RTP
+/// latches there); the peer then nominates the other family. Media, and
+/// the socket it leaves from, follow the nomination, also when RTP was
+/// latched; RTCP follows the peer's RTCP in the new family.
+#[tokio::test]
+async fn ice_lite_nomination_moves_media_to_the_other_family() {
+    for (setup, bind_ips, external_ips) in direct_setups() {
+        for mode in [TransportMode::Rtp, TransportMode::Srtp] {
+            for rtcp_mux in [true, false] {
+                for start_v4 in [true, false] {
+                    let what = format!("{setup}, {mode:?}, mux {rtcp_mux}, c= v4 {start_v4}");
+                    let peer = IcePeer::new(rtcp_mux).await;
+                    let mut cfg = config(mode.clone());
+                    cfg.enable_ice_lite = true;
+                    cfg.enable_latching = true;
+                    cfg.bind_ips = bind_ips.clone();
+                    cfg.external_ips = external_ips.clone();
+                    let pc = PeerConnection::new(cfg);
+                    let sdp = answer(&pc, &peer.offer(&mode, start_v4, 1)).await;
+                    let ice = our_ice(&sdp);
+                    let ours = |comp: u16, v4: bool| {
+                        ice.2
+                            .iter()
+                            .find(|(c, a)| *c == comp && a.is_ipv4() == v4)
+                            .map(|(_, a)| *a)
+                            .unwrap_or_else(|| panic!("{what}: no candidate {comp}/{v4}:\n{sdp}"))
+                    };
+                    let (from, to) = if start_v4 {
+                        (&peer.v4, &peer.v6)
+                    } else {
+                        (&peer.v6, &peer.v4)
+                    };
+                    // RTP from the c= family first: the node latches there.
+                    for seq in 0..5 {
+                        from.send_to(&rtp(seq), ours(1, start_v4)).await.unwrap();
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let conn = pc.rtp_transport_for_test().unwrap().ice_conn();
+                    assert_eq!(
+                        *conn.remote_addr.read(),
+                        IcePeer::addr(from),
+                        "{what}: latched"
+                    );
+
+                    // The peer nominates the other family (RTP, then RTCP).
+                    let resp = check(to, ours(1, !start_v4), &ice, true).await;
+                    assert_eq!(
+                        resp.map(|r| r.class),
+                        Some(StunClass::SuccessResponse),
+                        "{what}"
+                    );
+                    serve_checks(to).await;
+                    if let (Some(rtcp_from), Some(rtcp_to)) = if start_v4 {
+                        (&peer.v6_rtcp, peer.v6_rtcp.as_ref().map(|_| ours(2, false)))
+                    } else {
+                        (&peer.v4_rtcp, peer.v4_rtcp.as_ref().map(|_| ours(2, true)))
+                    } {
+                        let resp = check(rtcp_from, rtcp_to, &ice, true).await;
+                        assert!(resp.is_some(), "{what}: RTCP check answered");
+                    }
+                    let pair = pc.ice_transport().get_selected_pair().unwrap();
+                    assert_eq!(pair.local.address, ours(1, !start_v4), "{what}");
+                    assert_eq!(pair.remote.address, IcePeer::addr(to), "{what}");
+                    let send = || {
+                        let _ = conn.try_send(&rtp(9));
+                    };
+                    assert!(
+                        receives_media(to, send).await,
+                        "{what}: media in the new family"
+                    );
+
+                    if let Some(rtcp_to) = if start_v4 {
+                        &peer.v6_rtcp
+                    } else {
+                        &peer.v4_rtcp
+                    } {
+                        // The peer's RTCP from its new-family socket teaches
+                        // our RTCP destination there.
+                        let sr = [0x80u8, 200, 0, 1, 0, 0, 0, 7];
+                        for _ in 0..3 {
+                            rtcp_to.send_to(&sr, ours(2, !start_v4)).await.unwrap();
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        assert_eq!(
+                            *conn.remote_rtcp_addr.read(),
+                            Some(IcePeer::addr(rtcp_to)),
+                            "{what}: RTCP follows"
+                        );
+                    }
+                    pc.close();
+                }
+            }
+        }
+    }
+}
+
+/// A check from the other family on the same port as the current pair's
+/// remote is another path, not a NAT rebinding: without a nomination it
+/// moves nothing.
+#[tokio::test]
+async fn check_from_the_other_family_does_not_latch() {
+    for (setup, bind_ips, external_ips) in direct_setups() {
+        let v4 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let Ok(v6) = UdpSocket::bind(("::1", IcePeer::addr(&v4).port())).await else {
+            continue;
+        };
+        let mut cfg = config(TransportMode::Srtp);
+        cfg.enable_ice_lite = true;
+        cfg.enable_latching = true;
+        cfg.bind_ips = bind_ips.clone();
+        cfg.external_ips = external_ips.clone();
+        let pc = PeerConnection::new(cfg);
+        let mut offer = peer_offer(&TransportMode::Srtp, IcePeer::addr(&v4), 1, true);
+        offer += &format!("a=ice-ufrag:phon\r\na=ice-pwd:{PEER_PWD}\r\n");
+        let sdp = answer(&pc, &offer).await;
+        let ice = our_ice(&sdp);
+        let our_v6 = ice
+            .2
+            .iter()
+            .find(|(c, a)| *c == 1 && a.is_ipv6())
+            .unwrap()
+            .1;
+        assert!(check(&v6, our_v6, &ice, false).await.is_some(), "{setup}");
+        let pair = pc.ice_transport().get_selected_pair().unwrap();
+        assert_eq!(pair.remote.address, IcePeer::addr(&v4), "{setup}");
+        pc.close();
+    }
+}
+
+/// Without ICE, RTP from a source the media socket can't reach (another
+/// family, on another socket) never becomes the destination.
+#[tokio::test]
+async fn rtp_latching_stays_in_the_socket_family() {
+    let v4 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let v6 = UdpSocket::bind("[::1]:0").await.unwrap();
+    let mut cfg = config(TransportMode::Rtp);
+    cfg.enable_latching = true;
+    cfg.bind_ips = vec![ip("127.0.0.1"), ip("::1")];
+    let pc = PeerConnection::new(cfg);
+    let sdp = answer(
+        &pc,
+        &peer_offer(&TransportMode::Rtp, IcePeer::addr(&v4), 1, true),
+    )
+    .await;
+    let ours = media_addr(&sdp);
+    let cands = pc.ice_transport().local_candidates();
+    let our_v6 = cands
+        .iter()
+        .find(|c| c.component == 1 && c.address.is_ipv6())
+        .unwrap()
+        .address;
+    for seq in 0..10 {
+        v6.send_to(&rtp(seq), our_v6).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let conn = pc.rtp_transport_for_test().unwrap().ice_conn();
+    assert_eq!(*conn.remote_addr.read(), IcePeer::addr(&v4));
+    assert!(ours.is_ipv4());
+    assert!(
+        receives_media(&v4, || {
+            let _ = conn.try_send(&rtp(1));
+        })
+        .await
+    );
+    pc.close();
+}

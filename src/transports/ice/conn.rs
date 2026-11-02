@@ -129,6 +129,23 @@ pub struct SourceChange {
     pub switch: u8,
 }
 
+/// Whether `socket` can send to `addr`: a socket on an IPv4 address only to
+/// IPv4, one on `::` (dual-stack) to both, one on a given IPv6 address only
+/// to IPv6. Unknown (no socket yet, a relay, TCP): yes.
+fn can_reach(socket: Option<&IceSocketWrapper>, addr: SocketAddr) -> bool {
+    let local = match socket {
+        Some(IceSocketWrapper::Udp(s)) => s.local_addr().ok(),
+        Some(IceSocketWrapper::SharedUdp(h)) => h.local_addr().ok(),
+        Some(IceSocketWrapper::Platform(s)) => s.local_addr().ok(),
+        _ => None,
+    };
+    match local {
+        Some(SocketAddr::V4(_)) => addr.is_ipv4(),
+        Some(SocketAddr::V6(local)) => local.ip().is_unspecified() || addr.is_ipv6(),
+        None => true,
+    }
+}
+
 pub struct IceConn {
     pub socket_rx: watch::Receiver<Option<IceSocketWrapper>>,
     rtcp_socket_rx: watch::Receiver<Option<IceSocketWrapper>>,
@@ -625,6 +642,18 @@ impl IceConn {
         reason: &'static str,
     ) {
         let current = *self.remote_addr.read();
+        if current.is_ipv4() != addr.is_ipv4() {
+            // The pair moved to the other family, and the selected socket
+            // with it: the latched remote is out of its reach. Follow the
+            // pair; latching starts again in its family (RTCP too).
+            debug!(
+                "IceConn: selected-pair remote changed family {} -> {} ({})",
+                current, addr, reason
+            );
+            self.reset_latch();
+            *self.remote_addr.write() = addr;
+            return;
+        }
         if self.latch_on_rtp.load(Ordering::Relaxed)
             && self.rtp_latched.load(Ordering::Relaxed)
             && current != addr
@@ -974,7 +1003,15 @@ impl PacketReceiver for IceConn {
             } else {
             }
 
-            if self.latch_on_rtp.load(Ordering::Relaxed) {
+            // A source the media socket can't send to (the other family,
+            // from another socket of the transport) never becomes the
+            // destination.
+            let reachable = if is_rtcp {
+                can_reach(self.rtcp_socket_rx.borrow().as_ref(), addr)
+            } else {
+                can_reach(self.socket_rx.borrow().as_ref(), addr)
+            };
+            if self.latch_on_rtp.load(Ordering::Relaxed) && reachable {
                 if is_rtcp {
                     // RTCP may teach the RTCP destination in non-mux mode, but it must
                     // never override the RTP remote address.  A *new* RTCP source must

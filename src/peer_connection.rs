@@ -9161,6 +9161,11 @@ impl PeerConnection {
     pub fn ice_transport_for_test(&self) -> &crate::transports::ice::IceTransport {
         &self.inner.ice_transport
     }
+
+    /// The primary RTP transport, for unit tests of its media path.
+    pub fn rtp_transport_for_test(&self) -> Option<Arc<RtpTransport>> {
+        self.inner.rtp_transport.lock().clone()
+    }
 }
 
 #[cfg(all(test, feature = "std"))]
