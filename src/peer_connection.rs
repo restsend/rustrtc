@@ -1652,12 +1652,31 @@ impl PeerConnection {
                 "create_answer requires remote offer".into(),
             ));
         }
-        self.inner
-            .ice_transport
-            .set_role(crate::transports::ice::IceRole::Controlled);
+        // The answerer is controlled, except against an ICE-lite offerer
+        // (see `apply_remote_description`).
+        let remote_lite = self
+            .inner
+            .remote_description
+            .lock()
+            .as_ref()
+            .is_some_and(Self::sdp_is_ice_lite);
+        if !remote_lite {
+            self.inner
+                .ice_transport
+                .set_role(crate::transports::ice::IceRole::Controlled);
+        }
         self.inner
             .build_description(SdpType::Answer, |dir| dir.answer_direction())
             .await
+    }
+
+    /// The description is of an ICE-lite agent: `a=ice-lite` (session level,
+    /// RFC 8839 §5.3).
+    fn sdp_is_ice_lite(desc: &SessionDescription) -> bool {
+        desc.session
+            .attributes
+            .iter()
+            .any(|attr| attr.key == "ice-lite")
     }
 
     pub fn set_local_description(&self, desc: SessionDescription) -> RtcResult<()> {
@@ -2075,11 +2094,19 @@ impl PeerConnection {
         }
 
         if self.config().connectivity == Connectivity::Ice {
+            let remote_lite = Self::sdp_is_ice_lite(&desc);
+            if remote_lite {
+                // RFC 8445 §6.1.1: against an ICE-lite peer, the full agent is
+                // controlling, offerer or answerer. Set before the checks start.
+                self.inner
+                    .ice_transport
+                    .set_role(crate::transports::ice::IceRole::Controlling);
+            }
             if let (Some(u), Some(p)) = (ufrag.clone(), pwd.clone()) {
                 let params = crate::transports::ice::IceParameters {
                     username_fragment: u,
                     password: p,
-                    ice_lite: false,
+                    ice_lite: remote_lite,
                     tie_breaker: 0,
                 };
                 debug!("[pc-probe] answerer ICE start(params) called");

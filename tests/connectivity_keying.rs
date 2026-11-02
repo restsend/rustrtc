@@ -291,19 +291,16 @@ async fn ice_offers_to_ice_lite_dtls() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "full ICE answers an ICE-lite offer as controlled"]
 async fn ice_lite_offers_to_ice_none() -> Result<()> {
     call(Connectivity::IceLite, Connectivity::Ice, Keying::None).await
 }
 
 #[tokio::test]
-#[ignore = "full ICE answers an ICE-lite offer as controlled"]
 async fn ice_lite_offers_to_ice_sdes() -> Result<()> {
     call(Connectivity::IceLite, Connectivity::Ice, Keying::Sdes).await
 }
 
 #[tokio::test]
-#[ignore = "full ICE answers an ICE-lite offer as controlled"]
 async fn ice_lite_offers_to_ice_dtls() -> Result<()> {
     call(Connectivity::IceLite, Connectivity::Ice, Keying::Dtls).await
 }
