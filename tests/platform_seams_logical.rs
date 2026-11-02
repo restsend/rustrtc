@@ -165,7 +165,7 @@ fn noop_waker() -> std::task::Waker {
 /// receivers whichever polled `changed()` first consumed the version bump and
 /// the second silently missed the update. In the PeerConnection that meant the
 /// DTLS loop could miss ICE `Connected` (the ICE-state monitor consumed it
-/// first) and therefore never call `start_dtls` — the intermittent
+/// first) and therefore never call `start_transport` — the intermittent
 /// "ICE connects but no media" failure. Every receiver must observe every
 /// update on its own cursor.
 #[test]

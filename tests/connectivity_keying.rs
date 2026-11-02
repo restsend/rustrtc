@@ -241,7 +241,6 @@ async fn sdp_sdes() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "DTLS does not run on direct transports yet"]
 async fn sdp_dtls() -> Result<()> {
     call(Connectivity::Sdp, Connectivity::Sdp, Keying::Dtls).await
 }
@@ -257,19 +256,16 @@ async fn ice_lite_sdes() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "DTLS does not run on direct transports yet"]
 async fn ice_lite_dtls() -> Result<()> {
     call(Connectivity::IceLite, Connectivity::IceLite, Keying::Dtls).await
 }
 
 #[tokio::test]
-#[ignore = "full ICE always runs DTLS"]
 async fn ice_none() -> Result<()> {
     call(Connectivity::Ice, Connectivity::Ice, Keying::None).await
 }
 
 #[tokio::test]
-#[ignore = "full ICE always runs DTLS"]
 async fn ice_sdes() -> Result<()> {
     call(Connectivity::Ice, Connectivity::Ice, Keying::Sdes).await
 }
@@ -280,37 +276,34 @@ async fn ice_dtls() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "full ICE always runs DTLS"]
 async fn ice_offers_to_ice_lite_none() -> Result<()> {
     call(Connectivity::Ice, Connectivity::IceLite, Keying::None).await
 }
 
 #[tokio::test]
-#[ignore = "full ICE always runs DTLS"]
 async fn ice_offers_to_ice_lite_sdes() -> Result<()> {
     call(Connectivity::Ice, Connectivity::IceLite, Keying::Sdes).await
 }
 
 #[tokio::test]
-#[ignore = "DTLS does not run on direct transports yet"]
 async fn ice_offers_to_ice_lite_dtls() -> Result<()> {
     call(Connectivity::Ice, Connectivity::IceLite, Keying::Dtls).await
 }
 
 #[tokio::test]
-#[ignore = "full ICE always runs DTLS"]
+#[ignore = "full ICE answers an ICE-lite offer as controlled"]
 async fn ice_lite_offers_to_ice_none() -> Result<()> {
     call(Connectivity::IceLite, Connectivity::Ice, Keying::None).await
 }
 
 #[tokio::test]
-#[ignore = "full ICE always runs DTLS"]
+#[ignore = "full ICE answers an ICE-lite offer as controlled"]
 async fn ice_lite_offers_to_ice_sdes() -> Result<()> {
     call(Connectivity::IceLite, Connectivity::Ice, Keying::Sdes).await
 }
 
 #[tokio::test]
-#[ignore = "DTLS does not run on direct transports yet"]
+#[ignore = "full ICE answers an ICE-lite offer as controlled"]
 async fn ice_lite_offers_to_ice_dtls() -> Result<()> {
     call(Connectivity::IceLite, Connectivity::Ice, Keying::Dtls).await
 }
@@ -326,7 +319,7 @@ async fn without_bundle_sdes() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "DTLS does not run on direct transports yet"]
+#[ignore = "DTLS does not run on the other m-lines' transports yet"]
 async fn without_bundle_dtls() -> Result<()> {
     call_without_bundle(Keying::Dtls).await
 }

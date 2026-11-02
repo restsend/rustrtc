@@ -1002,7 +1002,7 @@ impl PeerConnection {
             }
             #[cfg(not(feature = "std"))]
             {
-                // Empty placeholder: WebRtc mode fails fast in start_dtls
+                // Empty placeholder: DTLS keying fails fast in start_dtls
                 // with a clear message instead of half-starting a handshake.
                 (Arc::new(dtls::Certificate::default()), String::new())
             }
@@ -1975,11 +1975,11 @@ impl PeerConnection {
         }
 
         // Decide the DTLS role from this description, but do NOT publish it
-        // yet: publishing wakes `handle_connected_state`, whose `start_dtls`
+        // yet: publishing wakes `handle_connected_state`, whose `start_transport`
         // reads `self.inner.remote_description` to decide whether an SCTP
         // transport is needed. Storing the description happens at the very end
         // of this function, so an early publish raced it: on fast (loopback)
-        // connects under load, start_dtls observed `remote_description == None`
+        // connects under load, start_transport observed `remote_description == None`
         // and permanently skipped SCTP setup — the PC still reached Connected,
         // and every subsequent data-channel send failed with
         // "SCTP not connected". Publish after the store instead.
@@ -2462,7 +2462,7 @@ impl PeerConnection {
             *remote = Some(desc.clone());
         }
 
-        // Remote description is visible now — safe to wake start_dtls (see the
+        // Remote description is visible now — safe to wake start_transport (see the
         // note above where the role is decided).
         if let Some(r) = pending_dtls_role {
             let _ = self.inner.dtls_role.send(Some(r));
@@ -2471,8 +2471,8 @@ impl PeerConnection {
         if self.config().connectivity.is_direct() {
             self.configure_rtp_media_transports_from_remote(&desc, ufrag, pwd, candidates)
                 .await?;
-            self.setup_sdes_media_transports();
         }
+        self.setup_sdes_media_transports();
 
         // Refresh mux/RTCP routing after any remote description change.
         // If the transport already exists, this keeps the derived RTCP
@@ -2588,76 +2588,45 @@ impl PeerConnection {
         }
     }
 
-    pub(crate) async fn start_dtls(
+    /// Starts the primary transport (the first m-line's, or the BUNDLE
+    /// group's) once it is connected, and keys it: SDES from the first
+    /// m-line's `a=crypto`, DTLS by a handshake (`start_dtls`). Returns its
+    /// loops (RTCP, pair monitor, and with DTLS, SCTP), joined.
+    pub(crate) async fn start_transport(
         &self,
         is_client: bool,
     ) -> RtcResult<core::pin::Pin<Box<dyn core::future::Future<Output = ()> + Send>>> {
         self.inner
             .pc_span
-            .in_scope(|| debug!("start_dtls: starting with is_client={}", is_client));
+            .in_scope(|| debug!("start_transport: starting with is_client={}", is_client));
         let pair = self
             .inner
             .ice_transport
             .get_selected_pair()
             .ok_or(RtcError::Internal("No selected pair".into()))?;
 
-        let socket_rx = self.inner.ice_transport.subscribe_selected_socket();
-        let rtcp_socket_rx = self.inner.ice_transport.subscribe_selected_rtcp_socket();
-
-        // Create IceConn and register it immediately to avoid dropping packets
-        let ice_conn = IceConn::new_with_rtcp(
-            socket_rx.clone(),
-            rtcp_socket_rx,
+        // Without rtcp-mux, a direct transport sends RTCP to the address of
+        // the SDP. Full ICE always muxes.
+        let rtcp_addr = if self.config().connectivity.is_direct() {
+            let remote_desc = self.inner.remote_description.lock();
+            remote_desc
+                .as_ref()
+                .and_then(|desc| Self::remote_rtcp_addr_from_sdp(desc, pair.remote.address))
+        } else {
+            None
+        };
+        if let Some(addr) = rtcp_addr {
+            debug!("RTCP-MUX not detected, setting RTCP address to {}", addr);
+        }
+        let (ice_conn, rtp_transport) = self.new_media_transport(
+            &self.inner.ice_transport,
             pair.remote.address,
-            self.config().label.clone(),
-            self.config().probation_max_packets,
+            rtcp_addr,
+            None,
         );
-        // Symmetric-RTP latching on a direct transport: a NAT'd peer whose SDP
-        // advertises a private `c=` still needs egress to follow its observed
-        // packet source. SRTP packets keep the clear RTP header, so the
-        // latch's header inspection works for SDES too.
-        if self.config().connectivity.is_direct() && self.config().enable_latching {
-            self.inner.pc_span.in_scope(|| {
-                debug!("start_dtls: enabling symmetric-RTP latch (direct mode)");
-            });
-            ice_conn.enable_latch_on_rtp();
-            // Surface latch commits / competitive re-latches to the app.
-            ice_conn.set_source_change_sender(self.source_change_sender());
-        }
-
         // Monitor selected pair changes to update remote address
-        #[allow(unused_mut)]
-        let mut pair_rx = self.inner.ice_transport.subscribe_selected_pair();
-        let ice_conn_monitor = ice_conn.clone();
+        let pair_rx = self.inner.ice_transport.subscribe_selected_pair();
 
-        if self.config().connectivity.is_direct() {
-            let rtcp_addr = {
-                let remote_desc = self.inner.remote_description.lock();
-                if let Some(desc) = &*remote_desc {
-                    Self::remote_rtcp_addr_from_sdp(desc, pair.remote.address)
-                } else {
-                    None
-                }
-            };
-
-            if let Some(addr) = rtcp_addr {
-                ice_conn.set_remote_rtcp_addr(Some(addr));
-                debug!("RTCP-MUX not detected, setting RTCP address to {}", addr);
-            }
-        }
-
-        let srtp_required = self.config().keying != Keying::None;
-        let allow_ssrc_change = self.config().enable_latching;
-        let rtp_transport = Arc::new(RtpTransport::new_with_ssrc_change(
-            ice_conn.clone(),
-            srtp_required,
-            allow_ssrc_change,
-        ));
-        {
-            let mut rx = ice_conn.rtp_receiver.write();
-            *rx =
-                Some(Arc::downgrade(&rtp_transport) as Weak<dyn crate::transports::PacketReceiver>);
-        }
         *self.inner.rtp_transport.lock() = Some(rtp_transport.clone());
         self.attach_registered_observers(&rtp_transport);
         self.sync_transport_send_gates();
@@ -2681,12 +2650,19 @@ impl PeerConnection {
             }
         }
 
-        if self.config().connectivity.is_direct() {
-            self.inner
-                .ice_transport
-                .set_data_receiver(ice_conn.clone())
-                .await;
-            if self.config().keying == Keying::Sdes {
+        let mut loops: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> = Vec::new();
+        match self.config().keying {
+            Keying::None => {
+                self.inner
+                    .ice_transport
+                    .set_data_receiver(ice_conn.clone())
+                    .await;
+            }
+            Keying::Sdes => {
+                self.inner
+                    .ice_transport
+                    .set_data_receiver(ice_conn.clone())
+                    .await;
                 // The direct transport can reach "connected" the moment its
                 // socket binds — on the ANSWERER side that may be before the
                 // local answer exists, so `setup_sdes` would fail with "Missing
@@ -2698,302 +2674,348 @@ impl PeerConnection {
                 // The primary transport: the keys of the first m-line.
                 self.setup_sdes(&rtp_transport, 0)?;
             }
-            let rtcp_loop = Self::create_rtcp_loop(
-                rtp_transport.clone(),
-                Arc::downgrade(&self.inner),
-                self.inner.stats_collector.clone(),
-            );
+            Keying::Dtls => {
+                let Some(dtls_loops) = self
+                    .start_dtls(&ice_conn, &rtp_transport, is_client, pair_rx.clone())
+                    .await?
+                else {
+                    // The DTLS transport went away during the handshake.
+                    return Ok(Box::pin(async {}));
+                };
+                loops = dtls_loops;
+            }
+        }
 
+        {
             let transceivers = self.inner.transceivers.lock();
             for t in transceivers.iter() {
                 let selected_transport =
                     self.rtp_transport_for_transceiver_or(t, rtp_transport.clone());
                 trace!(
-                    "start_dtls: transceiver kind={:?} mid={:?}",
+                    "start_transport: transceiver kind={:?} mid={:?}",
                     t.kind(),
                     t.mid()
                 );
                 self.attach_rtp_transport_to_transceiver(t, selected_transport);
             }
-            let pair_monitor = Self::create_pair_monitor(pair_rx.clone(), Arc::downgrade(&ice_conn_monitor));
-            return Ok(
-                self.spawn_transport_loops(vec![Box::pin(rtcp_loop), Box::pin(pair_monitor)])
-            );
         }
+        loops.push(Box::pin(Self::create_rtcp_loop(
+            rtp_transport.clone(),
+            Arc::downgrade(&self.inner),
+            self.inner.stats_collector.clone(),
+        )));
+        loops.push(Box::pin(Self::create_pair_monitor(
+            pair_rx,
+            Arc::downgrade(&ice_conn),
+        )));
+        Ok(self.spawn_transport_loops(loops))
+    }
 
-        // ── Full ICE + DTLS-SRTP (WebRTC) transport path. ──
-        // Direct transports returned above.
-        {
-            #[cfg(not(feature = "std"))]
-            if self.inner.certificate.certificate.is_empty() {
-                // No certificate generation without std: provide one via
-                // `RtcConfiguration::dtls_certificate`.
-                return Err(RtcError::InvalidState(
-                    "WebRtc mode on no_std requires a pre-provisioned DTLS                      certificate (RtcConfiguration::dtls_certificate)".to_string(),
-                ));
-            }
-            let remote_dtls_fingerprint = self.inner.remote_dtls_fingerprint.lock().clone();
-            let ice_conn_for_data = ice_conn.clone();
-            let (dtls, incoming_data_rx, dtls_runner) = DtlsTransport::new(
-                ice_conn,
-                self.inner.certificate.as_ref().clone(),
-                is_client,
-                self.config().dtls_buffer_size,
-                remote_dtls_fingerprint,
-            )
-            .await
-            .map_err(|e| RtcError::Internal(format!("DTLS failed: {}", e)))?;
+    /// DTLS-SRTP keying (RFC 5763/5764) of the primary transport: the
+    /// handshake on `ice_conn`, then SRTP keys from it for `rtp_transport`,
+    /// and SCTP when the remote has an `m=application`. Returns the SCTP
+    /// loops, or None when the DTLS transport went away first.
+    async fn start_dtls(
+        &self,
+        ice_conn: &Arc<IceConn>,
+        rtp_transport: &Arc<RtpTransport>,
+        is_client: bool,
+        #[allow(unused_mut)] mut pair_rx: watch::Receiver<
+            Option<crate::transports::ice::IceCandidatePair>,
+        >,
+    ) -> RtcResult<Option<Vec<Pin<Box<dyn Future<Output = ()> + Send>>>>> {
+        #[cfg(not(feature = "std"))]
+        if self.inner.certificate.certificate.is_empty() {
+            // No certificate generation without std: provide one via
+            // `RtcConfiguration::dtls_certificate`.
+            return Err(RtcError::InvalidState(
+                "DTLS keying on no_std requires a pre-provisioned DTLS certificate \
+                 (RtcConfiguration::dtls_certificate)"
+                    .to_string(),
+            ));
+        }
+        let remote_dtls_fingerprint = self.inner.remote_dtls_fingerprint.lock().clone();
+        let ice_conn_for_data = ice_conn.clone();
+        let (dtls, incoming_data_rx, dtls_runner) = DtlsTransport::new(
+            ice_conn.clone(),
+            self.inner.certificate.as_ref().clone(),
+            is_client,
+            self.config().dtls_buffer_size,
+            remote_dtls_fingerprint,
+        )
+        .await
+        .map_err(|e| RtcError::Internal(format!("DTLS failed: {}", e)))?;
 
-            // Start the handshake loop before flushing buffered packets so inbound
-            // DTLS records are not dropped on the try_send race.
-            // std: spawn_rtc returns a JoinHandle the select arm polls; no_std:
-            // the runner parks in the injected executor (the state watch
-            // carries the outcome), so there is no handle to poll.
-            #[cfg_attr(not(feature = "std"), allow(unused_mut, unused_variables))]
-            let mut dtls_runner_task = crate::spawn_rtc(
-                self.inner.config.runtime_handle.as_ref(),
-                self.inner.pc_span.clone(),
-                dtls_runner,
-            );
-            // Once the runner task completes we must not poll its JoinHandle again
-            // (tokio panics with "JoinHandle polled after completion"). This flag
-            // guards the select! branch below so the handle is only ever polled once.
-            #[allow(unused_mut)]
-            let mut dtls_runner_done = false;
+        // Start the handshake loop before flushing buffered packets so inbound
+        // DTLS records are not dropped on the try_send race.
+        // std: spawn_rtc returns a JoinHandle the select arm polls; no_std:
+        // the runner parks in the injected executor (the state watch
+        // carries the outcome), so there is no handle to poll.
+        #[cfg_attr(not(feature = "std"), allow(unused_mut, unused_variables))]
+        let mut dtls_runner_task = crate::spawn_rtc(
+            self.inner.config.runtime_handle.as_ref(),
+            self.inner.pc_span.clone(),
+            dtls_runner,
+        );
+        // Once the runner task completes we must not poll its JoinHandle again
+        // (tokio panics with "JoinHandle polled after completion"). This flag
+        // guards the select! branch below so the handle is only ever polled once.
+        #[allow(unused_mut)]
+        let mut dtls_runner_done = false;
 
-            // DTLS receiver is now registered (inside DtlsTransport::new),
-            // safe to set data receiver and flush buffered packets.
-            self.inner
-                .ice_transport
-                .set_data_receiver(ice_conn_for_data)
-                .await;
+        // DTLS receiver is now registered (inside DtlsTransport::new),
+        // safe to set data receiver and flush buffered packets.
+        self.inner
+            .ice_transport
+            .set_data_receiver(ice_conn_for_data)
+            .await;
 
-            let sctp_port = if let Some(caps) = &self.config().media_capabilities {
-                if let Some(app) = &caps.application {
-                    app.sctp_port
-                } else {
-                    5000
-                }
+        let sctp_port = if let Some(caps) = &self.config().media_capabilities {
+            if let Some(app) = &caps.application {
+                app.sctp_port
             } else {
                 5000
-            };
+            }
+        } else {
+            5000
+        };
 
-            let sctp_needed = {
-                let remote = self.inner.remote_description.lock();
-                if let Some(desc) = &*remote {
-                    desc.media_sections
-                        .iter()
-                        .any(|m| m.kind == MediaKind::Application)
+        let sctp_needed = {
+            let remote = self.inner.remote_description.lock();
+            if let Some(desc) = &*remote {
+                desc.media_sections
+                    .iter()
+                    .any(|m| m.kind == MediaKind::Application)
+            } else {
+                false
+            }
+        };
+
+        let (dc_tx, mut dc_rx) = mpsc::unbounded_channel();
+
+        let mut sctp_runner: Pin<Box<dyn Future<Output = ()> + Send>>;
+
+        if sctp_needed {
+            let (sctp, runner) = SctpTransport::new(
+                dtls.clone(),
+                incoming_data_rx,
+                self.inner.data_channels.clone(),
+                sctp_port,
+                sctp_port,
+                Some(dc_tx),
+                is_client,
+                self.config(),
+            );
+            *self.inner.sctp_transport.lock() = Some(sctp);
+            sctp_runner = Box::pin(runner);
+        } else {
+            drop(incoming_data_rx);
+            sctp_runner = Box::pin(core::future::pending());
+        }
+
+        // Close any previous DTLS transport so its background handshake/packet
+        // task stops instead of being orphaned (which caused a memory leak and
+        // the “no selected socket” retransmit log spam every second).
+        if let Some(old_dtls) = self.inner.dtls_transport.lock().take() {
+            debug!("Closing previous DTLS transport before creating a new one");
+            old_dtls.close();
+        }
+
+        *self.inner.dtls_transport.lock() = Some(dtls.clone());
+
+        let dtls_clone = dtls.clone();
+        let rtp_transport_clone = rtp_transport.clone();
+        let inner_weak_dc = Arc::downgrade(&self.inner);
+        let dc_listener = async move {
+            while let Some(dc) = dc_rx.recv().await {
+                if let Some(inner) = inner_weak_dc.upgrade() {
+                    let _ = inner.event_tx.send(QueuedEvent::DataChannel(dc));
                 } else {
-                    false
+                    break;
                 }
-            };
+            }
+        };
+        let mut dc_listener: Pin<Box<dyn Future<Output = ()> + Send>> = if sctp_needed {
+            Box::pin(dc_listener)
+        } else {
+            Box::pin(core::future::pending())
+        };
 
-            let (dc_tx, mut dc_rx) = mpsc::unbounded_channel();
-
-            let mut sctp_runner: Pin<Box<dyn Future<Output = ()> + Send>>;
-
-            if sctp_needed {
-                let (sctp, runner) = SctpTransport::new(
-                    dtls.clone(),
-                    incoming_data_rx,
-                    self.inner.data_channels.clone(),
-                    sctp_port,
-                    sctp_port,
-                    Some(dc_tx),
-                    is_client,
-                    self.config(),
-                );
-                *self.inner.sctp_transport.lock() = Some(sctp);
-                sctp_runner = Box::pin(runner);
-            } else {
-                drop(incoming_data_rx);
-                sctp_runner = Box::pin(core::future::pending());
+        #[allow(unused_mut)]
+        let mut state_rx = dtls_clone.subscribe_state();
+        loop {
+            let state = state_rx.borrow().clone();
+            match state {
+                dtls::DtlsState::Connected(_, profile_opt) => {
+                    self.setup_srtp(&dtls_clone, is_client, profile_opt, &rtp_transport_clone);
+                    return Ok(Some(vec![sctp_runner, dc_listener]));
+                }
+                dtls::DtlsState::Failed => {
+                    return Err(RtcError::Internal("DTLS handshake failed".into()));
+                }
+                dtls::DtlsState::Closed => {
+                    return Err(RtcError::Internal(
+                        "DTLS transport closed before completing handshake".into(),
+                    ));
+                }
+                _ => {}
             }
 
-            // Close any previous DTLS transport so its background handshake/packet
-            // task stops instead of being orphaned (which caused a memory leak and
-            // the “no selected socket” retransmit log spam every second).
-            if let Some(old_dtls) = self.inner.dtls_transport.lock().take() {
-                debug!("Closing previous DTLS transport before creating a new one");
-                old_dtls.close();
+            // The runner task has finished but the watch state wasn't
+            // Connected/Failed/Closed yet (the handshake can return Ok after
+            // setting Closed, or exit via feeder/close without a final state).
+            // Wait for a state transition instead of re-polling the completed
+            // JoinHandle, which would panic.
+            if dtls_runner_done {
+                if state_rx.changed().await.is_err() {
+                    break;
+                }
+                continue;
             }
 
-            *self.inner.dtls_transport.lock() = Some(dtls.clone());
-
-            let dtls_clone = dtls.clone();
-            let rtp_transport_clone = rtp_transport.clone();
-            let inner_weak = Arc::downgrade(&self.inner);
-            let stats_collector = self.inner.stats_collector.clone();
-
-            let inner_weak_dc = inner_weak.clone();
-            let dc_listener = async move {
-                while let Some(dc) = dc_rx.recv().await {
-                    if let Some(inner) = inner_weak_dc.upgrade() {
-                        let _ = inner.event_tx.send(QueuedEvent::DataChannel(dc));
-                    } else {
-                        break;
+            // On std spawn_rtc returns a polled JoinHandle arm; on no_std
+            // the DTLS runner parks in the injected executor and reports
+            // through the state watch, so the select has four arms.
+            #[cfg(feature = "std")]
+            {
+                use crate::platform::select::select5;
+                // Same-receiver polling: the notification future borrows
+                // `pair_rx` for this block only, so the match arms below
+                // can `pair_rx.borrow()` once the select has resolved.
+                let __which = {
+                    let mut arm_state = core::pin::pin!(state_rx.changed());
+                    let mut arm_pair = core::pin::pin!(pair_rx.changed());
+                    select5(
+                        &mut dtls_runner_task,
+                        &mut sctp_runner,
+                        &mut dc_listener,
+                        &mut arm_state,
+                        &mut arm_pair,
+                    )
+                    .await
+                };
+                match __which {
+                    crate::platform::select::Which5::A(res) => {
+                        if let Err(e) = res {
+                            return Err(RtcError::Internal(format!("DTLS runner panicked: {e}")));
+                        }
+                        dtls_runner_done = true;
                     }
-                }
-            };
-            let mut dc_listener: Pin<Box<dyn Future<Output = ()> + Send>> = if sctp_needed {
-                Box::pin(dc_listener)
-            } else {
-                Box::pin(core::future::pending())
-            };
-
-            #[allow(unused_mut)]
-            let mut state_rx = dtls_clone.subscribe_state();
-            loop {
-                let state = state_rx.borrow().clone();
-                match state {
-                    dtls::DtlsState::Connected(_, profile_opt) => {
-                        self.setup_srtp(&dtls_clone, is_client, profile_opt, &rtp_transport_clone);
-
-                        let rtcp_loop = Self::create_rtcp_loop(
-                            rtp_transport_clone.clone(),
-                            inner_weak.clone(),
-                            stats_collector.clone(),
-                        );
-
-                        let pair_monitor =
-                            Self::create_pair_monitor(pair_rx.clone(), Arc::downgrade(&ice_conn_monitor));
-
-                        return Ok(self.spawn_transport_loops(vec![
-                            Box::pin(rtcp_loop),
-                            sctp_runner,
-                            dc_listener,
-                            Box::pin(pair_monitor),
-                        ]));
-                    }
-                    dtls::DtlsState::Failed => {
-                        return Err(RtcError::Internal("DTLS handshake failed".into()));
-                    }
-                    dtls::DtlsState::Closed => {
+                    crate::platform::select::Which5::B(_) => {
                         return Err(RtcError::Internal(
-                            "DTLS transport closed before completing handshake".into(),
+                            "SCTP runner stopped unexpectedly".into(),
                         ));
                     }
-                    _ => {}
-                }
-
-                // The runner task has finished but the watch state wasn't
-                // Connected/Failed/Closed yet (the handshake can return Ok after
-                // setting Closed, or exit via feeder/close without a final state).
-                // Wait for a state transition instead of re-polling the completed
-                // JoinHandle, which would panic.
-                if dtls_runner_done {
-                    if state_rx.changed().await.is_err() {
-                        break;
+                    crate::platform::select::Which5::C(_) => {
+                        debug!("DataChannel listener stopped unexpectedly");
+                        return Err(RtcError::Internal(
+                            "DataChannel listener stopped unexpectedly".into(),
+                        ));
                     }
-                    continue;
-                }
-
-                // On std spawn_rtc returns a polled JoinHandle arm; on no_std
-                // the DTLS runner parks in the injected executor and reports
-                // through the state watch, so the select has four arms.
-                #[cfg(feature = "std")]
-                {
-                    use crate::platform::select::select5;
-                    // Same-receiver polling: the notification future borrows
-                    // `pair_rx` for this block only, so the match arms below
-                    // can `pair_rx.borrow()` once the select has resolved.
-                    let __which = {
-                        let mut arm_state = core::pin::pin!(state_rx.changed());
-                        let mut arm_pair = core::pin::pin!(pair_rx.changed());
-                        select5(
-                            &mut dtls_runner_task,
-                            &mut sctp_runner,
-                            &mut dc_listener,
-                            &mut arm_state,
-                            &mut arm_pair,
-                        )
-                        .await
-                    };
-                    match __which {
-                        crate::platform::select::Which5::A(res) => {
-                            if let Err(e) = res {
-                                return Err(RtcError::Internal(format!(
-                                    "DTLS runner panicked: {e}"
-                                )));
-                            }
-                            dtls_runner_done = true;
-                        }
-                        crate::platform::select::Which5::B(_) => {
-                            return Err(RtcError::Internal(
-                                "SCTP runner stopped unexpectedly".into(),
-                            ));
-                        }
-                        crate::platform::select::Which5::C(_) => {
-                            debug!("DataChannel listener stopped unexpectedly");
-                            return Err(RtcError::Internal(
-                                "DataChannel listener stopped unexpectedly".into(),
-                            ));
-                        }
-                        crate::platform::select::Which5::D(res) => {
-                            if res.is_err() {
-                                break;
-                            }
-                        }
-                        crate::platform::select::Which5::E(res) => {
-                            if res.is_ok()
-                                && let Some(pair) = pair_rx.borrow().clone()
-                            {
-                                ice_conn_monitor.set_remote_addr_from_selected_pair(
-                                    pair.remote.address,
-                                    "dtls pair monitor update",
-                                );
-                            }
+                    crate::platform::select::Which5::D(res) => {
+                        if res.is_err() {
+                            break;
                         }
                     }
-                }
-                #[cfg(not(feature = "std"))]
-                {
-                    use crate::platform::select::select4;
-                    let __which = {
-                        let mut arm_state = core::pin::pin!(state_rx.changed());
-                        let mut arm_pair = core::pin::pin!(pair_rx.changed());
-                        select4(
-                            &mut sctp_runner,
-                            &mut dc_listener,
-                            &mut arm_state,
-                            &mut arm_pair,
-                        )
-                        .await
-                    };
-                    match __which {
-                        crate::platform::select::Which4::A(_) => {
-                            return Err(RtcError::Internal(
-                                "SCTP runner stopped unexpectedly".into(),
-                            ));
-                        }
-                        crate::platform::select::Which4::B(_) => {
-                            debug!("DataChannel listener stopped unexpectedly");
-                            return Err(RtcError::Internal(
-                                "DataChannel listener stopped unexpectedly".into(),
-                            ));
-                        }
-                        crate::platform::select::Which4::C(res) => {
-                            if res.is_err() {
-                                break;
-                            }
-                        }
-                        crate::platform::select::Which4::D(res) => {
-                            if res.is_ok()
-                                && let Some(pair) = pair_rx.borrow().clone()
-                            {
-                                ice_conn_monitor.set_remote_addr_from_selected_pair(
-                                    pair.remote.address,
-                                    "dtls pair monitor update",
-                                );
-                            }
+                    crate::platform::select::Which5::E(res) => {
+                        if res.is_ok()
+                            && let Some(pair) = pair_rx.borrow().clone()
+                        {
+                            ice_conn.set_remote_addr_from_selected_pair(
+                                pair.remote.address,
+                                "dtls pair monitor update",
+                            );
                         }
                     }
                 }
             }
-
-            Ok(Box::pin(async {}) as Pin<Box<dyn Future<Output = ()> + Send>>)
+            #[cfg(not(feature = "std"))]
+            {
+                use crate::platform::select::select4;
+                let __which = {
+                    let mut arm_state = core::pin::pin!(state_rx.changed());
+                    let mut arm_pair = core::pin::pin!(pair_rx.changed());
+                    select4(
+                        &mut sctp_runner,
+                        &mut dc_listener,
+                        &mut arm_state,
+                        &mut arm_pair,
+                    )
+                    .await
+                };
+                match __which {
+                    crate::platform::select::Which4::A(_) => {
+                        return Err(RtcError::Internal(
+                            "SCTP runner stopped unexpectedly".into(),
+                        ));
+                    }
+                    crate::platform::select::Which4::B(_) => {
+                        debug!("DataChannel listener stopped unexpectedly");
+                        return Err(RtcError::Internal(
+                            "DataChannel listener stopped unexpectedly".into(),
+                        ));
+                    }
+                    crate::platform::select::Which4::C(res) => {
+                        if res.is_err() {
+                            break;
+                        }
+                    }
+                    crate::platform::select::Which4::D(res) => {
+                        if res.is_ok()
+                            && let Some(pair) = pair_rx.borrow().clone()
+                        {
+                            ice_conn.set_remote_addr_from_selected_pair(
+                                pair.remote.address,
+                                "dtls pair monitor update",
+                            );
+                        }
+                    }
+                }
+            }
         }
+        Ok(None)
+    }
+
+    /// The IceConn and RtpTransport of one transport, the primary or one
+    /// m-line's, on `ice_transport`'s socket: RTP latching on a direct
+    /// transport, RTCP to `rtcp_addr` when the remote has no rtcp-mux.
+    fn new_media_transport(
+        &self,
+        ice_transport: &IceTransport,
+        remote_addr: core::net::SocketAddr,
+        rtcp_addr: Option<core::net::SocketAddr>,
+        expected_ssrc: Option<u32>,
+    ) -> (Arc<IceConn>, Arc<RtpTransport>) {
+        let ice_conn = IceConn::new_with_rtcp(
+            ice_transport.subscribe_selected_socket(),
+            ice_transport.subscribe_selected_rtcp_socket(),
+            remote_addr,
+            self.config().label.clone(),
+            self.config().probation_max_packets,
+        );
+        // Symmetric-RTP latching on a direct transport: a NAT'd peer whose SDP
+        // advertises a private `c=` still needs egress to follow its observed
+        // packet source. SRTP packets keep the clear RTP header, so the
+        // latch's header inspection works for SDES too.
+        if self.config().connectivity.is_direct() && self.config().enable_latching {
+            self.inner.pc_span.in_scope(|| {
+                debug!("new_media_transport: enabling symmetric-RTP latch (direct mode)");
+            });
+            ice_conn.enable_latch_on_rtp();
+            // Surface latch commits / competitive re-latches to the app.
+            ice_conn.set_source_change_sender(self.source_change_sender());
+        }
+        ice_conn.set_remote_rtcp_addr(rtcp_addr);
+        if let Some(ssrc) = expected_ssrc {
+            ice_conn.set_expected_ssrc(ssrc);
+        }
+        let rtp_transport = Arc::new(RtpTransport::new_with_ssrc_change(
+            ice_conn.clone(),
+            self.config().keying != Keying::None,
+            self.config().enable_latching,
+        ));
+        ice_conn.set_rtp_receiver(rtp_transport.clone());
+        (ice_conn, rtp_transport)
     }
 
     /// The `a=crypto` (local, remote) of the m-line at `index` in both
@@ -3088,7 +3110,7 @@ impl PeerConnection {
     /// SDES: key the per-m-line direct transports (non-BUNDLE video, ...)
     /// that are not keyed yet, each with its own m-line's `a=crypto`. Runs
     /// when a description is set: both descriptions are needed. The primary
-    /// transport is keyed in `start_dtls`.
+    /// transport is keyed in `start_transport`.
     ///
     /// A transport that has keys gets new ones when an offer/answer changes
     /// them: a peer can send a new key in a re-INVITE, and it starts to use
@@ -3205,40 +3227,6 @@ impl PeerConnection {
                             is_client, profile
                         )
                     });
-
-                    let transceivers = self.inner.transceivers.lock();
-                    for t in transceivers.iter() {
-                        let sender_arc = t.sender.lock().clone();
-                        let receiver_arc = t.receiver.lock().clone();
-
-                        if let Some(sender) = &sender_arc {
-                            let mid_opt = t.mid();
-                            trace!(
-                                "start_dtls: transceiver kind={:?} mid={:?}",
-                                t.kind(),
-                                mid_opt
-                            );
-                            sender.set_transport(rtp_transport.clone());
-                        }
-
-                        if let Some(receiver) = &receiver_arc {
-                            receiver.set_transport(
-                                rtp_transport.clone(),
-                                Some(self.inner.event_tx.clone()),
-                                Some(Arc::downgrade(t)),
-                            );
-                            if let Some(sender) = &sender_arc {
-                                receiver.set_feedback_ssrc(sender.ssrc());
-                            }
-                        }
-                    }
-
-                    drop(transceivers);
-
-                    // Update the inner transport to ensure future transceivers get the correct one
-                    *self.inner.rtp_transport.lock() = Some(rtp_transport.clone());
-                    self.attach_registered_observers(&rtp_transport);
-                    self.sync_transport_send_gates();
                 }
                 Err(e) => {
                     warn!("Failed to create SRTP session: {}", e);
@@ -3533,38 +3521,17 @@ impl PeerConnection {
             return transport;
         }
 
-        let socket_rx = ice_transport.subscribe_selected_socket();
-        let rtcp_socket_rx = ice_transport.subscribe_selected_rtcp_socket();
         let remote_addr = remote_addr.unwrap_or_else(|| {
             core::net::SocketAddr::new(IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED), 0)
         });
-        let ice_conn = IceConn::new_with_rtcp(
-            socket_rx,
-            rtcp_socket_rx,
+        let (ice_conn, rtp_transport) = self.new_media_transport(
+            ice_transport,
             remote_addr,
-            self.config().label.clone(),
-            self.config().probation_max_packets,
-        );
-        if self.config().enable_latching {
-            ice_conn.enable_latch_on_rtp();
-            // Surface latch commits / competitive re-latches to the app.
-            ice_conn.set_source_change_sender(self.source_change_sender());
-        }
-        ice_conn.set_remote_rtcp_addr(
             section.and_then(|section| {
                 Self::remote_rtcp_addr_from_media_section(section, remote_addr)
             }),
+            section.and_then(Self::remote_ssrc_from_section),
         );
-        if let Some(ssrc) = section.and_then(Self::remote_ssrc_from_section) {
-            ice_conn.set_expected_ssrc(ssrc);
-        }
-
-        let rtp_transport = Arc::new(RtpTransport::new_with_ssrc_change(
-            ice_conn.clone(),
-            self.config().keying != Keying::None,
-            self.config().enable_latching,
-        ));
-        ice_conn.set_rtp_receiver(rtp_transport.clone());
         ice_transport.set_data_receiver(ice_conn.clone()).await;
 
         self.inner
@@ -5150,7 +5117,7 @@ async fn handle_connected_state(
                 inner: inner.clone(),
             };
 
-            match pc_temp.start_dtls(is_client).await {
+            match pc_temp.start_transport(is_client).await {
                 Err(e) => {
                     debug!("Transport start failed: {}", e);
                     let reason = if dtls {
@@ -6976,7 +6943,7 @@ impl RtpTransceiver {
         }
     }
 
-    /// Set the RTP transport reference. Called by start_dtls when transport is established.
+    /// Set the RTP transport reference. Called by start_transport when transport is established.
     pub fn set_rtp_transport(&self, transport: Weak<RtpTransport>) {
         *self.rtp_transport.lock() = Some(transport);
     }
@@ -13981,7 +13948,7 @@ a=mid:0
             "inline:QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNk"
         );
         assert_eq!(local.unwrap().key_params, keys[1]);
-        // The primary transport is keyed when it starts (start_dtls).
+        // The primary transport is keyed when it starts (start_transport).
         for _ in 0..100 {
             if primary.has_srtp() {
                 break;
@@ -14683,7 +14650,7 @@ a=rtpmap:8 PCMA/8000\r\n";
         let answer = SessionDescription::parse(SdpType::Answer, &callee_sdp).unwrap();
         pc.set_remote_description(answer).await.unwrap();
 
-        // Give start_dtls (spawned async) time to register the provisional
+        // Give start_transport (spawned async) time to register the provisional
         // listener and call set_data_receiver before we send the packet.
         crate::platform::task::sleep(core::time::Duration::from_millis(50)).await;
 
@@ -14714,7 +14681,7 @@ a=rtpmap:8 PCMA/8000\r\n";
     }
 
     /// Same scenario but without the 50ms pre-send delay.
-    /// Verifies that packets arriving before start_dtls completes are still
+    /// Verifies that packets arriving before start_transport completes are still
     /// delivered via the buffered-packet flush in set_data_receiver.
     #[tokio::test]
     async fn repro_rtp_offerer_track_event_fires_on_first_packet_no_delay() {
@@ -14778,12 +14745,12 @@ a=rtpmap:8 PCMA/8000\r\n";
         rtp.extend_from_slice(&[0xD5u8; 160]);
         fake_callee.send_to(&rtp, local_addr).await.unwrap();
 
-        // Allow time for start_dtls + buffer flush + run_loop processing
+        // Allow time for start_transport + buffer flush + run_loop processing
         let event =
             crate::platform::time::with_timeout(core::time::Duration::from_millis(500), pc.recv())
                 .await
                 .expect(
-                    "timed out – packet received before start_dtls; buffer flush must deliver it",
+                    "timed out – packet received before start_transport; buffer flush must deliver it",
                 );
 
         assert!(
@@ -15076,7 +15043,7 @@ a=rtpmap:8 PCMA/8000\r\n";
     ///   1. Carrier sends 183 early media → Track event fires → bridge wires up
     ///      forwarding loop A on transport A.
     ///   2. ICE restarts (re-INVITE with new credentials, or network change) →
-    ///      `start_dtls` called again → `set_transport(transport_B)` called.
+    ///      `start_transport` called again → `set_transport(transport_B)` called.
     ///   3. WITHOUT fix: `track_event_sent=true` (from step 1) is preserved →
     ///      no second Track event → bridge never re-wires → `pps=0`.
     ///      WITH fix: `track_event_sent` and SSRC are reset → first packet on
@@ -15590,12 +15557,12 @@ a=rtpmap:8 PCMA/8000\r\n";
     /// path rather than direct `set_transport` calls.
     ///
     /// Scenario (mirrors production WebRTC keepalive timeout):
-    ///   1. PC initialised → ICE Connected → `start_dtls` called → transport A
+    ///   1. PC initialised → ICE Connected → `start_transport` called → transport A
     ///   2. First RTP packet → Track event fires → `track_event_sent = true`
     ///   3. ICE keepalive timeout → `Disconnected`
     ///      (`handle_connected_state` returns `true`)
     ///   4. ICE recovers → `Connected` again
-    ///      → outer loop re-enters → `start_dtls` called again → transport B
+    ///      → outer loop re-enters → `start_transport` called again → transport B
     ///   5. Without Bug 3 fix: `track_event_sent` still `true` → no Track event
     ///      → bridge never re-wired → dead audio after reconnect
     ///   6. With Bug 3 fix: `set_transport` resets the flag → Track event fires
@@ -15627,21 +15594,21 @@ a=rtpmap:8 PCMA/8000\r\n";
 
         // Init ICE: bind a loopback socket, set selected pair, send Connected.
         // run_transport_loop sees Connected → handle_connected_state
-        // → start_dtls(false) → transport A registered on the receiver.
+        // → start_transport(false) → transport A registered on the receiver.
         let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let ice = pc.ice_transport_for_test();
         ice.setup_direct_rtp_with_rtcp(loopback, false)
             .await
             .unwrap();
 
-        // Allow run_transport_loop to process Connected and call start_dtls.
+        // Allow run_transport_loop to process Connected and call start_transport.
         crate::platform::task::sleep(core::time::Duration::from_millis(50)).await;
 
         // Grab the receiver and its current packet channel (transport A).
         let receiver = pc.get_transceivers()[0].receiver.lock().clone().unwrap();
         let ptx_a = receiver
             .packet_tx()
-            .expect("transport A packet_tx must exist after start_dtls");
+            .expect("transport A packet_tx must exist after start_transport");
 
         // ── Phase 1: first packet on transport A → Track event ────────────────
         ptx_a
@@ -15675,7 +15642,7 @@ a=rtpmap:8 PCMA/8000\r\n";
         crate::platform::task::sleep(core::time::Duration::from_millis(50)).await;
 
         // Recovery: outer run_transport_loop sees Connected →
-        // calls handle_connected_state again → start_dtls →
+        // calls handle_connected_state again → start_transport →
         // new Arc<RtpTransport> (transport B) → set_transport → Bug 3 fix resets flag.
         ice.force_state_for_test(IceTransportState::Connected);
         crate::platform::task::sleep(core::time::Duration::from_millis(80)).await;
@@ -15684,7 +15651,7 @@ a=rtpmap:8 PCMA/8000\r\n";
         assert!(
             !receiver.track_event_sent.load(Ordering::SeqCst),
             "Bug 3 fix (ICE reconnect): track_event_sent must be reset to false \
-             when start_dtls creates a new transport after ICE reconnect"
+             when start_transport creates a new transport after ICE reconnect"
         );
 
         let ptx_b = receiver
