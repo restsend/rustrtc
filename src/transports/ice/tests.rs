@@ -889,6 +889,100 @@ async fn test_ice_lite_connectivity_establishment() -> Result<()> {
     Ok(())
 }
 
+/// Send a Binding request from `peer` in `role` to `transport`, as if it came
+/// in on our socket `local`, and return the response `peer` gets.
+async fn check_in_role(
+    transport: &IceTransport,
+    local: &Arc<UdpSocket>,
+    peer: &UdpSocket,
+    role: StunAttribute,
+) -> Result<StunDecoded> {
+    let params = transport.local_parameters();
+    let mut request = StunMessage::binding_request(random_bytes::<12>(), None);
+    request.attributes = vec![
+        StunAttribute::Username(format!("{}:peer", params.username_fragment)),
+        StunAttribute::Priority(2130706431),
+        role,
+    ];
+    let bytes = request.encode(Some(params.password.as_bytes()), true)?;
+    let sender = IceSocketWrapper::Udp(local.clone());
+    let mut marshal_buf = Vec::new();
+    handle_packet(
+        &bytes,
+        peer.local_addr()?,
+        transport.inner.clone(),
+        sender,
+        &mut marshal_buf,
+    )
+    .await;
+
+    let mut buf = [0u8; 1500];
+    let (len, from) = timeout(Duration::from_secs(2), peer.recv_from(&mut buf)).await??;
+    assert_eq!(from, local.local_addr()?);
+    let response = StunMessage::decode(&buf[..len])?;
+    assert_eq!(response.transaction_id, request.transaction_id);
+    Ok(response)
+}
+
+/// An ICE-lite agent is always controlled (RFC 8445 §6.1.1). A full agent
+/// that checks it as controlled too (mediastreamer2 does when it answers our
+/// offer) gets 487 Role Conflict (§7.3.1.1), and the check changes nothing.
+/// The same peer checking as controlling gets a success response.
+#[tokio::test]
+async fn test_ice_lite_answers_a_controlled_check_with_487() -> Result<()> {
+    use crate::TransportMode;
+    use crate::transports::ice::stun::StunClass;
+
+    for mode in [TransportMode::Rtp, TransportMode::Srtp] {
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = mode.clone();
+        config.enable_ice_lite = true;
+        let (ice_lite, runner) = IceTransport::new(config);
+        tokio::spawn(runner);
+        let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        let peer = UdpSocket::bind("127.0.0.1:0").await?;
+        let peer_addr = peer.local_addr()?;
+        let knows_peer = |ice: &IceTransport| {
+            ice.remote_candidates()
+                .iter()
+                .any(|c| c.address == peer_addr)
+        };
+
+        let response =
+            check_in_role(&ice_lite, &local, &peer, StunAttribute::IceControlled(42)).await?;
+        assert_eq!(response.class, StunClass::ErrorResponse, "{mode:?}");
+        assert_eq!(response.error_code, Some(487), "{mode:?}");
+        assert!(!knows_peer(&ice_lite), "{mode:?}: a 487 changes nothing");
+
+        let response =
+            check_in_role(&ice_lite, &local, &peer, StunAttribute::IceControlling(42)).await?;
+        assert_eq!(response.class, StunClass::SuccessResponse, "{mode:?}");
+        assert_eq!(response.xor_mapped_address, Some(peer_addr), "{mode:?}");
+        assert!(knows_peer(&ice_lite), "{mode:?}");
+    }
+    Ok(())
+}
+
+/// Without ICE (no ICE in our descriptions) there is no role: a check is
+/// answered with success, also one sent as controlled.
+#[tokio::test]
+async fn test_no_ice_answers_a_controlled_check() -> Result<()> {
+    use crate::TransportMode;
+    use crate::transports::ice::stun::StunClass;
+
+    let mut config = RtcConfiguration::default();
+    config.transport_mode = TransportMode::Srtp;
+    let (transport, runner) = IceTransport::new(config);
+    tokio::spawn(runner);
+    let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let peer = UdpSocket::bind("127.0.0.1:0").await?;
+
+    let response =
+        check_in_role(&transport, &local, &peer, StunAttribute::IceControlled(42)).await?;
+    assert_eq!(response.class, StunClass::SuccessResponse);
+    Ok(())
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Nomination timeout / completion tests
 // ──────────────────────────────────────────────────────────────────────────────
