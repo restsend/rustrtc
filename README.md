@@ -208,7 +208,7 @@ All configuration goes through `RtcConfiguration` (or its builder `RtcConfigurat
 
 ### Transport & Network
 - **`connectivity`** — How the media path is found: `Connectivity::Ice` (full ICE, default), `Connectivity::IceLite` (ICE-lite, RFC 8445 §2.5), or `Connectivity::Sdp` (the `c=`/`m=` address of the peer's SDP, no ICE).
-- **`keying`** — How the SRTP keys are exchanged: `Keying::Dtls` (DTLS-SRTP, default), `Keying::Sdes` (`a=crypto`, RFC 4568), or `Keying::None` (plain RTP).
+- **`keying`** — How the SRTP keys are exchanged: `Keying::Dtls` (DTLS-SRTP, default), `Keying::Sdes` (`a=crypto`, RFC 4568), or `Keying::None` (plain RTP). Any keying works with any connectivity; data channels need `Keying::Dtls`.
 - **`webrtc_extensions`** — The peer is a WebRTC endpoint: offers claim rid, abs-send-time, sdes:mid (and with `enable_gcc`, transport-cc) header extensions, and descriptions carry `msid`. Default: `true`. Set it to `false` for SIP peers.
 
 | Peer | `connectivity` | `keying` | `webrtc_extensions` |

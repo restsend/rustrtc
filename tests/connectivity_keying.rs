@@ -319,7 +319,6 @@ async fn without_bundle_sdes() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "DTLS does not run on the other m-lines' transports yet"]
 async fn without_bundle_dtls() -> Result<()> {
     call_without_bundle(Keying::Dtls).await
 }

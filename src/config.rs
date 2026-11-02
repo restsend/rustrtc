@@ -101,7 +101,8 @@ pub enum RtcpMuxPolicy {
     Negotiate,
 }
 
-/// How the media path to the peer is found.
+/// How the media path to the peer is found. Any value works with any
+/// [`Keying`].
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum Connectivity {
     /// The c=/m= address of the peer's SDP (corrected by latching, when on).
@@ -122,7 +123,8 @@ impl Connectivity {
     }
 }
 
-/// How the SRTP keys are exchanged.
+/// How the SRTP keys are exchanged. Any value works with any
+/// [`Connectivity`]. Data channels (SCTP) need `Dtls`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum Keying {
     /// Plain RTP (RTP/AVP).

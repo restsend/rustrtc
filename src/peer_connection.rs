@@ -2675,8 +2675,15 @@ impl PeerConnection {
                 self.setup_sdes(&rtp_transport, 0)?;
             }
             Keying::Dtls => {
-                let Some(dtls_loops) = self
-                    .start_dtls(&ice_conn, &rtp_transport, is_client, pair_rx.clone())
+                let Some((_, dtls_loops)) = self
+                    .start_dtls(
+                        &self.inner.ice_transport,
+                        &ice_conn,
+                        &rtp_transport,
+                        is_client,
+                        pair_rx.clone(),
+                        true,
+                    )
                     .await?
                 else {
                     // The DTLS transport went away during the handshake.
@@ -2711,19 +2718,29 @@ impl PeerConnection {
         Ok(self.spawn_transport_loops(loops))
     }
 
-    /// DTLS-SRTP keying (RFC 5763/5764) of the primary transport: the
-    /// handshake on `ice_conn`, then SRTP keys from it for `rtp_transport`,
-    /// and SCTP when the remote has an `m=application`. Returns the SCTP
-    /// loops, or None when the DTLS transport went away first.
+    /// DTLS-SRTP keying (RFC 5763/5764) of a transport on `ice_transport`:
+    /// the handshake on `ice_conn`, then SRTP keys from it for
+    /// `rtp_transport`. The primary transport is the PeerConnection's DTLS
+    /// transport, with SCTP when the remote has an `m=application`; another
+    /// m-line's transport (no BUNDLE) has a handshake of its own. Returns the
+    /// DTLS transport and the SCTP loops, or None when the DTLS transport
+    /// went away first.
     async fn start_dtls(
         &self,
+        ice_transport: &IceTransport,
         ice_conn: &Arc<IceConn>,
         rtp_transport: &Arc<RtpTransport>,
         is_client: bool,
         #[allow(unused_mut)] mut pair_rx: watch::Receiver<
             Option<crate::transports::ice::IceCandidatePair>,
         >,
-    ) -> RtcResult<Option<Vec<Pin<Box<dyn Future<Output = ()> + Send>>>>> {
+        primary: bool,
+    ) -> RtcResult<
+        Option<(
+            Arc<DtlsTransport>,
+            Vec<Pin<Box<dyn Future<Output = ()> + Send>>>,
+        )>,
+    > {
         #[cfg(not(feature = "std"))]
         if self.inner.certificate.certificate.is_empty() {
             // No certificate generation without std: provide one via
@@ -2765,10 +2782,7 @@ impl PeerConnection {
 
         // DTLS receiver is now registered (inside DtlsTransport::new),
         // safe to set data receiver and flush buffered packets.
-        self.inner
-            .ice_transport
-            .set_data_receiver(ice_conn_for_data)
-            .await;
+        ice_transport.set_data_receiver(ice_conn_for_data).await;
 
         let sctp_port = if let Some(caps) = &self.config().media_capabilities {
             if let Some(app) = &caps.application {
@@ -2780,7 +2794,7 @@ impl PeerConnection {
             5000
         };
 
-        let sctp_needed = {
+        let sctp_needed = primary && {
             let remote = self.inner.remote_description.lock();
             if let Some(desc) = &*remote {
                 desc.media_sections
@@ -2813,15 +2827,17 @@ impl PeerConnection {
             sctp_runner = Box::pin(core::future::pending());
         }
 
-        // Close any previous DTLS transport so its background handshake/packet
-        // task stops instead of being orphaned (which caused a memory leak and
-        // the “no selected socket” retransmit log spam every second).
-        if let Some(old_dtls) = self.inner.dtls_transport.lock().take() {
-            debug!("Closing previous DTLS transport before creating a new one");
-            old_dtls.close();
-        }
+        if primary {
+            // Close any previous DTLS transport so its background handshake/packet
+            // task stops instead of being orphaned (which caused a memory leak and
+            // the “no selected socket” retransmit log spam every second).
+            if let Some(old_dtls) = self.inner.dtls_transport.lock().take() {
+                debug!("Closing previous DTLS transport before creating a new one");
+                old_dtls.close();
+            }
 
-        *self.inner.dtls_transport.lock() = Some(dtls.clone());
+            *self.inner.dtls_transport.lock() = Some(dtls.clone());
+        }
 
         let dtls_clone = dtls.clone();
         let rtp_transport_clone = rtp_transport.clone();
@@ -2848,7 +2864,7 @@ impl PeerConnection {
             match state {
                 dtls::DtlsState::Connected(_, profile_opt) => {
                     self.setup_srtp(&dtls_clone, is_client, profile_opt, &rtp_transport_clone);
-                    return Ok(Some(vec![sctp_runner, dc_listener]));
+                    return Ok(Some((dtls_clone, vec![sctp_runner, dc_listener])));
                 }
                 dtls::DtlsState::Failed => {
                     return Err(RtcError::Internal("DTLS handshake failed".into()));
@@ -3532,7 +3548,19 @@ impl PeerConnection {
             }),
             section.and_then(Self::remote_ssrc_from_section),
         );
-        ice_transport.set_data_receiver(ice_conn.clone()).await;
+        // DTLS registers itself on the IceConn before packets flow into it
+        // (`start_dtls`); the other keying takes packets at once.
+        let dtls_keying: Pin<Box<dyn Future<Output = ()> + Send>> =
+            if self.config().keying == Keying::Dtls {
+                Box::pin(self.dtls_keying_of_media_transport(
+                    ice_transport.clone(),
+                    ice_conn.clone(),
+                    rtp_transport.clone(),
+                ))
+            } else {
+                ice_transport.set_data_receiver(ice_conn.clone()).await;
+                Box::pin(core::future::pending())
+            };
 
         self.inner
             .rtp_media_transports
@@ -3553,15 +3581,81 @@ impl PeerConnection {
             async move {
                 let __s0 = core::pin::pin!(rtcp_loop);
                 let __s1 = core::pin::pin!(pair_monitor);
-                match crate::platform::select::select2(__s0, __s1).await {
-                    crate::platform::select::Either::A(_) => {}
-                    crate::platform::select::Either::B(_) => {}
-                }
+                let _ = crate::platform::select::select3(__s0, __s1, dtls_keying).await;
             },
         );
         self.inner.track_task(h);
 
         rtp_transport
+    }
+
+    /// DTLS keying of one m-line's own transport (no BUNDLE): a handshake of
+    /// its own, with our certificate, once the transport is connected and
+    /// our DTLS role is known. Then it stays pending while the transport
+    /// lives, and closes the DTLS transport when it is dropped.
+    fn dtls_keying_of_media_transport(
+        &self,
+        ice_transport: IceTransport,
+        ice_conn: Arc<IceConn>,
+        rtp_transport: Arc<RtpTransport>,
+    ) -> impl Future<Output = ()> + Send + 'static {
+        struct CloseOnDrop(Option<Arc<DtlsTransport>>);
+        impl Drop for CloseOnDrop {
+            fn drop(&mut self) {
+                if let Some(dtls) = self.0.take() {
+                    dtls.close();
+                }
+            }
+        }
+
+        let inner_weak = Arc::downgrade(&self.inner);
+        let mut role_rx = self.inner.dtls_role.subscribe();
+        let mut state_rx = ice_transport.subscribe_state();
+        let pair_rx = ice_transport.subscribe_selected_pair();
+        async move {
+            let is_client = loop {
+                if let Some(is_client) = *role_rx.borrow_and_update() {
+                    break is_client;
+                }
+                if role_rx.changed().await.is_err() {
+                    return;
+                }
+            };
+            while !matches!(
+                *state_rx.borrow_and_update(),
+                crate::transports::ice::IceTransportState::Connected
+                    | crate::transports::ice::IceTransportState::Completed
+            ) {
+                if state_rx.changed().await.is_err() {
+                    return;
+                }
+            }
+            let Some(inner) = inner_weak.upgrade() else {
+                return;
+            };
+            let pc = PeerConnection { inner };
+            let dtls = match pc
+                .start_dtls(
+                    &ice_transport,
+                    &ice_conn,
+                    &rtp_transport,
+                    is_client,
+                    pair_rx,
+                    false,
+                )
+                .await
+            {
+                Ok(dtls) => dtls.map(|(dtls, _)| dtls),
+                Err(e) => {
+                    warn!("DTLS keying of an m-line transport failed: {}", e);
+                    None
+                }
+            };
+            // Hold only the Weak while the transport lives.
+            drop(pc);
+            let _dtls = CloseOnDrop(dtls);
+            core::future::pending::<()>().await;
+        }
     }
 
     /// Update the RTCP address based on the current remote description.
