@@ -64,8 +64,7 @@ pub use config::{
     ApplicationCapability, AudioCapability, BundlePolicy, CertificateConfig, Connectivity,
     ExternalIpCandidateType, IceCredentialType, IceServer, IceTcpPolicy, IceTransportPolicy,
     Keying, MediaCapabilities, RecorderInterceptors, RtcConfiguration, RtcConfigurationBuilder,
-    RtcpMuxPolicy, SdpCompatibilityMode, T38Capability, T38FaxRateManagement, T38UdpEC,
-    VideoCapability,
+    RtcpMuxPolicy, T38Capability, T38FaxRateManagement, T38UdpEC, VideoCapability,
 };
 pub use errors::{RtcError, RtcResult, SdpError, SdpResult};
 #[cfg(feature = "std")]

@@ -263,6 +263,9 @@ async fn restart_ice_preserves_direction_intent() {
     answer.media_sections[0]
         .attributes
         .push(Attribute::new("setup", Some("active".to_string())));
+    answer.media_sections[0]
+        .attributes
+        .push(Attribute::new("rtcp-mux", None));
     pc.set_remote_description(answer).await.unwrap();
     assert_eq!(pc.signaling_state(), rustrtc::SignalingState::Stable);
 

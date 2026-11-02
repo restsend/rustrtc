@@ -264,7 +264,7 @@ async fn remote_hold_stops_raw_and_relayed_rtp_until_resumed() -> Result<()> {
 /// transport.
 #[tokio::test]
 async fn a_held_stream_inside_a_bundle_is_gated_by_ssrc() -> Result<()> {
-    held_stream_is_gated_by_ssrc(RtcConfiguration::default(), 0).await
+    held_stream_is_gated_by_ssrc(RtcConfiguration::default(), 0, true).await
 }
 
 /// Without BUNDLE each m-line has its own transport; RTP with the held
@@ -275,15 +275,21 @@ async fn a_held_stream_is_gated_on_every_transport_without_bundle() -> Result<()
         connectivity: Connectivity::Sdp,
         keying: Keying::None,
         webrtc_extensions: false,
-        sdp_compatibility: rustrtc::SdpCompatibilityMode::LegacySip,
+        bundle_policy: rustrtc::BundlePolicy::MaxCompat,
         ..RtcConfiguration::default()
     };
-    held_stream_is_gated_by_ssrc(config, 1).await
+    held_stream_is_gated_by_ssrc(config, 1, false).await
 }
 
 /// Two audio m-lines, `held` answered inactive and the other recvonly;
-/// send_raw_rtp sends both SSRCs on the first m-line's transport.
-async fn held_stream_is_gated_by_ssrc(config: RtcConfiguration, held: usize) -> Result<()> {
+/// send_raw_rtp sends both SSRCs on the first m-line's transport. Without
+/// `bundle`, the remote gets the offer without the BUNDLE group, as a peer
+/// without BUNDLE sees it.
+async fn held_stream_is_gated_by_ssrc(
+    config: RtcConfiguration,
+    held: usize,
+    bundle: bool,
+) -> Result<()> {
     let local = PeerConnection::new(config.clone());
     let remote = PeerConnection::new(config);
     for _ in 0..2 {
@@ -305,6 +311,10 @@ async fn held_stream_is_gated_by_ssrc(config: RtcConfiguration, held: usize) -> 
     local.wait_for_gathering_complete().await;
     let offer = local.create_offer().await?;
     local.set_local_description(offer.clone())?;
+    let mut offer = offer;
+    if !bundle {
+        offer.session.attributes.retain(|a| a.key != "group");
+    }
     remote.set_remote_description(offer).await?;
     let _ = remote.create_answer().await?;
     remote.wait_for_gathering_complete().await;

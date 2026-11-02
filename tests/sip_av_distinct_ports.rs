@@ -1,5 +1,6 @@
-//! Regression test: a LegacySip + Rtp-mode UAC offer with two media sections
-//! must keep one distinct RTP port per m-line in the *local description*.
+//! Regression test: a plain RTP UAC offer with two media sections must keep
+//! one distinct RTP port per m-line in the *local description*. It proposes
+//! BUNDLE, but a peer without BUNDLE needs a port per m-line (RFC 8843 §7.2).
 //!
 //! rustpbx plain-RTP repro for the 0.4.11 regression: `set_local_description`
 //! ran `update_local_description_on_gather`, whose non-WebRTC branch stamped
@@ -8,18 +9,18 @@
 //! its own transport listened elsewhere → strict SIP phones get a 488 /
 //! media blackhole).
 
-use rustrtc::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode, VideoCapability};
+use rustrtc::config::{AudioCapability, MediaCapabilities, VideoCapability};
 use rustrtc::media::MediaKind;
 use rustrtc::media::track::sample_track;
 use rustrtc::peer_connection::RtpCodecParameters;
-use rustrtc::{Connectivity, Keying, PeerConnection, RtcConfiguration};
+use rustrtc::{Connectivity, Keying, PeerConnection, RtcConfiguration, RtcpMuxPolicy};
 
 fn av_config() -> RtcConfiguration {
     let mut config = RtcConfiguration::default();
     config.connectivity = Connectivity::Sdp;
     config.keying = Keying::None;
     config.webrtc_extensions = false;
-    config.sdp_compatibility = SdpCompatibilityMode::LegacySip;
+    config.rtcp_mux_policy = RtcpMuxPolicy::Negotiate;
     config.rtp_start_port = Some(20000);
     config.rtp_end_port = Some(20100);
     config.external_ips = vec!["127.0.0.1".parse().unwrap()];
@@ -111,13 +112,13 @@ fn assert_distinct_ports(sdp: &str, what: &str) {
         "{what}: ports outside the configured range (audio={audio} video={video}):\n{sdp}"
     );
     assert!(
-        !sdp.contains("a=group:BUNDLE") && !sdp.contains("a=rtcp-mux"),
-        "{what}: LegacySip offer must not use BUNDLE/rtcp-mux:\n{sdp}"
+        sdp.contains("a=group:BUNDLE") && !sdp.contains("a=bundle-only"),
+        "{what}: the offer proposes BUNDLE, with a transport per m-line:\n{sdp}"
     );
 }
 
 #[tokio::test]
-async fn legacy_sip_rtp_range_av_local_description_keeps_distinct_ports() {
+async fn rtp_range_av_local_description_keeps_distinct_ports() {
     for round in 0..10 {
         let (offer_sdp, local_sdp) = uac_local_sdp().await;
         let what = format!("round {round}");

@@ -5,14 +5,14 @@
 //! tested against ICE-lite and against full ICE, offering and answering.
 use anyhow::Result;
 use bytes::Bytes;
-use rustrtc::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode, VideoCapability};
+use rustrtc::config::{AudioCapability, MediaCapabilities, VideoCapability};
 use rustrtc::media::MediaStreamTrack;
 use rustrtc::media::frame::{AudioFrame, MediaSample, VideoFrame};
 use rustrtc::media::track::{SampleStreamSource, sample_track};
 use rustrtc::peer_connection::{RtpSender, RtpTransceiver};
 use rustrtc::{
-    Connectivity, Keying, MediaKind, PeerConnection, RtcConfiguration, RtpCodecParameters, SdpType,
-    SessionDescription, TransceiverDirection,
+    BundlePolicy, Connectivity, Keying, MediaKind, PeerConnection, RtcConfiguration, RtcpMuxPolicy,
+    RtpCodecParameters, SdpType, SessionDescription, TransceiverDirection,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -140,20 +140,43 @@ fn check_description(sdp: &str, connectivity: Connectivity, keying: Keying, what
     );
 }
 
+/// A peer without BUNDLE and without RTCP multiplexing: it ignores what it
+/// does not know (RFC 4566 §5.13), so it gets the offer without these lines.
+fn as_legacy_peer_sees_it(offer: &str) -> String {
+    (offer.lines())
+        .filter(|line| {
+            !line.starts_with("a=group:BUNDLE")
+                && !line.starts_with("a=rtcp-mux")
+                && !line.contains("sdes:mid")
+        })
+        .map(|line| format!("{line}\r\n"))
+        .collect()
+}
+
 /// The offerer adds `kinds`, one m-line each; both sides negotiate, check
 /// their descriptions, connect, and send media both ways on every m-line.
+/// With `legacy_answerer`, the answerer sees the offer as a peer without
+/// BUNDLE and RTCP multiplexing does.
 async fn call_with(
     offerer: Connectivity,
     answerer: Connectivity,
     keying: Keying,
     kinds: &[MediaKind],
-    sdp_compatibility: SdpCompatibilityMode,
+    bundle_policy: BundlePolicy,
+    legacy_answerer: bool,
 ) -> Result<()> {
-    let what = format!("{offerer:?} offers to {answerer:?}, {keying:?}");
+    let what = format!(
+        "{offerer:?} offers to {answerer:?}, {keying:?}, {bundle_policy:?}, legacy answerer \
+         {legacy_answerer}"
+    );
     let mut config1 = config(offerer, keying);
     let mut config2 = config(answerer, keying);
-    config1.sdp_compatibility = sdp_compatibility.clone();
-    config2.sdp_compatibility = sdp_compatibility;
+    config1.bundle_policy = bundle_policy.clone();
+    config2.bundle_policy = bundle_policy;
+    if legacy_answerer {
+        config1.rtcp_mux_policy = RtcpMuxPolicy::Negotiate;
+        config2.rtcp_mux_policy = RtcpMuxPolicy::Negotiate;
+    }
     let pc1 = PeerConnection::new(config1);
     let pc2 = PeerConnection::new(config2);
     for &kind in kinds {
@@ -165,8 +188,11 @@ async fn call_with(
     pc1.wait_for_gathering_complete().await;
     let offer = pc1.create_offer().await?;
     pc1.set_local_description(offer.clone())?;
-    let offer = offer.to_sdp_string();
+    let mut offer = offer.to_sdp_string();
     check_description(&offer, offerer, keying, &format!("{what}: offer"));
+    if legacy_answerer {
+        offer = as_legacy_peer_sees_it(&offer);
+    }
     pc2.set_remote_description(SessionDescription::parse(SdpType::Offer, &offer)?)
         .await?;
     let _ = pc2.create_answer().await?;
@@ -175,6 +201,34 @@ async fn call_with(
     pc2.set_local_description(answer.clone())?;
     let answer = answer.to_sdp_string();
     check_description(&answer, answerer, keying, &format!("{what}: answer"));
+    // A full ICE offer always proposes BUNDLE, a direct one with two or
+    // more m-lines; the answer accepts it.
+    let bundled = (kinds.len() > 1 || offerer == Connectivity::Ice) && !legacy_answerer;
+    assert_eq!(
+        has_attr(&answer, "a=group:BUNDLE"),
+        bundled,
+        "{what}: BUNDLE:\n{answer}"
+    );
+    let ports: Vec<_> = (answer.lines())
+        .filter_map(|line| line.strip_prefix("m="))
+        .map(|line| line.split_whitespace().nth(1).unwrap().to_string())
+        .collect();
+    assert!(
+        !ports.contains(&"0".to_string()),
+        "{what}: rejected:\n{answer}"
+    );
+    if kinds.len() > 1 && answerer != Connectivity::Ice && offerer != Connectivity::Ice {
+        assert_eq!(
+            ports.windows(2).all(|p| p[0] == p[1]),
+            bundled,
+            "{what}: one port per m-line without BUNDLE:\n{answer}"
+        );
+    }
+    assert_eq!(
+        has_attr(&answer, "a=rtcp-mux"),
+        !legacy_answerer,
+        "{what}: a=rtcp-mux:\n{answer}"
+    );
     pc1.set_remote_description(SessionDescription::parse(SdpType::Answer, &answer)?)
         .await?;
 
@@ -213,21 +267,50 @@ async fn call(offerer: Connectivity, answerer: Connectivity, keying: Keying) -> 
         answerer,
         keying,
         &[MediaKind::Audio],
-        SdpCompatibilityMode::Standard,
+        BundlePolicy::default(),
+        false,
     )
     .await
 }
 
-/// Audio and video, each on its own transport: no BUNDLE.
+/// Audio and video on one transport: the answer accepts BUNDLE. Each
+/// policy, ICE-lite and plain.
+async fn call_with_bundle(keying: Keying) -> Result<()> {
+    for connectivity in [Connectivity::Sdp, Connectivity::IceLite] {
+        for policy in [
+            BundlePolicy::Balanced,
+            BundlePolicy::MaxCompat,
+            BundlePolicy::MaxBundle,
+        ] {
+            call_with(
+                connectivity,
+                connectivity,
+                keying,
+                &[MediaKind::Audio, MediaKind::Video],
+                policy,
+                false,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Audio and video, each on its own transport, against a peer without
+/// BUNDLE and without RTCP multiplexing.
 async fn call_without_bundle(keying: Keying) -> Result<()> {
-    call_with(
-        Connectivity::Sdp,
-        Connectivity::Sdp,
-        keying,
-        &[MediaKind::Audio, MediaKind::Video],
-        SdpCompatibilityMode::LegacySip,
-    )
-    .await
+    for policy in [BundlePolicy::Balanced, BundlePolicy::MaxCompat] {
+        call_with(
+            Connectivity::Sdp,
+            Connectivity::Sdp,
+            keying,
+            &[MediaKind::Audio, MediaKind::Video],
+            policy,
+            true,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -318,4 +401,19 @@ async fn without_bundle_sdes() -> Result<()> {
 #[tokio::test]
 async fn without_bundle_dtls() -> Result<()> {
     call_without_bundle(Keying::Dtls).await
+}
+
+#[tokio::test]
+async fn with_bundle_none() -> Result<()> {
+    call_with_bundle(Keying::None).await
+}
+
+#[tokio::test]
+async fn with_bundle_sdes() -> Result<()> {
+    call_with_bundle(Keying::Sdes).await
+}
+
+#[tokio::test]
+async fn with_bundle_dtls() -> Result<()> {
+    call_with_bundle(Keying::Dtls).await
 }

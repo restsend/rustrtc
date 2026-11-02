@@ -1,4 +1,4 @@
-use crate::config::{Connectivity, Keying};
+use crate::config::{BundlePolicy, Connectivity, Keying, RtcpMuxPolicy};
 use crate::errors::{RtcError, RtcResult};
 use crate::media::depacketizer::{Depacketizer, DepacketizerFactory};
 use crate::media::track::{MediaStreamTrack, SampleStreamSource, SampleStreamTrack, sample_track};
@@ -1628,18 +1628,21 @@ impl PeerConnection {
             .inner
             .build_description(SdpType::Offer, |dir| dir)
             .await?;
-        if self.inner.config.connectivity.is_direct() && !Self::sdp_has_bundle(&desc) {
-            for (media_index, (transceiver, _)) in self
-                .matched_rtp_media_sections(&desc)
-                .into_iter()
-                .enumerate()
-            {
-                if media_index == 0 {
-                    continue;
-                }
-                let ice_transport = self.inner.direct_rtp_ice_transport(transceiver.id(), false);
-                self.ensure_direct_rtp_media_transport(&transceiver, &ice_transport, None, None)
+        if self.inner.config.connectivity.is_direct() {
+            // The RTP transports of the m-lines with a transport of their own.
+            for (transceiver, _) in self.matched_rtp_media_sections(&desc) {
+                let ice_transport = (self.inner.rtp_media_ice_transports.lock())
+                    .get(&transceiver.id())
+                    .cloned();
+                if let Some(ice_transport) = ice_transport {
+                    self.ensure_direct_rtp_media_transport(
+                        &transceiver,
+                        &ice_transport,
+                        None,
+                        None,
+                    )
                     .await;
+                }
             }
         }
         Ok(desc)
@@ -1917,6 +1920,24 @@ impl PeerConnection {
         } else {
             None
         };
+        if self.inner.rtcp_mux_required() {
+            // RFC 9429 §5.8.3. A bundled m-line multiplexes as its tag.
+            let group = bundle_group(&desc);
+            let tag = group.first().copied();
+            let unmuxed = desc.media_sections.iter().find(|section| {
+                matches!(section.kind, MediaKind::Audio | MediaKind::Video)
+                    && !section_rejected(&desc, section)
+                    && !(group.contains(&section.mid.as_str()) && Some(section.mid.as_str()) != tag)
+                    && !has_rtcp_mux(section)
+            });
+            if let Some(section) = unmuxed {
+                return Err(RtcError::InvalidConfiguration(format!(
+                    "remote m-line {:?} (mid {:?}) has no a=rtcp-mux, and RTCP multiplexing is \
+                     required (rtcp_mux_policy Require, or full ICE)",
+                    section.kind, section.mid
+                )));
+            }
+        }
 
         let previous_remote = self.inner.remote_description.lock().clone();
         let media_parameters_changed = previous_remote.as_ref().is_none_or(|previous| {
@@ -3283,16 +3304,6 @@ impl PeerConnection {
         }
     }
 
-    fn sdp_has_bundle(desc: &SessionDescription) -> bool {
-        desc.session.attributes.iter().any(|attr| {
-            attr.key == "group"
-                && attr
-                    .value
-                    .as_deref()
-                    .is_some_and(|value| value.starts_with("BUNDLE"))
-        })
-    }
-
     fn bundle_tag_mid(desc: &SessionDescription) -> Option<String> {
         desc.session
             .attributes
@@ -3377,22 +3388,22 @@ impl PeerConnection {
         matched
     }
 
-    fn stop_extra_rtp_media_transports(&self) {
-        // BTreeMap::drain is unstable; swap the map out and drain the owner.
-        let extra_transports = core::mem::take(&mut *self.inner.rtp_media_transports.lock())
-            .into_iter()
-            .map(|(_, transport)| transport)
-            .collect::<Vec<_>>();
-        for transport in extra_transports {
-            transport.clear_listeners();
-        }
-
-        let extra_ice = core::mem::take(&mut *self.inner.rtp_media_ice_transports.lock())
-            .into_iter()
-            .map(|(_, transport)| transport)
-            .collect::<Vec<_>>();
-        for transport in extra_ice {
-            transport.stop();
+    /// Stop the transports of their own of these transceivers: they are
+    /// bundled now.
+    fn stop_extra_rtp_media_transports(&self, transceivers: &[Arc<RtpTransceiver>]) {
+        for transceiver in transceivers {
+            let transport = self
+                .inner
+                .rtp_media_transports
+                .lock()
+                .remove(&transceiver.id());
+            if let Some(transport) = transport {
+                transport.clear_listeners();
+            }
+            let ice = (self.inner.rtp_media_ice_transports.lock()).remove(&transceiver.id());
+            if let Some(ice) = ice {
+                ice.stop();
+            }
         }
     }
 
@@ -3408,25 +3419,74 @@ impl PeerConnection {
             return Ok(());
         }
 
-        if Self::sdp_has_bundle(desc) {
-            self.stop_extra_rtp_media_transports();
-            let bundle_tag = Self::bundle_tag_mid(desc);
-            let primary = bundle_tag
-                .as_ref()
-                .and_then(|mid| {
-                    matched
-                        .iter()
-                        .find(|(_, section_idx)| desc.media_sections[*section_idx].mid == *mid)
-                })
-                .or_else(|| matched.first());
+        // The transport of each m-line: as our answer to the offer will have
+        // it, or as our offer had it, bundled when the answer bundles it. An
+        // m-line we offered bundle-only has no transport without BUNDLE. One
+        // the answer rejects still completes the transport we offered: it
+        // sends nothing (`apply_negotiated_send_directions`).
+        let group = bundle_group(desc);
+        let answer_mlines =
+            (desc.sdp_type == SdpType::Offer).then(|| self.inner.answer_mlines(desc));
+        let local = self.inner.local_description.lock().clone();
+        let offered_bundle_only = |section_idx: usize| {
+            (local.as_ref())
+                .and_then(|local| local.media_sections.get(section_idx))
+                .is_some_and(MediaSection::is_bundle_only)
+        };
+        let transport_of = |transceiver: &Arc<RtpTransceiver>, section_idx: usize| {
+            let section = &desc.media_sections[section_idx];
+            let in_group = !section.mid.is_empty() && group.contains(&section.mid.as_str());
+            if let Some(mlines) = &answer_mlines {
+                mlines[section_idx]
+            } else if !in_group && offered_bundle_only(section_idx) {
+                Mline {
+                    transport: MlineTransport::Rejected,
+                    bundled: false,
+                }
+            } else if in_group && !section_rejected(desc, section) {
+                Mline {
+                    transport: MlineTransport::Primary,
+                    bundled: true,
+                }
+            } else {
+                let own =
+                    (self.inner.rtp_media_ice_transports.lock()).contains_key(&transceiver.id());
+                Mline {
+                    transport: if own {
+                        MlineTransport::Own
+                    } else {
+                        MlineTransport::Primary
+                    },
+                    bundled: false,
+                }
+            }
+        };
+        let matched: Vec<_> = (matched.into_iter())
+            .map(|(transceiver, section_idx)| {
+                let mline = transport_of(&transceiver, section_idx);
+                (transceiver, section_idx, mline)
+            })
+            .collect();
 
-            if let Some((transceiver, section_idx)) = primary
-                && let Some(remote_addr) =
-                    Self::remote_rtp_addr_from_section(desc, &desc.media_sections[*section_idx])
-            {
+        // The BUNDLE group: the primary transport, on the tag's address.
+        let bundled: Vec<_> = (matched.iter())
+            .filter(|(_, _, mline)| mline.bundled)
+            .collect();
+        if !bundled.is_empty() {
+            self.stop_extra_rtp_media_transports(
+                &bundled
+                    .iter()
+                    .map(|(t, _, _)| t.clone())
+                    .collect::<Vec<_>>(),
+            );
+            let (transceiver, section_idx, _) = (bundled.iter())
+                .find(|(_, idx, _)| desc.media_sections[*idx].mid == group[0])
+                .unwrap_or(&bundled[0]);
+            let section = &desc.media_sections[*section_idx];
+            if let Some(remote_addr) = Self::remote_rtp_addr_from_section(desc, section) {
                 self.configure_rtp_media_transport(
                     transceiver,
-                    &desc.media_sections[*section_idx],
+                    section,
                     true,
                     remote_addr,
                     ufrag.as_ref(),
@@ -3436,21 +3496,22 @@ impl PeerConnection {
                 .await?;
             }
             if let Some(transport) = self.inner.rtp_transport.lock().clone() {
-                for (transceiver, _) in matched {
-                    self.attach_rtp_transport_to_transceiver(&transceiver, transport.clone());
+                for (transceiver, _, _) in &bundled {
+                    self.attach_rtp_transport_to_transceiver(transceiver, transport.clone());
                 }
             }
-            return Ok(());
         }
 
-        for (media_index, (transceiver, section_idx)) in matched.iter().enumerate() {
-            if let Some(remote_addr) =
-                Self::remote_rtp_addr_from_section(desc, &desc.media_sections[*section_idx])
-            {
+        for (transceiver, section_idx, mline) in &matched {
+            if mline.bundled || !mline.has_transport() {
+                continue;
+            }
+            let section = &desc.media_sections[*section_idx];
+            if let Some(remote_addr) = Self::remote_rtp_addr_from_section(desc, section) {
                 self.configure_rtp_media_transport(
                     transceiver,
-                    &desc.media_sections[*section_idx],
-                    media_index == 0,
+                    section,
+                    mline.transport == MlineTransport::Primary,
                     remote_addr,
                     ufrag.as_ref(),
                     pwd.as_ref(),
@@ -5375,6 +5436,152 @@ impl PeerConnectionInner {
         transport
     }
 
+    /// Whether the peer must multiplex RTP and RTCP: [`RtcpMuxPolicy`]
+    /// `Require`, or full ICE (it gathers no RTCP component).
+    fn rtcp_mux_required(&self) -> bool {
+        self.config.rtcp_mux_policy == RtcpMuxPolicy::Require
+            || self.config.connectivity == Connectivity::Ice
+    }
+
+    /// The most recent answer, ours or the remote's, when there was a
+    /// negotiation.
+    fn previous_answer(&self) -> Option<SessionDescription> {
+        let local = self.local_description.lock().clone()?;
+        let remote = self.remote_description.lock().clone()?;
+        Some(if local.sdp_type == SdpType::Answer {
+            local
+        } else {
+            remote
+        })
+    }
+
+    /// The transport of an offer's m-lines (`sections`: the kind and MID of
+    /// each, in order).
+    ///
+    /// The first offer follows the bundle policy (RFC 9429 §5.2.1): the
+    /// first m-line has the primary transport, the others have their own or
+    /// are bundle-only. Full ICE has one agent: the others are bundle-only.
+    /// It proposes BUNDLE with two or more m-lines, and always with full ICE
+    /// (a WebRTC offer always has a group). A later offer keeps what the
+    /// last answer negotiated (RFC 9429 §5.2.2): its BUNDLE group shares the
+    /// primary transport, and new m-lines join it. Without a group, each
+    /// m-line keeps its transport; new m-lines follow the policy, and the
+    /// offer proposes BUNDLE again. An m-line is new when the last answer
+    /// has none at its index (m-lines are matched by position, RFC 3264
+    /// §8). T.38 (image) has its own transport (UDPTL), never bundled.
+    fn offer_mlines(&self, sections: &[(MediaKind, String)]) -> Vec<Mline> {
+        let direct = self.config.connectivity.is_direct();
+        let answer = self.previous_answer();
+        let known = |index: usize| {
+            answer
+                .as_ref()
+                .is_some_and(|a| index < a.media_sections.len())
+        };
+        let group = answer.as_ref().map(bundle_group).unwrap_or_default();
+        let media =
+            || (sections.iter().enumerate()).filter(|(_, (kind, _))| *kind != MediaKind::Image);
+        let new_mlines = media().any(|(index, _)| !known(index));
+        let bundle = new_mlines
+            && group.is_empty()
+            && (!direct || media().count() > 1)
+            && media().all(|(_, (_, mid))| !mid.is_empty());
+
+        let mut mlines = Vec::with_capacity(sections.len());
+        let mut have_primary = false;
+        let mut kinds_with_transport = Vec::new();
+        for (index, (kind, mid)) in sections.iter().enumerate() {
+            if *kind == MediaKind::Image {
+                mlines.push(Mline {
+                    transport: MlineTransport::Own,
+                    bundled: false,
+                });
+                continue;
+            }
+            let mline = if !group.is_empty() {
+                // The negotiated group, and new m-lines join it.
+                let bundled = !mid.is_empty() && (group.contains(&mid.as_str()) || !known(index));
+                let transport = if bundled || !have_primary || !direct {
+                    MlineTransport::Primary
+                } else {
+                    MlineTransport::Own
+                };
+                Mline { transport, bundled }
+            } else {
+                let own = direct
+                    && match self.config.bundle_policy {
+                        BundlePolicy::MaxCompat => true,
+                        BundlePolicy::Balanced => !kinds_with_transport.contains(kind),
+                        BundlePolicy::MaxBundle => false,
+                    };
+                let transport = if !have_primary {
+                    MlineTransport::Primary
+                } else if known(index) || !bundle || own {
+                    // An m-line keeps its transport.
+                    if direct {
+                        MlineTransport::Own
+                    } else {
+                        MlineTransport::Primary
+                    }
+                } else {
+                    MlineTransport::BundleOnly
+                };
+                Mline {
+                    transport,
+                    bundled: bundle,
+                }
+            };
+            have_primary = true;
+            if mline.has_transport() {
+                kinds_with_transport.push(*kind);
+            }
+            mlines.push(mline);
+        }
+        mlines
+    }
+
+    /// The transport of the m-lines of an answer to `offer`, in order
+    /// (RFC 9429 §5.3.1). The offered BUNDLE group shares the primary
+    /// transport. Without one, the first m-line has it, and the bundle
+    /// policy decides which others have their own; the rest is rejected.
+    /// Full ICE has one agent: it rejects all but the first.
+    fn answer_mlines(&self, offer: &SessionDescription) -> Vec<Mline> {
+        let direct = self.config.connectivity.is_direct();
+        let group = bundle_group(offer);
+        let mut mlines = Vec::with_capacity(offer.media_sections.len());
+        let mut have_primary = false;
+        let mut kinds_with_transport = Vec::new();
+        for section in &offer.media_sections {
+            let bundled = !section.mid.is_empty() && group.contains(&section.mid.as_str());
+            let own = match self.config.bundle_policy {
+                BundlePolicy::MaxCompat => true,
+                BundlePolicy::Balanced => !kinds_with_transport.contains(&section.kind),
+                BundlePolicy::MaxBundle => false,
+            };
+            let transport = if section_rejected(offer, section) {
+                MlineTransport::Rejected
+            } else if section.kind == MediaKind::Image {
+                MlineTransport::Own
+            } else if bundled || (group.is_empty() && !have_primary) {
+                MlineTransport::Primary
+            } else if direct && own {
+                MlineTransport::Own
+            } else {
+                MlineTransport::Rejected
+            };
+            if transport == MlineTransport::Primary {
+                have_primary = true;
+            }
+            if transport != MlineTransport::Rejected && section.kind != MediaKind::Image {
+                kinds_with_transport.push(section.kind);
+            }
+            mlines.push(Mline {
+                transport,
+                bundled: bundled && transport == MlineTransport::Primary,
+            });
+        }
+        mlines
+    }
+
     async fn build_description<F>(
         &self,
         sdp_type: SdpType,
@@ -5393,26 +5600,22 @@ impl PeerConnectionInner {
             ));
         }
 
-        let mut remote_offered_bundle = false;
+        // The previous answer, for an offer.
+        let previous_answer = if sdp_type == SdpType::Answer {
+            None
+        } else {
+            self.previous_answer()
+        };
 
-        let ordered_transceivers = if sdp_type == SdpType::Answer {
+        let (ordered_transceivers, mlines) = if sdp_type == SdpType::Answer {
             let remote_guard = self.remote_description.lock();
             let remote = remote_guard.as_ref().ok_or_else(|| {
                 RtcError::InvalidState("create_answer called without remote description".into())
             })?;
 
-            for attr in &remote.session.attributes {
-                if attr.key == "group"
-                    && let Some(val) = &attr.value
-                    && val.starts_with("BUNDLE")
-                {
-                    remote_offered_bundle = true;
-                }
-            }
-
             let mut ordered = Vec::new();
             let mut used_indices = alloc::collections::BTreeSet::new();
-            for section in &remote.media_sections {
+            for (section_idx, section) in remote.media_sections.iter().enumerate() {
                 let mid = &section.mid;
                 let mut found: Option<(usize, Arc<RtpTransceiver>)> = None;
 
@@ -5449,9 +5652,8 @@ impl PeerConnectionInner {
                     used_indices.insert(idx);
                     ordered.push((
                         t,
-                        section.attributes.iter().any(|attr| attr.key == "rtcp-mux"),
+                        mline_rtcp_mux(remote, mid, section_idx),
                         Some(TransceiverDirection::from(section.direction)),
-                        section_rejected(remote, section),
                     ));
                 } else {
                     return Err(RtcError::Internal(format!(
@@ -5460,7 +5662,7 @@ impl PeerConnectionInner {
                     )));
                 }
             }
-            ordered
+            (ordered, self.answer_mlines(remote))
         } else {
             // For Offer, we must ensure MIDs and sort by them to maintain m-line stability
             // This handles cases where transceivers were added out-of-order relative to their
@@ -5481,33 +5683,17 @@ impl PeerConnectionInner {
                     _ => mid_a.cmp(&mid_b),
                 }
             });
-            ordered
-                .into_iter()
-                .map(|t| (t, false, None, false))
-                .collect()
+            let sections: Vec<(MediaKind, String)> = (ordered.iter())
+                .map(|t| (t.kind(), t.mid().unwrap_or_default()))
+                .collect();
+            let mlines = self.offer_mlines(&sections);
+            let ordered = ordered.into_iter().map(|t| (t, None, None)).collect();
+            (ordered, mlines)
         };
 
         let connectivity = self.config.connectivity;
         let keying = self.config.keying;
-        // BUNDLE (RFC 8843): a group may contain a single m-section.  When we
-        // are answering an offer that already established a BUNDLE group we
-        // MUST echo it back -- even with only one media section -- otherwise
-        // strict agents such as Chrome reject the answer with
-        // "Answer cannot remove m= section ... from already-established BUNDLE
-        // group".  Plain-RTP/SIP offers group only 2+ sections; a WebRTC
-        // offer always carries a group (RFC 8829 §5.2.1).
-        let will_bundle = self.config.sdp_compatibility
-            != crate::config::SdpCompatibilityMode::LegacySip
-            && match sdp_type {
-                SdpType::Offer => {
-                    ordered_transceivers.len() > 1 || connectivity == Connectivity::Ice
-                }
-                SdpType::Answer => remote_offered_bundle,
-                _ => false,
-            };
-        let local_offers_rtcp_mux = self.config.rtcp_mux_policy
-            == crate::config::RtcpMuxPolicy::Require
-            && self.config.sdp_compatibility != crate::config::SdpCompatibilityMode::LegacySip;
+        let mux_required = self.rtcp_mux_required();
 
         // Full ICE gathers; a direct transport binds its socket per m-line
         // below (setup_direct_rtp_offer).
@@ -5560,12 +5746,26 @@ impl PeerConnectionInner {
                 .push(Attribute::new("msid-semantic", Some("WMS *".into())));
         }
 
-        for (
-            media_index,
-            (transceiver, remote_offered_rtcp_mux, offered_direction, offer_rejected),
-        ) in ordered_transceivers.into_iter().enumerate()
+        for (media_index, ((transceiver, offered_rtcp_mux, offered_direction), mline)) in
+            ordered_transceivers
+                .into_iter()
+                .zip(mlines.iter().copied())
+                .enumerate()
         {
             let mid = self.ensure_mid(&transceiver);
+            let rtp_media = matches!(transceiver.kind(), MediaKind::Audio | MediaKind::Video);
+            // RTCP multiplexing (RFC 5761 §5.1.1, RFC 9429 §5.2, §5.3): an
+            // answer multiplexes when the offer does. An offer proposes it,
+            // unless the last negotiation of the m-line refused it. A first
+            // offer that does not require it reserves an RTCP port, for an
+            // answer that refuses it.
+            let previous_rtcp_mux = (previous_answer.as_ref())
+                .and_then(|answer| mline_rtcp_mux(answer, &mid, media_index));
+            let first_offer_of_mline = sdp_type != SdpType::Answer && previous_rtcp_mux.is_none();
+            let (rtcp_mux, rtcp_port) = match offered_rtcp_mux.or(previous_rtcp_mux) {
+                Some(mux) => (mux, !mux),
+                None => (true, first_offer_of_mline && !mux_required),
+            };
             // An offer expresses our own willingness to send/receive, so it
             // starts from our preferred direction. An answer is the reverse of
             // the direction the remote offered, limited to what we want
@@ -5690,6 +5890,11 @@ impl PeerConnectionInner {
                         .unwrap_or(IpAddr::V4(core::net::Ipv4Addr::LOCALHOST));
                     section.connection = Some(crate::sdp::connection_address(ip));
                 }
+            } else if connectivity == Connectivity::Ice
+                && mline.transport == MlineTransport::BundleOnly
+            {
+                // No ICE credentials or candidates (RFC 9429 §5.2.1).
+                section.connection = Some("IN IP4 0.0.0.0".to_string());
             } else if connectivity == Connectivity::Ice {
                 section.connection = Some("IN IP4 0.0.0.0".to_string());
                 section
@@ -5718,18 +5923,15 @@ impl PeerConnectionInner {
                         .attributes
                         .push(Attribute::new("end-of-candidates", None));
                 }
-            } else {
+            } else if mline.has_transport() {
                 // A direct transport (RTP, SDES-SRTP): use the first candidate's
                 // address for c= and m= port. Prefer non-loopback candidates.
-                let section_ice_transport = if !will_bundle && media_index > 0 {
+                let section_ice_transport = if mline.transport == MlineTransport::Own {
                     self.direct_rtp_ice_transport(transceiver.id(), false)
                 } else {
                     self.ice_transport.clone()
                 };
-                let needs_rtcp = match sdp_type {
-                    SdpType::Answer => !remote_offered_rtcp_mux,
-                    _ => !local_offers_rtcp_mux,
-                };
+                let needs_rtcp = rtp_media && rtcp_port;
                 if section_ice_transport.local_candidates().is_empty() {
                     section_ice_transport
                         .setup_direct_rtp_offer_with_rtcp(needs_rtcp)
@@ -5741,9 +5943,14 @@ impl PeerConnectionInner {
                 // A direct transport skips the ICE gathering loop; section-driven
                 // direct socket setup publishes candidates synchronously.
                 let _ = self.ice_gathering_state.send(IceGatheringState::Complete);
-                let candidates = section_ice_transport.local_candidates();
+                // The RTCP candidates only while RTCP has its own port.
+                let candidates: Vec<_> = (section_ice_transport.local_candidates().into_iter())
+                    .filter(|c| needs_rtcp || c.component == 1)
+                    .collect();
                 if let Some(cand) = section_ice_transport.default_candidate() {
-                    local_rtcp_addr = section_ice_transport.local_rtcp_addr(&cand);
+                    if needs_rtcp {
+                        local_rtcp_addr = section_ice_transport.local_rtcp_addr(&cand);
+                    }
                     section.port = cand.address.port();
                     let conn = crate::sdp::connection_address(cand.address.ip());
                     if desc.session.connection.is_none() {
@@ -5790,17 +5997,24 @@ impl PeerConnectionInner {
                 }
             }
 
-            self.populate_media_capabilities(&mut section, transceiver.kind(), sdp_type);
-            if sdp_type == SdpType::Answer && !remote_offered_rtcp_mux {
-                section.attributes.retain(|attr| attr.key != "rtcp-mux");
-            }
-            if connectivity.is_direct()
-                && !section.attributes.iter().any(|attr| attr.key == "rtcp-mux")
-                && let Some(rtcp_addr) = local_rtcp_addr
-            {
-                section
-                    .attributes
-                    .push(Attribute::new("rtcp", Some(rtcp_addr.port().to_string())));
+            self.populate_media_capabilities(&mut section, transceiver.kind(), sdp_type, mline);
+            // Transport attributes, only on an m-line with a transport
+            // (RFC 9429 §5.2.1). a=rtcp-mux-only only in a first offer
+            // (RFC 8858 §4).
+            if rtp_media && mline.has_transport() {
+                if rtcp_mux {
+                    section.attributes.push(Attribute::new("rtcp-mux", None));
+                }
+                if rtcp_mux && mux_required && first_offer_of_mline {
+                    section
+                        .attributes
+                        .push(Attribute::new("rtcp-mux-only", None));
+                }
+                if let Some(rtcp_addr) = local_rtcp_addr {
+                    section
+                        .attributes
+                        .push(Attribute::new("rtcp", Some(rtcp_addr.port().to_string())));
+                }
             }
 
             // When this section advertises RTX and we send, allocate a local RTX SSRC
@@ -5935,53 +6149,43 @@ impl PeerConnectionInner {
                     .push(Attribute::new("crypto", Some(crypto_val)));
             }
 
-            // RFC 3264 §6: a stream offered with port 0 is answered with port 0.
-            if offer_rejected {
-                section.port = 0;
+            // RFC 3264 §6: a rejected stream has port 0, and so does a
+            // bundle-only one (RFC 8843 §6).
+            match mline.transport {
+                MlineTransport::BundleOnly => {
+                    section.port = 0;
+                    section.attributes.push(Attribute::new("bundle-only", None));
+                }
+                MlineTransport::Rejected => section.port = 0,
+                MlineTransport::Primary | MlineTransport::Own => {}
             }
             desc.media_sections.push(section);
         }
         // A direct transport's session c= is the first section's (set
-        // above). No section set one (all rejected): an external address,
-        // so the description still has a c= for every section.
-        if connectivity.is_direct()
-            && desc.session.connection.is_none()
-            && let Some(&ext_ip) = self.config.external_ips.first()
-        {
-            desc.session.connection = Some(crate::sdp::connection_address(ext_ip));
+        // above). No section set one (all rejected): the primary transport's
+        // address, else an external one, so that every section has a c=.
+        if connectivity.is_direct() && desc.session.connection.is_none() {
+            let ip = (self.ice_transport.default_candidate())
+                .map(|c| c.address.ip())
+                .or_else(|| self.config.external_ips.first().copied());
+            if let Some(ip) = ip {
+                desc.session.connection = Some(crate::sdp::connection_address(ip));
+            }
         }
 
-        if !desc.media_sections.is_empty() {
-            // Rejected sections are not bundled (RFC 9143 §7.3.2).
-            let mids: Vec<&str> = (desc.media_sections.iter())
-                .filter(|m| m.port != 0)
-                .map(|m| m.mid.as_str())
-                .collect();
-            if will_bundle && !mids.is_empty() {
-                let value = format!("BUNDLE {}", mids.join(" "));
-                desc.session
-                    .attributes
-                    .push(Attribute::new("group", Some(value)));
-            }
-
-            // In LegacySip mode, omit a=mid entirely: legacy SIP endpoints confuse
-            // a=mid without a matching a=group:BUNDLE.
-            if self.config.sdp_compatibility == crate::config::SdpCompatibilityMode::LegacySip {
-                for section in &mut desc.media_sections {
-                    section.mid = String::new();
-                }
-            } else if !will_bundle {
-                // In Standard mode with no BUNDLE, still clear mids from sections
-                // that have no group association to avoid confusing endpoints that
-                // interpret a=mid as requiring BUNDLE.
-                // Exception: single-section SDP keeps its mid (it's harmless and
-                // allows endpoints to identify the stream).
-                if desc.media_sections.len() > 1 {
-                    for section in &mut desc.media_sections {
-                        section.mid = String::new();
-                    }
-                }
-            }
+        // BUNDLE (RFC 8843): an answer keeps the offered group, also with
+        // one m-line; strict agents such as Chrome reject an answer that
+        // removes an m-line from an established group. Rejected m-lines are
+        // not in it (RFC 9143 §7.3.2).
+        let mids: Vec<&str> = (desc.media_sections.iter().zip(&mlines))
+            .filter(|(_, mline)| mline.bundled)
+            .map(|(section, _)| section.mid.as_str())
+            .collect();
+        if !mids.is_empty() {
+            let value = format!("BUNDLE {}", mids.join(" "));
+            desc.session
+                .attributes
+                .push(Attribute::new("group", Some(value)));
         }
 
         Ok(desc)
@@ -6063,6 +6267,7 @@ impl PeerConnectionInner {
         section: &mut MediaSection,
         kind: MediaKind,
         sdp_type: SdpType,
+        mline: Mline,
     ) {
         section.apply_config(&self.config);
         if let Some(caps) = self.reinvite_answer_audio_capabilities(&section.mid, kind, sdp_type) {
@@ -6079,9 +6284,9 @@ impl PeerConnectionInner {
         // Browsers reject descriptions with duplicate extension ids.
         let mut used_extmap_ids = self.get_remote_extmap_ids(&section.mid);
 
-        // Offers claim ids for WebRTC header extensions (rid, abs-send-time,
-        // sdes:mid) only with `webrtc_extensions`: SIP peers do not use them.
-        // Answers echo whatever the remote offered.
+        // Offers claim ids for WebRTC header extensions (rid, abs-send-time)
+        // only with `webrtc_extensions`: SIP peers do not use them. Answers
+        // echo whatever the remote offered.
 
         // Add extmap for Video
         if kind == MediaKind::Video {
@@ -6132,15 +6337,13 @@ impl PeerConnectionInner {
             }
         }
 
-        // Add sdes:mid extmap for BUNDLE support (RFC 8843).  Answers echo the
-        // remote ID when offered; WebRTC offers use a default ID so bundled
-        // audio/video can still be demuxed when payload types overlap.
-        if self.config.sdp_compatibility != crate::config::SdpCompatibilityMode::LegacySip {
+        // The sdes:mid extmap goes with BUNDLE (RFC 8843 §9.2): it tells the
+        // bundled m-lines apart when payload types overlap. An offer that
+        // proposes BUNDLE claims an id; an answer echoes the remote id when
+        // it accepts BUNDLE.
+        if mline.bundled {
             let mut sdes_mid_id = self.get_remote_extmap_id(&section.mid, crate::sdp::SDES_MID_URI);
-            if sdp_type == SdpType::Offer
-                && sdes_mid_id.is_none()
-                && self.config.webrtc_extensions
-            {
+            if sdp_type == SdpType::Offer && sdes_mid_id.is_none() {
                 sdes_mid_id = Some(Self::claim_free_extmap_id(&mut used_extmap_ids, 4));
             }
             if let Some(id) = sdes_mid_id {
@@ -6153,8 +6356,9 @@ impl PeerConnectionInner {
 
         // Only WebRTC uses DTLS-SRTP (a=fingerprint / a=setup). SDES-SRTP
         // keys via a=crypto and must NOT advertise DTLS attributes, otherwise
-        // SIP/SDES peers (e.g. Twilio) reject the SDP.
-        if self.config.keying == Keying::Dtls {
+        // SIP/SDES peers (e.g. Twilio) reject the SDP. They are transport
+        // attributes: not on a bundle-only m-line (RFC 9429 §5.2.1).
+        if self.config.keying == Keying::Dtls && mline.transport != MlineTransport::BundleOnly {
             let setup_value = match sdp_type {
                 SdpType::Offer => "actpass",
                 SdpType::Answer => {
@@ -6590,7 +6794,8 @@ impl PeerConnectionInner {
         }
         let mut primary = self.rtp_transport.lock();
         if let Some(transport) = primary.take() {
-            self.retired_received_rtp_packets.fetch_add(transport.received_rtp_packets(), Ordering::Relaxed);
+            self.retired_received_rtp_packets
+                .fetch_add(transport.received_rtp_packets(), Ordering::Relaxed);
         }
     }
 }
@@ -6605,6 +6810,65 @@ impl Drop for PeerConnectionInner {
         #[cfg(feature = "std")]
         self.abort_tracked_tasks();
     }
+}
+
+/// How an m-line is carried (RFC 8843; [`BundlePolicy`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MlineTransport {
+    /// The primary transport (`ice_transport`): the first m-line's, and the
+    /// one a BUNDLE group shares.
+    Primary,
+    /// A transport of its own (direct transports only).
+    Own,
+    /// In an offer: bundle-only (port 0, RFC 8843 §6), no transport.
+    BundleOnly,
+    /// In an answer: rejected (port 0).
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Mline {
+    transport: MlineTransport,
+    /// In the BUNDLE group of the description.
+    bundled: bool,
+}
+
+impl Mline {
+    fn has_transport(self) -> bool {
+        matches!(
+            self.transport,
+            MlineTransport::Primary | MlineTransport::Own
+        )
+    }
+}
+
+/// The MIDs of the first BUNDLE group (RFC 8843 §8); its first is the tag.
+fn bundle_group(desc: &SessionDescription) -> Vec<&str> {
+    (desc.session.attributes.iter())
+        .filter(|a| a.key == "group")
+        .filter_map(|a| a.value.as_deref()?.strip_prefix("BUNDLE"))
+        .map(|mids| mids.split_whitespace().collect())
+        .next()
+        .unwrap_or_default()
+}
+
+fn has_rtcp_mux(section: &MediaSection) -> bool {
+    section.attributes.iter().any(|a| a.key == "rtcp-mux")
+}
+
+/// Whether m-line `index` (MID `mid`) of `desc` multiplexes RTCP. A bundled
+/// m-line multiplexes as the BUNDLE tag does (RFC 8843 §9.1.1).
+fn mline_rtcp_mux(desc: &SessionDescription, mid: &str, index: usize) -> Option<bool> {
+    let group = bundle_group(desc);
+    // A peer without a=mid has none: then the m-line at the same index.
+    let section = if !mid.is_empty() && group.contains(&mid) {
+        desc.media_sections.iter().find(|s| s.mid == group[0])
+    } else {
+        (desc.media_sections.iter())
+            .find(|s| !mid.is_empty() && s.mid == mid)
+            .or_else(|| desc.media_sections.get(index).filter(|s| s.mid.is_empty()))
+    };
+    section.map(has_rtcp_mux)
 }
 
 /// RFC 3264 §6: a port-0 section is rejected, except a `bundle-only` non-tag
@@ -9701,6 +9965,7 @@ mod tests {
                        a=setup:passive\r\n\
                        c=IN IP4 127.0.0.1\r\n\
                        m=video 9 RTP/SAVPF 96\r\n\
+                       a=rtcp-mux\r\n\
                        a=rtpmap:96 VP8/90000\r\n\
                        a=rid:hi send\r\n\
                        a=rid:mid send\r\n\
@@ -10184,6 +10449,7 @@ o=- 123456 123456 IN IP4 127.0.0.1\r\n\
 s=-\r\n\
 t=0 0\r\n\
 m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=rtcp-mux\r\n\
 c=IN IP4 127.0.0.1\r\n\
 a=mid:0\r\n\
 a=sendrecv\r\n\
@@ -10218,6 +10484,7 @@ o=- 123456 123456 IN IP4 127.0.0.1\r\n\
 s=-\r\n\
 t=0 0\r\n\
 m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=rtcp-mux\r\n\
 c=IN IP4 127.0.0.1\r\n\
 a=mid:0\r\n\
 a=sendrecv\r\n\
@@ -10252,6 +10519,7 @@ o=- 123456 123456 IN IP4 127.0.0.1\r\n\
 s=-\r\n\
 t=0 0\r\n\
 m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=rtcp-mux\r\n\
 c=IN IP4 127.0.0.1\r\n\
 a=mid:0\r\n\
 a=sendrecv\r\n\
@@ -10342,6 +10610,7 @@ o=- 1 1 IN IP4 127.0.0.1\r\n\
 s=-\r\n\
 t=0 0\r\n\
 m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\n\
+a=rtcp-mux\r\n\
 c=IN IP4 127.0.0.1\r\n\
 a=mid:0\r\n\
 a=sendrecv\r\n\
@@ -10393,6 +10662,7 @@ o=- 1 1 IN IP4 127.0.0.1\r\n\
 s=-\r\n\
 t=0 0\r\n\
 m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=rtcp-mux\r\n\
 c=IN IP4 127.0.0.1\r\n\
 a=mid:0\r\n\
 a=sendrecv\r\n\
@@ -10473,6 +10743,7 @@ o=- 123456 123456 IN IP4 127.0.0.1\r\n\
 s=-\r\n\
 t=0 0\r\n\
 m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\n\
+a=rtcp-mux\r\n\
 c=IN IP4 127.0.0.1\r\n\
 a=mid:0\r\n\
 a=sendrecv\r\n\
@@ -10605,6 +10876,7 @@ o=- 123456 123456 IN IP4 127.0.0.1\r\n\
 s=-\r\n\
 t=0 0\r\n\
 m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\n\
+a=rtcp-mux\r\n\
 c=IN IP4 127.0.0.1\r\n\
 a=mid:0\r\n\
 a=sendrecv\r\n\
@@ -10644,6 +10916,7 @@ o=- 123456 123456 IN IP4 127.0.0.1\r\n\
 s=-\r\n\
 t=0 0\r\n\
 m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\n\
+a=rtcp-mux\r\n\
 c=IN IP4 127.0.0.1\r\n\
 a=mid:0\r\n\
 a=sendrecv\r\n\
@@ -10751,17 +11024,16 @@ a=ssrc:67890 cname:foo\r\n";
         assert_eq!(mki.rx_len, None);
     }
 
-    /// WebRTC header extensions (rid, abs-send-time, sdes:mid) are offered
-    /// only with `webrtc_extensions`, whatever the keying: SIP peers get none.
+    /// WebRTC header extensions (rid, abs-send-time) are offered only with
+    /// `webrtc_extensions`, whatever the keying: SIP peers get none. sdes:mid
+    /// goes with BUNDLE: a BUNDLE offer always has it.
     #[tokio::test]
     async fn create_offer_webrtc_extmaps_only_with_webrtc_extensions() {
         use crate::Keying;
-        use crate::config::SdpCompatibilityMode;
         let offer = |keying: Keying, webrtc_extensions: bool| async move {
             let mut config = RtcConfiguration::default();
             config.keying = keying;
             config.webrtc_extensions = webrtc_extensions;
-            config.sdp_compatibility = SdpCompatibilityMode::Standard;
             let pc = PeerConnection::new(config);
             pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
             pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
@@ -10771,7 +11043,12 @@ a=ssrc:67890 cname:foo\r\n";
         };
         for keying in [Keying::None, Keying::Sdes, Keying::Dtls] {
             let sdp = offer(keying, false).await;
-            assert!(!sdp.contains("a=extmap"), "{keying:?} offer:\n{sdp}");
+            assert!(
+                (sdp.lines().filter(|l| l.starts_with("a=extmap")))
+                    .all(|l| l.ends_with(crate::sdp::SDES_MID_URI)),
+                "{keying:?} offer:\n{sdp}"
+            );
+            assert!(sdp.contains(crate::sdp::SDES_MID_URI), "{keying:?} offer:\n{sdp}");
             assert!(!sdp.contains("msid"), "{keying:?} offer:\n{sdp}");
             let sdp = offer(keying, true).await;
             for uri in [
@@ -12498,74 +12775,6 @@ a=mid:0
     // ===== rtcp-mux policy tests =====
 
     #[tokio::test]
-    async fn rtp_mode_rtcp_mux_negotiate_omits_attribute() {
-        use crate::{Connectivity, Keying, RtcpMuxPolicy};
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
-        config.rtcp_mux_policy = RtcpMuxPolicy::Negotiate;
-
-        let pc = PeerConnection::new(config);
-        let transceiver = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
-        let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
-        let params = RtpCodecParameters {
-            payload_type: 8,
-            name: "PCMA".to_string(),
-            clock_rate: 8000,
-            channels: 1,
-        };
-        let sender = RtpSender::builder(track, 100)
-            .stream_id("s".to_string())
-            .params(params)
-            .build();
-        transceiver.set_sender(Some(sender));
-
-        let offer = pc.create_offer().await.unwrap();
-        let sdp = offer.to_sdp_string();
-
-        assert!(
-            !sdp.contains("rtcp-mux"),
-            "Negotiate policy should NOT include rtcp-mux in offer SDP, got:\n{}",
-            sdp
-        );
-    }
-
-    #[tokio::test]
-    async fn rtp_mode_rtcp_mux_require_includes_attribute() {
-        use crate::{Connectivity, Keying, RtcpMuxPolicy};
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
-        config.rtcp_mux_policy = RtcpMuxPolicy::Require;
-
-        let pc = PeerConnection::new(config);
-        let transceiver = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
-        let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
-        let params = RtpCodecParameters {
-            payload_type: 8,
-            name: "PCMA".to_string(),
-            clock_rate: 8000,
-            channels: 1,
-        };
-        let sender = RtpSender::builder(track, 100)
-            .stream_id("s".to_string())
-            .params(params)
-            .build();
-        transceiver.set_sender(Some(sender));
-
-        let offer = pc.create_offer().await.unwrap();
-        let sdp = offer.to_sdp_string();
-
-        assert!(
-            sdp.contains("rtcp-mux"),
-            "Require policy should include rtcp-mux in offer SDP, got:\n{}",
-            sdp
-        );
-    }
-
-    #[tokio::test]
     async fn rtp_mode_answer_omits_rtcp_mux_when_offer_omits_it() {
         use crate::{Connectivity, Keying, RtcpMuxPolicy};
 
@@ -12573,7 +12782,7 @@ a=mid:0
         config.connectivity = Connectivity::Sdp;
         config.keying = Keying::None;
         config.webrtc_extensions = false;
-        config.rtcp_mux_policy = RtcpMuxPolicy::Require;
+        config.rtcp_mux_policy = RtcpMuxPolicy::Negotiate;
 
         let pc = PeerConnection::new(config);
         let transceiver = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
@@ -12626,7 +12835,7 @@ a=mid:0
         config.connectivity = Connectivity::Sdp;
         config.keying = Keying::None;
         config.webrtc_extensions = false;
-        config.rtcp_mux_policy = RtcpMuxPolicy::Require;
+        config.rtcp_mux_policy = RtcpMuxPolicy::Negotiate;
         config.media_capabilities = Some(MediaCapabilities {
             audio: vec![
                 AudioCapability::opus(),
@@ -13082,8 +13291,9 @@ a=mid:0
         );
     }
 
+    /// Full ICE gathers no RTCP component: `Negotiate` works as `Require`.
     #[tokio::test]
-    async fn webrtc_mode_rtcp_mux_negotiate_omits_attribute() {
+    async fn webrtc_mode_rtcp_mux_negotiate_works_as_require() {
         use crate::RtcpMuxPolicy;
         let mut config = RtcConfiguration::default();
         config.rtcp_mux_policy = RtcpMuxPolicy::Negotiate;
@@ -13094,11 +13304,9 @@ a=mid:0
         let offer = pc.create_offer().await.unwrap();
         let sdp = offer.to_sdp_string();
 
-        assert!(
-            !sdp.contains("rtcp-mux"),
-            "Negotiate policy should NOT include rtcp-mux even in WebRTC mode, got:\n{}",
-            sdp
-        );
+        assert!(sdp.contains("a=rtcp-mux\r\n"), "{sdp}");
+        assert!(sdp.contains("a=rtcp-mux-only"), "{sdp}");
+        assert!(!sdp.contains("a=rtcp:"), "{sdp}");
     }
 
     // ===== ICE-lite in RTP mode tests =====
@@ -13746,169 +13954,358 @@ a=mid:0
         );
     }
 
-    // ── SdpCompatibilityMode::LegacySip / a=mid and BUNDLE ───────────────────
+    // ── a=mid, BUNDLE and RTCP multiplexing on direct transports ────────────
 
-    /// In LegacySip mode the generated offer must not contain any a=mid or a=rtcp-mux.
-    #[tokio::test]
-    async fn legacy_sip_offer_omits_mid_and_rtcp_mux() {
-        use crate::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode};
+    fn direct_av_config(
+        bundle_policy: crate::BundlePolicy,
+        rtcp_mux_policy: crate::RtcpMuxPolicy,
+    ) -> RtcConfiguration {
+        use crate::config::{AudioCapability, MediaCapabilities};
         use crate::{Connectivity, Keying};
 
         let mut config = RtcConfiguration::default();
         config.connectivity = Connectivity::Sdp;
         config.keying = Keying::None;
         config.webrtc_extensions = false;
-        config.sdp_compatibility = SdpCompatibilityMode::LegacySip;
-        config.media_capabilities = Some(MediaCapabilities {
-            audio: vec![AudioCapability::pcma()],
-            video: vec![],
-            application: None,
-            image: vec![],
-        });
-        let pc = PeerConnection::new(config);
-        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
-
-        let offer = pc.create_offer().await.unwrap();
-        let sdp = offer.to_sdp_string();
-
-        assert!(
-            !sdp.contains("a=mid:"),
-            "LegacySip offer must not contain a=mid, got SDP:\n{sdp}"
-        );
-        assert!(
-            !sdp.contains("a=rtcp-mux"),
-            "LegacySip offer must not contain a=rtcp-mux, got SDP:\n{sdp}"
-        );
-        assert!(
-            sdp.contains("a=rtcp:"),
-            "LegacySip offer without rtcp-mux must advertise the separate RTCP port, got SDP:\n{sdp}"
-        );
-        assert!(
-            !sdp.contains("a=group:BUNDLE"),
-            "LegacySip offer must not contain a=group:BUNDLE, got SDP:\n{sdp}"
-        );
-    }
-
-    /// Standard mode with two media sections MUST produce a=group:BUNDLE and a=mid.
-    #[tokio::test]
-    async fn standard_mode_multi_section_includes_bundle_and_mid() {
-        use crate::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode};
-        use crate::{Connectivity, Keying};
-
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
-        config.sdp_compatibility = SdpCompatibilityMode::Standard;
-        config.media_capabilities = Some(MediaCapabilities {
-            audio: vec![AudioCapability::pcma()],
-            video: vec![crate::config::VideoCapability::default()],
-            application: None,
-            image: vec![],
-        });
-        let pc = PeerConnection::new(config);
-        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
-        pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
-
-        let offer = pc.create_offer().await.unwrap();
-        let sdp = offer.to_sdp_string();
-
-        assert!(
-            sdp.contains("a=group:BUNDLE"),
-            "Standard mode with two sections must emit a=group:BUNDLE, got:\n{sdp}"
-        );
-        assert!(
-            sdp.contains("a=mid:"),
-            "Standard mode must emit a=mid for each section, got:\n{sdp}"
-        );
-    }
-
-    /// In LegacySip mode with two media sections, no BUNDLE and no a=mid.
-    #[tokio::test]
-    async fn legacy_sip_multi_section_no_bundle_no_mid() {
-        use crate::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode};
-        use crate::{Connectivity, Keying};
-
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
-        config.sdp_compatibility = SdpCompatibilityMode::LegacySip;
+        config.bundle_policy = bundle_policy;
+        config.rtcp_mux_policy = rtcp_mux_policy;
         config.media_capabilities = Some(MediaCapabilities {
             audio: vec![AudioCapability::pcma()],
             video: vec![crate::config::VideoCapability::h264()],
             application: None,
             image: vec![],
         });
-        let pc = PeerConnection::new(config);
-        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
-        pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
-
-        let offer = pc.create_offer().await.unwrap();
-        assert_eq!(offer.media_sections.len(), 2, "should have audio+video");
-
-        let sdp = offer.to_sdp_string();
-        assert!(
-            !sdp.contains("a=group:BUNDLE"),
-            "LegacySip must not emit a=group:BUNDLE, got:\n{sdp}"
-        );
-        assert!(
-            !sdp.contains("a=mid:"),
-            "LegacySip must not emit a=mid, got:\n{sdp}"
-        );
-        assert_eq!(
-            sdp.matches("a=rtcp:").count(),
-            2,
-            "non-BUNDLE RTP offer must advertise separate RTCP ports for audio and video:\n{sdp}"
-        );
+        config
     }
 
+    /// RFC 5761 §5.1.1: with `Negotiate`, an offer proposes multiplexing and
+    /// reserves an RTCP port for an answer that refuses it. One m-line: no
+    /// BUNDLE group.
     #[tokio::test]
-    async fn rtp_mode_legacy_non_bundle_offer_uses_distinct_media_ports() {
-        use crate::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode};
-        use crate::{Connectivity, Keying};
+    async fn negotiate_offer_proposes_mux_and_reserves_rtcp_port() {
+        use crate::{BundlePolicy, RtcpMuxPolicy};
 
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
-        config.sdp_compatibility = SdpCompatibilityMode::LegacySip;
-        config.media_capabilities = Some(MediaCapabilities {
-            audio: vec![AudioCapability::pcma()],
-            video: vec![crate::config::VideoCapability::h264()],
-            application: None,
-            image: vec![],
-        });
-        let pc = PeerConnection::new(config);
-        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::RecvOnly);
-        pc.add_transceiver(MediaKind::Video, TransceiverDirection::RecvOnly);
+        let pc = PeerConnection::new(direct_av_config(
+            BundlePolicy::default(),
+            RtcpMuxPolicy::Negotiate,
+        ));
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        let sdp = pc.create_offer().await.unwrap().to_sdp_string();
 
+        assert!(!sdp.contains("a=mid:"), "no BUNDLE group, so no a=mid:\n{sdp}");
+        assert!(sdp.contains("a=rtcp-mux\r\n"), "{sdp}");
+        assert!(!sdp.contains("a=rtcp-mux-only"), "{sdp}");
+        let port = pc.create_offer().await.unwrap().media_sections[0].port;
+        assert!(sdp.contains(&format!("a=rtcp:{}", port + 1)), "{sdp}");
+        assert!(!sdp.contains("a=group:BUNDLE"), "{sdp}");
+        pc.close();
+    }
+
+    /// RFC 8858: with `Require`, an offer requires multiplexing and has no
+    /// RTCP port; a remote description without it is an error.
+    #[tokio::test]
+    async fn require_offers_mux_only_and_refuses_unmuxed_peer() {
+        use crate::{BundlePolicy, RtcpMuxPolicy};
+
+        let pc = PeerConnection::new(direct_av_config(
+            BundlePolicy::default(),
+            RtcpMuxPolicy::Require,
+        ));
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        let sdp = pc.create_offer().await.unwrap().to_sdp_string();
+        assert!(sdp.contains("a=rtcp-mux\r\n"), "{sdp}");
+        assert!(sdp.contains("a=rtcp-mux-only"), "{sdp}");
+        assert!(!sdp.contains("a=rtcp:"), "{sdp}");
+        pc.close();
+
+        let pc = PeerConnection::new(direct_av_config(
+            BundlePolicy::default(),
+            RtcpMuxPolicy::Require,
+        ));
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        let offer = "v=0\r\n\
+            o=- 1 1 IN IP4 10.0.0.2\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 10.0.0.2\r\n\
+            m=audio 5000 RTP/AVP 8\r\n\
+            a=rtpmap:8 PCMA/8000\r\n\
+            a=sendrecv\r\n";
+        let offer = SessionDescription::parse(SdpType::Offer, offer).unwrap();
+        assert!(pc.set_remote_description(offer).await.is_err());
+        pc.close();
+    }
+
+    /// An answer multiplexes when the offer does, and then has no RTCP port.
+    #[tokio::test]
+    async fn answer_to_muxed_offer_multiplexes() {
+        use crate::{BundlePolicy, RtcpMuxPolicy};
+
+        let pc = PeerConnection::new(direct_av_config(
+            BundlePolicy::default(),
+            RtcpMuxPolicy::Negotiate,
+        ));
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        let offer = "v=0\r\n\
+            o=- 1 1 IN IP4 10.0.0.2\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 10.0.0.2\r\n\
+            m=audio 5000 RTP/AVP 8\r\n\
+            a=rtpmap:8 PCMA/8000\r\n\
+            a=rtcp-mux\r\n\
+            a=sendrecv\r\n";
+        let offer = SessionDescription::parse(SdpType::Offer, offer).unwrap();
+        pc.set_remote_description(offer).await.unwrap();
+        let sdp = pc.create_answer().await.unwrap().to_sdp_string();
+        assert!(sdp.contains("a=rtcp-mux\r\n"), "{sdp}");
+        assert!(!sdp.contains("a=rtcp-mux-only"), "{sdp}");
+        assert!(!sdp.contains("a=rtcp:"), "{sdp}");
+        pc.close();
+    }
+
+    /// A later offer keeps the multiplexing of the last negotiation
+    /// (RFC 9429 §5.2.2): the answer refused it, so no a=rtcp-mux.
+    #[tokio::test]
+    async fn reoffer_keeps_refused_mux() {
+        use crate::{BundlePolicy, RtcpMuxPolicy};
+
+        let pc = PeerConnection::new(direct_av_config(
+            BundlePolicy::default(),
+            RtcpMuxPolicy::Negotiate,
+        ));
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
         let offer = pc.create_offer().await.unwrap();
-        assert_eq!(offer.media_sections.len(), 2, "should have audio+video");
+        let rtcp_port = offer.media_sections[0].port + 1;
+        pc.set_local_description(offer).unwrap();
+        let answer = "v=0\r\n\
+            o=- 1 1 IN IP4 10.0.0.2\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 10.0.0.2\r\n\
+            m=audio 5000 RTP/AVP 8\r\n\
+            a=rtpmap:8 PCMA/8000\r\n\
+            a=sendrecv\r\n";
+        let answer = SessionDescription::parse(SdpType::Answer, answer).unwrap();
+        pc.set_remote_description(answer).await.unwrap();
 
-        let audio_port = offer.media_sections[0].port;
-        let video_port = offer.media_sections[1].port;
-        assert_ne!(
-            audio_port,
-            video_port,
-            "non-BUNDLE RTP offer must not reuse one RTP port for audio and video:\n{}",
-            offer.to_sdp_string()
-        );
+        let sdp = pc.create_offer().await.unwrap().to_sdp_string();
+        assert!(!sdp.contains("a=rtcp-mux"), "{sdp}");
+        assert!(sdp.contains(&format!("a=rtcp:{rtcp_port}")), "{sdp}");
+        pc.close();
+    }
 
+    /// An offer that proposes no BUNDLE group is written without a=mid,
+    /// also a later one. A SIP peer's answer then has none either, and its
+    /// m-line still matches ours (by position).
+    #[tokio::test]
+    async fn offer_without_bundle_group_has_no_mid() {
+        use crate::{BundlePolicy, RtcpMuxPolicy};
+
+        let config = || direct_av_config(BundlePolicy::Balanced, RtcpMuxPolicy::Negotiate);
+        let offerer = PeerConnection::new(config());
+        offerer.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        let answerer = PeerConnection::new(config());
+        answerer.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+
+        let offer = offerer.create_offer().await.unwrap();
         let sdp = offer.to_sdp_string();
+        assert!(!sdp.contains("a=mid:"), "{sdp}");
+        assert!(!sdp.contains("a=group:BUNDLE"), "{sdp}");
+        offerer.set_local_description(offer).unwrap();
+        let sdp = offerer.local_description().unwrap().to_sdp_string();
+        assert!(!sdp.contains("a=mid:"), "{sdp}");
+
+        // The peer gets the text.
+        let offer = SessionDescription::parse(SdpType::Offer, &sdp).unwrap();
+        answerer.set_remote_description(offer).await.unwrap();
+        let answer = answerer.create_answer().await.unwrap();
+        answerer.set_local_description(answer).unwrap();
+        let answer_sdp = answerer.local_description().unwrap().to_sdp_string();
+        assert!(!answer_sdp.contains("a=mid:"), "{answer_sdp}");
+        let answer = SessionDescription::parse(SdpType::Answer, &answer_sdp).unwrap();
+        offerer.set_remote_description(answer).await.unwrap();
+
+        // Negotiated: the answer took the offered mux.
+        let reoffer = offerer.create_offer().await.unwrap().to_sdp_string();
+        assert!(!reoffer.contains("a=mid:"), "{reoffer}");
+        assert!(reoffer.contains("a=rtcp-mux\r\n"), "{reoffer}");
+        offerer.close();
+        answerer.close();
+    }
+
+    /// An offer with a BUNDLE group, and every answer, write their mids.
+    #[test]
+    fn mids_written_with_a_bundle_group_and_in_answers() {
+        let text = "v=0\r\no=- 1 1 IN IP4 10.0.0.2\r\ns=-\r\nt=0 0\r\nc=IN IP4 10.0.0.2\r\n\
+            m=audio 5000 RTP/AVP 8\r\na=mid:0\r\na=rtpmap:8 PCMA/8000\r\na=sendrecv\r\n";
+        let answer = SessionDescription::parse(SdpType::Answer, text).unwrap();
+        assert!(answer.to_sdp_string().contains("a=mid:0\r\n"));
+        let offer = SessionDescription::parse(SdpType::Offer, text).unwrap();
+        assert!(!offer.to_sdp_string().contains("a=mid:"));
+        let bundled = text.replace("t=0 0\r\n", "t=0 0\r\na=group:BUNDLE 0\r\n");
+        let offer = SessionDescription::parse(SdpType::Offer, &bundled).unwrap();
+        assert!(offer.to_sdp_string().contains("a=mid:0\r\n"));
+    }
+
+    /// An audio/video offer proposes BUNDLE with a=mid and sdes:mid on
+    /// every m-line, and gives each m-line its own port (RFC 8843 §7.2), so
+    /// that a peer without BUNDLE gets both. With `Negotiate`, each has its
+    /// RTCP port.
+    #[tokio::test]
+    async fn direct_av_offer_proposes_bundle_with_a_port_per_mline() {
+        use crate::{BundlePolicy, RtcpMuxPolicy};
+
+        for policy in [BundlePolicy::Balanced, BundlePolicy::MaxCompat] {
+            let pc =
+                PeerConnection::new(direct_av_config(policy.clone(), RtcpMuxPolicy::Negotiate));
+            pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+            pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
+            let offer = pc.create_offer().await.unwrap();
+            let sdp = offer.to_sdp_string();
+
+            assert!(sdp.contains("a=group:BUNDLE 0 1"), "{policy:?}:\n{sdp}");
+            assert!(sdp.contains("a=mid:0") && sdp.contains("a=mid:1"), "{sdp}");
+            assert_eq!(sdp.matches(crate::sdp::SDES_MID_URI).count(), 2, "{sdp}");
+            assert!(!sdp.contains("a=bundle-only"), "{policy:?}:\n{sdp}");
+            let (audio, video) = (offer.media_sections[0].port, offer.media_sections[1].port);
+            assert!(audio != 0 && video != 0 && audio != video, "{sdp}");
+            assert!(sdp.contains(&format!("a=rtcp:{}", audio + 1)), "{sdp}");
+            assert!(sdp.contains(&format!("a=rtcp:{}", video + 1)), "{sdp}");
+            pc.close();
+        }
+    }
+
+    /// `MaxBundle`: only the first m-line has a port; the others are
+    /// bundle-only (RFC 8843 §6), without transport attributes.
+    #[tokio::test]
+    async fn max_bundle_offers_others_bundle_only() {
+        use crate::{BundlePolicy, RtcpMuxPolicy};
+
+        let pc = PeerConnection::new(direct_av_config(
+            BundlePolicy::MaxBundle,
+            RtcpMuxPolicy::Negotiate,
+        ));
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
+        let offer = pc.create_offer().await.unwrap();
+        let sdp = offer.to_sdp_string();
+
+        assert!(sdp.contains("a=group:BUNDLE 0 1"), "{sdp}");
+        assert_ne!(offer.media_sections[0].port, 0, "{sdp}");
+        let video = &offer.media_sections[1];
+        assert_eq!(video.port, 0, "{sdp}");
+        let has = |key: &str| video.attributes.iter().any(|a| a.key == key);
+        assert!(has("bundle-only"), "{sdp}");
         assert!(
-            !sdp.contains("a=group:BUNDLE"),
-            "LegacySip must not emit a=group:BUNDLE, got:\n{sdp}"
+            !has("rtcp-mux") && !has("rtcp") && !has("candidate"),
+            "{sdp}"
         );
+        pc.close();
+    }
+
+    /// `Balanced`: the second m-line of a kind is bundle-only, the first of
+    /// each kind has a port.
+    #[tokio::test]
+    async fn balanced_offers_second_mline_of_a_kind_bundle_only() {
+        use crate::{BundlePolicy, RtcpMuxPolicy};
+
+        let pc = PeerConnection::new(direct_av_config(
+            BundlePolicy::Balanced,
+            RtcpMuxPolicy::Negotiate,
+        ));
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
+        let offer = pc.create_offer().await.unwrap();
+        let ports: Vec<u16> = offer.media_sections.iter().map(|m| m.port).collect();
+        assert!(ports[0] != 0 && ports[1] == 0 && ports[2] != 0, "{ports:?}");
+        pc.close();
+    }
+
+    /// Full ICE has one agent: the m-lines after the first are bundle-only,
+    /// without ICE credentials or candidates (RFC 9429 §5.2.1).
+    #[tokio::test]
+    async fn full_ice_offers_others_bundle_only() {
+        let pc = PeerConnection::new(RtcConfiguration::default());
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
+        pc.wait_for_gathering_complete().await;
+        let offer = pc.create_offer().await.unwrap();
+        pc.set_local_description(offer).unwrap();
+        pc.wait_for_gathering_complete().await;
+        let offer = pc.local_description().unwrap();
+        let sdp = offer.to_sdp_string();
+
+        assert!(sdp.contains("a=group:BUNDLE 0 1"), "{sdp}");
+        let video = &offer.media_sections[1];
+        assert_eq!(video.port, 0, "{sdp}");
+        let has = |key: &str| video.attributes.iter().any(|a| a.key == key);
+        assert!(has("bundle-only"), "{sdp}");
         assert!(
-            !sdp.contains("a=mid:"),
-            "LegacySip must not emit a=mid, got:\n{sdp}"
+            !has("ice-ufrag") && !has("candidate") && !has("fingerprint"),
+            "{sdp}"
         );
+        assert!(sdp.contains("a=rtcp-mux-only"), "{sdp}");
+        pc.close();
+    }
+
+    /// An answer to an offer without BUNDLE gives each m-line its own port
+    /// and echoes the offered a=mid (RFC 5888 §9.1); the bundle policy
+    /// rejects what it gives no transport.
+    #[tokio::test]
+    async fn answer_to_non_bundle_offer_follows_bundle_policy() {
+        use crate::{BundlePolicy, RtcpMuxPolicy};
+
+        let offer = "v=0\r\n\
+            o=- 1 1 IN IP4 10.0.0.2\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 10.0.0.2\r\n\
+            m=audio 5000 RTP/AVP 8\r\n\
+            a=mid:as\r\n\
+            a=rtpmap:8 PCMA/8000\r\n\
+            a=sendrecv\r\n\
+            m=video 6000 RTP/AVP 96\r\n\
+            a=mid:vs\r\n\
+            a=rtpmap:96 H264/90000\r\n\
+            a=sendrecv\r\n";
+        for (policy, video_accepted) in [
+            (BundlePolicy::Balanced, true),
+            (BundlePolicy::MaxCompat, true),
+            (BundlePolicy::MaxBundle, false),
+        ] {
+            let pc =
+                PeerConnection::new(direct_av_config(policy.clone(), RtcpMuxPolicy::Negotiate));
+            pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+            pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
+            let remote = SessionDescription::parse(SdpType::Offer, offer).unwrap();
+            pc.set_remote_description(remote).await.unwrap();
+            let answer = pc.create_answer().await.unwrap();
+            let sdp = answer.to_sdp_string();
+
+            assert!(!sdp.contains("a=group:BUNDLE"), "{policy:?}:\n{sdp}");
+            assert!(
+                !sdp.contains(crate::sdp::SDES_MID_URI),
+                "{policy:?}:\n{sdp}"
+            );
+            assert!(
+                sdp.contains("a=mid:as") && sdp.contains("a=mid:vs"),
+                "{sdp}"
+            );
+            let (audio, video) = (answer.media_sections[0].port, answer.media_sections[1].port);
+            assert_ne!(audio, 0, "{policy:?}:\n{sdp}");
+            assert_eq!(video != 0, video_accepted, "{policy:?}:\n{sdp}");
+            if video_accepted {
+                assert_ne!(audio, video, "{policy:?}:\n{sdp}");
+            }
+            pc.close();
+        }
     }
 
     #[tokio::test]
     async fn rtp_mode_midless_non_bundle_offer_maps_each_media_transport() {
-        use crate::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode};
+        use crate::config::{AudioCapability, MediaCapabilities};
         use crate::{Connectivity, Keying};
         use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -13916,7 +14313,7 @@ a=mid:0
         config.connectivity = Connectivity::Sdp;
         config.keying = Keying::None;
         config.webrtc_extensions = false;
-        config.sdp_compatibility = SdpCompatibilityMode::LegacySip;
+        config.rtcp_mux_policy = crate::config::RtcpMuxPolicy::Negotiate;
         config.media_capabilities = Some(MediaCapabilities {
             audio: vec![AudioCapability::pcma()],
             video: vec![crate::config::VideoCapability::h264()],
@@ -13984,7 +14381,7 @@ a=mid:0
     /// without BUNDLE, each keyed with its own m-line's a=crypto (RFC 4568).
     #[tokio::test]
     async fn srtp_mode_non_bundle_keys_each_media_transport() {
-        use crate::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode};
+        use crate::config::{AudioCapability, MediaCapabilities};
         use crate::{Connectivity, Keying};
         use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -13992,7 +14389,7 @@ a=mid:0
         config.connectivity = Connectivity::Sdp;
         config.keying = Keying::Sdes;
         config.webrtc_extensions = false;
-        config.sdp_compatibility = SdpCompatibilityMode::LegacySip;
+        config.rtcp_mux_policy = crate::config::RtcpMuxPolicy::Negotiate;
         config.media_capabilities = Some(MediaCapabilities {
             audio: vec![AudioCapability::pcma()],
             video: vec![crate::config::VideoCapability::h264()],
@@ -14432,14 +14829,14 @@ a=sendrecv\r\n"
 
     #[tokio::test]
     async fn rtp_mode_midless_reinvite_reactivates_existing_video_transceiver() {
-        use crate::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode};
+        use crate::config::{AudioCapability, MediaCapabilities};
         use crate::{Connectivity, Keying};
 
         let mut config = RtcConfiguration::default();
         config.connectivity = Connectivity::Sdp;
         config.keying = Keying::None;
         config.webrtc_extensions = false;
-        config.sdp_compatibility = SdpCompatibilityMode::LegacySip;
+        config.rtcp_mux_policy = crate::config::RtcpMuxPolicy::Negotiate;
         config.media_capabilities = Some(MediaCapabilities {
             audio: vec![AudioCapability::pcma()],
             video: vec![crate::config::VideoCapability::h264()],
@@ -14508,7 +14905,7 @@ a=sendrecv\r\n"
 
     #[tokio::test]
     async fn rtp_mode_midless_non_bundle_answer_maps_each_media_transport() {
-        use crate::config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode};
+        use crate::config::{AudioCapability, MediaCapabilities};
         use crate::{Connectivity, Keying};
         use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -14516,7 +14913,7 @@ a=sendrecv\r\n"
         config.connectivity = Connectivity::Sdp;
         config.keying = Keying::None;
         config.webrtc_extensions = false;
-        config.sdp_compatibility = SdpCompatibilityMode::LegacySip;
+        config.rtcp_mux_policy = crate::config::RtcpMuxPolicy::Negotiate;
         config.media_capabilities = Some(MediaCapabilities {
             audio: vec![AudioCapability::pcma()],
             video: vec![crate::config::VideoCapability::h264()],
@@ -14591,60 +14988,6 @@ a=sendrecv\r\n"
         assert_eq!(
             *video_transport.ice_conn().remote_rtcp_addr.read(),
             Some(SocketAddr::new(remote_ip, 58854))
-        );
-    }
-
-    /// When answering a non-BUNDLE offer (e.g. Linphone), the answer must not
-    /// contain a=mid in the sections (Standard mode).
-    #[tokio::test]
-    async fn answer_to_non_bundle_offer_omits_mid_in_sections() {
-        use crate::config::{AudioCapability, MediaCapabilities};
-        use crate::{Connectivity, Keying};
-
-        // No a=group:BUNDLE in this remote offer (traditional SIP style)
-        let remote_sdp = "v=0\r\n\
-                          o=- 1 1 IN IP4 192.168.1.100\r\n\
-                          s=-\r\n\
-                          t=0 0\r\n\
-                          c=IN IP4 192.168.1.100\r\n\
-                          m=audio 5000 RTP/AVP 8\r\n\
-                          a=mid:as\r\n\
-                          a=sendrecv\r\n\
-                          a=rtpmap:8 PCMA/8000\r\n\
-                          m=video 5002 RTP/AVP 96\r\n\
-                          a=mid:vs\r\n\
-                          a=sendrecv\r\n\
-                          a=rtpmap:96 H264/90000\r\n\
-                          a=fmtp:96 packetization-mode=0;profile-level-id=42801F\r\n";
-
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
-        config.media_capabilities = Some(MediaCapabilities {
-            audio: vec![AudioCapability::pcma()],
-            video: vec![crate::config::VideoCapability::h264()],
-            application: None,
-            image: vec![],
-        });
-        let pc = PeerConnection::new(config);
-        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
-        pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
-
-        let remote = SessionDescription::parse(SdpType::Offer, remote_sdp).unwrap();
-        pc.set_remote_description(remote).await.unwrap();
-
-        let answer = pc.create_answer().await.unwrap();
-        let sdp = answer.to_sdp_string();
-
-        assert!(
-            !sdp.contains("a=group:BUNDLE"),
-            "answer to non-BUNDLE offer must not have a=group:BUNDLE, got:\n{sdp}"
-        );
-        // Neither section should have a=mid since there is no BUNDLE group
-        assert!(
-            !sdp.contains("a=mid:"),
-            "answer to non-BUNDLE offer must not have a=mid in any section, got:\n{sdp}"
         );
     }
 
@@ -16003,6 +16346,7 @@ a=mid:0
                        a=setup:actpass\r\n\
                        c=IN IP4 127.0.0.1\r\n\
                        m=audio 9 UDP/TLS/RTP/SAVPF 109\r\n\
+                       a=rtcp-mux\r\n\
                        a=mid:0\r\n\
                        a=rtpmap:109 opus/48000/2\r\n\
                        a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level\r\n\

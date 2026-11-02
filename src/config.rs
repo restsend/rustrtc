@@ -86,18 +86,41 @@ pub enum IceTcpPolicy {
     PassiveOnly,
 }
 
+/// Which m-lines of an offer have a transport of their own (RFC 9429
+/// §4.1.1). An offer with two or more m-lines proposes BUNDLE (RFC 8843):
+/// when the answer accepts it, all m-lines share one transport. The policy
+/// decides what a peer without BUNDLE gets. The other m-lines are offered
+/// bundle-only (port 0): such a peer rejects them. An answer to an offer
+/// without BUNDLE rejects the m-lines that the policy gives no transport.
+///
+/// Full ICE has one ICE agent: it always works as `MaxBundle`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum BundlePolicy {
+    /// A transport for the first m-line of each kind (audio, video, data).
+    /// A peer without BUNDLE gets one m-line of each kind.
     #[default]
     Balanced,
+    /// A transport for every m-line. A peer without BUNDLE gets them all.
     MaxCompat,
+    /// A transport for the first m-line only. A peer without BUNDLE gets
+    /// only the first m-line. RFC 9429 calls it "must-bundle".
     MaxBundle,
 }
 
+/// RTP/RTCP multiplexing on one port (RFC 5761, RFC 9429 §4.1.1). Offers
+/// propose it with `a=rtcp-mux`; answers accept it when the offer has it.
+///
+/// Full ICE gathers no RTCP component: it always works as `Require`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum RtcpMuxPolicy {
-    #[default]
+    /// The peer must multiplex. Offers also carry `a=rtcp-mux-only`
+    /// (RFC 8858) and reserve no RTCP port. A remote description with an
+    /// RTP m-line without `a=rtcp-mux` is an error.
     Require,
+    /// Offers reserve an RTCP port and advertise it with `a=rtcp`, for an
+    /// answer that does not multiplex (RFC 5761 §5.1.1). Use this for SIP
+    /// peers: many of them do not multiplex.
+    #[default]
     Negotiate,
 }
 
@@ -481,18 +504,6 @@ fn default_buffer_stats_log_interval() -> core::time::Duration {
     core::time::Duration::from_secs(10)
 }
 
-/// Controls SDP generation compatibility for interoperability with legacy SIP endpoints.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum SdpCompatibilityMode {
-    /// Standard WebRTC / RFC-compliant SDP output (default).
-    #[default]
-    Standard,
-    /// Compatibility mode for legacy SIP endpoints (e.g. Linphone):
-    /// omits `a=mid` unless BUNDLE is active, omits `a=rtcp-mux`.
-    LegacySip,
-}
-
 fn default_enable_upnp() -> bool {
     false
 }
@@ -524,11 +535,12 @@ pub struct RtcConfiguration {
     #[serde(default)]
     pub keying: Keying,
     /// The peer is a WebRTC endpoint (a browser, an SFU): offers claim
-    /// header extension ids for rid, repaired-rid, abs-send-time and
-    /// sdes:mid; with `enable_gcc`, descriptions carry transport-cc and we
-    /// send TWCC feedback; descriptions carry `msid`. Answers echo the rid,
-    /// abs-send-time and sdes:mid ids the remote offered either way. SIP
-    /// peers do not use these: set it to false for them. Default: true.
+    /// header extension ids for rid, repaired-rid and abs-send-time; with
+    /// `enable_gcc`, descriptions carry transport-cc and we send TWCC
+    /// feedback; descriptions carry `msid`. Answers echo the rid and
+    /// abs-send-time ids the remote offered either way. SIP peers do not use
+    /// these: set it to false for them. Default: true. (sdes:mid goes with
+    /// BUNDLE, see [`BundlePolicy`].)
     #[serde(default = "default_webrtc_extensions")]
     pub webrtc_extensions: bool,
     pub nack_buffer_size: usize,
@@ -721,9 +733,6 @@ pub struct RtcConfiguration {
     /// is enabled. All `PeerConnection`s sharing this port must agree on it.
     #[serde(default)]
     pub ice_udp_mux_port: Option<u16>,
-    /// SDP generation compatibility mode.
-    #[serde(default)]
-    pub sdp_compatibility: SdpCompatibilityMode,
     #[serde(skip, default)]
     pub label: Option<String>,
     #[serde(skip, default)]
@@ -803,7 +812,6 @@ impl PartialEq for RtcConfiguration {
             && self.ice_tcp_policy == other.ice_tcp_policy
             && self.ice_udp_mux == other.ice_udp_mux
             && self.ice_udp_mux_port == other.ice_udp_mux_port
-            && self.sdp_compatibility == other.sdp_compatibility
             && self.label == other.label
             && self.cname == other.cname
         // runtime_handle is intentionally omitted
@@ -874,7 +882,6 @@ impl Default for RtcConfiguration {
             ice_tcp_policy: IceTcpPolicy::default(),
             ice_udp_mux: false,
             ice_udp_mux_port: None,
-            sdp_compatibility: SdpCompatibilityMode::default(),
             label: None,
             cname: None,
             runtime_handle: None,
@@ -1236,11 +1243,6 @@ impl RtcConfigurationBuilder {
     /// Set the shared UDP mux port. Must be set when `ice_udp_mux` is enabled.
     pub fn ice_udp_mux_port(mut self, port: u16) -> Self {
         self.inner.ice_udp_mux_port = Some(port);
-        self
-    }
-
-    pub fn sdp_compatibility(mut self, mode: SdpCompatibilityMode) -> Self {
-        self.inner.sdp_compatibility = mode;
         self
     }
 
