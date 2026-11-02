@@ -4789,7 +4789,7 @@ async fn run_rtp_direct_loop(
         match ice_state {
             crate::transports::ice::IceTransportState::Connected
             | crate::transports::ice::IceTransportState::Completed => {
-                if !handle_connected_state_no_dtls(&inner_weak, &mut ice_state_rx).await {
+                if !handle_connected_state_no_dtls(&inner_weak, &ice_connection_state_tx, &mut ice_state_rx).await {
                     return;
                 }
                 continue;
@@ -4945,7 +4945,7 @@ async fn run_ice_dtls_loop(
                 };
 
                 if keying != Keying::Dtls {
-                    if !handle_connected_state_no_dtls(&inner_weak, &mut ice_state_rx).await {
+                    if !handle_connected_state_no_dtls(&inner_weak, &ice_connection_state_tx, &mut ice_state_rx).await {
                         return;
                     }
                     continue;
@@ -5039,6 +5039,7 @@ fn propagate_sctp_close_reason(inner: &PeerConnectionInner) {
 
 async fn handle_connected_state_no_dtls(
     inner_weak: &Weak<PeerConnectionInner>,
+    ice_connection_state_tx: &watch::Sender<IceConnectionState>,
     ice_state_rx: &mut watch::Receiver<crate::transports::ice::IceTransportState>,
 ) -> bool {
     if let Some(inner) = inner_weak.upgrade() {
@@ -5060,122 +5061,28 @@ async fn handle_connected_state_no_dtls(
                 let _ = inner.peer_state.send(PeerConnectionState::Failed);
                 return false;
             }
-            Ok(mut rtcp_loop) => {
+            Ok(rtcp_loop) => {
                 let _ = inner.peer_state.send(PeerConnectionState::Connected);
-                let grace = inner.config.ice_disconnect_grace;
                 drop(inner);
                 drop(pc_temp);
-
-                let (grace_tx, mut grace_rx) = mpsc::unbounded_channel::<u64>();
-                let mut disconnect_epoch: u64 = 0;
-
-                let mut grace_open = true;
-                loop {
-                    let __which = {
-                        let __s0 = core::pin::pin!(&mut rtcp_loop);
-                        let __s1 = core::pin::pin!(ice_state_rx.changed());
-                        let __s2 = if grace_open {
-                            crate::platform::select::Either::A(core::pin::pin!(grace_rx.recv()))
-                        } else {
-                            crate::platform::select::Either::B(
-                                core::future::pending::<Option<u64>>(),
-                            )
-                        };
-                        crate::platform::select::select3(__s0, __s1, __s2).await
-                    };
-                    match __which {
-                        crate::platform::select::Which3::A(_) => {
-                            if let Some(inner) = inner_weak.upgrade() {
-                                propagate_sctp_close_reason(&inner);
-                            }
-                            break;
-                        }
-                        crate::platform::select::Which3::B(res) => {
-                            if res.is_err() {
-                                return false;
-                            }
-                            let new_state = *ice_state_rx.borrow();
-                            if is_ice_failed_or_closed(new_state) {
-                                return true;
-                            }
-                            match new_state {
-                                crate::transports::ice::IceTransportState::Disconnected => {
-                                    if let Some(inner) = inner_weak.upgrade() {
-                                        let _ = inner
-                                            .peer_state
-                                            .send(PeerConnectionState::Disconnected);
-                                    }
-                                    let epoch = disconnect_epoch;
-                                    let tx = grace_tx.clone();
-                                    crate::platform::task::spawn(
-                                        async move {
-                                            crate::platform::task::sleep(grace).await;
-                                            let _ = tx.send(epoch);
-                                        }
-                                        .instrument(tracing::Span::current()),
-                                    );
-                                    debug!(
-                                        "ICE Disconnected, grace timer started ({:.1}s, epoch {})",
-                                        grace.as_secs_f64(),
-                                        epoch
-                                    );
-                                }
-                                crate::transports::ice::IceTransportState::Connected
-                                | crate::transports::ice::IceTransportState::Completed => {
-                                    disconnect_epoch += 1;
-                                    if let Some(inner) = inner_weak.upgrade() {
-                                        let _ =
-                                            inner.peer_state.send(PeerConnectionState::Connected);
-                                    }
-                                    debug!(
-                                        "ICE recovered (epoch {}), grace cancelled",
-                                        disconnect_epoch
-                                    );
-                                }
-                                _ => {}
-                            }
-                        }
-                        crate::platform::select::Which3::C(grace_msg) => {
-                            match grace_msg {
-                                Some(epoch) if epoch == disconnect_epoch => {
-                                    if let Some(inner) = inner_weak.upgrade() {
-                                        let _ = inner.disconnect_reason.send_if_modified(|cur| {
-                                            if cur.is_none() {
-                                                *cur = Some(DisconnectReason::IceDisconnected);
-                                                true
-                                            } else {
-                                                false
-                                            }
-                                        });
-                                        let _ = inner
-                                            .peer_state
-                                            .send(PeerConnectionState::Disconnected);
-                                        if let Some(sctp) = inner.sctp_transport.lock().as_ref() {
-                                            sctp.close();
-                                        }
-                                    }
-                                    debug!("ICE disconnect grace expired, cycling transport");
-                                    return true;
-                                }
-                                // Stale timer from a previous disconnect epoch — ignore.
-                                None => {
-                                    // channel closed: stop polling the grace arm
-                                    grace_open = false;
-                                }
-                                Some(_) => {}
-                            }
-                        }
-                    }
-                }
+                return monitor_transport(
+                    inner_weak.clone(),
+                    ice_connection_state_tx,
+                    ice_state_rx,
+                    None,
+                    rtcp_loop,
+                )
+                .await;
             }
         }
     }
     false
 }
 
-/// Monitors an established DTLS+ICE session until it ends: the RTCP loop
-/// finishing, an ICE Failed/Closed transition, DTLS Closed/Failed, or the ICE
-/// disconnect grace expiring.
+/// Monitors a started transport until it ends: the RTCP loop finishing, an
+/// ICE Failed/Closed transition, DTLS Closed/Failed (with `dtls_rx`), or the
+/// ICE disconnect grace expiring. True: the caller goes on to the final ICE
+/// verdict (or starts the transport again); false: it stops.
 ///
 /// Notification discipline: `dtls_rx` is owned here and `changed()` is polled
 /// on that SAME receiver across iterations, so every watch notification is
@@ -5184,12 +5091,11 @@ async fn handle_connected_state_no_dtls(
 /// every fresh clone observed the last DTLS write immediately and the loop
 /// spun hot — starving the TURN/ICE read tasks joined into the same runner.
 /// `dtls_monitor_parks_when_no_events` guards this.
-async fn monitor_ice_and_dtls(
+async fn monitor_transport(
     inner_weak: Weak<PeerConnectionInner>,
     ice_connection_state_tx: &watch::Sender<IceConnectionState>,
     ice_state_rx: &mut watch::Receiver<crate::transports::ice::IceTransportState>,
-    #[allow(unused_mut)]
-    mut dtls_rx: watch::Receiver<dtls::DtlsState>,
+    mut dtls_rx: Option<watch::Receiver<dtls::DtlsState>>,
     mut rtcp_loop: core::pin::Pin<Box<dyn core::future::Future<Output = ()> + Send>>,
 ) -> bool {
     let Some(grace) = inner_weak.upgrade().map(|i| i.config.ice_disconnect_grace) else {
@@ -5199,12 +5105,19 @@ async fn monitor_ice_and_dtls(
     let mut disconnect_epoch: u64 = 0;
     loop {
         #[cfg(feature = "test-hooks")]
-        crate::DTLS_MONITOR_ITERATIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if dtls_rx.is_some() {
+            crate::DTLS_MONITOR_ITERATIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
         let grace_open = true;
         let __s0 = core::pin::pin!(&mut rtcp_loop);
         let __which = {
             let __s1 = core::pin::pin!(ice_state_rx.changed());
-            let __s2 = core::pin::pin!(dtls_rx.changed());
+            let __s2 = match dtls_rx.as_mut() {
+                Some(dtls_rx) => {
+                    crate::platform::select::Either::A(core::pin::pin!(dtls_rx.changed()))
+                }
+                None => crate::platform::select::Either::B(core::future::pending()),
+            };
             let __s3 = if grace_open {
                 crate::platform::select::Either::A(core::pin::pin!(grace_rx.recv()))
             } else {
@@ -5262,7 +5175,9 @@ async fn monitor_ice_and_dtls(
                 }
             }
             crate::platform::select::Which4::C(res) => {
-                if res.is_ok() {
+                if res.is_ok()
+                    && let Some(dtls_rx) = &dtls_rx
+                {
                     let state = dtls_rx.borrow().clone();
                     if state == dtls::DtlsState::Closed || state == dtls::DtlsState::Failed {
                         debug!("DTLS closed/failed, disconnecting PC");
@@ -5353,7 +5268,7 @@ async fn handle_connected_state(
                         let _ = inner.peer_state.send(PeerConnectionState::Failed);
                         return false;
                     }
-                    Ok(mut rtcp_loop) => {
+                    Ok(rtcp_loop) => {
                         let _ = inner.peer_state.send(PeerConnectionState::Connected);
 
                         #[cfg(feature = "std")]
@@ -5369,119 +5284,16 @@ async fn handle_connected_state(
 
                         // Hold only the Weak while connected, so dropping the
                         // last PeerConnection still runs Drop (and closes it).
-                        let grace = inner.config.ice_disconnect_grace;
                         drop(pc_temp);
                         drop(inner);
-                        if let Some(dtls_rx) = dtls_state_rx {
-                            return monitor_ice_and_dtls(
-                                inner_weak.clone(),
-                                ice_connection_state_tx,
-                                &mut *ice_state_rx,
-                                dtls_rx,
-                                rtcp_loop,
-                            )
-                            .await;
-                        } else {
-                            let (grace_tx, mut grace_rx) = mpsc::unbounded_channel::<u64>();
-                            let mut disconnect_epoch: u64 = 0;
-                            loop {
-                                let grace_open = true;
-                                let __s0 = core::pin::pin!(&mut rtcp_loop);
-                                let __which = {
-                                    let __s1 = core::pin::pin!(ice_state_rx.changed());
-                                    let __s2 = if grace_open {
-                                        crate::platform::select::Either::A(core::pin::pin!(
-                                            grace_rx.recv()
-                                        ))
-                                    } else {
-                                        crate::platform::select::Either::B(core::future::pending::<
-                                            Option<u64>,
-                                        >(
-                                        ))
-                                    };
-                                    crate::platform::select::select3(__s0, __s1, __s2).await
-                                };
-                                let Some(inner) = inner_weak.upgrade() else {
-                                    return false;
-                                };
-                                match __which {
-                                    crate::platform::select::Which3::A(_) => {
-                                        propagate_sctp_close_reason(&inner);
-                                        break;
-                                    }
-                                    crate::platform::select::Which3::B(res) => {
-                                        if res.is_err() {
-                                            return false;
-                                        }
-                                        let new_state = *ice_state_rx.borrow();
-                                        if is_ice_failed_or_closed(new_state) {
-                                            return true;
-                                        }
-                                        match new_state {
-                                            crate::transports::ice::IceTransportState::Disconnected => {
-                                                let _ = inner.peer_state.send(PeerConnectionState::Disconnected);
-                                                let _ = ice_connection_state_tx.send(IceConnectionState::Disconnected);
-                                                let epoch = disconnect_epoch;
-                                                let tx = grace_tx.clone();
-                                                crate::platform::task::spawn(
-                                                    async move {
-                                                        crate::platform::task::sleep(grace).await;
-                                                        let _ = tx.send(epoch);
-                                                    }
-                                                    .instrument(tracing::Span::current()),
-                                                );
-                                                debug!("ICE Disconnected, grace timer started ({:.1}s, epoch {})", grace.as_secs_f64(), epoch);
-                                            }
-                                            crate::transports::ice::IceTransportState::Connected
-                                            | crate::transports::ice::IceTransportState::Completed => {
-                                                disconnect_epoch += 1;
-                                                let _ = inner.peer_state.send(PeerConnectionState::Connected);
-                                                let _ = ice_connection_state_tx.send(IceConnectionState::Connected);
-                                                debug!("ICE recovered (epoch {}), grace cancelled", disconnect_epoch);
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                    crate::platform::select::Which3::C(grace_msg) => {
-                                        match grace_msg {
-                                            Some(epoch) if epoch == disconnect_epoch => {
-                                                let _ = inner.disconnect_reason.send_if_modified(
-                                                    |cur| {
-                                                        if cur.is_none() {
-                                                            *cur = Some(
-                                                                DisconnectReason::IceDisconnected,
-                                                            );
-                                                            true
-                                                        } else {
-                                                            false
-                                                        }
-                                                    },
-                                                );
-                                                let _ = inner
-                                                    .peer_state
-                                                    .send(PeerConnectionState::Disconnected);
-                                                let _ = ice_connection_state_tx
-                                                    .send(IceConnectionState::Disconnected);
-                                                if let Some(sctp) =
-                                                    inner.sctp_transport.lock().as_ref()
-                                                {
-                                                    sctp.close();
-                                                }
-                                                debug!(
-                                                    "ICE disconnect grace expired, cycling transport"
-                                                );
-                                                return true;
-                                            }
-                                            // Stale timer from a previous epoch — ignore.
-                                            Some(_) => {}
-                                            None => {
-                                                // channel closed: stop polling the grace arm
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        return monitor_transport(
+                            inner_weak.clone(),
+                            ice_connection_state_tx,
+                            &mut *ice_state_rx,
+                            dtls_state_rx,
+                            rtcp_loop,
+                        )
+                        .await;
                     }
                 }
             }
@@ -9183,7 +8995,7 @@ mod tests {
     use crate::{Direction, MediaKind, RtcConfiguration};
 
     /// Connected-state DTLS monitor notification discipline (see
-    /// [`monitor_ice_and_dtls`]).
+    /// [`monitor_transport`]).
     mod dtls_monitor {
         use super::*;
         use core::sync::atomic::{AtomicUsize, Ordering};
@@ -9235,21 +9047,21 @@ mod tests {
 
         macro_rules! monitor {
             ($pc:ident, $ice_rx:ident, $dtls_rx:ident, $polls:ident) => {{
-                CountPolls {
-                    polls: {
-                        let polls = std::sync::Arc::new(AtomicUsize::new(0));
-                        $polls = polls.clone();
-                        polls
-                    },
-                    inner: Box::pin(monitor_ice_and_dtls(
-                        Arc::downgrade(&$pc.inner),
-                        &$pc.inner.ice_connection_state,
-                        &mut $ice_rx,
-                        $dtls_rx,
-                        pending_rtcp_loop(),
-                    )),
-                }
-            }};
+                            CountPolls {
+                                polls: {
+                                    let polls = std::sync::Arc::new(AtomicUsize::new(0));
+                                    $polls = polls.clone();
+                                    polls
+                                },
+                                inner: Box::pin(monitor_transport(
+                                    Arc::downgrade(&$pc.inner),
+                                    &$pc.inner.ice_connection_state,
+                                    &mut $ice_rx,
+                                    Some($dtls_rx),
+                                    pending_rtcp_loop(),
+                                )),
+                            }
+                        }};
         }
 
         /// Regression: the monitor must consume the stale snapshot

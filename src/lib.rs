@@ -49,7 +49,7 @@ pub mod t38;
 /// connections. A parked monitor advances a handful of times per session;
 /// the clone-notification busy-loop that starved TURN read tasks advanced
 /// thousands of times per second. Downstream integration tests assert the
-/// delta over an idle hold window (see `monitor_ice_and_dtls`).
+/// delta over an idle hold window (see `monitor_transport`).
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub static DTLS_MONITOR_ITERATIONS: crate::platform::atomic64::AtomicU64 =
