@@ -1083,10 +1083,10 @@ impl PeerConnection {
         };
 
         if is_direct {
-            // Direct transports (RTP, SDES-SRTP): skip ICE gathering/connectivity/DTLS loops.
-            // Only run the ice_runner for socket read loops (needed to receive packets).
-            // The ICE state machine and DTLS/SRTP setup are handled directly via
-            // setup_direct_rtp_with_rtcp / complete_direct_rtp.
+            // Direct transports: no ICE gathering or connectivity checks. The
+            // ice_runner runs the socket read loops (needed to receive
+            // packets); setup_direct_rtp_with_rtcp / complete_direct_rtp set
+            // the transport connected.
             let inner_weak = Arc::downgrade(&pc.inner);
             let ice_transport = pc.inner.ice_transport.clone();
             let ice_connection_state_tx = pc.inner.ice_connection_state.clone();
@@ -1094,11 +1094,15 @@ impl PeerConnection {
                 pc.inner.config.runtime_handle.as_ref(),
                 pc.inner.pc_span.clone(),
                 async move {
-                    let rtp_ice_loop =
-                        run_rtp_direct_loop(ice_transport, ice_connection_state_tx, inner_weak);
+                    let transport_loop = run_transport_loop(
+                        ice_transport,
+                        ice_connection_state_tx,
+                        dtls_role_rx,
+                        inner_weak,
+                    );
                     // seam join2 takes Unpin futures; async fn bodies are !Unpin
                     let ice_runner = core::pin::pin!(ice_runner);
-                    join2(core::pin::pin!(rtp_ice_loop), ice_runner).await;
+                    join2(core::pin::pin!(transport_loop), ice_runner).await;
                 },
             );
             pc.inner.track_task(h);
@@ -1121,7 +1125,7 @@ impl PeerConnection {
                         inner_weak_gathering,
                     );
 
-                    let dtls_loop = run_ice_dtls_loop(
+                    let transport_loop = run_transport_loop(
                         ice_transport,
                         ice_connection_state_tx,
                         dtls_role_rx,
@@ -1129,7 +1133,7 @@ impl PeerConnection {
                     );
 
                     crate::platform::task::spawn(gathering_loop);
-                    crate::platform::task::spawn(dtls_loop);
+                    crate::platform::task::spawn(transport_loop);
                     crate::platform::task::spawn(ice_runner);
                 },
             );
@@ -4761,82 +4765,18 @@ async fn run_gathering_loop(
     }
 }
 
-/// Simplified loop for RTP mode. Watches ICE state transitions from
-/// setup_direct_rtp_with_rtcp / complete_direct_rtp and triggers start_dtls
-/// when the connection becomes available. No ICE gathering or STUN.
-async fn run_rtp_direct_loop(
-    ice_transport: IceTransport,
-    ice_connection_state_tx: watch::Sender<IceConnectionState>,
-    inner_weak: Weak<PeerConnectionInner>,
-) {
-    let mut ice_state_rx = ice_transport.subscribe_state();
-    loop {
-        let ice_state = *ice_state_rx.borrow_and_update();
-
-        let pc_ice_state = match ice_state {
-            crate::transports::ice::IceTransportState::New => IceConnectionState::New,
-            crate::transports::ice::IceTransportState::Checking => IceConnectionState::Checking,
-            crate::transports::ice::IceTransportState::Connected => IceConnectionState::Connected,
-            crate::transports::ice::IceTransportState::Completed => IceConnectionState::Completed,
-            crate::transports::ice::IceTransportState::Failed => IceConnectionState::Failed,
-            crate::transports::ice::IceTransportState::Disconnected => {
-                IceConnectionState::Disconnected
-            }
-            crate::transports::ice::IceTransportState::Closed => IceConnectionState::Closed,
-        };
-        let _ = ice_connection_state_tx.send(pc_ice_state);
-
-        match ice_state {
-            crate::transports::ice::IceTransportState::Connected
-            | crate::transports::ice::IceTransportState::Completed => {
-                if !handle_connected_state_no_dtls(&inner_weak, &ice_connection_state_tx, &mut ice_state_rx).await {
-                    return;
-                }
-                continue;
-            }
-            crate::transports::ice::IceTransportState::Failed => {
-                if let Some(inner) = inner_weak.upgrade() {
-                    let _ = inner.disconnect_reason.send_if_modified(|cur| {
-                        if cur.is_none() {
-                            *cur = Some(DisconnectReason::IceFailed);
-                            true
-                        } else {
-                            false
-                        }
-                    });
-                    let _ = inner.peer_state.send(PeerConnectionState::Failed);
-                }
-                return;
-            }
-            crate::transports::ice::IceTransportState::Closed => {
-                if let Some(inner) = inner_weak.upgrade() {
-                    let _ = inner.disconnect_reason.send_if_modified(|cur| {
-                        if cur.is_none() {
-                            *cur = Some(DisconnectReason::IceDisconnected);
-                            true
-                        } else {
-                            false
-                        }
-                    });
-                    let _ = inner.peer_state.send(PeerConnectionState::Closed);
-                }
-                return;
-            }
-            _ => {}
-        }
-
-        if ice_state_rx.changed().await.is_err() {
-            return;
-        }
-    }
-}
-
-async fn run_ice_dtls_loop(
+/// Drives the primary transport: publishes the ICE state and, once the
+/// transport is connected, starts it (`handle_connected_state`) and watches
+/// it until it ends. Full ICE waits for nomination first. A direct transport
+/// is connected when its socket and the remote address are set
+/// (setup_direct_rtp_with_rtcp / complete_direct_rtp).
+async fn run_transport_loop(
     ice_transport: IceTransport,
     ice_connection_state_tx: watch::Sender<IceConnectionState>,
     mut dtls_role_rx: watch::Receiver<Option<bool>>,
     inner_weak: Weak<PeerConnectionInner>,
 ) {
+    let connectivity = ice_transport.config().connectivity;
     let mut ice_state_rx = ice_transport.subscribe_state();
     // Subscribe once; the channel starts as None and transitions to Some(_) exactly once.
     let nomination_complete_rx = ice_transport.subscribe_nomination_complete();
@@ -4862,93 +4802,81 @@ async fn run_ice_dtls_loop(
         match ice_state {
             crate::transports::ice::IceTransportState::Connected
             | crate::transports::ice::IceTransportState::Completed => {
-                ice_transport.nudge_passive_tcp_nomination();
-                crate::platform::task::yield_now().await;
-                // Wait for ICE nomination to complete before starting DTLS.
-                // This prevents a race where DTLS and the USE-CANDIDATE binding check
-                // compete for the same UDP socket, causing spurious nomination timeouts.
-                let nomination_timeout = if let Some(inner) = inner_weak.upgrade() {
-                    inner.config.nomination_timeout
-                } else {
-                    return;
-                };
-
-                // Wait for ICE nomination to complete before starting DTLS.
-                // ICE now tries candidate pairs in priority order (host → srflx → relay).
-                // Each pair gets `nomination_timeout` for its STUN retransmissions.
-                if nomination_complete_rx.borrow().is_none() {
-                    let wait_result = {
-                        let mut __nom0 = nomination_complete_rx.clone();
-                        let __s0 = core::pin::pin!(__nom0.changed());
-                        // Guard: abort if ICE transitions away from connected/completed.
-                        let __s1 = core::pin::pin!(async {
-                            loop {
-                                if ice_state_rx.changed().await.is_err() {
-                                    break;
-                                }
-                                let s = *ice_state_rx.borrow();
-                                if !matches!(
-                                    s,
-                                    crate::transports::ice::IceTransportState::Connected
-                                        | crate::transports::ice::IceTransportState::Completed
-                                ) {
-                                    break;
-                                }
-                            }
-                        });
-                        // Allow time for multiple candidate pairs to be tried.
-                        let __s2 = core::pin::pin!(crate::platform::task::sleep(
-                            nomination_timeout.saturating_mul(6)
-                        ));
-                        match crate::platform::select::select3(__s0, __s1, __s2).await {
-                            crate::platform::select::Which3::A(changed) => {
-                                changed.ok().and_then(|_| *nomination_complete_rx.borrow())
-                            }
-                            crate::platform::select::Which3::B(_) => None,
-                            crate::platform::select::Which3::C(_) => None,
-                        }
+                if connectivity == Connectivity::Ice {
+                    ice_transport.nudge_passive_tcp_nomination();
+                    crate::platform::task::yield_now().await;
+                    // Wait for ICE nomination to complete before starting DTLS.
+                    // This prevents a race where DTLS and the USE-CANDIDATE binding check
+                    // compete for the same UDP socket, causing spurious nomination timeouts.
+                    let nomination_timeout = if let Some(inner) = inner_weak.upgrade() {
+                        inner.config.nomination_timeout
+                    } else {
+                        return;
                     };
 
-                    if wait_result != Some(true) {
-                        debug!("ICE nomination did not succeed, skipping DTLS");
+                    // Wait for ICE nomination to complete before starting DTLS.
+                    // ICE now tries candidate pairs in priority order (host → srflx → relay).
+                    // Each pair gets `nomination_timeout` for its STUN retransmissions.
+                    if nomination_complete_rx.borrow().is_none() {
+                        let wait_result = {
+                            let mut __nom0 = nomination_complete_rx.clone();
+                            let __s0 = core::pin::pin!(__nom0.changed());
+                            // Guard: abort if ICE transitions away from connected/completed.
+                            let __s1 = core::pin::pin!(async {
+                                loop {
+                                    if ice_state_rx.changed().await.is_err() {
+                                        break;
+                                    }
+                                    let s = *ice_state_rx.borrow();
+                                    if !matches!(
+                                        s,
+                                        crate::transports::ice::IceTransportState::Connected
+                                            | crate::transports::ice::IceTransportState::Completed
+                                    ) {
+                                        break;
+                                    }
+                                }
+                            });
+                            // Allow time for multiple candidate pairs to be tried.
+                            let __s2 = core::pin::pin!(crate::platform::task::sleep(
+                                nomination_timeout.saturating_mul(6)
+                            ));
+                            match crate::platform::select::select3(__s0, __s1, __s2).await {
+                                crate::platform::select::Which3::A(changed) => {
+                                    changed.ok().and_then(|_| *nomination_complete_rx.borrow())
+                                }
+                                crate::platform::select::Which3::B(_) => None,
+                                crate::platform::select::Which3::C(_) => None,
+                            }
+                        };
+
+                        if wait_result != Some(true) {
+                            debug!("ICE nomination did not succeed, skipping DTLS");
+                            continue;
+                        }
+                        debug!("ICE nomination completed successfully, starting DTLS");
+                    }
+
+                    // Bail out if nomination was already completed with failure
+                    // (re-entry after continue above).  Wait for ICE to transition
+                    // away from Connected (should go to Failed) to avoid busy-looping.
+                    if *nomination_complete_rx.borrow() == Some(false) {
+                        debug!("ICE nomination failed, waiting for ICE to transition");
+                        loop {
+                            if ice_state_rx.changed().await.is_err() {
+                                return;
+                            }
+                            let s = *ice_state_rx.borrow();
+                            if !matches!(
+                                s,
+                                crate::transports::ice::IceTransportState::Connected
+                                    | crate::transports::ice::IceTransportState::Completed
+                            ) {
+                                break;
+                            }
+                        }
                         continue;
                     }
-                    debug!("ICE nomination completed successfully, starting DTLS");
-                }
-
-                // Bail out if nomination was already completed with failure
-                // (re-entry after continue above).  Wait for ICE to transition
-                // away from Connected (should go to Failed) to avoid busy-looping.
-                if *nomination_complete_rx.borrow() == Some(false) {
-                    debug!("ICE nomination failed, waiting for ICE to transition");
-                    loop {
-                        if ice_state_rx.changed().await.is_err() {
-                            return;
-                        }
-                        let s = *ice_state_rx.borrow();
-                        if !matches!(
-                            s,
-                            crate::transports::ice::IceTransportState::Connected
-                                | crate::transports::ice::IceTransportState::Completed
-                        ) {
-                            break;
-                        }
-                    }
-                    continue;
-                }
-
-                // Without DTLS keying, we don't need DTLS role to start
-                let keying = if let Some(inner) = inner_weak.upgrade() {
-                    inner.config.keying
-                } else {
-                    return;
-                };
-
-                if keying != Keying::Dtls {
-                    if !handle_connected_state_no_dtls(&inner_weak, &ice_connection_state_tx, &mut ice_state_rx).await {
-                        return;
-                    }
-                    continue;
                 }
 
                 if !handle_connected_state(
@@ -5035,48 +4963,6 @@ fn propagate_sctp_close_reason(inner: &PeerConnectionInner) {
             }
         });
     }
-}
-
-async fn handle_connected_state_no_dtls(
-    inner_weak: &Weak<PeerConnectionInner>,
-    ice_connection_state_tx: &watch::Sender<IceConnectionState>,
-    ice_state_rx: &mut watch::Receiver<crate::transports::ice::IceTransportState>,
-) -> bool {
-    if let Some(inner) = inner_weak.upgrade() {
-        let pc_temp = PeerConnection {
-            inner: inner.clone(),
-        };
-        // For RTP/SRTP, we pass false as is_client, but it doesn't matter as start_dtls handles it
-        match pc_temp.start_dtls(false).await {
-            Err(e) => {
-                debug!("Transport start failed: {}", e);
-                let _ = inner.disconnect_reason.send_if_modified(|cur| {
-                    if cur.is_none() {
-                        *cur = Some(DisconnectReason::TransportStartFailed(e.to_string()));
-                        true
-                    } else {
-                        false
-                    }
-                });
-                let _ = inner.peer_state.send(PeerConnectionState::Failed);
-                return false;
-            }
-            Ok(rtcp_loop) => {
-                let _ = inner.peer_state.send(PeerConnectionState::Connected);
-                drop(inner);
-                drop(pc_temp);
-                return monitor_transport(
-                    inner_weak.clone(),
-                    ice_connection_state_tx,
-                    ice_state_rx,
-                    None,
-                    rtcp_loop,
-                )
-                .await;
-            }
-        }
-    }
-    false
 }
 
 /// Monitors a started transport until it ends: the RTCP loop finishing, an
@@ -5240,6 +5126,9 @@ async fn monitor_transport(
     false
 }
 
+/// Starts the connected transport and watches it until it ends (see
+/// `monitor_transport`). DTLS keying waits for its role (a=setup) first;
+/// the other keying starts at once.
 async fn handle_connected_state(
     inner_weak: &Weak<PeerConnectionInner>,
     ice_connection_state_tx: &watch::Sender<IceConnectionState>,
@@ -5247,63 +5136,68 @@ async fn handle_connected_state(
     ice_state_rx: &mut watch::Receiver<crate::transports::ice::IceTransportState>,
 ) -> bool {
     loop {
-        let role = *dtls_role_rx.borrow_and_update();
+        let Some(inner) = inner_weak.upgrade() else {
+            return false;
+        };
+        let dtls = inner.config.keying == Keying::Dtls;
+        let role = if dtls {
+            *dtls_role_rx.borrow_and_update()
+        } else {
+            Some(false)
+        };
         if let Some(is_client) = role {
-            if let Some(inner) = inner_weak.upgrade() {
-                let pc_temp = PeerConnection {
-                    inner: inner.clone(),
-                };
+            let pc_temp = PeerConnection {
+                inner: inner.clone(),
+            };
 
-                match pc_temp.start_dtls(is_client).await {
-                    Err(e) => {
-                        debug!("DTLS start failed: {}", e);
-                        let _ = inner.disconnect_reason.send_if_modified(|cur| {
-                            if cur.is_none() {
-                                *cur = Some(DisconnectReason::DtlsFailed);
-                                true
-                            } else {
-                                false
-                            }
-                        });
-                        let _ = inner.peer_state.send(PeerConnectionState::Failed);
-                        return false;
-                    }
-                    Ok(rtcp_loop) => {
-                        let _ = inner.peer_state.send(PeerConnectionState::Connected);
+            match pc_temp.start_dtls(is_client).await {
+                Err(e) => {
+                    debug!("Transport start failed: {}", e);
+                    let reason = if dtls {
+                        DisconnectReason::DtlsFailed
+                    } else {
+                        DisconnectReason::TransportStartFailed(e.to_string())
+                    };
+                    let _ = inner.disconnect_reason.send_if_modified(|cur| {
+                        if cur.is_none() {
+                            *cur = Some(reason);
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    let _ = inner.peer_state.send(PeerConnectionState::Failed);
+                    return false;
+                }
+                Ok(rtcp_loop) => {
+                    let _ = inner.peer_state.send(PeerConnectionState::Connected);
 
-                        #[cfg(feature = "std")]
-                        #[cfg(feature = "std")]
-                        let dtls_state_rx = {
-                            let dtls_guard = inner.dtls_transport.lock();
-                            (*dtls_guard).as_ref().map(|dtls| dtls.subscribe_state())
-                        };
-                        #[cfg(not(feature = "std"))]
-                        let dtls_state_rx: Option<
-                            crate::platform::sync::watch::Receiver<dtls::DtlsState>,
-                        > = None;
+                    #[cfg(feature = "std")]
+                    let dtls_state_rx = {
+                        let dtls_guard = inner.dtls_transport.lock();
+                        (*dtls_guard).as_ref().map(|dtls| dtls.subscribe_state())
+                    };
+                    #[cfg(not(feature = "std"))]
+                    let dtls_state_rx: Option<
+                        crate::platform::sync::watch::Receiver<dtls::DtlsState>,
+                    > = None;
 
-                        // Hold only the Weak while connected, so dropping the
-                        // last PeerConnection still runs Drop (and closes it).
-                        drop(pc_temp);
-                        drop(inner);
-                        return monitor_transport(
-                            inner_weak.clone(),
-                            ice_connection_state_tx,
-                            &mut *ice_state_rx,
-                            dtls_state_rx,
-                            rtcp_loop,
-                        )
-                        .await;
-                    }
+                    // Hold only the Weak while connected, so dropping the
+                    // last PeerConnection still runs Drop (and closes it).
+                    drop(pc_temp);
+                    drop(inner);
+                    return monitor_transport(
+                        inner_weak.clone(),
+                        ice_connection_state_tx,
+                        &mut *ice_state_rx,
+                        dtls_state_rx,
+                        rtcp_loop,
+                    )
+                    .await;
                 }
             }
-
-            let state = *ice_state_rx.borrow();
-            if is_ice_failed_or_closed(state) {
-                return true;
-            }
-            return false;
         }
+        drop(inner);
 
         let __which = {
             let __s0 = core::pin::pin!(dtls_role_rx.changed());
@@ -15699,7 +15593,7 @@ a=rtpmap:8 PCMA/8000\r\n";
     ///   1. PC initialised → ICE Connected → `start_dtls` called → transport A
     ///   2. First RTP packet → Track event fires → `track_event_sent = true`
     ///   3. ICE keepalive timeout → `Disconnected`
-    ///      (`run_rtp_direct_loop` exits inner loop with `true`)
+    ///      (`handle_connected_state` returns `true`)
     ///   4. ICE recovers → `Connected` again
     ///      → outer loop re-enters → `start_dtls` called again → transport B
     ///   5. Without Bug 3 fix: `track_event_sent` still `true` → no Track event
@@ -15732,7 +15626,7 @@ a=rtpmap:8 PCMA/8000\r\n";
         )]));
 
         // Init ICE: bind a loopback socket, set selected pair, send Connected.
-        // run_rtp_direct_loop sees Connected → handle_connected_state_no_dtls
+        // run_transport_loop sees Connected → handle_connected_state
         // → start_dtls(false) → transport A registered on the receiver.
         let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let ice = pc.ice_transport_for_test();
@@ -15740,7 +15634,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             .await
             .unwrap();
 
-        // Allow run_rtp_direct_loop to process Connected and call start_dtls.
+        // Allow run_transport_loop to process Connected and call start_dtls.
         crate::platform::task::sleep(core::time::Duration::from_millis(50)).await;
 
         // Grab the receiver and its current packet channel (transport A).
@@ -15776,12 +15670,12 @@ a=rtpmap:8 PCMA/8000\r\n";
         // silence; in RTP mode it is triggered by an explicit reconnect or
         // network change.  We drive it directly via the test-only hook.
         ice.force_state_for_test(IceTransportState::Disconnected);
-        // Wait for grace timer to expire (1ms) and handle_connected_state_no_dtls
+        // Wait for grace timer to expire (1ms) and handle_connected_state
         // to return true, so the outer loop re-evaluates ICE state.
         crate::platform::task::sleep(core::time::Duration::from_millis(50)).await;
 
-        // Recovery: outer run_rtp_direct_loop sees Connected →
-        // calls handle_connected_state_no_dtls again → start_dtls →
+        // Recovery: outer run_transport_loop sees Connected →
+        // calls handle_connected_state again → start_dtls →
         // new Arc<RtpTransport> (transport B) → set_transport → Bug 3 fix resets flag.
         ice.force_state_for_test(IceTransportState::Connected);
         crate::platform::task::sleep(core::time::Duration::from_millis(80)).await;
