@@ -736,3 +736,29 @@ async fn rtp_latching_stays_in_the_socket_family() {
     );
     pc.close();
 }
+
+/// WebRTC without `bind_ips` gathers on every interface of both families,
+/// as browsers do; `disable_ipv6` leaves IPv6 out.
+#[tokio::test]
+async fn webrtc_gathers_ipv6_interfaces() {
+    let Some(v6) = crate::transports::get_local_ipv6() else {
+        return; // no IPv6 here
+    };
+    let cands = candidates(&gathered_offer(config(TransportMode::WebRtc)).await);
+    assert!(cands.iter().any(|c| c.0.is_ipv4()), "{cands:?}");
+    assert!(
+        cands.iter().any(|c| c.0 == core::net::IpAddr::V6(v6)),
+        "{cands:?}"
+    );
+    assert!(
+        cands
+            .iter()
+            .all(|c| !matches!(c.0, core::net::IpAddr::V6(ip) if ip.is_unicast_link_local())),
+        "{cands:?}"
+    );
+
+    let mut cfg = config(TransportMode::WebRtc);
+    cfg.disable_ipv6 = true;
+    let cands = candidates(&gathered_offer(cfg).await);
+    assert!(cands.iter().all(|c| c.0.is_ipv4()), "{cands:?}");
+}

@@ -5191,7 +5191,9 @@ impl IceGatherer {
 
     /// The addresses to bind on: `bind_ips` when configured, else for a
     /// direct transport the address of the default route, for ICE every
-    /// IPv4 interface (and loopback when asked for).
+    /// interface address: IPv4, and IPv6 that peers can reach (global or
+    /// unique local, not link-local; none with `disable_ipv6`), and loopback
+    /// when asked for.
     fn bind_addresses(&self) -> Vec<IpAddr> {
         if !self.config.bind_ips.is_empty() {
             return self.config.bind_ips.clone();
@@ -5212,22 +5214,29 @@ impl IceGatherer {
         }
         #[cfg(feature = "std")]
         if let Ok(interfaces) = local_ip_address::list_afinet_netifas() {
-            for (name, addr) in interfaces {
-                if let IpAddr::V4(ip) = addr
-                    && !ip.is_loopback()
-                    && !ips.contains(&IpAddr::V4(ip))
-                {
-                    // Skip common virtual interface prefixes
-                    if name.starts_with("utun")
-                        || name.starts_with("gif")
-                        || name.starts_with("stf")
-                        || name.starts_with("awdl")
-                        || name.starts_with("llw")
-                    {
-                        continue;
-                    }
-                    ips.push(IpAddr::V4(ip));
+            let reachable = |ip: &IpAddr| match ip {
+                IpAddr::V4(ip) => !ip.is_loopback(),
+                IpAddr::V6(ip) => {
+                    !self.config.disable_ipv6
+                        && !ip.is_loopback()
+                        && !ip.is_unspecified()
+                        && !ip.is_unicast_link_local()
+                        && !ip.is_multicast()
                 }
+            };
+            for (name, addr) in interfaces {
+                // Skip common virtual interface prefixes
+                if !reachable(&addr)
+                    || ips.contains(&addr)
+                    || name.starts_with("utun")
+                    || name.starts_with("gif")
+                    || name.starts_with("stf")
+                    || name.starts_with("awdl")
+                    || name.starts_with("llw")
+                {
+                    continue;
+                }
+                ips.push(addr);
             }
         }
         // no_std (embedded) has no interface enumeration, so use the
