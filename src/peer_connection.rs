@@ -767,6 +767,18 @@ pub enum PeerConnectionEvent {
     Track(Arc<RtpTransceiver>),
 }
 
+/// Internal payload queued in the connection's event channel: same shape as
+/// [`PeerConnectionEvent`] except that Track events hold the transceiver
+/// **weakly**. A backlog that outlives `close()` (application stopped polling
+/// `recv()`) therefore cannot pin the per-call transceiver → sender/receiver
+/// → track graph; [`PeerConnection::recv`] upgrades live transceivers and
+/// silently skips dead ones.
+#[derive(Clone)]
+pub(crate) enum QueuedEvent {
+    DataChannel(Arc<DataChannel>),
+    Track(Weak<RtpTransceiver>),
+}
+
 #[derive(Clone)]
 pub struct PeerConnection {
     inner: Arc<PeerConnectionInner>,
@@ -808,8 +820,8 @@ struct PeerConnectionInner {
     sdes_keys: Mutex<BTreeMap<usize, (crate::sdp::CryptoAttribute, crate::sdp::CryptoAttribute)>>,
     sctp_transport: Mutex<Option<Arc<SctpTransport>>>,
     data_channels: Arc<Mutex<Vec<Weak<DataChannel>>>>,
-    event_tx: mpsc::UnboundedSender<PeerConnectionEvent>,
-    event_rx: sync::AsyncMutex<mpsc::UnboundedReceiver<PeerConnectionEvent>>,
+    event_tx: mpsc::UnboundedSender<QueuedEvent>,
+    event_rx: sync::AsyncMutex<mpsc::UnboundedReceiver<QueuedEvent>>,
     /// Lazily-created sink for RTP source-change notifications from the
     /// media `IceConn`s; a forwarder task delivers them to the registered
     /// [`RtpObserver`]s.
@@ -2256,7 +2268,7 @@ impl PeerConnection {
                         if let Some(r) = t.receiver.lock().as_ref() {
                             r.track_event_sent.store(true, Ordering::SeqCst);
                         }
-                        let _ = self.inner.event_tx.send(PeerConnectionEvent::Track(t));
+                        let _ = self.inner.event_tx.send(QueuedEvent::Track(Arc::downgrade(&t)));
                     }
                 } else {
                     let kind = section.kind;
@@ -2354,7 +2366,7 @@ impl PeerConnection {
                         if let Some(r) = t.receiver.lock().as_ref() {
                             r.track_event_sent.store(true, Ordering::SeqCst);
                         }
-                        let _ = self.inner.event_tx.send(PeerConnectionEvent::Track(t));
+                        let _ = self.inner.event_tx.send(QueuedEvent::Track(Arc::downgrade(&t)));
                     }
                 }
             }
@@ -2414,7 +2426,7 @@ impl PeerConnection {
                             let _ = self
                                 .inner
                                 .event_tx
-                                .send(PeerConnectionEvent::Track(t.clone()));
+                                .send(QueuedEvent::Track(Arc::downgrade(&t)));
                             debug!(
                                 "Answer SDP: Sent Track event for SSRC {} mid={}",
                                 ssrc_val, mid
@@ -2814,7 +2826,7 @@ impl PeerConnection {
             let dc_listener = async move {
                 while let Some(dc) = dc_rx.recv().await {
                     if let Some(inner) = inner_weak_dc.upgrade() {
-                        let _ = inner.event_tx.send(PeerConnectionEvent::DataChannel(dc));
+                        let _ = inner.event_tx.send(QueuedEvent::DataChannel(dc));
                     } else {
                         break;
                     }
@@ -3878,7 +3890,22 @@ impl PeerConnection {
 
     pub async fn recv(&self) -> Option<PeerConnectionEvent> {
         let mut rx = self.inner.event_rx.lock().await;
-        rx.recv().await
+        loop {
+            match rx.recv().await? {
+                QueuedEvent::DataChannel(dc) => {
+                    return Some(PeerConnectionEvent::DataChannel(dc));
+                }
+                QueuedEvent::Track(weak) => {
+                    // Skip events whose transceiver graph was already torn
+                    // down (e.g. a backlog queued before a close the
+                    // application never observed). The Weak payload keeps
+                    // such a backlog from pinning the whole per-call graph.
+                    if let Some(transceiver) = weak.upgrade() {
+                        return Some(PeerConnectionEvent::Track(transceiver));
+                    }
+                }
+            }
+        }
     }
 
     /// Initialize a T.38 fax endpoint for the Image transceiver.
@@ -6684,6 +6711,10 @@ impl PeerConnectionInner {
             if count > 0 {
                 tracing::trace!("PeerConnection.close: cleared {} listeners", count);
             }
+            // Uninstall the rewrite bridge: its destination Arcs (possibly of
+            // other PeerConnections) would otherwise stay pinned — along with
+            // the TWCC flush loop they keep alive — after close.
+            transport.clear_bridge_rewrite();
 
             // Send RTCP BYE — synchronous, best-effort (no spawn/await: the
             // close path may run during runtime teardown where tokio::spawn
@@ -6704,6 +6735,29 @@ impl PeerConnectionInner {
             }
         }
 
+        // Release the transceiver graph: drop the sender/receiver Arcs (plus
+        // the per-transceiver UDPTL transport and the receiver's simulcast
+        // tracks) held by each transceiver, then the list itself. Without
+        // this, the per-call transceiver → sender/receiver → track/pipeline
+        // cascade survives teardown even after the application drops every
+        // handle (~5.9 KB/call measured on-device). Any clone that survives
+        // elsewhere afterwards (application handle, stale queued Track
+        // event) then holds an empty shell instead of the whole graph. This
+        // must run AFTER the RTCP BYE above, which reads the sender SSRCs.
+        {
+            let mut transceivers = self.transceivers.lock();
+            for t in transceivers.iter() {
+                if let Some(receiver) = t.receiver.lock().as_ref() {
+                    receiver.simulcast_tracks.lock().clear();
+                }
+                *t.sender.lock() = None;
+                *t.receiver.lock() = None;
+                *t.rtp_transport.lock() = None;
+                *t.udtl_transport.lock() = None;
+            }
+            transceivers.clear();
+        }
+
         let extra_transports = self.rtp_media_transports.lock().values().cloned().collect::<Vec<_>>();
         for transport in extra_transports {
             let count = transport.clear_listeners();
@@ -6713,6 +6767,7 @@ impl PeerConnectionInner {
                     count
                 );
             }
+            transport.clear_bridge_rewrite();
         }
 
         // Close SCTP transport before closing DTLS/ICE to stop retransmission timers
@@ -8109,7 +8164,7 @@ pub struct RtpReceiver {
     runner_tx: Mutex<Option<mpsc::UnboundedSender<ReceiverCommand>>>,
     interceptors: Vec<Arc<dyn RtpReceiverInterceptor>>,
     reception_stats: Option<Arc<StatsCollector>>,
-    track_ready_event_tx: Mutex<Option<mpsc::UnboundedSender<PeerConnectionEvent>>>,
+    track_ready_event_tx: Mutex<Option<mpsc::UnboundedSender<QueuedEvent>>>,
     track_ready_transceiver: Mutex<Option<Weak<RtpTransceiver>>>,
     track_event_sent: AtomicBool,
     /// Lock-free clock-rate cache keyed by payload type. The mapping is static
@@ -8582,10 +8637,13 @@ impl RtpReceiver {
         }
     }
 
-    pub fn set_transport(
+    /// `event_tx` is the connection's event channel clone; the queued
+    /// Track payload is weak (see [`QueuedEvent`]) so a backlog after
+    /// close cannot pin the transceiver graph.
+    pub(crate) fn set_transport(
         self: &Arc<Self>,
         transport: Arc<RtpTransport>,
-        event_tx: Option<mpsc::UnboundedSender<PeerConnectionEvent>>,
+        event_tx: Option<mpsc::UnboundedSender<QueuedEvent>>,
         transceiver: Option<Weak<RtpTransceiver>>,
     ) {
         {
@@ -8868,9 +8926,9 @@ impl RtpReceiver {
                                                         .and_then(|t| t.upgrade())
                                                     {
                                                         let _ = event_tx.send(
-                                                            PeerConnectionEvent::Track(
-                                                                transceiver.clone(),
-                                                            ),
+                                                            QueuedEvent::Track(Arc::downgrade(
+                                                                &transceiver,
+                                                            )),
                                                         );
                                                         trace!(
                                                             "RTP mode: Sent Track event after SSRC latching complete"
@@ -15224,7 +15282,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             Arc::new(RtpTransport::new(ice_conn, false))
         };
 
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QueuedEvent>();
         let transceiver_weak = Arc::downgrade(&transceiver);
 
         // ── Phase 1: transport A — simulate 183 early media ──────────────
@@ -15256,7 +15314,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             .await
             .expect("first Track event must arrive (early-media phase)");
         assert!(
-            matches!(first_event, Some(PeerConnectionEvent::Track(_))),
+            matches!(first_event, Some(QueuedEvent::Track(_))),
             "expected Track event from early-media packet"
         );
 
@@ -15318,7 +15376,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             .await
             .expect("second Track event must arrive after transport switch — Bug 3 regression");
         assert!(
-            matches!(second_event, Some(PeerConnectionEvent::Track(_))),
+            matches!(second_event, Some(QueuedEvent::Track(_))),
             "expected second Track event after transport replacement"
         );
     }
@@ -15358,7 +15416,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             },
         )]));
 
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QueuedEvent>();
         let transceiver_weak = Arc::downgrade(&transceiver);
 
         let (_, socket_rx) =
@@ -15393,7 +15451,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             })
             .await
             .expect("first Track event must arrive");
-        assert!(matches!(first_event, Some(PeerConnectionEvent::Track(_))));
+        assert!(matches!(first_event, Some(QueuedEvent::Track(_))));
         assert!(receiver.track_event_sent.load(Ordering::SeqCst));
 
         // ── Call set_transport with the SAME Arc (ptr_eq should early-return) ──
@@ -15453,7 +15511,7 @@ a=rtpmap:8 PCMA/8000\r\n";
         // Precondition: starts as false
         assert!(!receiver.track_event_sent.load(Ordering::SeqCst));
 
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QueuedEvent>();
         let transceiver_weak = Arc::downgrade(&transceiver);
 
         let (_, socket_rx) =
@@ -15494,7 +15552,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             })
             .await
             .expect("Track event must arrive after first packet on first transport");
-        assert!(matches!(ev, Some(PeerConnectionEvent::Track(_))));
+        assert!(matches!(ev, Some(QueuedEvent::Track(_))));
 
         // Exactly one — channel is now empty
         crate::platform::task::yield_now().await;
@@ -15546,7 +15604,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             Arc::new(RtpTransport::new(ice_conn, false))
         };
 
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QueuedEvent>();
         let tw = Arc::downgrade(&transceiver);
 
         // Transport A — SSRC = 0xAAAA_1111
@@ -15597,7 +15655,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             })
             .await
             .expect("Track event must fire on transport B with new SSRC");
-        assert!(matches!(second_event, Some(PeerConnectionEvent::Track(_))));
+        assert!(matches!(second_event, Some(QueuedEvent::Track(_))));
         // SSRC correctly updated to the new value
         assert_eq!(
             *receiver.ssrc.lock(),
@@ -16046,6 +16104,96 @@ a=mid:0
         };
         assert!(extmap_value(crate::sdp::SDES_MID_URI).starts_with("3 "));
         assert!(!extmap_value(crate::sdp::ABS_SEND_TIME_URI).starts_with("3 "));
+    }
+
+    /// Regression: `close()` must release the per-call transceiver graph
+    /// (transceiver → sender/receiver → track/pipeline, ~5.9 KB/call measured
+    /// on device) even though the connection handle itself stays alive:
+    /// - a never-polled Track-event backlog must hold transceivers weakly;
+    /// - the inner transceiver list and per-transceiver sender/receiver slots
+    ///   must be emptied, so every surviving clone (application handle, stale
+    ///   event) is an empty shell instead of pinning the whole graph.
+    #[tokio::test]
+    async fn close_releases_transceiver_graph_with_live_pc_handle() {
+        use crate::media::track::sample_track;
+        use crate::sdp::{SdpType, SessionDescription};
+
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+        config.enable_latching = true;
+        config.bind_ip = Some("127.0.0.1".to_string());
+
+        let pc = PeerConnection::new(config);
+
+        let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 8000);
+        let _ = pc
+            .add_track(
+                track.clone(),
+                RtpCodecParameters {
+                    payload_type: 8,
+                    name: "PCMA".to_string(),
+                    clock_rate: 8000,
+                    channels: 1,
+                },
+            )
+            .unwrap();
+
+        let offer = pc.create_offer().await.unwrap();
+        pc.set_local_description(offer).unwrap();
+
+        // Callee answer carrying an a=ssrc line: the answer path queues a
+        // Track event for the matched receiver that this test deliberately
+        // never recv()s — a backlog that must not pin the graph after close.
+        let callee_sdp = "v=0\r\n\
+             o=- 9876 9876 IN IP4 127.0.0.1\r\n\
+             s=-\r\n\
+             c=IN IP4 127.0.0.1\r\n\
+             t=0 0\r\n\
+             m=audio 20000 RTP/AVP 8\r\n\
+             a=rtpmap:8 PCMA/8000\r\n\
+             a=sendrecv\r\n\
+             a=ssrc:1111 cname:callee\r\n"
+            .to_string();
+        let answer = SessionDescription::parse(SdpType::Answer, &callee_sdp).unwrap();
+        pc.set_remote_description(answer).await.unwrap();
+
+        // Application handles, as an embedder would cache them.
+        let transceiver = pc.get_transceivers()[0].clone();
+        let weak_transceiver = alloc::sync::Arc::downgrade(&transceiver);
+        let weak_sender = transceiver.sender().as_ref().map(alloc::sync::Arc::downgrade);
+        let weak_receiver = transceiver.receiver().as_ref().map(alloc::sync::Arc::downgrade);
+        let weak_track = alloc::sync::Arc::downgrade(&track);
+        drop(transceiver);
+        drop(track);
+
+        pc.close();
+
+        // The queued Track event must be a Weak view: a backlog nobody polls
+        // cannot keep the transceiver alive past close.
+        assert!(
+            weak_transceiver.upgrade().is_none(),
+            "transceiver still alive after close with an unpollled Track-event backlog"
+        );
+        if let Some(weak) = &weak_sender {
+            assert!(
+                weak.upgrade().is_none(),
+                "sender still alive after close with a live PeerConnection handle"
+            );
+        }
+        if let Some(weak) = &weak_receiver {
+            assert!(
+                weak.upgrade().is_none(),
+                "receiver still alive after close with a live PeerConnection handle"
+            );
+        }
+
+        // The send loop exits cooperatively on the close stop signal; give it
+        // a moment, then the media track must be freeable too.
+        crate::platform::task::sleep(core::time::Duration::from_millis(200)).await;
+        assert!(
+            weak_track.upgrade().is_none(),
+            "media track still pinned after close and send-loop exit"
+        );
     }
 }
 

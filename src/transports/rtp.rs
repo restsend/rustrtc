@@ -192,8 +192,13 @@ struct OutTimeline {
 }
 
 struct RewriteBridge {
-    target: Arc<RtpTransport>,
-    video_target: Option<Arc<RtpTransport>>,
+    /// Destination, held **weakly**: a bridge must not keep a closed
+    /// destination transport (and the TWCC flush loop it keeps alive) alive
+    /// after its PeerConnection closed — including the self-bridge case,
+    /// which would otherwise be an unbreakable Arc cycle. Upgraded per
+    /// packet; a dead destination uninstalls the bridge.
+    target: Weak<RtpTransport>,
+    video_target: Option<Weak<RtpTransport>>,
     video_payload_types: BTreeSet<u8>,
     options: RtpRewriteBridgeOptions,
     rules: Vec<RtpRewriteRule>,
@@ -219,8 +224,8 @@ impl RewriteBridge {
         rules: Vec<RtpRewriteRule>,
     ) -> Self {
         Self {
-            target,
-            video_target,
+            target: Arc::downgrade(&target),
+            video_target: video_target.as_ref().map(Arc::downgrade),
             video_payload_types,
             options,
             rules,
@@ -245,14 +250,16 @@ impl RewriteBridge {
     }
 
     /// Select the destination from the packet's original negotiated payload
-    /// type. This runs before any payload-type rewrite.
-    fn target_for(&self, raw_pt: u8) -> Arc<RtpTransport> {
+    /// type. This runs before any payload-type rewrite. `None` = destination
+    /// transport freed (peer PeerConnection closed) — the caller uninstalls
+    /// the bridge and drops the packet.
+    fn target_for(&self, raw_pt: u8) -> Option<Arc<RtpTransport>> {
         if self.video_payload_types.contains(&raw_pt)
-            && let Some(video_target) = &self.video_target
+            && let Some(video_target) = self.video_target.as_ref().and_then(|w| w.upgrade())
         {
-            return video_target.clone();
+            return Some(video_target);
         }
-        self.target.clone()
+        self.target.upgrade()
     }
 
     fn rewrite_packet(&self, packet: &mut RtpPacket) {
@@ -1100,12 +1107,25 @@ impl RtpTransport {
         // bridge lock, then release it before SRTP protection and sending.
         let target = {
             let mut guard = self.rewrite_bridge.lock();
-            let Some(bridge) = guard.as_mut() else {
-                return Some(packet);
-            };
-            let target = bridge.target_for(packet.header.payload_type);
-            bridge.rewrite_packet(&mut packet);
-            target
+            let target = guard
+                .as_mut()
+                .and_then(|bridge| bridge.target_for(packet.header.payload_type));
+            match target {
+                Some(target) => {
+                    guard.as_mut().unwrap().rewrite_packet(&mut packet);
+                    target
+                }
+                None if guard.is_some() => {
+                    // Destination transport freed (its PeerConnection closed):
+                    // the bridge can never forward again. Uninstall it instead
+                    // of keeping the rewrite state alive, and drop the packet.
+                    *guard = None;
+                    drop(guard);
+                    self.has_bridge.store(false, Ordering::Release);
+                    return None;
+                }
+                None => return Some(packet), // no bridge installed
+            }
         };
         if !target.rtp_send_allowed_for(packet.header.ssrc) {
             // Relayed, but the destination stream may not send: drop.
@@ -2532,7 +2552,7 @@ mod tests {
         // Audio packet (PT 97) → audio SSRC + PT 96.
         let mut audio =
             RtpPacket::new(crate::rtp::RtpHeader::new(97, 7, 1111, 1111), vec![1u8; 32]);
-        let audio_target = bridge.target_for(audio.header.payload_type);
+        let audio_target = bridge.target_for(audio.header.payload_type).unwrap();
         bridge.rewrite_packet(&mut audio);
         assert!(Arc::ptr_eq(&audio_target, &dst_transport));
         assert_eq!(audio.header.ssrc, audio_ssrc);
@@ -2543,7 +2563,7 @@ mod tests {
             crate::rtp::RtpHeader::new(101, 7, 1111, 1111),
             vec![1u8; 32],
         );
-        let dtmf_target = bridge.target_for(dtmf.header.payload_type);
+        let dtmf_target = bridge.target_for(dtmf.header.payload_type).unwrap();
         bridge.rewrite_packet(&mut dtmf);
         assert!(Arc::ptr_eq(&dtmf_target, &dst_transport));
         assert_eq!(dtmf.header.ssrc, audio_ssrc);
@@ -2552,7 +2572,7 @@ mod tests {
         // Video packet (PT 98) → video SSRC + PT 102.
         let mut video =
             RtpPacket::new(crate::rtp::RtpHeader::new(98, 7, 2222, 2222), vec![1u8; 32]);
-        let video_target = bridge.target_for(video.header.payload_type);
+        let video_target = bridge.target_for(video.header.payload_type).unwrap();
         bridge.rewrite_packet(&mut video);
         assert!(Arc::ptr_eq(&video_target, &video_dst_transport));
         assert_eq!(video.header.ssrc, video_ssrc);
@@ -2560,7 +2580,7 @@ mod tests {
 
         // RTX packet (PT 99, distinct source SSRC) → video SSRC + PT 103.
         let mut rtx = RtpPacket::new(crate::rtp::RtpHeader::new(99, 7, 3333, 3333), vec![1u8; 32]);
-        let rtx_target = bridge.target_for(rtx.header.payload_type);
+        let rtx_target = bridge.target_for(rtx.header.payload_type).unwrap();
         bridge.rewrite_packet(&mut rtx);
         assert!(Arc::ptr_eq(&rtx_target, &video_dst_transport));
         assert_eq!(rtx.header.ssrc, video_ssrc);
@@ -2574,7 +2594,7 @@ mod tests {
         // silently discard).
         let mut video2 =
             RtpPacket::new(crate::rtp::RtpHeader::new(98, 8, 2382, 2222), vec![1u8; 32]);
-        let video2_target = bridge.target_for(video2.header.payload_type);
+        let video2_target = bridge.target_for(video2.header.payload_type).unwrap();
         bridge.rewrite_packet(&mut video2);
         assert!(Arc::ptr_eq(&video2_target, &video_dst_transport));
         assert_eq!(
