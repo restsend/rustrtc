@@ -27,7 +27,7 @@ async fn interop_datachannel_test() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
     // 1. Create RustRTC PeerConnection (Offerer)
-    let rust_config = RtcConfiguration::default();
+    let rust_config = RtcConfiguration::webrtc();
     let rust_pc = PeerConnection::new(rust_config);
 
     // Create DataChannel
@@ -185,7 +185,7 @@ async fn interop_datachannel_dcep_test() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
     // 1. Create RustRTC PeerConnection (Offerer)
-    let rust_config = RtcConfiguration::default();
+    let rust_config = RtcConfiguration::webrtc();
     let rust_pc = PeerConnection::new(rust_config);
 
     // Create DataChannel (DCEP)
@@ -298,7 +298,7 @@ async fn interop_datachannel_incoming_test() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
     // 1. Create RustRTC PeerConnection (Answerer)
-    let rust_config = RtcConfiguration::default();
+    let rust_config = RtcConfiguration::webrtc();
     let rust_pc = PeerConnection::new(rust_config);
 
     // 2. Create WebRTC PeerConnection (Offerer)

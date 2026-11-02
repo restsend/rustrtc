@@ -32,7 +32,7 @@ fn pc(mode: (Connectivity, Keying)) -> PeerConnection {
         connectivity: mode.0,
         keying: mode.1,
         webrtc_extensions: mode.0 == Connectivity::Ice,
-        ..RtcConfiguration::default()
+        ..RtcConfiguration::sip()
     })
 }
 
@@ -264,7 +264,7 @@ async fn remote_hold_stops_raw_and_relayed_rtp_until_resumed() -> Result<()> {
 /// transport.
 #[tokio::test]
 async fn a_held_stream_inside_a_bundle_is_gated_by_ssrc() -> Result<()> {
-    held_stream_is_gated_by_ssrc(RtcConfiguration::default(), 0, true).await
+    held_stream_is_gated_by_ssrc(RtcConfiguration::webrtc(), 0, true).await
 }
 
 /// Without BUNDLE each m-line has its own transport; RTP with the held
@@ -272,11 +272,8 @@ async fn a_held_stream_inside_a_bundle_is_gated_by_ssrc() -> Result<()> {
 #[tokio::test]
 async fn a_held_stream_is_gated_on_every_transport_without_bundle() -> Result<()> {
     let config = RtcConfiguration {
-        connectivity: Connectivity::Sdp,
-        keying: Keying::None,
-        webrtc_extensions: false,
         bundle_policy: rustrtc::BundlePolicy::MaxCompat,
-        ..RtcConfiguration::default()
+        ..RtcConfiguration::sip()
     };
     held_stream_is_gated_by_ssrc(config, 1, false).await
 }

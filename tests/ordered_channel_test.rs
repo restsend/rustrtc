@@ -130,7 +130,7 @@ async fn ordered_negotiated_channel_test() -> Result<()> {
     });
 
     // --- RustRTC Setup (Server/Answerer) ---
-    let rust_config = RtcConfiguration::default();
+    let rust_config = RtcConfiguration::webrtc();
     let rust_pc = Arc::new(PeerConnection::new(rust_config));
 
     // Create negotiated DataChannels with ordered=TRUE
@@ -340,7 +340,7 @@ async fn dcep_ordered_channel_test() -> Result<()> {
     });
 
     // --- RustRTC Setup (Server/Answerer) ---
-    let rust_config = RtcConfiguration::default();
+    let rust_config = RtcConfiguration::webrtc();
     let rust_pc = Arc::new(PeerConnection::new(rust_config));
 
     // --- Signaling ---
@@ -532,7 +532,7 @@ async fn dcep_ordered_bidirectional_test() -> Result<()> {
     });
 
     // --- RustRTC Setup ---
-    let rust_config = RtcConfiguration::default();
+    let rust_config = RtcConfiguration::webrtc();
     let rust_pc = Arc::new(PeerConnection::new(rust_config));
 
     let offer_sdp = offer_rx.await?;

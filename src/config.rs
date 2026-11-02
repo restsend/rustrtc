@@ -94,11 +94,10 @@ pub enum IceTcpPolicy {
 /// without BUNDLE rejects the m-lines that the policy gives no transport.
 ///
 /// Full ICE has one ICE agent: it always works as `MaxBundle`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BundlePolicy {
     /// A transport for the first m-line of each kind (audio, video, data).
     /// A peer without BUNDLE gets one m-line of each kind.
-    #[default]
     Balanced,
     /// A transport for every m-line. A peer without BUNDLE gets them all.
     MaxCompat,
@@ -111,7 +110,7 @@ pub enum BundlePolicy {
 /// propose it with `a=rtcp-mux`; answers accept it when the offer has it.
 ///
 /// Full ICE gathers no RTCP component: it always works as `Require`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RtcpMuxPolicy {
     /// The peer must multiplex. Offers also carry `a=rtcp-mux-only`
     /// (RFC 8858) and reserve no RTCP port. A remote description with an
@@ -120,13 +119,12 @@ pub enum RtcpMuxPolicy {
     /// Offers reserve an RTCP port and advertise it with `a=rtcp`, for an
     /// answer that does not multiplex (RFC 5761 §5.1.1). Use this for SIP
     /// peers: many of them do not multiplex.
-    #[default]
     Negotiate,
 }
 
 /// How the media path to the peer is found. Any value works with any
 /// [`Keying`].
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Connectivity {
     /// The c=/m= address of the peer's SDP (corrected by latching, when on).
     /// A direct transport: no ICE agent.
@@ -135,7 +133,6 @@ pub enum Connectivity {
     /// peer's checks and follows its nomination.
     IceLite,
     /// Full ICE: gathering, connectivity checks, nomination.
-    #[default]
     Ice,
 }
 
@@ -148,14 +145,13 @@ impl Connectivity {
 
 /// How the SRTP keys are exchanged. Any value works with any
 /// [`Connectivity`]. Data channels (SCTP) need `Dtls`.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Keying {
     /// Plain RTP (RTP/AVP).
     None,
     /// SDES, `a=crypto` (RFC 4568), RTP/SAVP.
     Sdes,
     /// DTLS-SRTP, `a=fingerprint` (RFC 5763/5764), UDP/TLS/RTP/SAVPF.
-    #[default]
     Dtls,
 }
 
@@ -492,10 +488,6 @@ fn default_enable_gcc() -> bool {
     true
 }
 
-fn default_webrtc_extensions() -> bool {
-    true
-}
-
 fn default_rtp_buffer_capacity() -> usize {
     100
 }
@@ -521,6 +513,12 @@ fn default_upnp_refresh_interval() -> core::time::Duration {
 }
 
 /// Primary configuration for a `PeerConnection`.
+///
+/// There is no default: start from the kind of peer,
+/// [`RtcConfiguration::webrtc`] or [`RtcConfiguration::sip`], and change
+/// what you need. They differ in `connectivity`, `keying`,
+/// `webrtc_extensions`, `rtcp_mux_policy` and `bundle_policy`; the other
+/// fields have the same values.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RtcConfiguration {
     pub ice_servers: Vec<IceServer>,
@@ -528,20 +526,17 @@ pub struct RtcConfiguration {
     pub bundle_policy: BundlePolicy,
     pub rtcp_mux_policy: RtcpMuxPolicy,
     pub certificates: Vec<CertificateConfig>,
-    /// How the media path is found. Default: full ICE.
-    #[serde(default)]
+    /// How the media path is found.
     pub connectivity: Connectivity,
-    /// How the SRTP keys are exchanged. Default: DTLS.
-    #[serde(default)]
+    /// How the SRTP keys are exchanged.
     pub keying: Keying,
     /// The peer is a WebRTC endpoint (a browser, an SFU): offers claim
     /// header extension ids for rid, repaired-rid and abs-send-time; with
     /// `enable_gcc`, descriptions carry transport-cc and we send TWCC
     /// feedback; descriptions carry `msid`. Answers echo the rid and
     /// abs-send-time ids the remote offered either way. SIP peers do not use
-    /// these: set it to false for them. Default: true. (sdes:mid goes with
-    /// BUNDLE, see [`BundlePolicy`].)
-    #[serde(default = "default_webrtc_extensions")]
+    /// these: set it to false for them. (sdes:mid goes with BUNDLE, see
+    /// [`BundlePolicy`].)
     pub webrtc_extensions: bool,
     pub nack_buffer_size: usize,
     /// Enable the TWCC + GCC bandwidth-adaptation loop: stamp outgoing RTP
@@ -820,17 +815,50 @@ impl PartialEq for RtcConfiguration {
 
 impl Eq for RtcConfiguration {}
 
-impl Default for RtcConfiguration {
-    fn default() -> Self {
+impl RtcConfiguration {
+    /// For a WebRTC peer (a browser, an SFU): full ICE, DTLS-SRTP, the
+    /// WebRTC header extensions, RTCP multiplexing required, one transport
+    /// for all m-lines (BUNDLE).
+    pub fn webrtc() -> Self {
+        Self::new(
+            Connectivity::Ice,
+            Keying::Dtls,
+            true,
+            RtcpMuxPolicy::Require,
+            BundlePolicy::MaxBundle,
+        )
+    }
+
+    /// For a SIP peer (a trunk, a phone, a PBX): the address of its SDP (no
+    /// ICE), plain RTP, no WebRTC header extensions, RTCP multiplexing when
+    /// the peer accepts it, a transport for each kind of media without
+    /// BUNDLE. Change `keying` for SDES-SRTP, `connectivity` for ICE-lite.
+    pub fn sip() -> Self {
+        Self::new(
+            Connectivity::Sdp,
+            Keying::None,
+            false,
+            RtcpMuxPolicy::Negotiate,
+            BundlePolicy::Balanced,
+        )
+    }
+
+    fn new(
+        connectivity: Connectivity,
+        keying: Keying,
+        webrtc_extensions: bool,
+        rtcp_mux_policy: RtcpMuxPolicy,
+        bundle_policy: BundlePolicy,
+    ) -> Self {
         Self {
             ice_servers: Vec::new(),
             ice_transport_policy: IceTransportPolicy::default(),
-            bundle_policy: BundlePolicy::default(),
-            rtcp_mux_policy: RtcpMuxPolicy::default(),
+            bundle_policy,
+            rtcp_mux_policy,
             certificates: Vec::new(),
-            connectivity: Connectivity::default(),
-            keying: Keying::default(),
-            webrtc_extensions: default_webrtc_extensions(),
+            connectivity,
+            keying,
+            webrtc_extensions,
             nack_buffer_size: 200,
             enable_gcc: default_enable_gcc(),
             media_capabilities: None,
@@ -894,12 +922,6 @@ pub struct RtcConfigurationBuilder {
     inner: RtcConfiguration,
 }
 
-impl Default for RtcConfigurationBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Wrapper for interceptor lists so that `RtcConfiguration` can still derive
 /// `Debug / Clone / PartialEq / Eq` — the actual interceptor trait objects
 /// are opaque and only compared by count.
@@ -946,9 +968,17 @@ impl PartialEq for RecorderInterceptors {
 impl Eq for RecorderInterceptors {}
 
 impl RtcConfigurationBuilder {
-    pub fn new() -> Self {
+    /// Start from [`RtcConfiguration::webrtc`].
+    pub fn webrtc() -> Self {
         Self {
-            inner: RtcConfiguration::default(),
+            inner: RtcConfiguration::webrtc(),
+        }
+    }
+
+    /// Start from [`RtcConfiguration::sip`].
+    pub fn sip() -> Self {
+        Self {
+            inner: RtcConfiguration::sip(),
         }
     }
 
@@ -1296,14 +1326,14 @@ mod tests {
         // Two peer connections must not share SSRCs by default. (A false
         // failure needs two equal random u32s: 1 in 2^32.)
         assert_ne!(
-            RtcConfiguration::default().ssrc_start,
-            RtcConfiguration::default().ssrc_start
+            RtcConfiguration::webrtc().ssrc_start,
+            RtcConfiguration::webrtc().ssrc_start
         );
     }
 
     #[test]
     fn test_rtc_configuration_defaults() {
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         assert_eq!(config.ice_connection_timeout, Duration::from_secs(120));
         assert_eq!(config.ice_disconnect_threshold, Duration::from_secs(30));
         assert_eq!(config.ice_disconnect_grace, Duration::from_secs(60));
@@ -1322,7 +1352,7 @@ mod tests {
 
     #[test]
     fn test_rtc_configuration_builder() {
-        let config = RtcConfigurationBuilder::new()
+        let config = RtcConfigurationBuilder::webrtc()
             .stun_timeout(Duration::from_secs(10))
             .build();
         assert_eq!(config.stun_timeout, Duration::from_secs(10));
@@ -1332,7 +1362,7 @@ mod tests {
 
     #[test]
     fn test_buffer_config_builder() {
-        let config = RtcConfigurationBuilder::new()
+        let config = RtcConfigurationBuilder::webrtc()
             .rtp_buffer_capacity(200)
             .buffer_drop_strategy(BufferDropStrategy::DropOldest)
             .buffer_stats_log_interval(Duration::from_secs(5))
@@ -1344,7 +1374,7 @@ mod tests {
 
     #[test]
     fn test_sctp_builder_methods() {
-        let config = RtcConfigurationBuilder::new()
+        let config = RtcConfigurationBuilder::webrtc()
             .sctp_rto_initial(Duration::from_millis(500))
             .sctp_rto_min(Duration::from_millis(200))
             .sctp_rto_max(Duration::from_secs(10))
@@ -1372,7 +1402,7 @@ mod tests {
     #[test]
     fn test_turn_optimized_config() {
         // Verify a TURN-optimized configuration can be expressed cleanly
-        let config = RtcConfigurationBuilder::new()
+        let config = RtcConfigurationBuilder::webrtc()
             .sctp_rto_initial(Duration::from_millis(500))
             .sctp_rto_min(Duration::from_millis(100))
             .sctp_rto_max(Duration::from_secs(10))
@@ -1384,7 +1414,7 @@ mod tests {
             .build();
 
         // Verify the TURN-optimized values are more aggressive than defaults
-        let defaults = RtcConfiguration::default();
+        let defaults = RtcConfiguration::webrtc();
         assert!(config.sctp_rto_initial < defaults.sctp_rto_initial);
         assert!(config.sctp_rto_min < defaults.sctp_rto_min);
         assert!(config.sctp_rto_max < defaults.sctp_rto_max);
@@ -1397,19 +1427,21 @@ mod tests {
 
     #[test]
     fn test_external_port_defaults() {
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         assert_eq!(config.external_port, None);
     }
 
     #[test]
     fn test_external_port_builder() {
-        let config = RtcConfigurationBuilder::new().external_port(30000).build();
+        let config = RtcConfigurationBuilder::webrtc()
+            .external_port(30000)
+            .build();
         assert_eq!(config.external_port, Some(30000));
     }
 
     #[test]
     fn test_external_port_with_external_ip_builder() {
-        let config = RtcConfigurationBuilder::new()
+        let config = RtcConfigurationBuilder::webrtc()
             .external_ips(vec!["203.0.113.5".parse().unwrap()])
             .external_port(30000)
             .build();
@@ -1422,7 +1454,7 @@ mod tests {
 
     #[test]
     fn test_upnp_defaults() {
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         assert!(!config.enable_upnp, "UPnP should be disabled by default");
         assert_eq!(config.upnp_lease_duration, 3600);
         assert_eq!(config.upnp_refresh_interval, Duration::from_secs(30));
@@ -1430,7 +1462,7 @@ mod tests {
 
     #[test]
     fn test_upnp_builder_methods() {
-        let config = RtcConfigurationBuilder::new()
+        let config = RtcConfigurationBuilder::webrtc()
             .enable_upnp(false)
             .upnp_lease_duration(7200)
             .build();
@@ -1440,16 +1472,16 @@ mod tests {
 
     #[test]
     fn test_upnp_refresh_interval_builder() {
-        let config = RtcConfigurationBuilder::new()
+        let config = RtcConfigurationBuilder::webrtc()
             .upnp_refresh_interval(Duration::from_secs(60))
             .build();
         assert_eq!(config.upnp_refresh_interval, Duration::from_secs(60));
 
         // Refresh interval participates in PartialEq
-        let a = RtcConfigurationBuilder::new()
+        let a = RtcConfigurationBuilder::webrtc()
             .upnp_refresh_interval(Duration::from_secs(60))
             .build();
-        let b = RtcConfigurationBuilder::new()
+        let b = RtcConfigurationBuilder::webrtc()
             .upnp_refresh_interval(Duration::from_secs(120))
             .build();
         assert_ne!(a, b);
@@ -1458,7 +1490,7 @@ mod tests {
 
     #[test]
     fn test_upnp_optimized_config() {
-        let config = RtcConfigurationBuilder::new()
+        let config = RtcConfigurationBuilder::webrtc()
             .enable_upnp(true)
             .upnp_lease_duration(1800)
             .build();
@@ -1467,7 +1499,7 @@ mod tests {
         assert_eq!(config.upnp_lease_duration, 1800);
 
         // Verify defaults remain for other options
-        let defaults = RtcConfiguration::default();
+        let defaults = RtcConfiguration::webrtc();
         assert_eq!(
             config.ice_connection_timeout,
             defaults.ice_connection_timeout
@@ -1476,7 +1508,7 @@ mod tests {
 
     #[test]
     fn test_ice_udp_mux_defaults() {
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         assert!(
             !config.ice_udp_mux,
             "ICE UDP mux should be disabled by default"
@@ -1486,7 +1518,7 @@ mod tests {
 
     #[test]
     fn test_ice_udp_mux_builder_methods() {
-        let config = RtcConfigurationBuilder::new()
+        let config = RtcConfigurationBuilder::webrtc()
             .ice_udp_mux(true)
             .ice_udp_mux_port(30500)
             .build();

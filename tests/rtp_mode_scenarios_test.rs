@@ -10,8 +10,8 @@
 #![allow(clippy::zombie_processes)]
 use anyhow::Result;
 use rustrtc::{
-    Connectivity, Keying, MediaKind, PeerConnection, PeerConnectionEvent, RtcConfiguration,
-    RtpCodecParameters, SdpType, SessionDescription, TransceiverDirection,
+    MediaKind, PeerConnection, PeerConnectionEvent, RtcConfiguration, RtpCodecParameters, SdpType,
+    SessionDescription, TransceiverDirection,
 };
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -66,10 +66,7 @@ async fn test_rtp_mode_callee_no_ssrc_signaled() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
     // PC: Receiver (RTP Mode)
-    let mut config = RtcConfiguration::default();
-    config.connectivity = Connectivity::Sdp;
-    config.keying = Keying::None;
-    config.webrtc_extensions = false;
+    let config = RtcConfiguration::sip();
     let pc = PeerConnection::new(config);
 
     // Add a transceiver to receive
@@ -88,10 +85,7 @@ async fn test_rtp_mode_callee_no_ssrc_signaled() -> Result<()> {
 
     // 1. Create Offer from a fake remote peer (we construct SDP manually or use a helper PC)
     // We'll use a helper PC to generate valid SDP, then strip SSRC
-    let mut config_fake = RtcConfiguration::default();
-    config_fake.connectivity = Connectivity::Sdp;
-    config_fake.keying = Keying::None;
-    config_fake.webrtc_extensions = false;
+    let config_fake = RtcConfiguration::sip();
     let pc_fake = PeerConnection::new(config_fake);
     let (_source, track, _) =
         rustrtc::media::track::sample_track(rustrtc::media::frame::MediaKind::Video, 100);
@@ -171,10 +165,7 @@ async fn test_rtp_mode_callee_no_ssrc_signaled_stun_first() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
     // PC: Receiver (RTP Mode)
-    let mut config = RtcConfiguration::default();
-    config.connectivity = Connectivity::Sdp;
-    config.keying = Keying::None;
-    config.webrtc_extensions = false;
+    let config = RtcConfiguration::sip();
     let pc = PeerConnection::new(config);
 
     pc.add_transceiver(MediaKind::Video, TransceiverDirection::RecvOnly);
@@ -190,10 +181,7 @@ async fn test_rtp_mode_callee_no_ssrc_signaled_stun_first() -> Result<()> {
     });
 
     // Create No-SSRC Offer
-    let mut config_fake = RtcConfiguration::default();
-    config_fake.connectivity = Connectivity::Sdp;
-    config_fake.keying = Keying::None;
-    config_fake.webrtc_extensions = false;
+    let config_fake = RtcConfiguration::sip();
     let pc_fake = PeerConnection::new(config_fake);
     let (_source, track, _) =
         rustrtc::media::track::sample_track(rustrtc::media::frame::MediaKind::Video, 100);
@@ -263,10 +251,7 @@ async fn test_rtp_mode_caller_no_ssrc_signaled() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
     // PC: Caller (RTP Mode)
-    let mut config = RtcConfiguration::default();
-    config.connectivity = Connectivity::Sdp;
-    config.keying = Keying::None;
-    config.webrtc_extensions = false;
+    let config = RtcConfiguration::sip();
     let pc = PeerConnection::new(config);
 
     // Add a transceiver to receive (SendRecv or RecvOnly)
@@ -290,10 +275,7 @@ async fn test_rtp_mode_caller_no_ssrc_signaled() -> Result<()> {
     pc.set_local_description(offer.clone())?;
 
     // 2. Create Fake Answer (Remote Peer)
-    let mut config_fake = RtcConfiguration::default();
-    config_fake.connectivity = Connectivity::Sdp;
-    config_fake.keying = Keying::None;
-    config_fake.webrtc_extensions = false;
+    let config_fake = RtcConfiguration::sip();
     let pc_fake = PeerConnection::new(config_fake);
     let (_source, track, _) =
         rustrtc::media::track::sample_track(rustrtc::media::frame::MediaKind::Video, 100);

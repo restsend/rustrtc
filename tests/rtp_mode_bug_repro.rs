@@ -11,8 +11,8 @@
 use anyhow::Result;
 use rustrtc::media::MediaStreamTrack;
 use rustrtc::{
-    Connectivity, Keying, MediaKind, PeerConnection, PeerConnectionEvent, RtcConfiguration,
-    RtpCodecParameters, SdpType, SessionDescription, TransceiverDirection,
+    MediaKind, PeerConnection, PeerConnectionEvent, RtcConfiguration, RtpCodecParameters, SdpType,
+    SessionDescription, TransceiverDirection,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,10 +49,7 @@ async fn test_rtp_mode_missing_data_bug_repro() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
     // 1. Setup Receiver PC (RTP Mode, Late Binding)
-    let mut config = RtcConfiguration::default();
-    config.connectivity = Connectivity::Sdp;
-    config.keying = Keying::None;
-    config.webrtc_extensions = false;
+    let config = RtcConfiguration::sip();
     let pc = PeerConnection::new(config);
     pc.add_transceiver(MediaKind::Video, TransceiverDirection::RecvOnly);
 
@@ -67,10 +64,7 @@ async fn test_rtp_mode_missing_data_bug_repro() -> Result<()> {
     });
 
     // 2. Create No-SSRC Offer to force latching
-    let mut config_fake = RtcConfiguration::default();
-    config_fake.connectivity = Connectivity::Sdp;
-    config_fake.keying = Keying::None;
-    config_fake.webrtc_extensions = false;
+    let config_fake = RtcConfiguration::sip();
     let pc_fake = PeerConnection::new(config_fake);
     let (_source, track, _) =
         rustrtc::media::track::sample_track(rustrtc::media::frame::MediaKind::Video, 100);

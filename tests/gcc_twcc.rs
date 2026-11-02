@@ -37,11 +37,11 @@ async fn gcc_loop_runs_over_loopback() -> Result<()> {
 
     let pc1 = PeerConnection::new(RtcConfiguration {
         enable_gcc: true,
-        ..Default::default()
+        ..RtcConfiguration::webrtc()
     });
     let pc2 = PeerConnection::new(RtcConfiguration {
         enable_gcc: true,
-        ..Default::default()
+        ..RtcConfiguration::webrtc()
     });
 
     // PC1: sender with a live video source.
@@ -140,9 +140,9 @@ async fn gcc_disabled_skips_transport_cc_extmap() -> Result<()> {
 
     let pc1 = PeerConnection::new(RtcConfiguration {
         enable_gcc: false,
-        ..Default::default()
+        ..RtcConfiguration::webrtc()
     });
-    let pc2 = PeerConnection::new(RtcConfiguration::default());
+    let pc2 = PeerConnection::new(RtcConfiguration::webrtc());
 
     let (_source, track, _) =
         rustrtc::media::track::sample_track(rustrtc::media::MediaKind::Video, 10);
@@ -182,7 +182,7 @@ async fn twcc_flush_loop_ends_with_the_connection() -> Result<()> {
     for enable_gcc in [true, false] {
         let config = || RtcConfiguration {
             enable_gcc,
-            ..Default::default()
+            ..RtcConfiguration::webrtc()
         };
         let (pc1, pc2) = (PeerConnection::new(config()), PeerConnection::new(config()));
         pc1.add_transceiver(MediaKind::Audio, rustrtc::TransceiverDirection::SendRecv);

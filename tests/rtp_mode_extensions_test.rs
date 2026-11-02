@@ -10,9 +10,7 @@
 #![allow(clippy::zombie_processes)]
 use anyhow::Result;
 use rustrtc::media::frame::{MediaSample, VideoFrame};
-use rustrtc::{
-    Connectivity, Keying, PeerConnection, RtcConfiguration, RtpCodecParameters, SdpType,
-};
+use rustrtc::{PeerConnection, RtcConfiguration, RtpCodecParameters, SdpType};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -22,10 +20,7 @@ async fn test_rtp_mode_no_default_extensions() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
     // 1. Setup PeerConnection (PC) with RTP Mode
-    let mut config = RtcConfiguration::default();
-    config.connectivity = Connectivity::Sdp;
-    config.keying = Keying::None;
-    config.webrtc_extensions = false;
+    let mut config = RtcConfiguration::sip();
     config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
     config.rtp_start_port = Some(40200);
     config.rtp_end_port = Some(40300);

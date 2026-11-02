@@ -173,7 +173,7 @@ use rustrtc::{PeerConnection, RtcConfiguration};
 
 #[tokio::main]
 async fn main() {
-    let config = RtcConfiguration::default();
+    let config = RtcConfiguration::webrtc();
     let pc = PeerConnection::new(config);
 
     // Create a Data Channel
@@ -204,23 +204,31 @@ async fn main() {
 
 ## Configuration
 
-All configuration goes through `RtcConfiguration` (or its builder `RtcConfigurationBuilder`):
+All configuration goes through `RtcConfiguration` (or its builder `RtcConfigurationBuilder`). There is no default: start from the kind of peer, `RtcConfiguration::webrtc()` or `RtcConfiguration::sip()` (`RtcConfigurationBuilder::webrtc()` / `::sip()`), then change what you need. The two differ only in these fields:
+
+| Field | `webrtc()` | `sip()` |
+|---|---|---|
+| `connectivity` | `Ice` | `Sdp` |
+| `keying` | `Dtls` | `None` |
+| `webrtc_extensions` | `true` | `false` |
+| `rtcp_mux_policy` | `Require` | `Negotiate` |
+| `bundle_policy` | `MaxBundle` | `Balanced` |
+
+| Peer | Start from | Then |
+|---|---|---|
+| Browser, SFU (WebRTC) | `webrtc()` | |
+| SIP trunk, plain RTP | `sip()` | |
+| SIP trunk, SDES-SRTP | `sip()` | `keying = Keying::Sdes` |
+| SIP phone with ICE (e.g. Linphone) | `sip()` | `connectivity = Connectivity::IceLite`, `keying = Keying::Sdes` |
 
 ### Transport & Network
-- **`connectivity`** — How the media path is found: `Connectivity::Ice` (full ICE, default), `Connectivity::IceLite` (ICE-lite, RFC 8445 §2.5), or `Connectivity::Sdp` (the `c=`/`m=` address of the peer's SDP, no ICE).
-- **`keying`** — How the SRTP keys are exchanged: `Keying::Dtls` (DTLS-SRTP, default), `Keying::Sdes` (`a=crypto`, RFC 4568), or `Keying::None` (plain RTP). Any keying works with any connectivity; data channels need `Keying::Dtls`.
-- **`webrtc_extensions`** — The peer is a WebRTC endpoint: offers claim rid and abs-send-time (and with `enable_gcc`, transport-cc) header extensions, and descriptions carry `msid`. Default: `true`. Set it to `false` for SIP peers.
-- **`bundle_policy`** — Which m-lines of an offer have a transport of their own (RFC 9429 §4.1.1). An offer with two or more m-lines proposes BUNDLE (RFC 8843), with the `sdes:mid` header extension; when the answer accepts it, all m-lines share one transport. The policy decides what a peer without BUNDLE gets: `Balanced` (default) gives a transport to the first m-line of each kind, `MaxCompat` to every m-line, `MaxBundle` to the first only; the others are offered bundle-only (port 0). An answer to an offer without BUNDLE rejects the m-lines that the policy gives no transport. Full ICE always works as `MaxBundle`.
-- **`rtcp_mux_policy`** — RTP/RTCP multiplexing (RFC 5761). `Negotiate` (default) offers `a=rtcp-mux` and reserves an RTCP port (`a=rtcp`) for an answer that refuses it; use it for SIP peers. `Require` also offers `a=rtcp-mux-only` (RFC 8858) and makes a remote description without `a=rtcp-mux` an error. Answers multiplex when the offer does. Full ICE always works as `Require`.
+- **`connectivity`** — How the media path is found: `Connectivity::Ice` (full ICE), `Connectivity::IceLite` (ICE-lite, RFC 8445 §2.5), or `Connectivity::Sdp` (the `c=`/`m=` address of the peer's SDP, no ICE).
+- **`keying`** — How the SRTP keys are exchanged: `Keying::Dtls` (DTLS-SRTP), `Keying::Sdes` (`a=crypto`, RFC 4568), or `Keying::None` (plain RTP). Any keying works with any connectivity; data channels need `Keying::Dtls`.
+- **`webrtc_extensions`** — The peer is a WebRTC endpoint: offers claim rid and abs-send-time (and with `enable_gcc`, transport-cc) header extensions, and descriptions carry `msid`. SIP peers do not use them.
+- **`bundle_policy`** — Which m-lines of an offer have a transport of their own (RFC 9429 §4.1.1). An offer with two or more m-lines proposes BUNDLE (RFC 8843), with the `sdes:mid` header extension; when the answer accepts it, all m-lines share one transport. The policy decides what a peer without BUNDLE gets: `Balanced` gives a transport to the first m-line of each kind, `MaxCompat` to every m-line, `MaxBundle` to the first only; the others are offered bundle-only (port 0). An answer to an offer without BUNDLE rejects the m-lines that the policy gives no transport. Full ICE always works as `MaxBundle`.
+- **`rtcp_mux_policy`** — RTP/RTCP multiplexing (RFC 5761). `Negotiate` offers `a=rtcp-mux` and reserves an RTCP port (`a=rtcp`) for an answer that refuses it; many SIP peers do. `Require` also offers `a=rtcp-mux-only` (RFC 8858) and makes a remote description without `a=rtcp-mux` an error. Answers multiplex when the offer does. Full ICE always works as `Require`.
 
-| Peer | `connectivity` | `keying` | `webrtc_extensions` |
-|---|---|---|---|
-| Browser (WebRTC, the default) | `Ice` | `Dtls` | `true` |
-| SIP trunk, plain RTP | `Sdp` | `None` | `false` |
-| SIP trunk, SDES-SRTP | `Sdp` | `Sdes` | `false` |
-| SIP phone with ICE (e.g. Linphone) | `IceLite` | `Sdes` | `false` |
-
-Migration from `TransportMode`: `WebRtc` is the default; `Rtp` is `Sdp` + `None`; `Srtp` is `Sdp` + `Sdes`; both with `webrtc_extensions = false`. `enable_ice_lite = true` is `Connectivity::IceLite`.
+Migration from `TransportMode`: `WebRtc` is `webrtc()`; `Rtp` is `sip()`; `Srtp` is `sip()` with `Keying::Sdes`. `enable_ice_lite = true` is `Connectivity::IceLite`. `RtcConfiguration::default()` is `webrtc()`, `RtcConfigurationBuilder::new()` is `RtcConfigurationBuilder::webrtc()`. `SdpCompatibilityMode::LegacySip` is gone: SIP peers ignore BUNDLE and `a=mid` when they do not support them.
 - **`ice_servers`** — STUN/TURN server list.
 - **`ice_transport_policy`** — `All` or `Relay`.
 - **`rtp_start_port` / `rtp_end_port`** — Restrict RTP/ICE to a port range.
@@ -263,7 +271,7 @@ Remote-initiated restarts (peer offers new credentials) are detected and mirrore
 
 ```rust,ignore
 let cert = rustrtc::transports::dtls::Certificate::from_pkcs8_der(cert_der, key_der)?;
-let config = RtcConfigurationBuilder::new()
+let config = RtcConfigurationBuilder::webrtc()
     .dtls_certificate(Arc::new(cert))
     .build();
 ```
@@ -283,7 +291,7 @@ Note: persistence-based latching is accident-robustness (stale NAT bindings, por
 
 ### Media Capabilities
 - **`media_capabilities`** — Configure audio/video/image (T.38) codecs and SCTP port via `MediaCapabilities`. Video presets: `VideoCapability::default()` (VP8), `VideoCapability::vp9()` / `vp9_with_rtx(pt)` (RFC 9628), `VideoCapability::h264()`.
-- **`ssrc_start`** — Starting SSRC value for local tracks (later tracks count up from it). Random by default per RFC 3550 §8.1; pin it only if your deployment needs deterministic SSRCs. Note: two default configs therefore never compare equal via `PartialEq`.
+- **`ssrc_start`** — Starting SSRC value for local tracks (later tracks count up from it). Random by default per RFC 3550 §8.1; pin it only if your deployment needs deterministic SSRCs. Note: two configs from the same constructor therefore never compare equal via `PartialEq`.
 - **`depacketizer_strategy`** — Pluggable per-kind depacketizer (e.g. `Vp9Depacketizer` for RFC 9628 VP9 reassembly).
 
 ### SCTP (Data Channels)
@@ -296,14 +304,11 @@ Note: persistence-based latching is accident-robustness (stale NAT bindings, por
 ```rust
 use rustrtc::{
     PeerConnection, RtcConfiguration, RtcConfigurationBuilder,
-    Connectivity, IceServer, Keying, config::T38Capability,
+    IceServer, Keying, config::T38Capability,
 };
 
 // Using builder
-let config = RtcConfigurationBuilder::new()
-    .connectivity(Connectivity::Sdp)
-    .keying(Keying::None)
-    .webrtc_extensions(false)
+let config = RtcConfigurationBuilder::sip()
     .enable_latching(true)
     .probation_max_packets(Some(5))
     .rtp_port_range(50000, 50100)
@@ -317,10 +322,8 @@ let pc = PeerConnection::new(config);
 
 ```rust
 // Direct field access
-let mut config = RtcConfiguration::default();
-config.connectivity = Connectivity::Sdp;
+let mut config = RtcConfiguration::sip();
 config.keying = Keying::Sdes;
-config.webrtc_extensions = false;
 config.enable_latching = true;
 config.rtp_start_port = Some(50000);
 config.rtp_end_port = Some(50100);

@@ -41,7 +41,7 @@ async fn connected_pair(
         connectivity: mode.0,
         keying: mode.1,
         webrtc_extensions: mode.0 == Connectivity::Ice,
-        ..RtcConfiguration::default()
+        ..RtcConfiguration::sip()
     };
     let (pc1, pc2) = (PeerConnection::new(config()), PeerConnection::new(config()));
     pc1.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);

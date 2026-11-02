@@ -75,10 +75,7 @@ fn session_level_sdp(session_direction: Direction) -> String {
 }
 
 fn rtp_pc_with_audio_sender() -> PeerConnection {
-    let mut config = RtcConfiguration::default();
-    config.connectivity = Connectivity::Sdp;
-    config.keying = Keying::None;
-    config.webrtc_extensions = false;
+    let config = RtcConfiguration::sip();
     let pc = PeerConnection::new(config);
     let (_source, track, _) =
         rustrtc::media::track::sample_track(rustrtc::media::MediaKind::Audio, 10);
@@ -233,7 +230,7 @@ async fn reoffer_after_session_level_hold_carries_local_direction() {
 /// direction intent: the restart offer keeps sendrecv.
 #[tokio::test]
 async fn restart_ice_preserves_direction_intent() {
-    let pc = PeerConnection::new(RtcConfiguration::default());
+    let pc = PeerConnection::new(RtcConfiguration::webrtc());
     pc.create_data_channel("dir", None).unwrap();
 
     // Establish a stable session first (Stable state is required for
@@ -321,7 +318,7 @@ async fn senderless_offer(
         connectivity: mode.0,
         keying: mode.1,
         webrtc_extensions: mode.0 == Connectivity::Ice,
-        ..RtcConfiguration::default()
+        ..RtcConfiguration::sip()
     };
     let pc = PeerConnection::new(config());
     if from_remote {
@@ -377,10 +374,7 @@ async fn set_direction_is_offered_without_a_sender() {
 /// preference for a senderless transceiver too, once that direction is its own.
 #[tokio::test]
 async fn rewritten_offer_direction_is_adopted_without_a_sender() {
-    let mut config = RtcConfiguration::default();
-    config.connectivity = Connectivity::Sdp;
-    config.keying = Keying::None;
-    config.webrtc_extensions = false;
+    let config = RtcConfiguration::sip();
     let pc = PeerConnection::new(config);
     let t = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::RecvOnly);
     t.set_direction(TransceiverDirection::SendRecv);

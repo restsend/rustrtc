@@ -12,8 +12,7 @@ use anyhow::Result;
 use rustrtc::media::MediaStreamTrack;
 use rustrtc::media::frame::{MediaSample, VideoFrame};
 use rustrtc::{
-    Connectivity, Keying, MediaKind, PeerConnection, RtcConfiguration, RtpCodecParameters,
-    TransceiverDirection,
+    MediaKind, PeerConnection, RtcConfiguration, RtpCodecParameters, TransceiverDirection,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,17 +22,11 @@ async fn test_remote_addr_and_raw_packet() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
     // PC1: Publisher (RTP Mode)
-    let mut config1 = RtcConfiguration::default();
-    config1.connectivity = Connectivity::Sdp;
-    config1.keying = Keying::None;
-    config1.webrtc_extensions = false;
+    let config1 = RtcConfiguration::sip();
     let pc1 = PeerConnection::new(config1);
 
     // PC2: Receiver (RTP Mode)
-    let mut config2 = RtcConfiguration::default();
-    config2.connectivity = Connectivity::Sdp;
-    config2.keying = Keying::None;
-    config2.webrtc_extensions = false;
+    let config2 = RtcConfiguration::sip();
     let pc2 = PeerConnection::new(config2);
 
     // PC1 adds a track

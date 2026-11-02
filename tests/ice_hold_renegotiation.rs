@@ -87,12 +87,12 @@ async fn setup_echo_pair(
     std::sync::Arc<rustrtc::transports::sctp::DataChannel>,
 )> {
     let pc_a = PeerConnection::new({
-        let mut c = RtcConfiguration::default();
+        let mut c = RtcConfiguration::webrtc();
         c.label = Some(format!("{prefix}-A-offerer").into());
         c
     });
     let pc_b = PeerConnection::new({
-        let mut c = RtcConfiguration::default();
+        let mut c = RtcConfiguration::webrtc();
         c.label = Some(format!("{prefix}-B-answerer").into());
         c
     });

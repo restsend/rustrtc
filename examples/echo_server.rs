@@ -131,7 +131,7 @@ async fn handle_rustrtc_offer(payload: OfferRequest) -> Json<OfferResponse> {
     let offer_sdp = SessionDescription::parse(SdpType::Offer, &payload.sdp).unwrap();
     let vp8_pt = find_vp8_payload_type(&offer_sdp).unwrap_or(96);
     info!("Determined VP8 Payload Type: {}", vp8_pt);
-    let mut config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::webrtc();
     // Configure media capabilities with the found PT
     let mut caps = rustrtc::config::MediaCapabilities::default();
     caps.video = vec![rustrtc::config::VideoCapability {

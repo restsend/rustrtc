@@ -9,7 +9,7 @@ async fn test_sctp_reliability_under_loss() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
     // We'll use two PeerConnections and a proxy to simulate packet loss
-    let config = RtcConfiguration::default();
+    let config = RtcConfiguration::webrtc();
     let pc1 = PeerConnection::new(config.clone());
     let pc2 = PeerConnection::new(config);
 

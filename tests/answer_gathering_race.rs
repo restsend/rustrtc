@@ -36,9 +36,9 @@ fn candidate_count(desc: &rustrtc::SessionDescription) -> usize {
 async fn answer_gathered_before_local_description_still_connects() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let offerer = PeerConnection::new(RtcConfiguration::default());
+    let offerer = PeerConnection::new(RtcConfiguration::webrtc());
     offerer.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
-    let answerer = PeerConnection::new(RtcConfiguration::default());
+    let answerer = PeerConnection::new(RtcConfiguration::webrtc());
     answerer.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
 
     // trickle-style offer: no candidates in the SDP

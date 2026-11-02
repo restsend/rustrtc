@@ -12,9 +12,7 @@ use rustrtc::media::{
     MediaError, MediaKind, MediaResult, MediaSample, MediaSource, Packetizer, VideoFrame,
     Vp8Payloader,
 };
-use rustrtc::{
-    Connectivity, Keying, PeerConnection, RtcConfiguration, SdpType, SessionDescription,
-};
+use rustrtc::{PeerConnection, RtcConfiguration, SdpType, SessionDescription};
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
@@ -40,10 +38,7 @@ async fn main() {
     println!("------------------------------------------------");
     println!("Command: ffplay -protocol_whitelist file,udp,rtp -i examples/rtp_play.sdp");
 
-    let mut config = RtcConfiguration::default();
-    config.connectivity = Connectivity::Sdp;
-    config.keying = Keying::None;
-    config.webrtc_extensions = false;
+    let config = RtcConfiguration::sip();
     let pc = PeerConnection::new(config);
 
     let (sample_source, track, _) = rustrtc::media::sample_track(MediaKind::Video, 100);

@@ -32,7 +32,7 @@ fn pc(mode: (Connectivity, Keying)) -> PeerConnection {
         connectivity: mode.0,
         keying: mode.1,
         webrtc_extensions: mode.0 == Connectivity::Ice,
-        ..RtcConfiguration::default()
+        ..RtcConfiguration::sip()
     })
 }
 

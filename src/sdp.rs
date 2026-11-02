@@ -1618,7 +1618,7 @@ a=fingerprint:sha-256 AA:BB:CC:EE\r\n";
 
     /// Helper: build a minimal RtcConfiguration with the given media capabilities.
     fn make_config(caps: crate::config::MediaCapabilities) -> RtcConfiguration {
-        let mut c = RtcConfiguration::default();
+        let mut c = RtcConfiguration::webrtc();
         c.media_capabilities = Some(caps);
         c
     }
@@ -2268,7 +2268,7 @@ a=T38FaxUdpEC:t38UDPRedundancy\r\n";
             application: None,
             image: vec![t38],
         };
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.media_capabilities = Some(caps);
 
         let mut section = MediaSection::new(MediaKind::Image, "0");

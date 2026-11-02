@@ -9,18 +9,14 @@
 #![allow(clippy::cloned_ref_to_slice_refs)]
 #![allow(clippy::zombie_processes)]
 use anyhow::Result;
-use rustrtc::{
-    Connectivity, Keying, MediaKind, PeerConnection, RtcConfiguration, TransceiverDirection,
-};
+use rustrtc::{Keying, MediaKind, PeerConnection, RtcConfiguration, TransceiverDirection};
 
 #[tokio::test]
 async fn test_srtp_local_sdp_port() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let mut config = RtcConfiguration::default();
-    config.connectivity = Connectivity::Sdp;
+    let mut config = RtcConfiguration::sip();
     config.keying = Keying::Sdes;
-    config.webrtc_extensions = false;
 
     let pc = PeerConnection::new(config);
 
@@ -66,10 +62,7 @@ async fn test_srtp_local_sdp_port() -> Result<()> {
 async fn test_rtp_local_sdp_port() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let mut config = RtcConfiguration::default();
-    config.connectivity = Connectivity::Sdp;
-    config.keying = Keying::None;
-    config.webrtc_extensions = false;
+    let config = RtcConfiguration::sip();
 
     let pc = PeerConnection::new(config);
 
@@ -106,7 +99,7 @@ async fn test_rtp_local_sdp_port() -> Result<()> {
 async fn test_ssrc_negotiation_without_track() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let config = RtcConfiguration::default();
+    let config = RtcConfiguration::webrtc();
 
     let pc = PeerConnection::new(config);
 

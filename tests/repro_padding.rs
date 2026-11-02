@@ -24,12 +24,12 @@ async fn test_padding_packet_drop() -> Result<()> {
 
     // 1. Create PC1 (Client)
     println!("Create PC1");
-    let config1 = RtcConfiguration::default();
+    let config1 = RtcConfiguration::webrtc();
     let pc1 = PeerConnection::new(config1);
 
     // 2. Create PC2 (Server)
     println!("Create PC2");
-    let config2 = RtcConfiguration::default();
+    let config2 = RtcConfiguration::webrtc();
     let pc2 = PeerConnection::new(config2);
 
     // Setup Sending on PC1 (Before Negotiation)

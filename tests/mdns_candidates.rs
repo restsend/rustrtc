@@ -36,10 +36,10 @@ async fn mdns_candidates_obfuscate_sdp_but_still_connect() -> Result<()> {
 
     let config_a = RtcConfiguration {
         enable_mdns: true,
-        ..Default::default()
+        ..RtcConfiguration::webrtc()
     };
     let pc_a = PeerConnection::new(config_a);
-    let pc_b = PeerConnection::new(RtcConfiguration::default());
+    let pc_b = PeerConnection::new(RtcConfiguration::webrtc());
 
     let dc_a = pc_a.create_data_channel(
         "mdns",
@@ -175,7 +175,7 @@ async fn mdns_responder_answers_a_query() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn remote_local_candidates_are_tolerated() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
-    let pc_a = PeerConnection::new(RtcConfiguration::default());
+    let pc_a = PeerConnection::new(RtcConfiguration::webrtc());
     pc_a.create_data_channel("tol", None)?;
 
     // An offer whose host candidate uses an mDNS hostname (like Chrome's).

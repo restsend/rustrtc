@@ -24,10 +24,8 @@ use rustrtc::peer_connection::{
 use rustrtc::sdp::MediaKind;
 
 fn srtp_agent(start: u16, end: u16) -> PeerConnection {
-    let mut config = RtcConfiguration::default();
-    config.connectivity = Connectivity::Sdp;
+    let mut config = RtcConfiguration::sip();
     config.keying = Keying::Sdes;
-    config.webrtc_extensions = false;
     config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
     config.rtp_start_port = Some(start);
     config.rtp_end_port = Some(end);

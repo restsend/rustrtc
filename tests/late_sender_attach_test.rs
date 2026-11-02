@@ -88,7 +88,7 @@ async fn sender_installed_before_transport_up(mode: (Connectivity, Keying)) -> R
         connectivity: mode.0,
         keying: mode.1,
         webrtc_extensions: mode.0 == Connectivity::Ice,
-        ..RtcConfiguration::default()
+        ..RtcConfiguration::sip()
     };
     let pc1 = PeerConnection::new(config());
     let pc2 = PeerConnection::new(config());
@@ -116,8 +116,8 @@ async fn sender_installed_before_transport_up_rtp() -> Result<()> {
 
 #[tokio::test]
 async fn sender_replaced_after_transport_up() -> Result<()> {
-    let pc1 = PeerConnection::new(RtcConfiguration::default());
-    let pc2 = PeerConnection::new(RtcConfiguration::default());
+    let pc1 = PeerConnection::new(RtcConfiguration::webrtc());
+    let pc2 = PeerConnection::new(RtcConfiguration::webrtc());
 
     let (_initial, track, _) = sample_track(rustrtc::media::frame::MediaKind::Audio, 100);
     pc1.add_track(track, opus())?;
@@ -142,7 +142,7 @@ async fn sender_installed_on_transceiver_from_reoffer(mode: (Connectivity, Keyin
         connectivity: mode.0,
         keying: mode.1,
         webrtc_extensions: mode.0 == Connectivity::Ice,
-        ..RtcConfiguration::default()
+        ..RtcConfiguration::sip()
     };
     let pc1 = PeerConnection::new(config());
     let pc2 = PeerConnection::new(config());
@@ -199,7 +199,7 @@ async fn sender_installed_on_transceiver_added_after_connect(
         connectivity: mode.0,
         keying: mode.1,
         webrtc_extensions: mode.0 == Connectivity::Ice,
-        ..RtcConfiguration::default()
+        ..RtcConfiguration::sip()
     };
     let pc1 = PeerConnection::new(config());
     let pc2 = PeerConnection::new(config());
@@ -254,7 +254,7 @@ async fn sender_installed_after_senderless_sendrecv_reoffer(
         connectivity: mode.0,
         keying: mode.1,
         webrtc_extensions: mode.0 == Connectivity::Ice,
-        ..RtcConfiguration::default()
+        ..RtcConfiguration::sip()
     };
     let pc1 = PeerConnection::new(config());
     let pc2 = PeerConnection::new(config());

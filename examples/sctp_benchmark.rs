@@ -28,7 +28,7 @@ async fn main() -> anyhow::Result<()> {
     println!("Chunk Size: {} KB", chunk_size / 1024);
 
     // 1. Create PeerConnections
-    let config = RtcConfiguration::default();
+    let config = RtcConfiguration::webrtc();
     let pc1 = PeerConnection::new(config.clone());
     let pc2 = PeerConnection::new(config);
 

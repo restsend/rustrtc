@@ -16,7 +16,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== RTP Reinvite Demo ===\n");
 
     // Create PeerConnection
-    let config = RtcConfiguration::default();
+    let config = RtcConfiguration::webrtc();
     let pc = PeerConnection::new(config);
 
     println!("1. Initial negotiation");

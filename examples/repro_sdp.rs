@@ -11,7 +11,7 @@ use rustrtc::{MediaKind, PeerConnection, RtcConfiguration, TransceiverDirection}
 
 #[tokio::main]
 async fn main() {
-    let config = RtcConfiguration::default();
+    let config = RtcConfiguration::webrtc();
 
     let pc = PeerConnection::new(config);
     pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);

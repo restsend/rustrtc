@@ -117,7 +117,7 @@ async fn run_server(addr_str: &str) {
 async fn handle_offer(Json(payload): Json<OfferRequest>) -> impl IntoResponse {
     info!("Received offer");
 
-    let mut config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::webrtc();
     // Enable VP8 + VP9 negotiation (RFC 9628).
     let mut caps = rustrtc::config::MediaCapabilities::default();
     caps.video = vec![
@@ -303,7 +303,7 @@ fn extract_attr(desc: &SessionDescription, key: &str) -> String {
 }
 
 async fn run_client(addr_str: &str) {
-    let mut config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::webrtc();
     let mut caps = rustrtc::config::MediaCapabilities::default();
     caps.video = vec![rustrtc::config::VideoCapability {
         payload_type: 96,

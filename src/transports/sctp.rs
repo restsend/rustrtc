@@ -4250,7 +4250,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         let mut config = config;
         config.sctp_rto_initial = Duration::from_secs(1);
         config.sctp_rto_min = Duration::from_secs(1);
@@ -4358,7 +4358,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.sctp_rto_initial = Duration::from_secs(1);
         config.sctp_rto_min = Duration::from_secs(1);
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -4457,7 +4457,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.sctp_rto_initial = Duration::from_secs(1);
         config.sctp_rto_min = Duration::from_secs(1);
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -4521,7 +4521,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.sctp_rto_initial = Duration::from_secs(1);
         config.sctp_rto_min = Duration::from_secs(1);
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -4605,7 +4605,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.sctp_rto_initial = Duration::from_secs(1);
         config.sctp_rto_min = Duration::from_secs(1);
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -4686,7 +4686,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         let mut config = config;
         config.sctp_max_association_retransmits = 10; // Higher threshold
 
@@ -4956,7 +4956,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         let mut config = config;
         config.sctp_max_association_retransmits = 10; // More realistic threshold
 
@@ -5149,7 +5149,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
 
         let (sctp, runner) = SctpTransport::new(
@@ -5235,7 +5235,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.sctp_max_association_retransmits = 20;
 
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -5321,7 +5321,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
 
         let (sctp, runner) = SctpTransport::new(
@@ -5468,7 +5468,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
 
         let (sctp, runner) = SctpTransport::new(
@@ -6009,7 +6009,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.sctp_rto_max = Duration::from_secs(4);
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
 
@@ -6093,7 +6093,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
 
         let (sctp, runner) = SctpTransport::new(
@@ -6176,7 +6176,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
 
         let (sctp, runner) = SctpTransport::new(
@@ -6278,7 +6278,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
 
         let (sctp, runner) = SctpTransport::new(
@@ -6406,7 +6406,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
 
         let (sctp, runner) = SctpTransport::new(
@@ -6532,7 +6532,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.sctp_max_association_retransmits = 10; // Low threshold to test protection
         config.sctp_rto_initial = Duration::from_millis(100);
         config.sctp_rto_min = Duration::from_millis(50);
@@ -7377,7 +7377,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
 
         let (sctp, runner) = SctpTransport::new(
@@ -7515,7 +7515,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.sctp_max_association_retransmits = 10; // Set a reasonable limit
 
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -7658,7 +7658,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
 
         let (sctp, runner) = SctpTransport::new(
@@ -7743,7 +7743,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.sctp_max_association_retransmits = 5; // Low limit to test protection
 
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -7917,7 +7917,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
 
         let (sctp, runner) = SctpTransport::new(
@@ -8059,7 +8059,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
 
         let (sctp, runner) = SctpTransport::new(
@@ -8157,7 +8157,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.sctp_max_association_retransmits = 10;
 
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -8275,7 +8275,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.sctp_max_association_retransmits = 20;
         config.sctp_rto_initial = Duration::from_secs(3);
 
@@ -8439,7 +8439,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.sctp_max_association_retransmits = 5; // Low limit for fast test
 
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -8519,7 +8519,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
 
         let (sctp, runner) = SctpTransport::new(
@@ -8719,7 +8719,7 @@ mod tests {
             .unwrap();
 
         // Test with default config
-        let default_config = RtcConfiguration::default();
+        let default_config = RtcConfiguration::webrtc();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
         let (sctp_default, _runner) = SctpTransport::new(
             dtls.clone(),
@@ -8742,7 +8742,7 @@ mod tests {
         );
 
         // Test with TURN-optimized config
-        let mut turn_config = RtcConfiguration::default();
+        let mut turn_config = RtcConfiguration::webrtc();
         turn_config.sctp_heartbeat_interval = Duration::from_secs(10);
         turn_config.sctp_max_heartbeat_failures = 8;
 
@@ -8783,7 +8783,7 @@ mod tests {
             .unwrap();
 
         // Default config: max_burst = 0 (heuristic)
-        let default_config = RtcConfiguration::default();
+        let default_config = RtcConfiguration::webrtc();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
         let (sctp_default, _runner) = SctpTransport::new(
             dtls.clone(),
@@ -8801,7 +8801,7 @@ mod tests {
         );
 
         // TURN-optimized config: max_burst = 4
-        let mut turn_config = RtcConfiguration::default();
+        let mut turn_config = RtcConfiguration::webrtc();
         turn_config.sctp_max_burst = 4;
 
         let (_incoming_tx2, incoming_rx2) = mpsc::unbounded_channel();
@@ -8836,7 +8836,7 @@ mod tests {
             .unwrap();
 
         // Test with a smaller max_cwnd
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.sctp_max_cwnd = 32 * 1024; // 32 KB
         config.sctp_rto_initial = Duration::from_secs(1);
         config.sctp_rto_min = Duration::from_secs(1);
@@ -8930,7 +8930,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.sctp_receive_window = 512 * 1024; // 512 KB
         config.sctp_rto_initial = Duration::from_secs(1);
         config.sctp_rto_min = Duration::from_secs(1);
@@ -8970,7 +8970,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.sctp_rto_initial = Duration::from_millis(500);
         config.sctp_rto_min = Duration::from_millis(200);
         config.sctp_rto_max = Duration::from_secs(10);
@@ -9040,7 +9040,7 @@ mod tests {
     /// This is a compatibility test — default behavior must remain RFC 4960 compliant.
     #[test]
     fn test_default_config_rfc_compliance() {
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
 
         // RFC 4960 §6.3.1: RTO.Initial = 3 seconds
         assert_eq!(
@@ -9155,7 +9155,7 @@ mod tests {
             .unwrap();
 
         // Configure with 8 max association retransmits (instead of default 20) for fast test
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.sctp_rto_initial = Duration::from_secs(1);
         config.sctp_rto_min = Duration::from_secs(1);
         config.sctp_max_association_retransmits = 8;
@@ -9234,7 +9234,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.sctp_max_cwnd = 16 * 1024; // Small max_cwnd = 16 KB
         config.sctp_rto_initial = Duration::from_secs(1);
         config.sctp_rto_min = Duration::from_secs(1);
@@ -9406,7 +9406,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
 
         let (sctp, runner) = SctpTransport::new(
@@ -9464,7 +9464,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
 
         let (sctp, runner) = SctpTransport::new(
@@ -9562,7 +9562,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
         let (sctp, runner) = SctpTransport::new(
             dtls,
@@ -9641,7 +9641,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
 
         let (sctp, runner) = SctpTransport::new(
@@ -9760,7 +9760,7 @@ mod tests {
         let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
             .await
             .unwrap();
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
         let (sctp, runner) = SctpTransport::new(
             dtls,
@@ -9885,7 +9885,7 @@ mod tests {
         let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
             .await
             .unwrap();
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
         let (sctp, runner) = SctpTransport::new(
             dtls,
@@ -9949,7 +9949,7 @@ mod tests {
         let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
             .await
             .unwrap();
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.sctp_max_burst = 0; // use the default heuristic
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
         let (sctp, runner) = SctpTransport::new(
@@ -10020,7 +10020,7 @@ mod tests {
         let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
             .await
             .unwrap();
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.sctp_rto_min = Duration::from_millis(50);
         config.sctp_rto_initial = Duration::from_millis(50);
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -10114,7 +10114,7 @@ mod tests {
         let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
             .await
             .unwrap();
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.sctp_rto_min = Duration::from_millis(200);
         config.sctp_rto_initial = Duration::from_millis(200);
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -10173,7 +10173,7 @@ mod tests {
         let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
             .await
             .unwrap();
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.sctp_rto_min = Duration::from_millis(500);
         config.sctp_rto_initial = Duration::from_millis(500);
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -10280,7 +10280,7 @@ mod tests {
         let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
             .await
             .unwrap();
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.sctp_rto_min = Duration::from_millis(500);
         config.sctp_rto_initial = Duration::from_millis(500);
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -10369,7 +10369,7 @@ mod tests {
         let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100, None)
             .await
             .unwrap();
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
         let (sctp, runner) = SctpTransport::new(
             dtls,
@@ -10458,7 +10458,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
 
         let (sctp, runner) = SctpTransport::new(
@@ -10516,7 +10516,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
 
         let (sctp, runner) = SctpTransport::new(

@@ -58,7 +58,7 @@ async fn interop_datachannel_stress_test() -> Result<()> {
     }));
 
     // --- RustRTC Setup (Server/Answerer) ---
-    let rust_config = RtcConfiguration::default();
+    let rust_config = RtcConfiguration::webrtc();
     let rust_pc = Arc::new(PeerConnection::new(rust_config));
 
     // --- Signaling ---

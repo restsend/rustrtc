@@ -34,7 +34,7 @@ fn parse_turn_uri() {
 
 #[tokio::test]
 async fn builder_starts_gathering() {
-    let (transport, runner) = IceTransportBuilder::new(RtcConfiguration::default()).build();
+    let (transport, runner) = IceTransportBuilder::new(RtcConfiguration::webrtc()).build();
     tokio::spawn(runner);
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(matches!(
@@ -46,7 +46,7 @@ async fn builder_starts_gathering() {
 #[tokio::test]
 async fn stun_probe_yields_server_reflexive_candidate() -> Result<()> {
     let mut turn_server = TestTurnServer::start().await?;
-    let mut config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::webrtc();
     config
         .ice_servers
         .push(IceServer::new(vec![turn_server.stun_url()]));
@@ -69,7 +69,7 @@ async fn stun_candidate_raddr_is_not_unspecified() -> Result<()> {
     // Verify that STUN candidate's related address (raddr) is not 0.0.0.0
     // Per RFC 5245, raddr should be the base (host) address
     let mut turn_server = TestTurnServer::start().await?;
-    let mut config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::webrtc();
     config
         .ice_servers
         .push(IceServer::new(vec![turn_server.stun_url()]));
@@ -119,7 +119,7 @@ async fn stun_candidate_raddr_is_not_unspecified() -> Result<()> {
 #[serial]
 async fn turn_probe_yields_relay_candidate() -> Result<()> {
     let mut turn_server = TestTurnServer::start().await?;
-    let mut config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::webrtc();
     config.ice_servers.push(
         IceServer::new(vec![turn_server.turn_url()]).with_credential(TEST_USERNAME, TEST_PASSWORD),
     );
@@ -140,7 +140,7 @@ async fn turn_probe_yields_relay_candidate() -> Result<()> {
 #[tokio::test]
 async fn policy_relay_only_gathers_relay_candidates() -> Result<()> {
     let mut turn_server = TestTurnServer::start().await?;
-    let mut config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::webrtc();
     config.ice_transport_policy = IceTransportPolicy::Relay;
     config.ice_servers.push(
         IceServer::new(vec![turn_server.turn_url()]).with_credential(TEST_USERNAME, TEST_PASSWORD),
@@ -173,7 +173,7 @@ async fn policy_relay_only_gathers_relay_candidates() -> Result<()> {
 
 #[tokio::test]
 async fn default_gather_excludes_loopback_host_candidates() -> Result<()> {
-    let config = RtcConfiguration::default();
+    let config = RtcConfiguration::webrtc();
     let (tx, _) = broadcast::channel(100);
     let (socket_tx, _) = tokio::sync::mpsc::unbounded_channel();
     let gatherer = IceGatherer::new(config, tx, socket_tx);
@@ -195,7 +195,7 @@ async fn default_gather_excludes_loopback_host_candidates() -> Result<()> {
 
 #[tokio::test]
 async fn include_loopback_option_gathers_loopback_candidate() -> Result<()> {
-    let mut config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::webrtc();
     config.ice_include_loopback_candidates = true;
     let (tx, _) = broadcast::channel(100);
     let (socket_tx, _) = tokio::sync::mpsc::unbounded_channel();
@@ -226,7 +226,7 @@ async fn turn_client_can_create_permission() -> Result<()> {
     client.create_permission(peer.local_addr()?).await?;
 
     // Exercise the real TURN read loop without ICE keepalives masking silence.
-    let (transport, _runner) = IceTransportBuilder::new(RtcConfiguration::default()).build();
+    let (transport, _runner) = IceTransportBuilder::new(RtcConfiguration::webrtc()).build();
     let (tx, mut rx) = tokio::sync::mpsc::channel(4);
     struct TestReceiver(tokio::sync::mpsc::Sender<Bytes>);
     #[async_trait::async_trait]
@@ -315,7 +315,7 @@ async fn turn_connection_relay_to_host() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Agent 1: Relay only
-    let mut config1 = RtcConfiguration::default();
+    let mut config1 = RtcConfiguration::webrtc();
     config1.ice_transport_policy = IceTransportPolicy::Relay;
     config1.ice_servers.push(
         IceServer::new(vec![turn_server.turn_url()]).with_credential(TEST_USERNAME, TEST_PASSWORD),
@@ -326,7 +326,7 @@ async fn turn_connection_relay_to_host() -> Result<()> {
     tokio::spawn(runner1);
 
     // Agent 2: Host only
-    let mut config2 = RtcConfiguration::default();
+    let mut config2 = RtcConfiguration::webrtc();
     // Same-host TURN relay delivers to loopback-only destinations.
     config2.ice_include_loopback_candidates = true;
     let (transport2, runner2) = IceTransportBuilder::new(config2)
@@ -451,7 +451,7 @@ async fn turn_connection_relay_to_host() -> Result<()> {
 }
 #[tokio::test]
 async fn test_ice_connection_timeout() -> Result<()> {
-    let mut config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::webrtc();
     config.ice_connection_timeout = Duration::from_millis(100);
 
     let (transport, runner) = IceTransportBuilder::new(config).build();
@@ -600,13 +600,10 @@ fn ice_candidate_foundation_compliance() {
 #[tokio::test]
 #[serial]
 async fn test_ice_lite_stun_response() -> Result<()> {
-    use crate::{Connectivity, Keying};
+    use crate::Connectivity;
 
     // Create ICE-lite transport (RTP mode)
-    let mut config = RtcConfiguration::default();
-    config.connectivity = Connectivity::Sdp;
-    config.keying = Keying::None;
-    config.webrtc_extensions = false;
+    let mut config = RtcConfiguration::sip();
     config.connectivity = Connectivity::IceLite;
     config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
 
@@ -734,13 +731,10 @@ async fn test_ice_lite_stun_response() -> Result<()> {
 #[tokio::test]
 #[serial]
 async fn test_ice_lite_connectivity_establishment() -> Result<()> {
-    use crate::{Connectivity, Keying};
+    use crate::Connectivity;
 
     // Set up ICE-lite agent
-    let mut lite_config = RtcConfiguration::default();
-    lite_config.connectivity = Connectivity::Sdp;
-    lite_config.keying = Keying::None;
-    lite_config.webrtc_extensions = false;
+    let mut lite_config = RtcConfiguration::sip();
     lite_config.connectivity = Connectivity::IceLite;
     lite_config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
 
@@ -748,7 +742,7 @@ async fn test_ice_lite_connectivity_establishment() -> Result<()> {
     tokio::spawn(lite_runner);
 
     // Set up full-ICE agent
-    let full_config = RtcConfiguration::default();
+    let full_config = RtcConfiguration::webrtc();
     let (ice_full, full_runner) = IceTransportBuilder::new(full_config)
         .role(IceRole::Controlling)
         .build();
@@ -938,10 +932,9 @@ async fn test_ice_lite_answers_a_controlled_check_with_487() -> Result<()> {
     use crate::{Connectivity, Keying};
 
     for keying in [Keying::None, Keying::Sdes] {
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::sip();
         config.connectivity = Connectivity::IceLite;
         config.keying = keying;
-        config.webrtc_extensions = false;
         let (ice_lite, runner) = IceTransport::new(config);
         tokio::spawn(runner);
         let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
@@ -972,13 +965,11 @@ async fn test_ice_lite_answers_a_controlled_check_with_487() -> Result<()> {
 /// answered with success, also one sent as controlled.
 #[tokio::test]
 async fn test_no_ice_answers_a_controlled_check() -> Result<()> {
+    use crate::Keying;
     use crate::transports::ice::stun::StunClass;
-    use crate::{Connectivity, Keying};
 
-    let mut config = RtcConfiguration::default();
-    config.connectivity = Connectivity::Sdp;
+    let mut config = RtcConfiguration::sip();
     config.keying = Keying::Sdes;
-    config.webrtc_extensions = false;
     let (transport, runner) = IceTransport::new(config);
     tokio::spawn(runner);
     let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
@@ -999,7 +990,7 @@ async fn test_no_ice_answers_a_controlled_check() -> Result<()> {
 /// regular connectivity check.
 #[test]
 fn test_nomination_timeout_larger_than_stun_timeout() {
-    let config = RtcConfiguration::default();
+    let config = RtcConfiguration::webrtc();
     assert!(
         config.nomination_timeout > config.stun_timeout,
         "nomination_timeout ({:?}) must be > stun_timeout ({:?}) to allow more retransmissions",
@@ -1014,7 +1005,7 @@ fn test_nomination_timeout_builder() {
     use crate::config::RtcConfigurationBuilder;
 
     let custom = std::time::Duration::from_secs(20);
-    let config = RtcConfigurationBuilder::new()
+    let config = RtcConfigurationBuilder::webrtc()
         .nomination_timeout(custom)
         .build();
     assert_eq!(config.nomination_timeout, custom);
@@ -1148,7 +1139,7 @@ async fn wait_for_selected_pair(
 #[serial]
 async fn test_hold_renegotiation_keeps_connected_state() -> Result<()> {
     let (controlling, controlled) =
-        setup_host_pair(RtcConfiguration::default(), RtcConfiguration::default()).await;
+        setup_host_pair(RtcConfiguration::webrtc(), RtcConfiguration::webrtc()).await;
 
     let ctrl_state = controlling.subscribe_state();
     let ctrd_state = controlled.subscribe_state();
@@ -1225,7 +1216,7 @@ async fn test_hold_renegotiation_keeps_connected_state() -> Result<()> {
 #[tokio::test]
 #[serial]
 async fn test_keepalive_tick_repairs_stranded_checking_with_selected_pair() -> Result<()> {
-    let (transport, runner) = IceTransportBuilder::new(RtcConfiguration::default()).build();
+    let (transport, runner) = IceTransportBuilder::new(RtcConfiguration::webrtc()).build();
     tokio::spawn(runner);
 
     transport.start_gathering()?;
@@ -1291,10 +1282,7 @@ async fn test_keepalive_tick_repairs_stranded_checking_with_selected_pair() -> R
 /// parameters still gets one.
 #[tokio::test]
 async fn test_keepalive_only_to_ice_peers() -> Result<()> {
-    let mut config = RtcConfiguration::default();
-    config.connectivity = crate::Connectivity::Sdp;
-    config.keying = crate::Keying::None;
-    config.webrtc_extensions = false;
+    let config = RtcConfiguration::sip();
     let (transport, runner) = IceTransportBuilder::new(config).build();
     tokio::spawn(runner);
 
@@ -1425,7 +1413,7 @@ async fn test_hold_renegotiation_while_disconnected_keeps_timers_alive() -> Resu
 #[serial]
 async fn test_keepalive_repair_does_not_mask_real_outage() -> Result<()> {
     // Short timeouts so the outage is testable in milliseconds.
-    let config = RtcConfigurationBuilder::new()
+    let config = RtcConfigurationBuilder::webrtc()
         .ice_disconnect_threshold(Duration::from_millis(150))
         .ice_connection_timeout(Duration::from_millis(400))
         .build();
@@ -1511,7 +1499,7 @@ async fn setup_turn_transport(
     let creds = TurnCredentials::from_server(&server)?;
     let alloc = client.allocate(creds).await?;
 
-    let mut config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::webrtc();
     config.ice_transport_policy = IceTransportPolicy::Relay;
     config.ice_servers.push(server);
     let (transport, runner) = IceTransport::new(config);
@@ -1588,7 +1576,7 @@ async fn assert_refresh_rotates_nonce(
 #[serial]
 async fn test_credential_change_still_restarts_checks() -> Result<()> {
     let (controlling, controlled) =
-        setup_host_pair(RtcConfiguration::default(), RtcConfiguration::default()).await;
+        setup_host_pair(RtcConfiguration::webrtc(), RtcConfiguration::webrtc()).await;
 
     let ctrl_state = controlling.subscribe_state();
     let ctrd_state = controlled.subscribe_state();
@@ -1634,7 +1622,7 @@ async fn test_credential_change_still_restarts_checks() -> Result<()> {
 #[tokio::test]
 #[serial]
 async fn test_trickle_ice_no_premature_failure() -> Result<()> {
-    let config = RtcConfiguration::default();
+    let config = RtcConfiguration::webrtc();
 
     // Build two transports
     let (controlling, runner_c) = IceTransportBuilder::new(config.clone())
@@ -1720,8 +1708,8 @@ async fn test_trickle_ice_no_premature_failure() -> Result<()> {
 #[tokio::test]
 #[serial]
 async fn test_nomination_complete_fires_on_connection() -> Result<()> {
-    let config1 = RtcConfiguration::default();
-    let config2 = RtcConfiguration::default();
+    let config1 = RtcConfiguration::webrtc();
+    let config2 = RtcConfiguration::webrtc();
 
     let (controlling, controlled) = setup_host_pair(config1, config2).await;
 
@@ -1788,7 +1776,7 @@ async fn test_nomination_complete_fires_on_connection() -> Result<()> {
 #[tokio::test]
 async fn test_nomination_uses_nomination_timeout_not_stun_timeout() -> Result<()> {
     // Using a very short nomination_timeout to make the test fast.
-    let mut config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::webrtc();
     config.stun_timeout = Duration::from_secs(30); // Would take 30 s if wrong timeout is used.
     config.nomination_timeout = Duration::from_millis(200); // Should fire quickly.
 
@@ -1897,8 +1885,8 @@ async fn test_nomination_succeeds_under_moderate_packet_loss() -> Result<()> {
     };
 
     let result: Result<()> = async {
-        let mut config1 = RtcConfiguration::default();
-        let mut config2 = RtcConfiguration::default();
+        let mut config1 = RtcConfiguration::webrtc();
+        let mut config2 = RtcConfiguration::webrtc();
         // Use generous timeouts so the test is robust under CI load.
         config1.nomination_timeout = Duration::from_secs(15);
         config1.stun_timeout = Duration::from_secs(5);
@@ -1994,11 +1982,11 @@ async fn test_ice_connection_with_external_ip() -> Result<()> {
     // Using 203.0.113.x which is in the TEST-NET-3 range (documentation purpose)
     // Loopback stays on: the rewritten LAN candidates point at TEST-NET-3 and
     // the same-host raw loopback pair is what actually carries checks here.
-    let mut config1 = RtcConfiguration::default();
+    let mut config1 = RtcConfiguration::webrtc();
     config1.ice_include_loopback_candidates = true;
     config1.external_ips = vec!["203.0.113.10".parse().unwrap()];
 
-    let mut config2 = RtcConfiguration::default();
+    let mut config2 = RtcConfiguration::webrtc();
     config2.ice_include_loopback_candidates = true;
     config2.external_ips = vec!["203.0.113.20".parse().unwrap()];
 
@@ -2055,11 +2043,11 @@ async fn test_ice_connection_with_external_ip() -> Result<()> {
 #[tokio::test]
 #[serial]
 async fn test_nomination_with_external_ip() -> Result<()> {
-    let mut config1 = RtcConfiguration::default();
+    let mut config1 = RtcConfiguration::webrtc();
     config1.ice_include_loopback_candidates = true;
     config1.external_ips = vec!["203.0.113.10".parse().unwrap()];
 
-    let mut config2 = RtcConfiguration::default();
+    let mut config2 = RtcConfiguration::webrtc();
     config2.ice_include_loopback_candidates = true;
     config2.external_ips = vec!["203.0.113.20".parse().unwrap()];
 
@@ -2124,8 +2112,8 @@ async fn test_nomination_with_external_ip() -> Result<()> {
 #[serial]
 async fn test_ice_connection_without_external_ip() -> Result<()> {
     // Default config has no external_ip
-    let config1 = RtcConfiguration::default();
-    let config2 = RtcConfiguration::default();
+    let config1 = RtcConfiguration::webrtc();
+    let config2 = RtcConfiguration::webrtc();
 
     let (controlling, controlled) = setup_host_pair(config1, config2).await;
 
@@ -2192,8 +2180,8 @@ async fn test_ice_connection_without_external_ip() -> Result<()> {
 #[tokio::test]
 #[serial]
 async fn test_nomination_delayed_by_dtls_socket_contention() -> Result<()> {
-    let mut config1 = RtcConfiguration::default();
-    let mut config2 = RtcConfiguration::default();
+    let mut config1 = RtcConfiguration::webrtc();
+    let mut config2 = RtcConfiguration::webrtc();
     config1.nomination_timeout = Duration::from_millis(500);
     config1.stun_timeout = Duration::from_millis(200);
     config2.nomination_timeout = Duration::from_millis(500);
@@ -2273,7 +2261,7 @@ async fn test_nomination_delayed_by_dtls_socket_contention() -> Result<()> {
 async fn test_turn_refresh_succeeds_normally() -> Result<()> {
     let mut turn_server = TestTurnServer::start().await?;
 
-    let mut config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::webrtc();
     config.ice_transport_policy = IceTransportPolicy::Relay;
     config.ice_servers.push(
         IceServer::new(vec![turn_server.turn_url()]).with_credential(TEST_USERNAME, TEST_PASSWORD),
@@ -2460,7 +2448,7 @@ async fn test_turn_refresh_retries_on_stale_nonce() -> Result<()> {
 async fn test_turn_refresh_tolerates_server_unreachable() -> Result<()> {
     let mut turn_server = TestTurnServer::start().await?;
 
-    let mut config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::webrtc();
     config.ice_transport_policy = IceTransportPolicy::Relay;
     config.ice_servers.push(
         IceServer::new(vec![turn_server.turn_url()]).with_credential(TEST_USERNAME, TEST_PASSWORD),
@@ -2577,7 +2565,7 @@ async fn test_ice_stop_destroys_turn_allocations() -> Result<()> {
 
     let mut turn_server = TestTurnServer::start().await?;
 
-    let mut config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::webrtc();
     config.ice_transport_policy = IceTransportPolicy::Relay;
     config.ice_servers.push(
         IceServer::new(vec![turn_server.turn_url()]).with_credential(TEST_USERNAME, TEST_PASSWORD),
@@ -2653,7 +2641,7 @@ async fn test_nomination_fails_immediately_on_host_unreachable() -> Result<()> {
     // With the transient-error retry fix, EHOSTUNREACH is no longer an immediate
     // failure.  Nomination retries until nomination_timeout, then yields Some(false).
     // Use a short nomination_timeout so the test still terminates quickly.
-    let mut config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::webrtc();
     config.stun_timeout = Duration::from_secs(30);
     config.nomination_timeout = Duration::from_millis(500);
 
@@ -2722,8 +2710,8 @@ async fn test_nomination_fails_immediately_on_host_unreachable() -> Result<()> {
 
 #[tokio::test]
 async fn test_dtls_proceeds_after_nomination_timeout() -> Result<()> {
-    let mut config1 = RtcConfiguration::default();
-    let mut config2 = RtcConfiguration::default();
+    let mut config1 = RtcConfiguration::webrtc();
+    let mut config2 = RtcConfiguration::webrtc();
     config1.nomination_timeout = Duration::from_millis(1);
     config1.stun_timeout = Duration::from_secs(5);
     config2.nomination_timeout = Duration::from_millis(1);
@@ -2847,10 +2835,10 @@ async fn test_nomination_fallback_all_pairs_fail() -> Result<()> {
     // Very short nomination_timeout — on CI/slow systems the nomination should
     // fail (timeout fires before response arrives).  On fast localhost it may
     // still succeed because the STUN round-trip can be < 100µs.
-    let mut config1 = RtcConfiguration::default();
+    let mut config1 = RtcConfiguration::webrtc();
     config1.nomination_timeout = Duration::from_micros(10);
     config1.stun_timeout = Duration::from_secs(5);
-    let mut config2 = RtcConfiguration::default();
+    let mut config2 = RtcConfiguration::webrtc();
     config2.nomination_timeout = Duration::from_micros(10);
     config2.stun_timeout = Duration::from_secs(5);
 
@@ -2944,7 +2932,7 @@ async fn test_nomination_fallback_all_pairs_fail() -> Result<()> {
 #[tokio::test]
 #[serial]
 async fn test_parallel_nomination_with_unreachable_candidate() -> Result<()> {
-    let config = RtcConfiguration::default();
+    let config = RtcConfiguration::webrtc();
 
     let (controlling, runner_c) = IceTransportBuilder::new(config.clone())
         .role(IceRole::Controlling)
@@ -3031,10 +3019,10 @@ async fn test_nomination_fallback_controlled_side_works() -> Result<()> {
     // Controlled side should still receive USE-CANDIDATE and signal
     // nomination_complete = Some(true), even when the controlling side
     // goes to Failed after nomination timeout.
-    let mut config1 = RtcConfiguration::default();
+    let mut config1 = RtcConfiguration::webrtc();
     config1.nomination_timeout = Duration::ZERO;
     config1.stun_timeout = Duration::from_secs(5);
-    let mut config2 = RtcConfiguration::default();
+    let mut config2 = RtcConfiguration::webrtc();
     config2.nomination_timeout = Duration::ZERO;
     config2.stun_timeout = Duration::from_secs(5);
 
@@ -3098,8 +3086,8 @@ async fn test_nomination_race_under_high_packet_loss() -> Result<()> {
         prev: PACKET_LOSS_RATE.swap(8000, Ordering::SeqCst),
     };
 
-    let mut config1 = RtcConfiguration::default();
-    let mut config2 = RtcConfiguration::default();
+    let mut config1 = RtcConfiguration::webrtc();
+    let mut config2 = RtcConfiguration::webrtc();
     config1.nomination_timeout = Duration::from_secs(3);
     config1.stun_timeout = Duration::from_secs(1);
     config2.nomination_timeout = Duration::from_secs(3);
@@ -3307,7 +3295,7 @@ async fn test_upnp_mapper_clone() {
 /// Test RtcConfiguration UPnP defaults
 #[test]
 fn test_config_upnp_defaults() {
-    let config = RtcConfiguration::default();
+    let config = RtcConfiguration::webrtc();
     assert!(!config.enable_upnp, "UPnP should be disabled by default");
     assert_eq!(
         config.upnp_lease_duration, 3600,
@@ -3318,7 +3306,7 @@ fn test_config_upnp_defaults() {
 /// Test RtcConfigurationBuilder UPnP methods
 #[test]
 fn test_config_builder_upnp_methods() {
-    let config = RtcConfigurationBuilder::new()
+    let config = RtcConfigurationBuilder::webrtc()
         .enable_upnp(false)
         .upnp_lease_duration(7200)
         .build();
@@ -3330,7 +3318,7 @@ fn test_config_builder_upnp_methods() {
 /// Test that UPnP is disabled when the policy is Relay-only
 #[tokio::test]
 async fn test_upnp_disabled_when_relay_policy() {
-    let mut config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::webrtc();
     config.ice_transport_policy = IceTransportPolicy::Relay;
     config.enable_upnp = true; // Explicitly enable, but should be ignored
 
@@ -3353,7 +3341,7 @@ async fn test_upnp_disabled_when_relay_policy() {
 /// Test that UPnP gathering is skipped when disabled in config
 #[tokio::test]
 async fn test_upnp_disabled_in_config() {
-    let mut config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::webrtc();
     config.enable_upnp = false;
 
     let (tx, _) = broadcast::channel(100);
@@ -3378,7 +3366,7 @@ async fn test_upnp_disabled_in_config() {
 /// Test cleanup_upnp_mappings method
 #[tokio::test]
 async fn test_upnp_cleanup_mappings() {
-    let config = RtcConfiguration::default();
+    let config = RtcConfiguration::webrtc();
 
     let (tx, _) = broadcast::channel(100);
     let (socket_tx, _) = tokio::sync::mpsc::unbounded_channel();
@@ -3412,7 +3400,7 @@ async fn test_upnp_ipv6_rejection() {
     assert!(addr.ip().is_loopback());
 
     // Create gatherer with IPv6-capable config
-    let config = RtcConfiguration::default();
+    let config = RtcConfiguration::webrtc();
 
     let (tx, _) = broadcast::channel(100);
     let (socket_tx, _) = tokio::sync::mpsc::unbounded_channel();
@@ -3436,7 +3424,7 @@ async fn test_upnp_ipv6_rejection() {
 #[tokio::test]
 async fn test_upnp_gathering_graceful_errors() {
     // Create config with UPnP enabled but no actual UPnP gateway
-    let mut config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::webrtc();
     config.enable_upnp = true;
     config.upnp_lease_duration = 1800;
 
@@ -3474,12 +3462,7 @@ fn test_upnp_library_exports() {
 /// Test that RTP mode respects UPnP enable flag
 #[tokio::test]
 async fn test_rtp_mode_upnp_disabled() {
-    use crate::{Connectivity, Keying};
-
-    let mut config = RtcConfiguration::default();
-    config.connectivity = Connectivity::Sdp;
-    config.keying = Keying::None;
-    config.webrtc_extensions = false;
+    let mut config = RtcConfiguration::sip();
     config.enable_upnp = false;
 
     let (transport, _runner) = IceTransport::new(config);
@@ -3506,12 +3489,7 @@ async fn test_rtp_mode_upnp_disabled() {
 /// Test that RTP mode attempts UPnP when enabled (will fail in test env but shouldn't panic)
 #[tokio::test]
 async fn test_rtp_mode_upnp_enabled_graceful() {
-    use crate::{Connectivity, Keying};
-
-    let mut config = RtcConfiguration::default();
-    config.connectivity = Connectivity::Sdp;
-    config.keying = Keying::None;
-    config.webrtc_extensions = false;
+    let mut config = RtcConfiguration::sip();
     config.enable_upnp = true;
 
     let (transport, _runner) = IceTransport::new(config);
@@ -3534,10 +3512,10 @@ async fn test_rtp_mode_upnp_enabled_graceful() {
 /// nominate the pair and move the state to Connected.
 #[tokio::test]
 async fn use_candidate_nominates_first_pair() -> Result<()> {
-    let (t1, r1) = IceTransportBuilder::new(RtcConfiguration::default())
+    let (t1, r1) = IceTransportBuilder::new(RtcConfiguration::webrtc())
         .role(IceRole::Controlling)
         .build();
-    let (t2, r2) = IceTransportBuilder::new(RtcConfiguration::default())
+    let (t2, r2) = IceTransportBuilder::new(RtcConfiguration::webrtc())
         .role(IceRole::Controlled)
         .build();
     tokio::spawn(r1);
@@ -3663,10 +3641,10 @@ async fn wait_selected_remote(
 #[tokio::test]
 async fn use_candidate_follows_renomination_from_new_candidate() -> Result<()> {
     // 1. Connect two ICE agents (controlling + controlled).
-    let (t1, r1) = IceTransportBuilder::new(RtcConfiguration::default())
+    let (t1, r1) = IceTransportBuilder::new(RtcConfiguration::webrtc())
         .role(IceRole::Controlling)
         .build();
-    let (t2, r2) = IceTransportBuilder::new(RtcConfiguration::default())
+    let (t2, r2) = IceTransportBuilder::new(RtcConfiguration::webrtc())
         .role(IceRole::Controlled)
         .build();
     tokio::spawn(r1);
@@ -3772,7 +3750,7 @@ async fn use_candidate_follows_renomination_from_new_candidate() -> Result<()> {
 /// agent's path-verification check (see `verify_nominated_path`).
 #[tokio::test]
 async fn use_candidate_follows_renomination_to_higher_priority_pair() -> Result<()> {
-    let (t1, t2) = setup_host_pair(RtcConfiguration::default(), RtcConfiguration::default()).await;
+    let (t1, t2) = setup_host_pair(RtcConfiguration::webrtc(), RtcConfiguration::webrtc()).await;
 
     assert!(
         wait_ice_connected(t1.subscribe_state(), Duration::from_secs(10)).await,
@@ -3842,7 +3820,7 @@ async fn use_candidate_verification_is_retransmitted() -> Result<()> {
     const PRIORITY: u16 = 0x0024;
     const ICE_CONTROLLED: u16 = 0x8029;
 
-    let (t1, t2) = setup_host_pair(RtcConfiguration::default(), RtcConfiguration::default()).await;
+    let (t1, t2) = setup_host_pair(RtcConfiguration::webrtc(), RtcConfiguration::webrtc()).await;
     assert!(
         wait_ice_connected(t1.subscribe_state(), Duration::from_secs(10)).await,
         "controlling agent failed to connect"
@@ -3920,8 +3898,8 @@ async fn use_candidate_verification_is_retransmitted() -> Result<()> {
 async fn latching_retarget_setup(
     connectivity: crate::Connectivity,
 ) -> Result<(IceTransport, IceCandidatePair, std::net::SocketAddr)> {
-    let (t1, t2) = setup_host_pair(RtcConfiguration::default(), {
-        let mut cfg = RtcConfiguration::default();
+    let (t1, t2) = setup_host_pair(RtcConfiguration::webrtc(), {
+        let mut cfg = RtcConfiguration::sip();
         cfg.connectivity = connectivity;
         cfg.enable_latching = true;
         cfg
@@ -4019,7 +3997,7 @@ async fn test_buffered_dtls_packets_delivered_when_dtls_receiver_registered_firs
     use super::conn::IceConn;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    let config = RtcConfiguration::default();
+    let config = RtcConfiguration::webrtc();
     let (ctrl, _ctrd) = setup_host_pair(config.clone(), config.clone()).await;
 
     // Wait for ICE to connect (this also clears any STUN packets from the buffer)
@@ -4183,10 +4161,10 @@ fn test_ice_tcp_priority_ordering() {
 #[tokio::test]
 #[serial]
 async fn test_ice_tcp_pair_formation() -> Result<()> {
-    let mut config1 = RtcConfiguration::default();
+    let mut config1 = RtcConfiguration::webrtc();
     config1.ice_tcp_policy = crate::config::IceTcpPolicy::Enabled;
 
-    let mut config2 = RtcConfiguration::default();
+    let mut config2 = RtcConfiguration::webrtc();
     config2.ice_tcp_policy = crate::config::IceTcpPolicy::Enabled;
 
     let (t1, r1) = IceTransportBuilder::new(config1)
@@ -4280,7 +4258,7 @@ async fn wait_ice_connected_or_timeout(
 #[tokio::test]
 #[serial]
 async fn test_ice_tcp_disabled_gathers_udp_only() -> Result<()> {
-    let config = RtcConfiguration::default();
+    let config = RtcConfiguration::webrtc();
     assert_eq!(config.ice_tcp_policy, crate::config::IceTcpPolicy::Disabled);
 
     let (transport, runner) = IceTransportBuilder::new(config).build();
@@ -4306,7 +4284,7 @@ async fn test_ice_tcp_disabled_gathers_udp_only() -> Result<()> {
 #[tokio::test]
 #[serial]
 async fn test_ice_tcp_gathers_tcp_candidates() -> Result<()> {
-    let mut config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::webrtc();
     config.ice_tcp_policy = crate::config::IceTcpPolicy::Enabled;
 
     let (transport, runner) = IceTransportBuilder::new(config).build();
@@ -4420,14 +4398,14 @@ async fn test_tcp_write_all_large_data() {
 #[serial]
 async fn test_ice_tcp_end_to_end_connectivity() -> Result<()> {
     // Controlled side: passive TCP listener
-    let mut controlled_config = RtcConfiguration::default();
+    let mut controlled_config = RtcConfiguration::webrtc();
     controlled_config.ice_gather_udp_hosts = false;
     controlled_config.ice_tcp_policy = crate::config::IceTcpPolicy::Enabled;
     controlled_config.tcp_port_range_start = Some(20_000);
     controlled_config.tcp_port_range_end = Some(20_010);
 
     // Controlling side: active TCP candidate, no UDP
-    let mut controlling_config = RtcConfiguration::default();
+    let mut controlling_config = RtcConfiguration::webrtc();
     controlling_config.ice_gather_udp_hosts = false;
     controlling_config.ice_tcp_policy = crate::config::IceTcpPolicy::Enabled;
 
@@ -4548,13 +4526,13 @@ async fn test_ice_tcp_end_to_end_connectivity() -> Result<()> {
 #[tokio::test]
 #[serial]
 async fn test_ice_tcp_data_flow_bidirectional() -> Result<()> {
-    let mut controlled_config = RtcConfiguration::default();
+    let mut controlled_config = RtcConfiguration::webrtc();
     controlled_config.ice_gather_udp_hosts = false;
     controlled_config.ice_tcp_policy = crate::config::IceTcpPolicy::Enabled;
     controlled_config.tcp_port_range_start = Some(20_011);
     controlled_config.tcp_port_range_end = Some(20_020);
 
-    let mut controlling_config = RtcConfiguration::default();
+    let mut controlling_config = RtcConfiguration::webrtc();
     controlling_config.ice_gather_udp_hosts = false;
     controlling_config.ice_tcp_policy = crate::config::IceTcpPolicy::Enabled;
 
@@ -4741,12 +4719,12 @@ async fn shared_udp_demux_routes_by_ufrag_and_peer_addr() -> Result<()> {
 async fn ice_udp_mux_connects_through_shared_port() -> Result<()> {
     let port = pick_free_udp_port();
 
-    let mut controlled_cfg = RtcConfiguration::default();
+    let mut controlled_cfg = RtcConfiguration::webrtc();
     controlled_cfg.ice_udp_mux = true;
     controlled_cfg.ice_udp_mux_port = Some(port);
     controlled_cfg.bind_ips = vec!["127.0.0.1".parse().unwrap()];
 
-    let mut controlling_cfg = RtcConfiguration::default();
+    let mut controlling_cfg = RtcConfiguration::webrtc();
     controlling_cfg.bind_ips = vec!["127.0.0.1".parse().unwrap()];
 
     let (controlled, runner_d) = IceTransportBuilder::new(controlled_cfg)
@@ -4846,7 +4824,7 @@ async fn ice_udp_mux_two_sessions_share_one_port() -> Result<()> {
     let port = pick_free_udp_port();
 
     fn mux_config(port: u16) -> RtcConfiguration {
-        let mut cfg = RtcConfiguration::default();
+        let mut cfg = RtcConfiguration::webrtc();
         cfg.ice_udp_mux = true;
         cfg.ice_udp_mux_port = Some(port);
         cfg.bind_ips = vec!["127.0.0.1".parse().unwrap()];
@@ -4992,7 +4970,7 @@ fn build_raw_stun_error_response(
 /// and retrying with the fresh nonce from the response.
 #[tokio::test]
 async fn test_handle_packet_dispatches_error_response_to_pending_transactions() {
-    let config = RtcConfiguration::default();
+    let config = RtcConfiguration::webrtc();
     let (transport, runner) = IceTransport::new(config);
     tokio::spawn(runner);
 
@@ -5052,7 +5030,7 @@ async fn test_handle_packet_dispatches_error_response_to_pending_transactions() 
 /// (the other common TURN auth error) to `pending_transactions`.
 #[tokio::test]
 async fn test_handle_packet_dispatches_401_to_pending_transactions() {
-    let config = RtcConfiguration::default();
+    let config = RtcConfiguration::webrtc();
     let (transport, runner) = IceTransport::new(config);
     tokio::spawn(runner);
 
@@ -5092,7 +5070,7 @@ async fn test_handle_packet_dispatches_401_to_pending_transactions() {
 /// must be silently ignored (no panic, no channel send).
 #[tokio::test]
 async fn test_handle_packet_ignores_unmatched_error_response() {
-    let config = RtcConfiguration::default();
+    let config = RtcConfiguration::webrtc();
     let (transport, runner) = IceTransport::new(config);
     tokio::spawn(runner);
 
@@ -5162,7 +5140,7 @@ async fn test_run_turn_refresh_succeeds_after_stale_nonce_via_inner() -> Result<
     let alloc = client.allocate(creds).await?;
 
     // Build a transport inner (runner is required to keep state channels alive).
-    let mut config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::webrtc();
     config.ice_transport_policy = IceTransportPolicy::Relay;
     config.ice_servers.push(server.clone());
     let (transport, runner) = IceTransport::new(config);
@@ -5221,7 +5199,7 @@ async fn test_run_turn_refresh_succeeds_after_stale_nonce_via_inner() -> Result<
 /// IceTransport::stop(). The fire-and-forget task clears mappers asynchronously.
 #[tokio::test]
 async fn test_upnp_mappings_cleaned_on_stop() -> Result<()> {
-    let mut config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::webrtc();
     config.enable_upnp = true;
     let (transport, runner) = IceTransportBuilder::new(config).build();
     tokio::spawn(runner);
@@ -5255,7 +5233,7 @@ async fn test_upnp_mappings_cleaned_on_stop() -> Result<()> {
 /// immediately rather than waiting for Arc<IceTransportInner> release.
 #[tokio::test]
 async fn test_shared_udp_socket_cleared_on_stop() {
-    let config = RtcConfiguration::default();
+    let config = RtcConfiguration::webrtc();
     let (transport, runner) = IceTransportBuilder::new(config).build();
     tokio::spawn(runner);
 
@@ -5280,7 +5258,7 @@ async fn test_shared_udp_socket_cleared_on_stop() {
 async fn test_runner_upnp_refresh_tick_renews_mappings() {
     use crate::transports::ice::upnp::test_mock_igd::{MockIgd, STALE_AGE};
 
-    let mut config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::webrtc();
     config.enable_upnp = true;
     config.upnp_refresh_interval = Duration::from_millis(200);
 
@@ -5442,7 +5420,7 @@ async fn rewrite_bridge_relays_rtp_to_turn_leg() -> Result<()> {
 #[tokio::test]
 #[serial]
 async fn udp_read_loop_survives_wsaconnreset() -> Result<()> {
-    let (transport, runner) = IceTransport::new(RtcConfiguration::default());
+    let (transport, runner) = IceTransport::new(RtcConfiguration::webrtc());
     tokio::spawn(runner);
     let inner = transport.inner.clone();
 
@@ -5518,7 +5496,7 @@ async fn silent_remote_relay_candidate_still_gets_probed_and_connects() -> Resul
     let dead_srflx = UdpSocket::bind("127.0.0.1:0").await?;
     let _ = (&dead_host, &dead_srflx);
 
-    let mut config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::webrtc();
     config.ice_include_loopback_candidates = true;
     config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
 
@@ -5619,7 +5597,7 @@ async fn silent_remote_relay_candidate_still_gets_probed_and_connects() -> Resul
 #[serial]
 async fn second_nomination_requires_path_verification() -> Result<()> {
     let (controlling, controlled) =
-        setup_host_pair(RtcConfiguration::default(), RtcConfiguration::default()).await;
+        setup_host_pair(RtcConfiguration::webrtc(), RtcConfiguration::webrtc()).await;
     wait_for_selected_pair(&controlled, Duration::from_secs(5)).await?;
     let initial = controlled
         .get_selected_pair()
@@ -5713,7 +5691,7 @@ async fn second_nomination_requires_path_verification() -> Result<()> {
 #[tokio::test]
 #[serial]
 async fn second_remote_ice_restart_still_restarts() -> Result<()> {
-    let (transport, runner) = IceTransportBuilder::new(RtcConfiguration::default()).build();
+    let (transport, runner) = IceTransportBuilder::new(RtcConfiguration::webrtc()).build();
     tokio::spawn(runner);
 
     // Initial start: no previous remote parameters, so this is not a restart.
@@ -5754,7 +5732,7 @@ async fn second_remote_ice_restart_still_restarts() -> Result<()> {
 #[serial]
 async fn superseded_nomination_does_not_override_newer() -> Result<()> {
     let (controlling, controlled) =
-        setup_host_pair(RtcConfiguration::default(), RtcConfiguration::default()).await;
+        setup_host_pair(RtcConfiguration::webrtc(), RtcConfiguration::webrtc()).await;
     wait_for_selected_pair(&controlled, Duration::from_secs(5)).await?;
 
     let agent_addr = controlled
@@ -5898,7 +5876,7 @@ async fn answer_binding_checks(
 async fn controlled_late_check_round_keeps_first_selection() -> Result<()> {
     use tokio::net::UdpSocket;
 
-    let mut cfg = RtcConfiguration::default();
+    let mut cfg = RtcConfiguration::webrtc();
     cfg.bind_ips = vec!["127.0.0.1".parse().unwrap()];
     let (t, runner) = IceTransportBuilder::new(cfg)
         .role(IceRole::Controlled)
@@ -5966,7 +5944,7 @@ async fn controlled_late_check_round_keeps_first_selection() -> Result<()> {
 async fn stale_check_round_after_restart_does_not_commit() -> Result<()> {
     use tokio::net::UdpSocket;
 
-    let mut cfg = RtcConfiguration::default();
+    let mut cfg = RtcConfiguration::webrtc();
     cfg.bind_ips = vec!["127.0.0.1".parse().unwrap()];
     let (t, runner) = IceTransportBuilder::new(cfg)
         .role(IceRole::Controlled)
@@ -6052,7 +6030,7 @@ async fn stale_check_round_after_restart_does_not_commit() -> Result<()> {
 /// mismatch `selection_lock` exists to prevent.
 #[tokio::test]
 async fn select_pair_refuses_unresolvable_local() -> Result<()> {
-    let mut cfg = RtcConfiguration::default();
+    let mut cfg = RtcConfiguration::webrtc();
     cfg.bind_ips = vec!["127.0.0.1".parse().unwrap()];
     let (t, runner) = IceTransportBuilder::new(cfg).build();
     tokio::spawn(runner);
@@ -6103,7 +6081,7 @@ async fn select_pair_refuses_unresolvable_local() -> Result<()> {
 /// Build a controlling-side transport with loopback gathering so a gathered
 /// local socket exists and `commit_selected_pair` can resolve it.
 async fn nomination_test_fixture() -> IceTransport {
-    let mut config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::webrtc();
     config.ice_include_loopback_candidates = true;
     let (transport, runner) = IceTransportBuilder::new(config)
         .role(IceRole::Controlling)
@@ -6362,14 +6340,14 @@ async fn test_round_retries_after_concurrent_nomination_failure() -> Result<()> 
 /// beat a cross-ISP direct pair to nomination.
 #[test]
 fn test_nomination_grace_default_and_builder() {
-    let config = RtcConfiguration::default();
+    let config = RtcConfiguration::webrtc();
     assert_eq!(
         config.nomination_grace,
         Duration::from_millis(200),
         "default must keep the historical 200 ms grace"
     );
 
-    let config = RtcConfigurationBuilder::new()
+    let config = RtcConfigurationBuilder::webrtc()
         .nomination_grace(Duration::from_millis(500))
         .build();
     assert_eq!(config.nomination_grace, Duration::from_millis(500));
@@ -6421,7 +6399,7 @@ fn upgrade_candidate_pairs_only_higher_priority_best_first() {
 #[serial]
 async fn test_post_nomination_upgrade_to_higher_priority_pair() -> Result<()> {
     let (controlling, _controlled) =
-        setup_host_pair(RtcConfiguration::default(), RtcConfiguration::default()).await;
+        setup_host_pair(RtcConfiguration::webrtc(), RtcConfiguration::webrtc()).await;
 
     let ctrl_state = controlling.subscribe_state();
     assert!(
@@ -6473,11 +6451,11 @@ async fn test_post_nomination_upgrade_to_higher_priority_pair() -> Result<()> {
 async fn test_slower_higher_priority_pair_upgrades_after_nomination() -> Result<()> {
     // Manual setup (mirrors setup_host_pair) so the slow candidate is present
     // BEFORE checks start — no late-trickle re-arm may rescue the round.
-    let (controlling, runner_c) = IceTransportBuilder::new(RtcConfiguration::default())
+    let (controlling, runner_c) = IceTransportBuilder::new(RtcConfiguration::webrtc())
         .role(IceRole::Controlling)
         .build();
     tokio::spawn(runner_c);
-    let (controlled, runner_d) = IceTransportBuilder::new(RtcConfiguration::default())
+    let (controlled, runner_d) = IceTransportBuilder::new(RtcConfiguration::webrtc())
         .role(IceRole::Controlled)
         .build();
     tokio::spawn(runner_d);
@@ -6586,14 +6564,14 @@ async fn test_slower_higher_priority_pair_upgrades_after_nomination() -> Result<
 #[tokio::test]
 #[serial]
 async fn test_upgrade_across_local_interfaces_publishes_correct_socket() -> Result<()> {
-    let mut cfg = RtcConfiguration::default();
+    let mut cfg = RtcConfiguration::webrtc();
     cfg.ice_include_loopback_candidates = true;
 
     let (controlling, runner_c) = IceTransportBuilder::new(cfg)
         .role(IceRole::Controlling)
         .build();
     tokio::spawn(runner_c);
-    let (controlled, runner_d) = IceTransportBuilder::new(RtcConfiguration::default())
+    let (controlled, runner_d) = IceTransportBuilder::new(RtcConfiguration::webrtc())
         .role(IceRole::Controlled)
         .build();
     tokio::spawn(runner_d);
@@ -6710,7 +6688,7 @@ async fn test_upgrade_across_local_interfaces_publishes_correct_socket() -> Resu
 #[serial]
 async fn test_no_downgrade_after_upgrade() -> Result<()> {
     let (controlling, _controlled) =
-        setup_host_pair(RtcConfiguration::default(), RtcConfiguration::default()).await;
+        setup_host_pair(RtcConfiguration::webrtc(), RtcConfiguration::webrtc()).await;
     let ctrl_state = controlling.subscribe_state();
     assert!(wait_ice_connected(ctrl_state, Duration::from_secs(10)).await);
     let base = wait_for_selected_pair(&controlling, Duration::from_secs(10)).await?;
@@ -6764,7 +6742,7 @@ async fn test_no_downgrade_after_upgrade() -> Result<()> {
 async fn test_healthy_connect_latency_bound() -> Result<()> {
     let started = tokio::time::Instant::now();
     let (controlling, _controlled) =
-        setup_host_pair(RtcConfiguration::default(), RtcConfiguration::default()).await;
+        setup_host_pair(RtcConfiguration::webrtc(), RtcConfiguration::webrtc()).await;
     let ctrl_state = controlling.subscribe_state();
     assert!(wait_ice_connected(ctrl_state, Duration::from_secs(10)).await);
     let _ = wait_for_selected_pair(&controlling, Duration::from_secs(10)).await?;

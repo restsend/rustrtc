@@ -32,7 +32,7 @@ fn config(connectivity: Connectivity, keying: Keying) -> RtcConfiguration {
             application: None,
             image: vec![],
         }),
-        ..RtcConfiguration::default()
+        ..RtcConfiguration::webrtc()
     }
 }
 
@@ -267,7 +267,7 @@ async fn call(offerer: Connectivity, answerer: Connectivity, keying: Keying) -> 
         answerer,
         keying,
         &[MediaKind::Audio],
-        BundlePolicy::default(),
+        BundlePolicy::Balanced,
         false,
     )
     .await

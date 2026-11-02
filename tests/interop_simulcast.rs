@@ -29,7 +29,7 @@ async fn test_simulcast_ingest_and_switch() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
     // 1. Create RustRTC PeerConnection (SFU)
-    let rust_config = RtcConfiguration::default();
+    let rust_config = RtcConfiguration::webrtc();
     let rust_pc = PeerConnection::new(rust_config);
 
     // Add a transceiver to receive Video (Simulcast)

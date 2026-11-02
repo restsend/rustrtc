@@ -20,7 +20,7 @@ fn external() -> IpAddr {
 fn config(typ: Option<ExternalIpCandidateType>) -> RtcConfiguration {
     let mut config = RtcConfiguration {
         external_ips: vec![EXTERNAL.parse().unwrap()],
-        ..RtcConfiguration::default()
+        ..RtcConfiguration::webrtc()
     };
     if let Some(typ) = typ {
         config.external_ip_candidate_type = typ;
@@ -182,9 +182,9 @@ async fn peers_connect_over_the_host_candidate() -> Result<()> {
     let pc1 = PeerConnection::new(RtcConfiguration {
         external_ips: vec![EXTERNAL.parse().unwrap()],
         external_ip_candidate_type: ExternalIpCandidateType::ServerReflexive,
-        ..RtcConfiguration::default()
+        ..RtcConfiguration::webrtc()
     });
-    let pc2 = PeerConnection::new(RtcConfiguration::default());
+    let pc2 = PeerConnection::new(RtcConfiguration::webrtc());
     pc1.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
     let _ = pc1.create_offer().await?;
     tokio::time::timeout(Duration::from_secs(5), pc1.wait_for_gathering_complete()).await?;
@@ -232,7 +232,7 @@ async fn server_reflexive_skips_an_external_ip_of_the_other_family() -> Result<(
     let config = RtcConfiguration {
         external_ips: vec!["2001:db8::5".parse().unwrap()],
         external_ip_candidate_type: ExternalIpCandidateType::ServerReflexive,
-        ..RtcConfiguration::default()
+        ..RtcConfiguration::webrtc()
     };
     let candidates = gather(config, "udp").await?;
     assert!(!candidates.is_empty());

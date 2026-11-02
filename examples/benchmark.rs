@@ -487,7 +487,7 @@ async fn run_rustrtc(count: usize) -> (f64, u64, u64) {
         let pb = pb.clone();
 
         handles.push(tokio::spawn(async move {
-            let config = RtcConfiguration::default();
+            let config = RtcConfiguration::webrtc();
             let pc1 = PeerConnection::new(config.clone());
             let pc2 = PeerConnection::new(config);
 

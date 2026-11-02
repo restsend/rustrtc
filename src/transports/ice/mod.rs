@@ -6572,7 +6572,7 @@ mod bind_socket_retry_tests {
     fn gatherer(start: u16, end: u16) -> IceGatherer {
         let (candidate_tx, _) = broadcast::channel(1);
         let (socket_tx, _socket_rx) = crate::platform::sync::mpsc::unbounded_channel();
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.rtp_start_port = Some(start);
         config.rtp_end_port = Some(end);
         IceGatherer::new(config, candidate_tx, socket_tx)

@@ -13,14 +13,10 @@ use rustrtc::config::{AudioCapability, MediaCapabilities, VideoCapability};
 use rustrtc::media::MediaKind;
 use rustrtc::media::track::sample_track;
 use rustrtc::peer_connection::RtpCodecParameters;
-use rustrtc::{Connectivity, Keying, PeerConnection, RtcConfiguration, RtcpMuxPolicy};
+use rustrtc::{PeerConnection, RtcConfiguration};
 
 fn av_config() -> RtcConfiguration {
-    let mut config = RtcConfiguration::default();
-    config.connectivity = Connectivity::Sdp;
-    config.keying = Keying::None;
-    config.webrtc_extensions = false;
-    config.rtcp_mux_policy = RtcpMuxPolicy::Negotiate;
+    let mut config = RtcConfiguration::sip();
     config.rtp_start_port = Some(20000);
     config.rtp_end_port = Some(20100);
     config.external_ips = vec!["127.0.0.1".parse().unwrap()];

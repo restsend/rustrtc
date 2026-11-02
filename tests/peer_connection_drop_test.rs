@@ -90,7 +90,7 @@ async fn dropping_a_connected_peer_connection_closes_it() {
                 image: vec![Default::default()],
                 ..Default::default()
             }),
-            ..RtcConfiguration::default()
+            ..RtcConfiguration::sip()
         };
         let (pc1, pc2) = connected_pair(config, setup).await;
         // Handles the application may still hold do not keep the PC alive.

@@ -9236,8 +9236,8 @@ mod tests {
         )
     }
     use super::*;
+    use crate::Keying;
     use crate::transports::ice::IceTransportState;
-    use crate::{Connectivity, Keying};
     use crate::{Direction, MediaKind, RtcConfiguration};
 
     /// Connected-state DTLS monitor notification discipline (see
@@ -9281,7 +9281,7 @@ mod tests {
         // Expands to statements so the bindings outlive the macro call.
         macro_rules! started {
             ($pc:ident, $ice_tx:ident, $ice_rx:ident, $dtls_tx:ident, $dtls_rx:ident) => {
-                let mut config = RtcConfiguration::default();
+                let mut config = RtcConfiguration::webrtc();
                 config.ice_disconnect_grace = Duration::from_millis(30);
                 let $pc = PeerConnection::new(config);
                 #[allow(unused_variables)]
@@ -9475,7 +9475,7 @@ mod tests {
     async fn received_rtp_stats_complete_during_media_registration() {
         // Media registration resolves its fallback transport while owning the
         // media map. Reproduce that ordering while a public stats read runs.
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
         let (held_tx, held_rx) = std::sync::mpsc::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
@@ -9529,10 +9529,7 @@ mod tests {
         }
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let mut cfg = RtcConfiguration::default();
-        cfg.connectivity = Connectivity::Sdp;
-        cfg.keying = Keying::None;
-        cfg.webrtc_extensions = false;
+        let cfg = RtcConfiguration::sip();
         let pc = PeerConnection::new(cfg);
         // Register BEFORE any RTP transport exists.
         pc.add_observer(Arc::new(IngressCounter(counter.clone())));
@@ -9591,10 +9588,7 @@ mod tests {
 
         for (direct, dynamic_rid) in [(false, false), (true, false), (false, true)] {
             let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let mut config = RtcConfiguration::default();
-            config.connectivity = Connectivity::Sdp;
-            config.keying = Keying::None;
-            config.webrtc_extensions = false;
+            let mut config = RtcConfiguration::sip();
             config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
             config.rtcp_mux_policy = crate::RtcpMuxPolicy::Require;
             let pc = PeerConnection::new(config);
@@ -9826,7 +9820,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_offer_contains_transceiver() {
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
         let transceiver = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
 
         // Add a sender so direction is not downgraded
@@ -9910,7 +9904,7 @@ mod tests {
 
     #[tokio::test]
     async fn offer_includes_video_capabilities() {
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
         pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
         let offer = pc.create_offer().await.unwrap();
         let section = &offer.media_sections[0];
@@ -9930,7 +9924,7 @@ mod tests {
 
     #[tokio::test]
     async fn offer_includes_application_capabilities() {
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
         pc.add_transceiver(MediaKind::Application, TransceiverDirection::SendRecv);
         let offer = pc.create_offer().await.unwrap();
         let section = &offer.media_sections[0];
@@ -9952,7 +9946,7 @@ mod tests {
     #[tokio::test]
     async fn test_simulcast_setup() {
         use crate::{SdpType, SessionDescription};
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
 
         // Create SDP with Simulcast
         // We need to include extmap for RID
@@ -9990,12 +9984,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_rtcp_mux_detection() {
-        use crate::{Connectivity, Keying, SdpType, SessionDescription};
+        use crate::{SdpType, SessionDescription};
         // Setup PC in RTP mode
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let config = RtcConfiguration::sip();
         let pc = PeerConnection::new(config);
 
         // Create SDP without rtcp-mux
@@ -10030,12 +10021,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_rtcp_mux_enabled() {
-        use crate::{Connectivity, Keying, SdpType, SessionDescription};
+        use crate::{SdpType, SessionDescription};
         // Setup PC in RTP mode
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let config = RtcConfiguration::sip();
         let pc = PeerConnection::new(config);
 
         // Create SDP WITH rtcp-mux
@@ -10068,7 +10056,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_local_description_transitions_state() {
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
         let offer = pc.create_offer().await.unwrap();
         pc.set_local_description(offer.clone()).unwrap();
@@ -10085,7 +10073,7 @@ mod tests {
     /// HaveLocalOffer so the final 200 OK answer can still arrive.
     #[tokio::test]
     async fn pranswer_sets_up_media_without_completing_negotiation() {
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
         let offer = pc.create_offer().await.unwrap();
         pc.set_local_description(offer.clone()).unwrap();
@@ -10119,11 +10107,11 @@ mod tests {
     /// have the local description carry the candidates gathered so far.
     #[tokio::test]
     async fn answer_gets_candidates_gathered_before_local_description() {
-        let offerer = PeerConnection::new(RtcConfiguration::default());
+        let offerer = PeerConnection::new(RtcConfiguration::webrtc());
         offerer.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
         let offer = offerer.create_offer().await.unwrap();
 
-        let callee = PeerConnection::new(RtcConfiguration::default());
+        let callee = PeerConnection::new(RtcConfiguration::webrtc());
         callee.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
         callee.set_remote_description(offer).await.unwrap();
 
@@ -10163,11 +10151,11 @@ mod tests {
 
     #[tokio::test]
     async fn set_local_description_pranswer_keeps_have_remote_offer_state() {
-        let offerer = PeerConnection::new(RtcConfiguration::default());
+        let offerer = PeerConnection::new(RtcConfiguration::webrtc());
         offerer.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
         let offer = offerer.create_offer().await.unwrap();
 
-        let callee = PeerConnection::new(RtcConfiguration::default());
+        let callee = PeerConnection::new(RtcConfiguration::webrtc());
         callee.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
         callee.set_remote_description(offer).await.unwrap();
         assert_eq!(callee.signaling_state(), SignalingState::HaveRemoteOffer);
@@ -10186,11 +10174,11 @@ mod tests {
 
     #[tokio::test]
     async fn set_local_description_pranswer_then_answer_completes_negotiation() {
-        let offerer = PeerConnection::new(RtcConfiguration::default());
+        let offerer = PeerConnection::new(RtcConfiguration::webrtc());
         offerer.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
         let offer = offerer.create_offer().await.unwrap();
 
-        let callee = PeerConnection::new(RtcConfiguration::default());
+        let callee = PeerConnection::new(RtcConfiguration::webrtc());
         callee.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
         callee.set_remote_description(offer).await.unwrap();
 
@@ -10218,7 +10206,7 @@ mod tests {
     async fn set_local_description_pranswer_requires_have_remote_offer() {
         // Case 1: Stable state (no negotiation in progress).
         {
-            let pc = PeerConnection::new(RtcConfiguration::default());
+            let pc = PeerConnection::new(RtcConfiguration::webrtc());
             pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
             let offer = pc.create_offer().await.unwrap();
             let mut pranswer = offer.clone();
@@ -10232,7 +10220,7 @@ mod tests {
 
         // Case 2: HaveLocalOffer (caller side, waiting for remote answer).
         {
-            let pc = PeerConnection::new(RtcConfiguration::default());
+            let pc = PeerConnection::new(RtcConfiguration::webrtc());
             pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
             let offer = pc.create_offer().await.unwrap();
             pc.set_local_description(offer.clone()).unwrap();
@@ -10250,11 +10238,11 @@ mod tests {
 
     #[tokio::test]
     async fn set_local_description_pranswer_stores_local_description() {
-        let offerer = PeerConnection::new(RtcConfiguration::default());
+        let offerer = PeerConnection::new(RtcConfiguration::webrtc());
         offerer.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
         let offer = offerer.create_offer().await.unwrap();
 
-        let callee = PeerConnection::new(RtcConfiguration::default());
+        let callee = PeerConnection::new(RtcConfiguration::webrtc());
         callee.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
         callee.set_remote_description(offer).await.unwrap();
 
@@ -10284,11 +10272,11 @@ mod tests {
 
     #[tokio::test]
     async fn set_local_description_pranswer_allows_multiple_provisional_answers() {
-        let offerer = PeerConnection::new(RtcConfiguration::default());
+        let offerer = PeerConnection::new(RtcConfiguration::webrtc());
         offerer.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
         let offer = offerer.create_offer().await.unwrap();
 
-        let callee = PeerConnection::new(RtcConfiguration::default());
+        let callee = PeerConnection::new(RtcConfiguration::webrtc());
         callee.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
         callee.set_remote_description(offer).await.unwrap();
 
@@ -10319,7 +10307,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_answer_requires_remote_offer() {
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
         pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly);
         let err = pc.create_answer().await.unwrap_err();
         assert!(matches!(err, RtcError::InvalidState(_)));
@@ -10337,7 +10325,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_answer_without_local_offer_is_error() {
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::RecvOnly);
         let mut fake_answer = pc.create_offer().await.unwrap();
         fake_answer.sdp_type = SdpType::Answer;
@@ -10347,7 +10335,7 @@ mod tests {
 
     #[tokio::test]
     async fn peer_connection_exposes_ice_transport() {
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
         let ice = pc.ice_transport();
         assert_eq!(ice.state(), IceTransportState::New);
         assert_eq!(ice.config().ice_servers.len(), 0);
@@ -10355,11 +10343,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_offer_rtp_mode() {
-        use crate::{Connectivity, Keying};
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let config = RtcConfiguration::sip();
         let pc = PeerConnection::new(config);
         let transceiver = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
 
@@ -10408,11 +10392,9 @@ mod tests {
 
     #[tokio::test]
     async fn create_offer_srtp_mode() {
-        use crate::{Connectivity, Keying};
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
+        use crate::Keying;
+        let mut config = RtcConfiguration::sip();
         config.keying = Keying::Sdes;
-        config.webrtc_extensions = false;
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
 
@@ -10441,7 +10423,7 @@ mod tests {
     #[tokio::test]
     async fn test_ssrc_parsing_with_fid_group() {
         let _ = env_logger::builder().is_test(true).try_init();
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
 
         // Mock SDP
         let sdp_str = "v=0\r\n\
@@ -10476,7 +10458,7 @@ a=ssrc-group:FID 12345 67890\r\n";
     #[tokio::test]
     async fn test_ssrc_parsing_with_fid_group_before_ssrc() {
         let _ = env_logger::builder().is_test(true).try_init();
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
 
         // Mock SDP
         let sdp_str = "v=0\r\n\
@@ -10511,7 +10493,7 @@ a=ssrc:67890 cname:foo\r\n";
     #[tokio::test]
     async fn test_ssrc_parsing_rtx_first_group_last() {
         let _ = env_logger::builder().is_test(true).try_init();
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
 
         // Mock SDP: RTX (67890) comes before Primary (12345), and Group is last.
         let sdp_str = "v=0\r\n\
@@ -10549,7 +10531,7 @@ a=ssrc-group:FID 12345 67890\r\n";
     async fn offer_with_rtx_capability_emits_rtpmap_fmtp_and_fid() {
         use crate::config::{MediaCapabilities, VideoCapability};
 
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.media_capabilities = Some(MediaCapabilities {
             audio: vec![],
             video: vec![VideoCapability::vp8_with_rtx(97)],
@@ -10602,7 +10584,7 @@ a=ssrc-group:FID 12345 67890\r\n";
 
     #[tokio::test]
     async fn answer_echoes_remote_rtx_when_offered() {
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
         pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
 
         let offer_sdp = "v=0\r\n\
@@ -10647,7 +10629,7 @@ a=ice-pwd:testpassword12345678901\r\n";
         use crate::config::{MediaCapabilities, VideoCapability};
 
         // Local config enables RTX, but remote offer has none — answer must not invent RTX.
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.media_capabilities = Some(MediaCapabilities {
             audio: vec![],
             video: vec![VideoCapability::vp8_with_rtx(97)],
@@ -10700,7 +10682,7 @@ a=ice-pwd:testpassword12345678901\r\n";
 
     #[tokio::test]
     async fn default_offer_has_no_rtx_without_capability() {
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
         let (source, track, _) =
             crate::media::track::sample_track(crate::media::frame::MediaKind::Video, 8);
         let _ = source;
@@ -10737,7 +10719,7 @@ a=ice-pwd:testpassword12345678901\r\n";
 
     #[tokio::test]
     async fn remote_rtx_apt_map_stored_on_receiver() {
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
         let sdp_str = "v=0\r\n\
 o=- 123456 123456 IN IP4 127.0.0.1\r\n\
 s=-\r\n\
@@ -10840,7 +10822,7 @@ a=ssrc:67890 cname:foo\r\n";
     async fn sender_set_rtx_returns_true_with_default_handler() {
         use crate::config::{MediaCapabilities, VideoCapability};
 
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.media_capabilities = Some(MediaCapabilities {
             audio: vec![],
             video: vec![VideoCapability::vp8_with_rtx(97)],
@@ -10870,7 +10852,7 @@ a=ssrc:67890 cname:foo\r\n";
     /// the apt map (safety guard: don't misinterpret 2 payload bytes as OSN).
     #[tokio::test]
     async fn maybe_unwrap_rtx_drops_unmapped_pt_on_rtx_ssrc() {
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
         let sdp_str = "v=0\r\n\
 o=- 123456 123456 IN IP4 127.0.0.1\r\n\
 s=-\r\n\
@@ -10910,7 +10892,7 @@ a=ssrc:67890 cname:foo\r\n";
     /// Verify that maybe_unwrap_rtx passes through a primary packet unchanged.
     #[tokio::test]
     async fn maybe_unwrap_rtx_passes_through_primary_packet() {
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
         let sdp_str = "v=0\r\n\
 o=- 123456 123456 IN IP4 127.0.0.1\r\n\
 s=-\r\n\
@@ -11031,7 +11013,7 @@ a=ssrc:67890 cname:foo\r\n";
     async fn create_offer_webrtc_extmaps_only_with_webrtc_extensions() {
         use crate::Keying;
         let offer = |keying: Keying, webrtc_extensions: bool| async move {
-            let mut config = RtcConfiguration::default();
+            let mut config = RtcConfiguration::webrtc();
             config.keying = keying;
             config.webrtc_extensions = webrtc_extensions;
             let pc = PeerConnection::new(config);
@@ -11063,11 +11045,9 @@ a=ssrc:67890 cname:foo\r\n";
 
     #[tokio::test]
     async fn create_offer_srtp_mode_includes_crypto() {
-        use crate::{Connectivity, Keying};
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
+        use crate::Keying;
+        let mut config = RtcConfiguration::sip();
         config.keying = Keying::Sdes;
-        config.webrtc_extensions = false;
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
 
@@ -11098,10 +11078,8 @@ a=ssrc:67890 cname:foo\r\n";
             ("AES_CM_128_HMAC_SHA1_32", 30),
         ] {
             let pc = PeerConnection::new(RtcConfiguration {
-                connectivity: Connectivity::Sdp,
                 keying: Keying::Sdes,
-                webrtc_extensions: false,
-                ..Default::default()
+                ..RtcConfiguration::sip()
             });
             let peer_key = vec![0x11; key_len];
             let encoded = BASE64_STANDARD.encode(&peer_key);
@@ -11156,7 +11134,7 @@ a=ssrc:67890 cname:foo\r\n";
 
     #[tokio::test]
     async fn create_answer_srtp_mode_uses_savp_profile() {
-        use crate::{Connectivity, Keying};
+        use crate::Keying;
         // Simulate a Twilio-style SDES-SRTP offer (RTP/SAVP + a=crypto).
         let remote_offer = "v=0\r\n\
 o=root 1 1 IN IP4 168.86.151.229\r\n\
@@ -11170,10 +11148,8 @@ a=rtpmap:8 PCMA/8000\r\n\
 a=rtpmap:101 telephone-event/8000\r\n\
 a=sendrecv\r\n";
 
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
+        let mut config = RtcConfiguration::sip();
         config.keying = Keying::Sdes;
-        config.webrtc_extensions = false;
         let pc = PeerConnection::new(config);
         let offer = SessionDescription::parse(SdpType::Offer, remote_offer).expect("parse offer");
         pc.set_remote_description(offer).await.expect("set remote");
@@ -11196,7 +11172,7 @@ a=sendrecv\r\n";
     /// packet we send.
     #[tokio::test]
     async fn create_answer_srtp_mode_echoes_offer_mki_and_tag() {
-        use crate::{Connectivity, Keying};
+        use crate::Keying;
         let remote_offer = "v=0\r\n\
 o=root 1 1 IN IP4 168.86.151.229\r\n\
 s=-\r\n\
@@ -11209,10 +11185,8 @@ a=rtpmap:8 PCMA/8000\r\n\
 a=rtpmap:101 telephone-event/8000\r\n\
 a=sendrecv\r\n";
 
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
+        let mut config = RtcConfiguration::sip();
         config.keying = Keying::Sdes;
-        config.webrtc_extensions = false;
         let pc = PeerConnection::new(config);
         let offer = SessionDescription::parse(SdpType::Offer, remote_offer).expect("parse offer");
         pc.set_remote_description(offer).await.expect("set remote");
@@ -11247,11 +11221,9 @@ a=sendrecv\r\n";
     /// literally... and every peer that ignores MKI — i.e. everyone).
     #[tokio::test]
     async fn create_offer_srtp_mode_has_no_mki() {
-        use crate::{Connectivity, Keying};
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
+        use crate::Keying;
+        let mut config = RtcConfiguration::sip();
         config.keying = Keying::Sdes;
-        config.webrtc_extensions = false;
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
 
@@ -11642,7 +11614,7 @@ a=sendrecv\r\n";
 
     #[tokio::test]
     async fn test_nack_configuration() {
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.nack_buffer_size = 200;
 
         let pc = PeerConnection::new(config);
@@ -11663,10 +11635,7 @@ a=sendrecv\r\n";
     #[tokio::test]
     async fn rtp_mode_sends_track_event_after_ssrc_latching() {
         // Test that in RTP mode, Track event is sent after SSRC latching
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let config = RtcConfiguration::sip();
 
         let pc = PeerConnection::new(config);
 
@@ -11724,7 +11693,7 @@ a=mid:0
         }
 
         let factory: Arc<dyn DepacketizerFactory> = Arc::new(MockFactory);
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.depacketizer_strategy = DepacketizerStrategy {
             factory: factory.clone(),
         };
@@ -11833,10 +11802,7 @@ a=mid:0
             }
         }
 
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let mut config = RtcConfiguration::sip();
         config.depacketizer_strategy.factory = Arc::new(MockFactory);
 
         let pc = PeerConnection::new(config);
@@ -11906,11 +11872,7 @@ a=mid:0
 
     #[tokio::test]
     async fn rtp_mode_external_ip_in_sdp() {
-        use crate::{Connectivity, Keying};
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let mut config = RtcConfiguration::sip();
         config.external_ips = vec!["203.0.113.5".parse().unwrap()];
 
         let pc = PeerConnection::new(config);
@@ -11948,11 +11910,7 @@ a=mid:0
 
     #[tokio::test]
     async fn rtp_mode_external_port_in_sdp() {
-        use crate::{Connectivity, Keying};
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let mut config = RtcConfiguration::sip();
         config.external_ips = vec!["203.0.113.5".parse().unwrap()];
         config.external_port = Some(30000);
 
@@ -12017,11 +11975,8 @@ a=mid:0
     #[tokio::test]
     async fn rtp_mode_external_port_only_no_ip() {
         // Test external_port without external_ip — only the port is overridden.
-        use crate::{Connectivity, Keying};
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+
+        let mut config = RtcConfiguration::sip();
         config.external_port = Some(31000);
 
         let pc = PeerConnection::new(config);
@@ -12058,11 +12013,8 @@ a=mid:0
     #[tokio::test]
     async fn rtp_mode_external_port_offerer_connects() {
         // Verify external_port works through the full offer/answer exchange.
-        use crate::{Connectivity, Keying};
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+
+        let mut config = RtcConfiguration::sip();
         config.external_ips = vec!["203.0.113.5".parse().unwrap()];
         config.external_port = Some(30000);
         let pc = PeerConnection::new(config);
@@ -12183,7 +12135,7 @@ a=mid:0
     /// allocations, runner task) survives until full close().
     #[tokio::test]
     async fn test_cleanup_orphaned_extra_transports() {
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
         pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
 
@@ -12263,7 +12215,7 @@ a=mid:0
 
     #[tokio::test]
     async fn cleanup_orphaned_extra_transports_preserves_midless_video() {
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
         let audio = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
         let video = pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
         audio.set_mid("0".into());
@@ -12313,11 +12265,7 @@ a=mid:0
 
     #[tokio::test]
     async fn rtp_mode_gathering_completes_immediately() {
-        use crate::{Connectivity, Keying};
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let config = RtcConfiguration::sip();
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
 
@@ -12333,11 +12281,7 @@ a=mid:0
 
     #[tokio::test]
     async fn rtp_mode_offer_has_gathering_complete_after_create() {
-        use crate::{Connectivity, Keying};
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let config = RtcConfiguration::sip();
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
 
@@ -12354,11 +12298,7 @@ a=mid:0
 
     #[tokio::test]
     async fn rtp_mode_answerer_latching_config_propagates() {
-        use crate::{Connectivity, Keying};
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let mut config = RtcConfiguration::sip();
         config.enable_latching = true;
 
         let pc = PeerConnection::new(config);
@@ -12404,11 +12344,7 @@ a=mid:0
 
     #[tokio::test]
     async fn rtp_mode_offerer_connects_after_answer() {
-        use crate::{Connectivity, Keying};
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let config = RtcConfiguration::sip();
         let pc = PeerConnection::new(config);
 
         let transceiver = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
@@ -12472,11 +12408,7 @@ a=mid:0
 
     #[tokio::test]
     async fn rtp_mode_answerer_connects_on_set_remote() {
-        use crate::{Connectivity, Keying};
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let config = RtcConfiguration::sip();
         let pc = PeerConnection::new(config);
 
         // Simulate incoming offer
@@ -12512,11 +12444,7 @@ a=mid:0
 
     #[tokio::test]
     async fn rtp_mode_no_ice_dtls_artifacts() {
-        use crate::{Connectivity, Keying};
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let config = RtcConfiguration::sip();
         let pc = PeerConnection::new(config);
 
         let transceiver = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
@@ -12575,11 +12503,7 @@ a=mid:0
 
     #[tokio::test]
     async fn rtp_mode_rtcp_separate_port_answerer() {
-        use crate::{Connectivity, Keying};
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let config = RtcConfiguration::sip();
         let pc = PeerConnection::new(config);
 
         // SDP without rtcp-mux → RTCP on port+1
@@ -12622,11 +12546,7 @@ a=mid:0
 
     #[tokio::test]
     async fn rtp_mode_rtcp_explicit_port_answerer() {
-        use crate::{Connectivity, Keying};
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let config = RtcConfiguration::sip();
         let pc = PeerConnection::new(config);
 
         let remote_sdp = "v=0\r\n\
@@ -12669,11 +12589,7 @@ a=mid:0
 
     #[tokio::test]
     async fn rtp_mode_rtcp_mux_answerer() {
-        use crate::{Connectivity, Keying};
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let config = RtcConfiguration::sip();
         let pc = PeerConnection::new(config);
 
         // SDP with rtcp-mux → no separate RTCP addr
@@ -12712,11 +12628,7 @@ a=mid:0
 
     #[tokio::test]
     async fn rtp_mode_track_event_after_set_remote() {
-        use crate::{Connectivity, Keying};
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let config = RtcConfiguration::sip();
         let pc = PeerConnection::new(config);
 
         // Remote offer without SSRC should keep receiver SSRC unknown until real RTP arrives.
@@ -12744,11 +12656,7 @@ a=mid:0
 
     #[tokio::test]
     async fn rtp_mode_track_event_with_remote_ssrc() {
-        use crate::{Connectivity, Keying};
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let config = RtcConfiguration::sip();
         let pc = PeerConnection::new(config);
 
         // Remote offer with explicit SSRC
@@ -12776,13 +12684,7 @@ a=mid:0
 
     #[tokio::test]
     async fn rtp_mode_answer_omits_rtcp_mux_when_offer_omits_it() {
-        use crate::{Connectivity, Keying, RtcpMuxPolicy};
-
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
-        config.rtcp_mux_policy = RtcpMuxPolicy::Negotiate;
+        let config = RtcConfiguration::sip();
 
         let pc = PeerConnection::new(config);
         let transceiver = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
@@ -12828,14 +12730,9 @@ a=mid:0
 
     #[tokio::test]
     async fn reinvite_answer_audio_codecs_follow_remote_offer_subset() {
-        use crate::config::{MediaCapabilities, RtcpMuxPolicy};
-        use crate::{Connectivity, Keying};
+        use crate::config::MediaCapabilities;
 
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
-        config.rtcp_mux_policy = RtcpMuxPolicy::Negotiate;
+        let mut config = RtcConfiguration::sip();
         config.media_capabilities = Some(MediaCapabilities {
             audio: vec![
                 AudioCapability::opus(),
@@ -12905,12 +12802,9 @@ a=mid:0
 
     #[tokio::test]
     async fn reinvite_updates_remote_addr_in_rtp_mode() {
-        use crate::{Connectivity, Keying, SdpType, SessionDescription};
+        use crate::{SdpType, SessionDescription};
 
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let config = RtcConfiguration::sip();
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
 
@@ -12978,10 +12872,7 @@ a=mid:0
 
     #[tokio::test]
     async fn pranswer_final_same_endpoint_preserves_latched_nat_address() {
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let mut config = RtcConfiguration::sip();
         config.enable_latching = true;
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
@@ -13053,10 +12944,7 @@ a=mid:0
 
     #[tokio::test]
     async fn pranswer_final_changed_endpoint_resets_latch_without_rebinding() {
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let mut config = RtcConfiguration::sip();
         config.enable_latching = true;
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
@@ -13136,10 +13024,7 @@ a=mid:0
 
     #[tokio::test]
     async fn changed_second_pranswer_updates_transport_and_final_answer_only_completes_state() {
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let config = RtcConfiguration::sip();
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
 
@@ -13234,10 +13119,7 @@ a=mid:0
 
     #[tokio::test]
     async fn pranswer_final_codec_change_updates_transceiver_without_rebinding() {
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let config = RtcConfiguration::sip();
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
 
@@ -13295,7 +13177,7 @@ a=mid:0
     #[tokio::test]
     async fn webrtc_mode_rtcp_mux_negotiate_works_as_require() {
         use crate::RtcpMuxPolicy;
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.rtcp_mux_policy = RtcpMuxPolicy::Negotiate;
 
         let pc = PeerConnection::new(config);
@@ -13313,11 +13195,8 @@ a=mid:0
 
     #[tokio::test]
     async fn rtp_mode_ice_lite_sdp_attributes() {
-        use crate::{Connectivity, Keying};
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        use crate::Connectivity;
+        let mut config = RtcConfiguration::sip();
         config.connectivity = Connectivity::IceLite;
 
         let pc = PeerConnection::new(config);
@@ -13376,11 +13255,7 @@ a=mid:0
 
     #[tokio::test]
     async fn rtp_mode_no_ice_lite_no_ice_attributes() {
-        use crate::{Connectivity, Keying};
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let config = RtcConfiguration::sip();
 
         let pc = PeerConnection::new(config);
         let transceiver = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
@@ -13424,13 +13299,9 @@ a=mid:0
     /// The fix fires Track directly in the Answer processing path.
     #[tokio::test]
     async fn answer_sdp_with_ssrc_fires_track_event() {
-        use crate::{Connectivity, Keying};
         let _ = env_logger::builder().is_test(true).try_init();
 
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let config = RtcConfiguration::sip();
         let pc = PeerConnection::new(config);
 
         // Add a RecvOnly audio transceiver (simulates the caller expecting media)
@@ -13502,7 +13373,7 @@ a=mid:0
             }
         }
 
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
         let seen = Arc::new(StdMutex::new(Vec::new()));
         pc.add_observer(Arc::new(Recorder(seen.clone())));
 
@@ -13541,11 +13412,8 @@ a=mid:0
 
     #[tokio::test]
     async fn rtp_mode_ice_lite_stores_remote_params() {
-        use crate::{Connectivity, Keying};
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        use crate::Connectivity;
+        let mut config = RtcConfiguration::sip();
         config.connectivity = Connectivity::IceLite;
 
         let pc = PeerConnection::new(config);
@@ -13602,10 +13470,7 @@ a=mid:0
         use tokio::net::UdpSocket;
 
         let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let mut config = RtcConfiguration::sip();
         config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
         config.rtcp_mux_policy = crate::RtcpMuxPolicy::Require;
         let pc = PeerConnection::new(config);
@@ -13716,7 +13581,7 @@ a=mid:0
     async fn test_set_remote_description_rejects_missing_fingerprint_webrtc() {
         use crate::{Keying, SdpType, SessionDescription};
 
-        let pc = PeerConnection::new(RtcConfiguration::default()); // WebRtc mode
+        let pc = PeerConnection::new(RtcConfiguration::webrtc()); // WebRtc mode
         assert_eq!(pc.config().keying, Keying::Dtls);
 
         // SDP has no a=fingerprint — must be rejected
@@ -13748,7 +13613,7 @@ a=mid:0
     async fn test_set_remote_description_accepts_valid_sha256_fingerprint_webrtc() {
         use crate::{Keying, SdpType, SessionDescription};
 
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
         assert_eq!(pc.config().keying, Keying::Dtls);
 
         // Syntactically valid sha-256 fingerprint (random bytes)
@@ -13782,7 +13647,7 @@ a=mid:0
     async fn test_set_remote_description_rejects_unsupported_fingerprint_algorithm() {
         use crate::{Keying, SdpType, SessionDescription};
 
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
         assert_eq!(pc.config().keying, Keying::Dtls);
 
         let sdp_str = "v=0\r\n\
@@ -13807,12 +13672,9 @@ a=mid:0
     /// RTP mode: missing fingerprint is fine — no DTLS identity binding applies.
     #[tokio::test]
     async fn test_set_remote_description_allows_missing_fingerprint_rtp_mode() {
-        use crate::{Connectivity, Keying, SdpType, SessionDescription};
+        use crate::{SdpType, SessionDescription};
 
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let config = RtcConfiguration::sip();
         let pc = PeerConnection::new(config);
 
         let sdp_str = "v=0\r\n\
@@ -13841,12 +13703,8 @@ a=mid:0
     #[tokio::test]
     async fn offer_h264_emits_fmtp_in_sdp() {
         use crate::config::{MediaCapabilities, VideoCapability};
-        use crate::{Connectivity, Keying};
 
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let mut config = RtcConfiguration::sip();
         config.media_capabilities = Some(MediaCapabilities {
             audio: vec![],
             video: vec![VideoCapability::h264()],
@@ -13887,16 +13745,13 @@ a=mid:0
     #[tokio::test]
     async fn offer_vp8_no_fmtp_in_sdp() {
         use crate::config::{MediaCapabilities, VideoCapability};
-        use crate::{Connectivity, Keying};
+        
 
         let vp8 = VideoCapability {
             fmtp: None,
             ..VideoCapability::default()
         };
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let mut config = RtcConfiguration::sip();
         config.media_capabilities = Some(MediaCapabilities {
             audio: vec![],
             video: vec![vp8],
@@ -13920,12 +13775,8 @@ a=mid:0
     #[tokio::test]
     async fn offer_h264_emits_rtcp_fb_in_sdp() {
         use crate::config::{MediaCapabilities, VideoCapability};
-        use crate::{Connectivity, Keying};
 
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let mut config = RtcConfiguration::sip();
         config.media_capabilities = Some(MediaCapabilities {
             audio: vec![],
             video: vec![VideoCapability::h264()],
@@ -13961,12 +13812,8 @@ a=mid:0
         rtcp_mux_policy: crate::RtcpMuxPolicy,
     ) -> RtcConfiguration {
         use crate::config::{AudioCapability, MediaCapabilities};
-        use crate::{Connectivity, Keying};
 
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let mut config = RtcConfiguration::sip();
         config.bundle_policy = bundle_policy;
         config.rtcp_mux_policy = rtcp_mux_policy;
         config.media_capabilities = Some(MediaCapabilities {
@@ -13986,7 +13833,7 @@ a=mid:0
         use crate::{BundlePolicy, RtcpMuxPolicy};
 
         let pc = PeerConnection::new(direct_av_config(
-            BundlePolicy::default(),
+            BundlePolicy::Balanced,
             RtcpMuxPolicy::Negotiate,
         ));
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
@@ -14008,7 +13855,7 @@ a=mid:0
         use crate::{BundlePolicy, RtcpMuxPolicy};
 
         let pc = PeerConnection::new(direct_av_config(
-            BundlePolicy::default(),
+            BundlePolicy::Balanced,
             RtcpMuxPolicy::Require,
         ));
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
@@ -14019,7 +13866,7 @@ a=mid:0
         pc.close();
 
         let pc = PeerConnection::new(direct_av_config(
-            BundlePolicy::default(),
+            BundlePolicy::Balanced,
             RtcpMuxPolicy::Require,
         ));
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
@@ -14042,7 +13889,7 @@ a=mid:0
         use crate::{BundlePolicy, RtcpMuxPolicy};
 
         let pc = PeerConnection::new(direct_av_config(
-            BundlePolicy::default(),
+            BundlePolicy::Balanced,
             RtcpMuxPolicy::Negotiate,
         ));
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
@@ -14071,7 +13918,7 @@ a=mid:0
         use crate::{BundlePolicy, RtcpMuxPolicy};
 
         let pc = PeerConnection::new(direct_av_config(
-            BundlePolicy::default(),
+            BundlePolicy::Balanced,
             RtcpMuxPolicy::Negotiate,
         ));
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
@@ -14227,7 +14074,7 @@ a=mid:0
     /// without ICE credentials or candidates (RFC 9429 §5.2.1).
     #[tokio::test]
     async fn full_ice_offers_others_bundle_only() {
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
         pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
         pc.wait_for_gathering_complete().await;
@@ -14306,14 +14153,10 @@ a=mid:0
     #[tokio::test]
     async fn rtp_mode_midless_non_bundle_offer_maps_each_media_transport() {
         use crate::config::{AudioCapability, MediaCapabilities};
-        use crate::{Connectivity, Keying};
+
         use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
-        config.rtcp_mux_policy = crate::config::RtcpMuxPolicy::Negotiate;
+        let mut config = RtcConfiguration::sip();
         config.media_capabilities = Some(MediaCapabilities {
             audio: vec![AudioCapability::pcma()],
             video: vec![crate::config::VideoCapability::h264()],
@@ -14381,15 +14224,12 @@ a=mid:0
     /// without BUNDLE, each keyed with its own m-line's a=crypto (RFC 4568).
     #[tokio::test]
     async fn srtp_mode_non_bundle_keys_each_media_transport() {
+        use crate::Keying;
         use crate::config::{AudioCapability, MediaCapabilities};
-        use crate::{Connectivity, Keying};
         use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
+        let mut config = RtcConfiguration::sip();
         config.keying = Keying::Sdes;
-        config.webrtc_extensions = false;
-        config.rtcp_mux_policy = crate::config::RtcpMuxPolicy::Negotiate;
         config.media_capabilities = Some(MediaCapabilities {
             audio: vec![AudioCapability::pcma()],
             video: vec![crate::config::VideoCapability::h264()],
@@ -14481,7 +14321,7 @@ a=mid:0
     /// like an IPv4 one (Linphone on a dual-stack mobile network).
     #[tokio::test]
     async fn srtp_mode_offer_with_ipv6_connection_starts_transport() {
-        use crate::{Connectivity, Keying};
+        use crate::Keying;
         let remote_offer = "v=0\r\n\
             o=- 1 1 IN IP6 2001:db8::1\r\n\
             s=-\r\n\
@@ -14491,10 +14331,8 @@ a=mid:0
             a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:a976SJLwniPcMiUP27gdcLYYcPm0bHZcghV84DsK\r\n\
             a=rtpmap:0 PCMU/8000\r\n\
             a=sendrecv\r\n";
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
+        let mut config = RtcConfiguration::sip();
         config.keying = Keying::Sdes;
-        config.webrtc_extensions = false;
         let pc = PeerConnection::new(config);
         let offer = SessionDescription::parse(SdpType::Offer, remote_offer).unwrap();
         pc.set_remote_description(offer).await.unwrap();
@@ -14522,7 +14360,7 @@ a=mid:0
     /// with our sender still on the old one, made it drop all our audio.
     #[tokio::test]
     async fn srtp_mode_reinvite_keeps_our_key_and_takes_a_new_remote_key() {
-        use crate::{Connectivity, Keying};
+        use crate::Keying;
         let offer = |version: u32, key: &str| {
             let sdp = format!(
                 "v=0\r\n\
@@ -14542,10 +14380,8 @@ a=mid:0
                 .key_params
                 .clone()
         };
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
+        let mut config = RtcConfiguration::sip();
         config.keying = Keying::Sdes;
-        config.webrtc_extensions = false;
         let pc = PeerConnection::new(config);
 
         let first_key = "a976SJLwniPcMiUP27gdcLYYcPm0bHZcghV84DsK";
@@ -14601,7 +14437,7 @@ a=mid:0
     /// reuses our key.
     #[tokio::test]
     async fn srtp_mode_reinvite_suite_change_generates_a_new_key() {
-        use crate::{Connectivity, Keying};
+        use crate::Keying;
         let offer = |version: u32, suite: &str, key: &str| {
             let sdp = format!(
                 "v=0\r\n\
@@ -14619,10 +14455,8 @@ a=mid:0
         let crypto = |answer: &SessionDescription| {
             answer.media_sections[0].get_crypto_attributes()[0].clone()
         };
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
+        let mut config = RtcConfiguration::sip();
         config.keying = Keying::Sdes;
-        config.webrtc_extensions = false;
         let pc = PeerConnection::new(config);
 
         let key = "a976SJLwniPcMiUP27gdcLYYcPm0bHZcghV84DsK";
@@ -14681,10 +14515,8 @@ a=mid:0
             a=ice-pwd:phonepasswordphonepassword\r\n\
             a=candidate:1 1 UDP 2130706431 127.0.0.1 4000 typ host\r\n\
             a=sendrecv\r\n";
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
+        let mut config = RtcConfiguration::sip();
         config.keying = Keying::Sdes;
-        config.webrtc_extensions = false;
         config.connectivity = Connectivity::IceLite;
         let pc = PeerConnection::new(config);
         let offer = SessionDescription::parse(SdpType::Offer, remote_offer).unwrap();
@@ -14741,10 +14573,8 @@ a=candidate:1 2 UDP 2130706302 10.0.0.253 38517 typ host\r\n\
 a=sendrecv\r\n"
         );
 
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
+        let mut config = RtcConfiguration::sip();
         config.keying = Keying::Sdes;
-        config.webrtc_extensions = false;
         config.connectivity = Connectivity::IceLite;
         config.enable_latching = true;
         config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
@@ -14830,13 +14660,8 @@ a=sendrecv\r\n"
     #[tokio::test]
     async fn rtp_mode_midless_reinvite_reactivates_existing_video_transceiver() {
         use crate::config::{AudioCapability, MediaCapabilities};
-        use crate::{Connectivity, Keying};
 
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
-        config.rtcp_mux_policy = crate::config::RtcpMuxPolicy::Negotiate;
+        let mut config = RtcConfiguration::sip();
         config.media_capabilities = Some(MediaCapabilities {
             audio: vec![AudioCapability::pcma()],
             video: vec![crate::config::VideoCapability::h264()],
@@ -14906,14 +14731,10 @@ a=sendrecv\r\n"
     #[tokio::test]
     async fn rtp_mode_midless_non_bundle_answer_maps_each_media_transport() {
         use crate::config::{AudioCapability, MediaCapabilities};
-        use crate::{Connectivity, Keying};
+
         use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
-        config.rtcp_mux_policy = crate::config::RtcpMuxPolicy::Negotiate;
+        let mut config = RtcConfiguration::sip();
         config.media_capabilities = Some(MediaCapabilities {
             audio: vec![AudioCapability::pcma()],
             video: vec![crate::config::VideoCapability::h264()],
@@ -15022,7 +14843,7 @@ a=rtcp-mux\r\n\
 a=rtpmap:0 PCMU/8000\r\n\
 a=rtpmap:8 PCMA/8000\r\n";
 
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
 
         let remote = SessionDescription::parse(SdpType::Offer, remote_sdp).unwrap();
@@ -15059,10 +14880,7 @@ a=rtpmap:8 PCMA/8000\r\n";
         use crate::sdp::{SdpType, SessionDescription};
 
         // ── build a loopback-bound RTP PC (simulating the bridge RTP side) ──
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let mut config = RtcConfiguration::sip();
         config.enable_latching = true;
         config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
 
@@ -15152,10 +14970,7 @@ a=rtpmap:8 PCMA/8000\r\n";
         use crate::media::track::sample_track;
         use crate::sdp::{SdpType, SessionDescription};
 
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let mut config = RtcConfiguration::sip();
         config.enable_latching = true;
         config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
 
@@ -15234,10 +15049,7 @@ a=rtpmap:8 PCMA/8000\r\n";
         use crate::media::track::sample_track;
         use crate::sdp::{SdpType, SessionDescription};
 
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let mut config = RtcConfiguration::sip();
         config.enable_latching = true;
         config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
 
@@ -15327,10 +15139,7 @@ a=rtpmap:8 PCMA/8000\r\n";
         use crate::media::track::sample_track;
         use crate::sdp::{SdpType, SessionDescription};
 
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let mut config = RtcConfiguration::sip();
         config.enable_latching = true;
         config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
 
@@ -15426,10 +15235,7 @@ a=rtpmap:8 PCMA/8000\r\n";
     async fn repro_bug1_static_pt_registered_without_rtpmap() {
         use crate::sdp::{SdpType, SessionDescription};
 
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let mut config = RtcConfiguration::sip();
         config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
 
         let pc = PeerConnection::new(config);
@@ -15476,10 +15282,7 @@ a=rtpmap:8 PCMA/8000\r\n";
                            m=audio 9002 RTP/AVP 0\r\n\
                            a=sendonly\r\n";
         let pc2 = PeerConnection::new({
-            let mut c = RtcConfiguration::default();
-            c.connectivity = Connectivity::Sdp;
-            c.keying = Keying::None;
-            c.webrtc_extensions = false;
+            let c = RtcConfiguration::sip();
             c
         });
         pc2.add_transceiver(MediaKind::Audio, TransceiverDirection::RecvOnly);
@@ -15949,10 +15752,7 @@ a=rtpmap:8 PCMA/8000\r\n";
     async fn repro_bug1_dynamic_pt_without_rtpmap_not_registered() {
         use crate::sdp::{SdpType, SessionDescription};
 
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let config = RtcConfiguration::sip();
 
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::RecvOnly);
@@ -15985,10 +15785,7 @@ a=rtpmap:8 PCMA/8000\r\n";
     async fn repro_bug1_explicit_rtpmap_overrides_iana_static_default() {
         use crate::sdp::{SdpType, SessionDescription};
 
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let config = RtcConfiguration::sip();
 
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::RecvOnly);
@@ -16038,10 +15835,7 @@ a=rtpmap:8 PCMA/8000\r\n";
         use core::net::SocketAddr;
         use core::sync::atomic::Ordering;
 
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let mut config = RtcConfiguration::sip();
         config.ice_disconnect_grace = core::time::Duration::from_millis(1);
 
         let pc = PeerConnection::new(config);
@@ -16155,10 +15949,7 @@ a=rtpmap:8 PCMA/8000\r\n";
     // transceiver without a MID.
     #[tokio::test]
     async fn test_add_track_reuses_offer_transceiver_whep_answerer() {
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let config = RtcConfiguration::sip();
 
         let pc = PeerConnection::new(config);
 
@@ -16234,10 +16025,7 @@ a=mid:0
     // Same as above but with video — ensures the reuse works for both kinds.
     #[tokio::test]
     async fn test_add_track_reuses_offer_transceiver_video() {
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let config = RtcConfiguration::sip();
 
         let pc = PeerConnection::new(config);
 
@@ -16281,10 +16069,7 @@ a=mid:0
             ("recvonly", TransceiverDirection::RecvOnly),
             ("inactive", TransceiverDirection::Inactive),
         ] {
-            let mut config = RtcConfiguration::default();
-            config.connectivity = Connectivity::Sdp;
-            config.keying = Keying::None;
-            config.webrtc_extensions = false;
+            let config = RtcConfiguration::sip();
             let pc = PeerConnection::new(config);
             let offer_sdp = format!(
                 "v=0\r\n\
@@ -16310,7 +16095,7 @@ a=mid:0
     // back to creating a new transceiver (backward compat).
     #[tokio::test]
     async fn test_add_track_creates_new_transceiver_if_no_offer() {
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
 
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
         let params = RtpCodecParameters {
@@ -16334,7 +16119,7 @@ a=mid:0
     #[tokio::test]
     async fn renegotiation_offer_has_unique_extmap_ids() {
         use crate::{SdpType, SessionDescription};
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
 
         // Firefox-style audio offer: sdes:mid on id 3, no abs-send-time.
         let sdp_str = "v=0\r\n\
@@ -16405,10 +16190,7 @@ a=mid:0
         use crate::media::track::sample_track;
         use crate::sdp::{SdpType, SessionDescription};
 
-        let mut config = RtcConfiguration::default();
-        config.connectivity = Connectivity::Sdp;
-        config.keying = Keying::None;
-        config.webrtc_extensions = false;
+        let mut config = RtcConfiguration::sip();
         config.enable_latching = true;
         config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
 

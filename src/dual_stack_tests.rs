@@ -10,7 +10,7 @@ fn config(connectivity: Connectivity, keying: Keying) -> RtcConfiguration {
         connectivity,
         keying,
         webrtc_extensions: connectivity == Connectivity::Ice,
-        ..RtcConfiguration::default()
+        ..RtcConfiguration::sip()
     }
 }
 

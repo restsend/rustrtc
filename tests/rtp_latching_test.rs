@@ -12,9 +12,7 @@ use anyhow::Result;
 use local_ip_address::list_afinet_netifas;
 use rustrtc::media::frame::{MediaSample, VideoFrame};
 use rustrtc::transports::ice::stun::StunMessage;
-use rustrtc::{
-    Connectivity, Keying, PeerConnection, RtcConfiguration, RtpCodecParameters, SdpType,
-};
+use rustrtc::{PeerConnection, RtcConfiguration, RtpCodecParameters, SdpType};
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -117,10 +115,7 @@ async fn test_rtp_latching() -> Result<()> {
     println!("Selected IPs: IP1={}, IP2={}", ip1, ip2);
 
     // 1. Setup PeerConnection (PC) with RTP Mode & Latching
-    let mut config = RtcConfiguration::default();
-    config.connectivity = Connectivity::Sdp;
-    config.keying = Keying::None;
-    config.webrtc_extensions = false;
+    let mut config = RtcConfiguration::sip();
     config.enable_latching = true;
     config.bind_ips = vec!["0.0.0.0".parse().unwrap()];
     config.rtp_start_port = Some(40000);

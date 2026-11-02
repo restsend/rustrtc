@@ -71,7 +71,7 @@ impl Setup {
             keying,
             webrtc_extensions: connectivity == Connectivity::Ice,
             enable_latching: true,
-            ..RtcConfiguration::default()
+            ..RtcConfiguration::sip()
         };
         // Loopback is the address of each family here: the dual-stack socket
         // advertises it through `external_ips`.
