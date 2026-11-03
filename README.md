@@ -7,7 +7,7 @@ A high-performance, full-stack real-time communication library — **WebRTC, RTP
 
 ## Features
 
-- **High performance** — ~3.3× faster than `webrtc-rs` and ~3.2× faster than `pion` (Go) in throughput, with ~52% less memory than `webrtc-rs` (see the benchmark below).
+- **High performance** — ~3.9× faster than `webrtc-rs` and ~3.7× faster than `pion` (Go) in throughput, with ~52% less memory than `webrtc-rs` (see the benchmark below).
 - **Full protocol stack** — WebRTC, RTP, SRTP, and **T.38 fax** in a single library, plus **UPnP IGD** NAT traversal. Few moving parts, no missing pieces.
 - **Unified `PeerConnection` API** — one interface for every transport mode (`WebRtc` ICE/DTLS/SRTP, `Srtp`, `Rtp`, and T.38). No fragmented APIs.
 - **WebRTC compliant** — interoperable with Chrome/WebRTC and pion; offer/answer, renegotiation, rollback, and standard SDP attributes.
@@ -172,6 +172,49 @@ receiver-side TWCC feedback generation), and throughput still holds 3.3× / 3.2�
 `webrtc-rs` / `pion`. ICE restart, mDNS candidate obfuscation, and the VP9 codec are
 likewise pure add-ons — the ratios above are the stable signal across releases
 (0.3.114: 2.95× / 2.7×; 0.3.141: 3.3× / 3.2×).
+
+## Benchmark update in 0.5.0 (SRTP/SCTP crypto overhaul)
+
+Same host (`Intel(R) Core(TM) i7-9700T`, Debian 13, same script — `cargo run -r --example
+benchmark`), same peers (webrtc-rs 0.17 / pion via go1.24.4), **median of 3 runs**; the
+host is a shared CI box, so the per-run `rustrtc/webrtc` ratio is the load-independent
+signal:
+
+| Metric              | 0.3.141 (README above) | 0.5.0 (median of 3) |
+|---------------------|------------------------|---------------------|
+| Throughput (MB/s)   | 549.04                 | **504.51** (403.77–577.78) |
+| vs `webrtc-rs`      | 3.31×                  | **3.92×** (3.87–5.12) |
+| vs `pion`           | 3.25×                  | **~3.7×** (3.05–3.84) |
+| MB/s per CPU%       | 0.74                   | **0.86** |
+| Setup latency (ms)  | 0.45                   | 0.50–0.61 (same) |
+| Memory (MB)         | 21                     | 20–22 (same) |
+
+The ratio series across releases stays monotonic: **2.95× (0.3.114) → 3.3× (0.3.141) →
+3.9× (0.5.0)**.
+
+### What changed under the hood
+
+- **SRTP GCM on aarch64 runs hardware AES now**: `aes-gcm` was pinned to `aes 0.8`,
+  which has no aarch64 hardware backend — every GCM packet ran fixslice software AES
+  on ARM. On Apple Silicon the SRTP AES-GCM roundtrip went from 112k to 2076k ops/s
+  (18.5×); x86_64 already had runtime AES-NI detection and gains are instead ~+13%
+  median throughput from the allocation/lock cleanup below.
+- **Zero-allocation hot paths**: per-packet vectors on the SRTP protect/unprotect
+  paths are gone (caller-owned buffers: `RtpTransport::send_rtp_into`), SRTCP GCM
+  encrypts/decrypts in place, and `RtpTransport::with_srtp_session` amortizes the
+  session lock across a whole frame.
+- **Anti-replay window** (RFC 3711 §3.3.2): duplicates and out-of-window packets are
+  rejected before any crypto work (`SrtpError::ReplayRejected`), with the window
+  committed only after authentication so forged indices cannot poison it. Overhead
+  below measurement noise.
+- **Datachannel throughput doubled** on the same host: SCTP benchmark 102 → 201 MB/s
+  (1 GB over a loopback WebRTC association), from the same record-layer crypto fix.
+- **Connection setup**: the DTLS certificate is generated once per process
+  (was per PeerConnection) — 0.38 ms → 8.8 µs per connection (43×).
+
+Micro-benchmarks live in `examples/`: `gcm_backend_bench` (SRTP crypto backends,
+session roundtrip, frame batch), `sctp_benchmark` (datachannel throughput),
+`cert_cache_bench` (setup), `aes_block_probe` / `dual_stack_probe` (platform probes).
 
 ## Usage
 
