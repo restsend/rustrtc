@@ -38,6 +38,35 @@ struct LocalIpCacheEntry {
 #[cfg(feature = "std")]
 static LOCAL_IP_CACHE: OnceLock<Mutex<Option<LocalIpCacheEntry>>> = OnceLock::new();
 
+/// `addr` with an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) turned into
+/// the IPv4 address. A dual-stack socket (bound to `::`) reports its IPv4
+/// peers in the mapped form; everything above the socket compares them with
+/// addresses from SDP, candidates and STUN, where they are IPv4.
+pub fn canonical_addr(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
+}
+
+/// Bind a UDP socket on `addr`. An IPv6 socket has `IPV6_V6ONLY` set
+/// explicitly, so the `net.ipv6.bindv6only` sysctl (or the OS default, on
+/// in BSD and Windows) does not decide it: one on `::` is dual-stack and
+/// serves IPv4 too, one on a given IPv6 address serves only IPv6.
+#[cfg(feature = "std")]
+pub fn bind_udp(addr: SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(!addr.ip().is_unspecified())?;
+    }
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    tokio::net::UdpSocket::from_std(socket.into())
+}
+
 #[async_trait]
 pub trait PacketReceiver: Send + Sync {
     async fn receive(&self, packet: Bytes, addr: SocketAddr, marshal_buf: &mut Vec<u8>);
@@ -160,6 +189,33 @@ fn resolve_local_ip_uncached() -> Result<IpAddr, anyhow::Error> {
     }
 
     Err(anyhow::anyhow!("No suitable network interface found"))
+}
+
+/// An IPv6 address of this host that peers can reach: a global one, else a
+/// unique local one (`fc00::/7`). Never loopback or link-local (`fe80::/10`:
+/// it needs a scope). None: no IPv6 here.
+#[cfg(feature = "std")]
+pub fn get_local_ipv6() -> Option<core::net::Ipv6Addr> {
+    let interfaces = local_ip_address::list_afinet_netifas().ok()?;
+    let usable = interfaces.into_iter().filter_map(|(_, addr)| match addr {
+        IpAddr::V6(ip)
+            if !ip.is_loopback()
+                && !ip.is_unspecified()
+                && !ip.is_unicast_link_local()
+                && !ip.is_multicast() =>
+        {
+            Some(ip)
+        }
+        _ => None,
+    });
+    // Global before unique local.
+    usable.min_by_key(|ip| ip.is_unique_local())
+}
+
+/// No interface enumeration on the embedded target.
+#[cfg(not(feature = "std"))]
+pub fn get_local_ipv6() -> Option<core::net::Ipv6Addr> {
+    None
 }
 
 #[cfg(feature = "std")]

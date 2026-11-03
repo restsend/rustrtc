@@ -20,8 +20,8 @@ fn av_config() -> RtcConfiguration {
     config.sdp_compatibility = SdpCompatibilityMode::LegacySip;
     config.rtp_start_port = Some(20000);
     config.rtp_end_port = Some(20100);
-    config.external_ip = Some("127.0.0.1".to_string());
-    config.bind_ip = Some("127.0.0.1".to_string());
+    config.external_ips = vec!["127.0.0.1".parse().unwrap()];
+    config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
     config.media_capabilities = Some(MediaCapabilities {
         audio: vec![AudioCapability {
             payload_type: 0,

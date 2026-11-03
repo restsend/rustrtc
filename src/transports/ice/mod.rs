@@ -409,10 +409,10 @@ fn start_mdns_responder(
     inner: &Arc<IceTransportInner>,
 ) -> anyhow::Result<crate::transports::ice::mdns::MdnsResponder> {
     let mut addresses: Vec<core::net::IpAddr> = Vec::new();
-    if let Some(bind) = &inner.config.bind_ip
-        && let Ok(ip) = bind.parse::<core::net::IpAddr>()
-    {
-        addresses.push(ip);
+    for &ip in &inner.config.bind_ips {
+        if !ip.is_unspecified() && !addresses.contains(&ip) {
+            addresses.push(ip);
+        }
     }
     #[cfg(feature = "std")]
     use local_ip_address::list_afinet_netifas;
@@ -972,6 +972,7 @@ impl IceTransportRunner {
             match which {
                 crate::platform::select::Either::A(accept_res) => match accept_res {
                     Ok((stream, peer_addr)) => {
+                        let peer_addr = crate::transports::canonical_addr(peer_addr);
                         trace!("TCP accepted connection from {}", peer_addr);
                         let wrapper = split_tcp_stream(stream, peer_addr);
                         inner.gatherer.store_tcp_stream(local_addr, wrapper.clone());
@@ -1572,13 +1573,49 @@ impl IceTransport {
         self.inner.gatherer.local_candidates()
     }
 
-    pub(crate) fn local_rtcp_addr(&self) -> Option<SocketAddr> {
-        self.inner
+    /// The RTCP address that goes with the RTP candidate `rtp`: the RTCP
+    /// candidate on its address (from the socket next to its own).
+    pub(crate) fn local_rtcp_addr(&self, rtp: &IceCandidate) -> Option<SocketAddr> {
+        let rtcp: Vec<_> = self
+            .inner
             .gatherer
             .local_candidates()
             .into_iter()
-            .find(|candidate| candidate.component == 2)
+            .filter(|candidate| candidate.component == 2)
+            .collect();
+        rtcp.iter()
+            .find(|candidate| candidate.address.ip() == rtp.address.ip())
+            .or_else(|| rtcp.first())
             .map(|candidate| candidate.address)
+    }
+
+    /// The candidate a direct transport puts in `c=` and the `m=` port: the
+    /// local side of the selected pair (the family the peer uses: the offer's
+    /// when we answer), else one of the family `prefer_ipv6` asks for, not
+    /// loopback when there is another.
+    pub(crate) fn default_candidate(&self) -> Option<IceCandidate> {
+        let locals: Vec<_> = self
+            .inner
+            .gatherer
+            .local_candidates()
+            .into_iter()
+            .filter(|candidate| candidate.component == 1)
+            .collect();
+        if let Some(pair) = self.inner.selected_pair.lock().as_ref()
+            && let Some(local) = locals.iter().find(|c| c.address == pair.local.address)
+        {
+            return Some(local.clone());
+        }
+        let ipv6 = self.inner.config.prefer_ipv6;
+        let not_loopback = |c: &&IceCandidate| !c.address.ip().is_loopback();
+        locals
+            .iter()
+            .filter(not_loopback)
+            .find(|c| c.address.is_ipv6() == ipv6)
+            .or_else(|| locals.iter().find(|c| c.address.is_ipv6() == ipv6))
+            .or_else(|| locals.iter().find(not_loopback))
+            .or_else(|| locals.first())
+            .cloned()
     }
 
     pub fn remote_candidates(&self) -> Vec<IceCandidate> {
@@ -1879,114 +1916,29 @@ impl IceTransport {
         remote_addr: SocketAddr,
         bind_rtcp: bool,
     ) -> RtcResult<SocketAddr> {
-        let bind_ip = if let Some(bind_ip_str) = &self.inner.config.bind_ip {
-            bind_ip_str.parse::<IpAddr>().unwrap_or_else(|_| {
-                get_local_ip().unwrap_or(IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED))
-            })
-        } else if let Ok(ip) = get_local_ip() {
-            ip
-        } else {
-            IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED)
-        };
-
-        let socket = self.inner.gatherer.bind_socket(bind_ip).await?;
-        let local_addr = socket.local_addr()?;
-
-        // Register the socket wrapper for the read loop (handled by runner);
-        // backend bookkeeping already happened in bind_one.
-        self.inner.gatherer.register_bound(&socket);
-
-        // Build a local candidate for SDP generation
-        let mut cand_addr = local_addr;
-        #[allow(unused_mut)]
-        let mut upnp_external_addr: Option<SocketAddr> = None;
-
-        // Try UPnP if enabled (for RTP mode behind NAT) — std-only
-        // (UPnP is excluded from the embedded target)
-        #[cfg(feature = "std")]
-        if self.inner.config.enable_upnp && !local_addr.ip().is_loopback() && !local_addr.is_ipv6()
-        {
-            let mut mapper = UpnpPortMapper::with_lease_duration(
-                local_addr,
-                self.inner.config.upnp_lease_duration,
-            );
-            if let Err(e) = mapper.discover().await {
-                trace!("UPnP discovery failed for RTP mode: {}", e);
-            } else if let Ok(ext_addr) = mapper.add_mapping(0).await {
-                debug!(
-                    "UPnP mapping created for RTP mode: {} -> {}",
-                    local_addr, ext_addr
-                );
-                cand_addr.set_ip(ext_addr.ip());
-                cand_addr.set_port(ext_addr.port());
-                upnp_external_addr = Some(ext_addr);
-                self.inner.gatherer.upnp_mappers.lock().push(mapper);
-            } else {
-                debug!("UPnP mapping failed for RTP mode, using local address");
-            }
-        }
-
-        // Fall back to external_ip config if UPnP not available
-        if upnp_external_addr.is_none() {
-            if let Some(ext_ip) = &self.inner.config.external_ip {
-                if let Ok(parsed_ip) = ext_ip.parse::<IpAddr>()
-                    && !bind_ip.is_loopback()
-                {
-                    cand_addr.set_ip(parsed_ip);
-                }
-            } else if bind_ip.is_unspecified()
-                && let Ok(local_ip) = get_local_ip()
-            {
-                cand_addr.set_ip(local_ip);
-            }
-        }
-
-        // Apply external_port override (for NAT port forwarding)
-        if upnp_external_addr.is_none()
-            && let Some(ext_port) = self.inner.config.external_port
-            && !bind_ip.is_loopback()
-        {
-            cand_addr.set_port(ext_port);
-        }
-
-        let mut local_candidate = IceCandidate::host(cand_addr, 1);
-        if cand_addr != local_addr {
-            local_candidate.related_address = Some(local_addr);
-        }
-        let mut rtcp_socket = None;
-        let mut rtcp_candidate = None;
-        if bind_rtcp {
-            let (rtcp, candidate) =
-                bind_direct_rtcp_socket(&self.inner, local_addr, cand_addr.ip()).await?;
-            rtcp_socket = Some(rtcp);
-            rtcp_candidate = Some(candidate);
-        }
-        self.inner.gatherer.push_candidate(local_candidate.clone());
-        if let Some(candidate) = rtcp_candidate {
-            self.inner.gatherer.push_candidate(candidate);
-        }
-
-        // Set gathering as complete
-        *self.inner.gatherer.state.lock() = IceGathererState::Complete;
-        let _ = self.inner.gathering_state.send(IceGathererState::Complete);
+        let bound = self.bind_direct_sockets(bind_rtcp).await?;
+        // A candidate of the peer's family: an IPv4 socket can't reach an
+        // IPv6 peer (RFC 6157 §4.1: the answer is in the offer's family).
+        let (direct, local_candidate) = DirectSocket::pick(&bound, remote_addr.is_ipv4());
+        let local_candidate = local_candidate.clone();
 
         // Set up the selected pair. The RTP socket is the one just bound, and
         // the RTCP socket is the dedicated one when bound (else the RTP
         // socket); write pair and both sockets together under the selection
         // lock so the triple is never observed half-updated.
         let remote_candidate = IceCandidate::host(remote_addr, 1);
-        let pair = IceCandidatePair::new(local_candidate, remote_candidate);
-        let rtcp_socket = rtcp_socket.unwrap_or_else(|| socket.clone());
+        let pair = IceCandidatePair::new(local_candidate.clone(), remote_candidate);
+        let rtcp_socket = direct.rtcp.clone().unwrap_or_else(|| direct.rtp.clone());
         {
             let _selection = self.inner.selection_lock.lock();
             *self.inner.selected_pair.lock() = Some(pair.clone());
             let _ = self.inner.selected_pair_notifier.send(Some(pair));
-            let _ = self.inner.selected_socket.send(Some(socket.clone()));
+            let _ = self.inner.selected_socket.send(Some(direct.rtp.clone()));
             let _ = self.inner.selected_rtcp_socket.send(Some(rtcp_socket));
         }
         let _ = self.inner.set_state(IceTransportState::Connected);
 
-        Ok(cand_addr)
+        Ok(local_candidate.address)
     }
 
     /// Set up a direct UDP socket for RTP mode (offer side, no remote addr yet).
@@ -2000,108 +1952,127 @@ impl IceTransport {
         &self,
         bind_rtcp: bool,
     ) -> RtcResult<SocketAddr> {
-        let bind_ip = if let Some(bind_ip_str) = &self.inner.config.bind_ip {
-            bind_ip_str.parse::<IpAddr>().unwrap_or_else(|_| {
-                get_local_ip().unwrap_or(IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED))
-            })
-        } else if let Ok(ip) = get_local_ip() {
-            ip
-        } else {
-            IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED)
-        };
-
-        let socket = self.inner.gatherer.bind_socket(bind_ip).await?;
-        let local_addr = socket.local_addr()?;
-        self.inner.gatherer.register_bound(&socket);
-
-        let mut cand_addr = local_addr;
-        #[allow(unused_mut)]
-        let mut upnp_external_addr: Option<SocketAddr> = None;
-
-        // Try UPnP if enabled (for RTP mode behind NAT) — std-only
-        // (UPnP is excluded from the embedded target)
-        #[cfg(feature = "std")]
-        if self.inner.config.enable_upnp && !local_addr.ip().is_loopback() && !local_addr.is_ipv6()
-        {
-            let mut mapper = UpnpPortMapper::with_lease_duration(
-                local_addr,
-                self.inner.config.upnp_lease_duration,
-            );
-            if let Err(e) = mapper.discover().await {
-                trace!("UPnP discovery failed for RTP offer mode: {}", e);
-            } else if let Ok(ext_addr) = mapper.add_mapping(0).await {
-                debug!(
-                    "UPnP mapping created for RTP offer mode: {} -> {}",
-                    local_addr, ext_addr
-                );
-                cand_addr.set_ip(ext_addr.ip());
-                cand_addr.set_port(ext_addr.port());
-                upnp_external_addr = Some(ext_addr);
-                self.inner.gatherer.upnp_mappers.lock().push(mapper);
-            } else {
-                debug!("UPnP mapping failed for RTP offer mode, using local address");
-            }
+        let bound = self.bind_direct_sockets(bind_rtcp).await?;
+        let (direct, local_candidate) = DirectSocket::pick(&bound, !self.inner.config.prefer_ipv6);
+        if let Some(rtcp_socket) = &direct.rtcp {
+            let _ = self
+                .inner
+                .selected_rtcp_socket
+                .send(Some(rtcp_socket.clone()));
         }
+        Ok(local_candidate.address)
+    }
 
-        // Fall back to external_ip config if UPnP not available
-        if upnp_external_addr.is_none() {
-            if let Some(ext_ip) = &self.inner.config.external_ip {
-                if let Ok(parsed_ip) = ext_ip.parse::<IpAddr>()
-                    && !bind_ip.is_loopback()
-                {
-                    cand_addr.set_ip(parsed_ip);
+    /// Bind the sockets of a direct transport (no ICE gathering, STUN or
+    /// checks): one RTP socket on each bind address (`bind_ips`, else the
+    /// address of the default route), and an RTCP socket next to each when
+    /// `bind_rtcp`. Their candidates, one per family a socket serves (see
+    /// `IceGatherer::advertised_ips`), are pushed and gathering is complete.
+    /// A bind address that fails is skipped; all failing is an error.
+    async fn bind_direct_sockets(&self, bind_rtcp: bool) -> RtcResult<Vec<DirectSocket>> {
+        let gatherer = &self.inner.gatherer;
+        let mut bound = Vec::new();
+        let mut last_error = None;
+        for bind_ip in gatherer.bind_addresses() {
+            let socket = match gatherer.bind_socket(bind_ip).await {
+                Ok(socket) => socket,
+                Err(e) => {
+                    debug!(%bind_ip, error = %e, "direct transport: bind failed");
+                    last_error = Some(e);
+                    continue;
                 }
-            } else if bind_ip.is_unspecified()
-                && let Ok(local_ip) = get_local_ip()
+            };
+            let local_addr = socket.local_addr()?;
+            // Register the socket wrapper for the read loop (handled by
+            // runner); backend bookkeeping already happened in bind_one.
+            gatherer.register_bound(&socket);
+
+            let mut candidates = Vec::new();
+            // Try UPnP if enabled (for RTP mode behind NAT) — std-only
+            // (UPnP is excluded from the embedded target)
+            #[cfg(feature = "std")]
+            if self.inner.config.enable_upnp
+                && !local_addr.ip().is_loopback()
+                && !local_addr.is_ipv6()
             {
-                cand_addr.set_ip(local_ip);
+                let mut mapper = UpnpPortMapper::with_lease_duration(
+                    local_addr,
+                    self.inner.config.upnp_lease_duration,
+                );
+                if let Err(e) = mapper.discover().await {
+                    trace!("UPnP discovery failed for RTP mode: {}", e);
+                } else if let Ok(ext_addr) = mapper.add_mapping(0).await {
+                    debug!(
+                        "UPnP mapping created for RTP mode: {} -> {}",
+                        local_addr, ext_addr
+                    );
+                    let mut cand = IceCandidate::host(ext_addr, 1);
+                    cand.related_address = Some(local_addr);
+                    candidates.push(cand);
+                    gatherer.upnp_mappers.lock().push(mapper);
+                } else {
+                    debug!("UPnP mapping failed for RTP mode, using local address");
+                }
             }
+            // Else the external addresses (or the local ones), and the
+            // external_port override (for NAT port forwarding).
+            if candidates.is_empty() {
+                let port = match self.inner.config.external_port {
+                    Some(port) if !bind_ip.is_loopback() => port,
+                    _ => local_addr.port(),
+                };
+                candidates = gatherer.host_candidates(local_addr, bind_ip, port, 1);
+            }
+            if candidates.is_empty() {
+                debug!(%bind_ip, "direct transport: no address to advertise");
+                continue;
+            }
+
+            let mut rtcp = None;
+            let mut rtcp_candidates = Vec::new();
+            if bind_rtcp {
+                let (socket, cands) =
+                    bind_direct_rtcp_socket(&self.inner, local_addr, &candidates).await?;
+                rtcp = Some(socket);
+                rtcp_candidates = cands;
+            }
+            for candidate in candidates.iter().chain(&rtcp_candidates) {
+                gatherer.push_candidate(candidate.clone());
+            }
+            bound.push(DirectSocket {
+                rtp: socket,
+                rtcp,
+                candidates,
+            });
+        }
+        if bound.is_empty() {
+            return Err(last_error
+                .unwrap_or_else(|| RtcError::Internal("no local address to bind on".into())));
         }
 
-        // Apply external_port override (for NAT port forwarding)
-        if upnp_external_addr.is_none()
-            && let Some(ext_port) = self.inner.config.external_port
-            && !bind_ip.is_loopback()
-        {
-            cand_addr.set_port(ext_port);
-        }
-
-        let mut local_candidate = IceCandidate::host(cand_addr, 1);
-        if cand_addr != local_addr {
-            local_candidate.related_address = Some(local_addr);
-        }
-        let mut rtcp_socket = None;
-        let mut rtcp_candidate = None;
-        if bind_rtcp {
-            let (rtcp, candidate) =
-                bind_direct_rtcp_socket(&self.inner, local_addr, cand_addr.ip()).await?;
-            rtcp_socket = Some(rtcp);
-            rtcp_candidate = Some(candidate);
-        }
-        self.inner.gatherer.push_candidate(local_candidate);
-        if let Some(candidate) = rtcp_candidate {
-            self.inner.gatherer.push_candidate(candidate);
-        }
-        if let Some(rtcp_socket) = rtcp_socket {
-            let _ = self.inner.selected_rtcp_socket.send(Some(rtcp_socket));
-        }
-
-        *self.inner.gatherer.state.lock() = IceGathererState::Complete;
+        // Set gathering as complete
+        *gatherer.state.lock() = IceGathererState::Complete;
         let _ = self.inner.gathering_state.send(IceGathererState::Complete);
-
-        Ok(cand_addr)
+        Ok(bound)
     }
 
     /// Complete the RTP direct connection by setting the remote address.
     /// Call after setup_direct_rtp_offer when the answer arrives with the remote address.
     pub fn complete_direct_rtp(&self, remote_addr: SocketAddr) {
         let remote_candidate = IceCandidate::host(remote_addr, 1);
-        let local_candidate = self
+        // Of the peer's family when we have one (a re-INVITE can change it).
+        let locals: Vec<_> = self
             .inner
             .gatherer
             .local_candidates()
             .into_iter()
-            .find(|candidate| candidate.component == 1)
+            .filter(|candidate| candidate.component == 1)
+            .collect();
+        let local_candidate = locals
+            .iter()
+            .find(|candidate| candidate.address.is_ipv4() == remote_addr.is_ipv4())
+            .or_else(|| locals.first())
+            .cloned()
             .unwrap_or_else(|| {
                 IceCandidate::host(
                     SocketAddr::new(IpAddr::V4(core::net::Ipv4Addr::LOCALHOST), 0),
@@ -3273,7 +3244,7 @@ fn publish_selected_socket(
         "ICE: published selected socket"
     );
     let _ = inner.selected_socket.send(Some(socket.clone()));
-    publish_selected_rtcp_socket(inner, Some(socket));
+    publish_selected_rtcp_socket(inner, Some(pair), Some(socket));
 }
 
 /// Apply a verified controlled-side nomination only if it is still the most
@@ -3389,7 +3360,7 @@ async fn complete_controlled_inbound_tcp_nomination(
             // cannot interleave with a concurrent pair+socket commit.
             let _selection = inner.selection_lock.lock();
             let _ = inner.selected_socket.send(Some(sender.clone()));
-            publish_selected_rtcp_socket(&inner, Some(sender.clone()));
+            publish_selected_rtcp_socket(&inner, None, Some(sender.clone()));
         }
     }
     let _ = inner.nomination_complete.send(Some(true));
@@ -3408,12 +3379,28 @@ async fn complete_controlled_inbound_tcp_nomination(
     );
 }
 
-fn resolve_rtcp_socket(inner: &IceTransportInner) -> Option<IceSocketWrapper> {
-    let candidate = inner
+/// The RTCP socket that goes with the media `pair`: the one of the RTCP
+/// candidate on its local address (the socket next to the media socket, of
+/// its family), else the first RTCP candidate's.
+fn resolve_rtcp_socket(
+    inner: &IceTransportInner,
+    pair: Option<&IceCandidatePair>,
+) -> Option<IceSocketWrapper> {
+    let rtcp: Vec<_> = inner
         .gatherer
         .local_candidates()
         .into_iter()
-        .find(|candidate| candidate.component == 2)?;
+        .filter(|candidate| candidate.component == 2)
+        .collect();
+    let candidate = pair
+        .map(|p| p.local.address)
+        .and_then(|local| {
+            rtcp.iter()
+                .find(|c| c.address.ip() == local.ip())
+                .or_else(|| rtcp.iter().find(|c| c.address.is_ipv4() == local.is_ipv4()))
+        })
+        .or_else(|| rtcp.first())?
+        .clone();
 
     if candidate.typ == IceCandidateType::Relay {
         let clients = inner.gatherer.turn_clients.lock();
@@ -3438,17 +3425,46 @@ fn resolve_rtcp_socket(inner: &IceTransportInner) -> Option<IceSocketWrapper> {
     }
 }
 
-fn publish_selected_rtcp_socket(inner: &IceTransportInner, fallback: Option<IceSocketWrapper>) {
-    if let Some(socket) = resolve_rtcp_socket(inner).or(fallback) {
+fn publish_selected_rtcp_socket(
+    inner: &IceTransportInner,
+    pair: Option<&IceCandidatePair>,
+    fallback: Option<IceSocketWrapper>,
+) {
+    if let Some(socket) = resolve_rtcp_socket(inner, pair).or(fallback) {
         let _ = inner.selected_rtcp_socket.send(Some(socket));
     }
 }
 
+/// A socket of a direct transport (see
+/// `IceTransport::bind_direct_sockets`).
+struct DirectSocket {
+    rtp: IceSocketWrapper,
+    /// The RTCP socket next to it, without rtcp-mux.
+    rtcp: Option<IceSocketWrapper>,
+    /// Its RTP (component 1) candidates, one per family it serves.
+    candidates: Vec<IceCandidate>,
+}
+
+impl DirectSocket {
+    /// The socket and RTP candidate for a family: the first candidate of it,
+    /// else the first one (a peer of a family we don't have).
+    fn pick(bound: &[DirectSocket], ipv4: bool) -> (&DirectSocket, &IceCandidate) {
+        bound
+            .iter()
+            .flat_map(|d| d.candidates.iter().map(move |c| (d, c)))
+            .find(|(_, c)| c.address.is_ipv4() == ipv4)
+            .unwrap_or((&bound[0], &bound[0].candidates[0]))
+    }
+}
+
+/// Bind the RTCP socket of a direct transport next to its RTP socket
+/// (`rtp_base`, port + 1 when free), with an RTCP (component 2) candidate on
+/// the address of each RTP candidate.
 async fn bind_direct_rtcp_socket(
     inner: &IceTransportInner,
     rtp_base: SocketAddr,
-    advertised_ip: IpAddr,
-) -> RtcResult<(IceSocketWrapper, IceCandidate)> {
+    rtp_candidates: &[IceCandidate],
+) -> RtcResult<(IceSocketWrapper, Vec<IceCandidate>)> {
     let rtcp_bind_addr = rtp_base
         .port()
         .checked_add(1)
@@ -3476,13 +3492,18 @@ async fn bind_direct_rtcp_socket(
     let local_rtcp_addr = rtcp.local_addr()?;
     inner.gatherer.register_bound(&rtcp);
 
-    let mut rtcp_cand_addr = local_rtcp_addr;
-    rtcp_cand_addr.set_ip(advertised_ip);
-    let mut candidate = IceCandidate::host(rtcp_cand_addr, 2);
-    if rtcp_cand_addr != local_rtcp_addr {
-        candidate.related_address = Some(local_rtcp_addr);
-    }
-    Ok((rtcp, candidate))
+    let candidates = rtp_candidates
+        .iter()
+        .map(|rtp| {
+            let rtcp_cand_addr = SocketAddr::new(rtp.address.ip(), local_rtcp_addr.port());
+            let mut candidate = IceCandidate::host(rtcp_cand_addr, 2);
+            if rtcp_cand_addr != local_rtcp_addr {
+                candidate.related_address = Some(local_rtcp_addr);
+            }
+            candidate
+        })
+        .collect();
+    Ok((rtcp, candidates))
 }
 
 async fn handle_packet(
@@ -3495,6 +3516,7 @@ async fn handle_packet(
     if should_drop_packet() {
         return;
     }
+    let addr = crate::transports::canonical_addr(addr);
     inner.last_received_nanos.store(
         inner.created_at.elapsed().as_nanos() as u64,
         Ordering::Relaxed,
@@ -3727,6 +3749,28 @@ async fn handle_stun_request(
     addr: SocketAddr,
     inner: Arc<IceTransportInner>,
 ) {
+    // Role conflict (RFC 8445 §7.3.1.1). An ICE-lite agent is always
+    // controlled (§6.1.1), so a full agent must control it. One that checks
+    // as controlled too (mediastreamer2 keeps that role when it answers our
+    // offer, ignoring a=ice-lite) gets 487 Role Conflict: it takes the
+    // controlling role (§7.2.5.1), checks again and nominates. Else nobody
+    // nominates, and the media path stays the c= one.
+    if inner.config.connectivity() == Connectivity::IceLite && msg.ice_controlled.is_some() {
+        let response =
+            StunMessage::binding_error_response(msg.transaction_id, 487, "Role Conflict");
+        let password = inner.local_parameters.lock().password.clone();
+        if let Ok(bytes) = response.encode(Some(password.as_bytes()), true)
+            && let Err(e) = sender.send_to(&bytes, addr).await
+        {
+            debug!("Failed to send STUN 487 to {}: {}", addr, e);
+        }
+        debug!(
+            "ICE-lite: 487 Role Conflict to a controlled check from {}",
+            addr
+        );
+        return;
+    }
+
     let response = StunMessage::binding_success_response(msg.transaction_id, addr);
 
     #[cfg(any(test, feature = "simulator"))]
@@ -3820,6 +3864,9 @@ async fn handle_stun_request(
         if let Some(pair) = current_pair
             && pair.remote.address.port() == addr.port()
             && pair.remote.address.ip() != addr.ip()
+            // The other family is another path, not a NAT rebinding: only a
+            // nomination moves the pair there.
+            && pair.remote.address.is_ipv4() == addr.is_ipv4()
         {
             debug!(
                 "RTP latching: updating remote address from {} to {}",
@@ -3901,8 +3948,13 @@ async fn handle_stun_request(
                 IceSocketWrapper::Turn(_, addr) => *addr,
             };
 
+            // The socket's candidate of the peer's family: a dual-stack socket
+            // has one per family.
             let locals = inner.gatherer.local_candidates();
-            let local_cand = locals.iter().find(|c| c.base_address() == local_addr);
+            let on_socket = || locals.iter().filter(|c| c.base_address() == local_addr);
+            let local_cand = on_socket()
+                .find(|c| c.address.is_ipv4() == addr.is_ipv4())
+                .or_else(|| on_socket().next());
 
             let pair = {
                 let remotes = inner.remote_candidates.lock();
@@ -5081,63 +5133,198 @@ impl IceGatherer {
         *self.transport_inner.lock() = Some(inner);
     }
 
-    /// The external IP to advertise as a srflx candidate (ServerReflexive
-    /// mode, WebRTC, non-loopback bind, non-relay policy).
-    fn external_srflx_ip(&self, bind_ip: IpAddr) -> Option<IpAddr> {
-        if self.config.external_ip_candidate_type
-            != crate::config::ExternalIpCandidateType::ServerReflexive
-            || self.config.connectivity() != Connectivity::Ice
-            || self.config.ice_transport_policy != IceTransportPolicy::All
-            || bind_ip.is_loopback()
-        {
-            return None;
-        }
-        self.config.external_ip.as_ref()?.parse().ok()
+    /// The configured external address of a family.
+    fn external_ip_for(&self, ipv4: bool) -> Option<IpAddr> {
+        self.config
+            .external_ips
+            .iter()
+            .copied()
+            .find(|ip| ip.is_ipv4() == ipv4)
     }
 
-    /// Push the host candidate for a socket bound at `local_addr`, plus the
-    /// external IP as a server-reflexive candidate on the same socket.
-    /// Returns false when the mode does not apply.
+    /// The local addresses of a socket bound on `bind_ip`, one per family it
+    /// serves: the address itself; for `0.0.0.0`, the address of the default
+    /// route (else `0.0.0.0`); for `::` (dual-stack), the IPv4 address of the
+    /// default route and a reachable IPv6 address, those that exist.
+    fn local_ips(&self, bind_ip: IpAddr) -> Vec<IpAddr> {
+        let local_v4 = || get_local_ip().ok().filter(IpAddr::is_ipv4);
+        let mut ips = match bind_ip {
+            IpAddr::V4(ip) if ip.is_unspecified() => vec![local_v4().unwrap_or(bind_ip)],
+            IpAddr::V6(ip) if ip.is_unspecified() => local_v4()
+                .into_iter()
+                .chain(crate::transports::get_local_ipv6().map(IpAddr::V6))
+                .collect(),
+            ip => vec![ip],
+        };
+        if self.config.disable_ipv6 {
+            ips.retain(IpAddr::is_ipv4);
+        }
+        ips
+    }
+
+    /// Where peers reach a socket bound on `bind_ip`, one address per family
+    /// it serves: the family's external address when one is configured,
+    /// else the local one (`local_ips`). Loopback is never mapped. A socket
+    /// on `::` with an external address of a family but no local address of
+    /// it still advertises the external one (a 1:1 NAT in front).
+    fn advertised_ips(&self, bind_ip: IpAddr) -> Vec<IpAddr> {
+        if bind_ip.is_loopback() {
+            return vec![bind_ip];
+        }
+        let families: &[bool] = match bind_ip {
+            IpAddr::V6(ip) if ip.is_unspecified() => &[true, false],
+            ip => &[ip.is_ipv4()],
+        };
+        let local = self.local_ips(bind_ip);
+        families
+            .iter()
+            .filter_map(|&ipv4| {
+                self.external_ip_for(ipv4)
+                    .or_else(|| local.iter().copied().find(|ip| ip.is_ipv4() == ipv4))
+            })
+            .filter(|ip| !(self.config.disable_ipv6 && ip.is_ipv6()))
+            .collect()
+    }
+
+    /// Host candidates of a socket bound on `bind_ip` with local address
+    /// `local_addr`: one per advertised address (`advertised_ips`), on
+    /// `port`. A candidate on another address than the socket's own has the
+    /// socket's address as `related_address` (its base), where its packets
+    /// go out from.
+    fn host_candidates(
+        &self,
+        local_addr: SocketAddr,
+        bind_ip: IpAddr,
+        port: u16,
+        component: u16,
+    ) -> Vec<IceCandidate> {
+        self.advertised_ips(bind_ip)
+            .into_iter()
+            .map(|ip| {
+                let addr = SocketAddr::new(ip, port);
+                let mut cand = IceCandidate::host(addr, component);
+                if addr != local_addr {
+                    cand.related_address = Some(local_addr);
+                }
+                cand
+            })
+            .collect()
+    }
+
+    /// The addresses to bind on: `bind_ips` when configured, else for a
+    /// direct transport the address of the default route, for ICE every
+    /// interface address: IPv4, and IPv6 that peers can reach (global or
+    /// unique local, not link-local; none with `disable_ipv6`), and loopback
+    /// when asked for.
+    fn bind_addresses(&self) -> Vec<IpAddr> {
+        if !self.config.bind_ips.is_empty() {
+            return self.config.bind_ips.clone();
+        }
+        if self.config.connectivity().is_direct() {
+            // A direct transport: prefer a LAN IP if available. Binding to
+            // 0.0.0.0 on macOS can lead to "No route to host" (os error 65)
+            // if the destination is on a LAN segment but the OS picks a wrong
+            // default interface.
+            return vec![get_local_ip().unwrap_or(IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED))];
+        }
+        // Every LAN IP. Loopback only on explicit opt-in
+        // (`ice_include_loopback_candidates`): advertising 127.0.0.1 to remote
+        // peers is useless and wastes their permissions/checks.
+        let mut ips = Vec::new();
+        if self.config.ice_include_loopback_candidates {
+            ips.push(IpAddr::V4(core::net::Ipv4Addr::LOCALHOST));
+        }
+        #[cfg(feature = "std")]
+        if let Ok(interfaces) = local_ip_address::list_afinet_netifas() {
+            let reachable = |ip: &IpAddr| match ip {
+                IpAddr::V4(ip) => !ip.is_loopback(),
+                IpAddr::V6(ip) => {
+                    !self.config.disable_ipv6
+                        && !ip.is_loopback()
+                        && !ip.is_unspecified()
+                        && !ip.is_unicast_link_local()
+                        && !ip.is_multicast()
+                }
+            };
+            for (name, addr) in interfaces {
+                // Skip common virtual interface prefixes
+                if !reachable(&addr)
+                    || ips.contains(&addr)
+                    || name.starts_with("utun")
+                    || name.starts_with("gif")
+                    || name.starts_with("stf")
+                    || name.starts_with("awdl")
+                    || name.starts_with("llw")
+                {
+                    continue;
+                }
+                ips.push(addr);
+            }
+        }
+        // no_std (embedded) has no interface enumeration, so use the
+        // embedder's local-IP seam (`platform::net`/`set_local_ip_fn`) to
+        // produce a host candidate — otherwise the WebRTC offer carries no
+        // candidates at all.
+        #[cfg(not(feature = "std"))]
+        if let Ok(ip) = get_local_ip() {
+            ips.push(ip);
+        }
+        ips
+    }
+
+    /// Server-reflexive mode (ServerReflexive, WebRTC, non-loopback bind,
+    /// non-relay policy) with an external address configured.
+    fn external_as_srflx(&self, bind_ip: IpAddr) -> bool {
+        self.config.external_ip_candidate_type
+            == crate::config::ExternalIpCandidateType::ServerReflexive
+            && self.config.connectivity() == Connectivity::Ice
+            && self.config.ice_transport_policy == IceTransportPolicy::All
+            && !bind_ip.is_loopback()
+            && !self.config.external_ips.is_empty()
+    }
+
+    /// Push the host candidates for a socket bound at `local_addr` (one per
+    /// family it serves, on its local address), plus each family's external
+    /// address as a server-reflexive candidate on the same socket. Returns
+    /// false when the mode does not apply.
     fn push_host_with_external_srflx(
         &self,
         local_addr: SocketAddr,
         bind_ip: IpAddr,
         tcp_type: Option<TcpType>,
     ) -> bool {
-        let Some(external) = self.external_srflx_ip(bind_ip) else {
+        if !self.external_as_srflx(bind_ip) {
             return false;
-        };
-        let mut host_addr = local_addr;
-        if bind_ip.is_unspecified()
-            && let Ok(local_ip) = get_local_ip()
-        {
-            host_addr.set_ip(local_ip);
         }
-        let mut host = match tcp_type {
-            Some(tcp_type) => IceCandidate::host_tcp(host_addr, 1, tcp_type),
-            None => IceCandidate::host(host_addr, 1),
-        };
-        if host_addr != local_addr {
-            host.related_address = Some(local_addr);
-        }
-        // Base = the socket's own address, as for STUN-learned candidates.
-        let mut srflx = IceCandidate::server_reflexive(
-            local_addr,
-            SocketAddr::new(external, local_addr.port()),
-            1,
-        );
-        if let Some(tcp_type) = tcp_type {
-            srflx = srflx.with_tcp_type(tcp_type);
-            srflx.foundation = IceCandidate::compute_foundation(
-                IceCandidateType::ServerReflexive,
+        for local_ip in self.local_ips(bind_ip) {
+            let host_addr = SocketAddr::new(local_ip, local_addr.port());
+            let mut host = match tcp_type {
+                Some(tcp_type) => IceCandidate::host_tcp(host_addr, 1, tcp_type),
+                None => IceCandidate::host(host_addr, 1),
+            };
+            if host_addr != local_addr {
+                host.related_address = Some(local_addr);
+            }
+            self.push_candidate(host);
+            let Some(external) = self.external_ip_for(local_ip.is_ipv4()) else {
+                continue;
+            };
+            // Base = the socket's own address, as for STUN-learned candidates.
+            let mut srflx = IceCandidate::server_reflexive(
                 local_addr,
-                "tcp",
+                SocketAddr::new(external, local_addr.port()),
+                1,
             );
-            srflx.priority =
-                IceCandidate::priority_for_tcp(IceCandidateType::ServerReflexive, 1, tcp_type);
-        }
-        self.push_candidate(host);
-        if external.is_ipv4() == local_addr.is_ipv4() {
+            if let Some(tcp_type) = tcp_type {
+                srflx = srflx.with_tcp_type(tcp_type);
+                srflx.foundation = IceCandidate::compute_foundation(
+                    IceCandidateType::ServerReflexive,
+                    local_addr,
+                    "tcp",
+                );
+                srflx.priority =
+                    IceCandidate::priority_for_tcp(IceCandidateType::ServerReflexive, 1, tcp_type);
+            }
             self.push_candidate(srflx);
         }
         true
@@ -5149,28 +5336,13 @@ impl IceGatherer {
         if self.push_host_with_external_srflx(local_addr, bind_ip, Some(TcpType::Passive)) {
             return;
         }
-        if let Some(ext_ip) = &self.config.external_ip
-            && let Ok(parsed_ip) = ext_ip.parse::<IpAddr>()
-        {
-            if !bind_ip.is_loopback() {
-                let mut ext_addr = local_addr;
-                ext_addr.set_ip(parsed_ip);
-                let mut cand = IceCandidate::tcp(ext_addr, 1, "passive");
+        for ip in self.advertised_ips(bind_ip) {
+            let addr = SocketAddr::new(ip, local_addr.port());
+            let mut cand = IceCandidate::tcp(addr, 1, "passive");
+            if addr != local_addr {
                 cand.related_address = Some(local_addr);
-                self.push_candidate(cand);
-            } else {
-                self.push_candidate(IceCandidate::tcp(local_addr, 1, "passive"));
             }
-        } else if bind_ip.is_unspecified() {
-            let mut cand_addr = local_addr;
-            if let Ok(local_ip) = get_local_ip() {
-                cand_addr.set_ip(local_ip);
-            }
-            let mut cand = IceCandidate::tcp(cand_addr, 1, "passive");
-            cand.related_address = Some(local_addr);
             self.push_candidate(cand);
-        } else {
-            self.push_candidate(IceCandidate::tcp(local_addr, 1, "passive"));
         }
     }
 
@@ -5283,8 +5455,7 @@ impl IceGatherer {
 
         #[cfg(feature = "std")]
         {
-            let socket = UdpSocket::bind(addr).await?;
-            let socket = Arc::new(socket);
+            let socket = Arc::new(crate::transports::bind_udp(addr)?);
             self.sockets.lock().push(socket.clone());
             Ok(IceSocketWrapper::Udp(socket))
         }
@@ -5504,15 +5675,15 @@ impl IceGatherer {
             ))
         })?;
 
-        let bind_ip = if let Some(bind_ip_str) = &self.config.bind_ip {
-            bind_ip_str
-                .parse::<IpAddr>()
-                .map_err(|e| RtcError::Internal(format!("invalid bind_ip {bind_ip_str}: {e}")))?
-        } else {
-            // Bind on the wildcard so the shared socket accepts on every
-            // interface; the advertised candidate IP is rewritten below.
-            IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED)
-        };
+        // The first bind address; none: the wildcard, so the shared socket
+        // accepts on every interface (the advertised candidate IP is
+        // rewritten below).
+        let bind_ip = self
+            .config
+            .bind_ips
+            .first()
+            .copied()
+            .unwrap_or(IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED));
 
         if self.config.disable_ipv6 && bind_ip.is_ipv6() {
             return Err(RtcError::Internal(format!(
@@ -5542,87 +5713,16 @@ impl IceGatherer {
         *self.shared_udp_socket.lock() = Some(wrapper.clone());
         let _ = self.socket_tx.send(wrapper);
 
-        if self.push_host_with_external_srflx(local_addr, bind_ip, None) {
-            return Ok(());
-        }
-        // Derive the advertised candidate address (mirror the per-IP path).
-        let mut cand_addr = local_addr;
-        if let Some(ext_ip) = &self.config.external_ip
-            && let Ok(parsed_ip) = ext_ip.parse::<IpAddr>()
-        {
-            if !bind_ip.is_loopback() {
-                cand_addr.set_ip(parsed_ip);
+        if !self.push_host_with_external_srflx(local_addr, bind_ip, None) {
+            for cand in self.host_candidates(local_addr, bind_ip, local_addr.port(), 1) {
+                self.push_candidate(cand);
             }
-        } else if bind_ip.is_unspecified()
-            && let Ok(local_ip) = get_local_ip()
-        {
-            cand_addr.set_ip(local_ip);
         }
-
-        let mut cand = IceCandidate::host(cand_addr, 1);
-        if cand_addr != local_addr {
-            cand.related_address = Some(local_addr);
-        }
-        self.push_candidate(cand);
         Ok(())
     }
 
     async fn gather_host_candidates(&self) -> RtcResult<()> {
-        let mut bind_ips = Vec::new();
-
-        if let Some(bind_ip_str) = &self.config.bind_ip {
-            if let Ok(ip) = bind_ip_str.parse::<IpAddr>() {
-                bind_ips.push(ip);
-            }
-        } else if self.config.connectivity().is_direct() {
-            // A direct transport: prefer a LAN IP if available.
-            // Binding to 0.0.0.0 on macOS can lead to "No route to host" (os error 65)
-            // if the destination is on a LAN segment but the OS picks a wrong default interface.
-            if let Ok(ip) = get_local_ip() {
-                bind_ips.push(ip);
-            } else {
-                bind_ips.push(IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED));
-            }
-        } else {
-            // Default: bind to all LAN IPs. Loopback is only added on explicit
-            // opt-in (`ice_include_loopback_candidates`) — advertising 127.0.0.1
-            // to remote peers is useless and wastes their permissions/checks.
-            if self.config.ice_include_loopback_candidates {
-                bind_ips.push(IpAddr::V4(core::net::Ipv4Addr::LOCALHOST));
-            }
-
-            #[cfg(feature = "std")]
-            use local_ip_address::list_afinet_netifas;
-            #[cfg(feature = "std")]
-            if let Ok(interfaces) = list_afinet_netifas() {
-                for (name, addr) in interfaces {
-                    if let IpAddr::V4(ip) = addr
-                        && !ip.is_loopback()
-                        && !bind_ips.contains(&IpAddr::V4(ip))
-                    {
-                        // Skip common virtual interface prefixes
-                        if name.starts_with("utun")
-                            || name.starts_with("gif")
-                            || name.starts_with("stf")
-                            || name.starts_with("awdl")
-                            || name.starts_with("llw")
-                        {
-                            continue;
-                        }
-                        bind_ips.push(IpAddr::V4(ip));
-                    }
-                }
-            }
-
-            // no_std (embedded) has no interface enumeration, so use the
-            // embedder's local-IP seam (`platform::net`/`set_local_ip_fn`) to
-            // produce a host candidate — otherwise the WebRTC offer carries no
-            // candidates at all.
-            #[cfg(not(feature = "std"))]
-            if let Ok(ip) = get_local_ip() {
-                bind_ips.push(ip);
-            }
-        }
+        let bind_ips = self.bind_addresses();
 
         if self.config.ice_udp_mux
             && let Err(e) = self.gather_shared_udp_host_candidate().await
@@ -5642,39 +5742,18 @@ impl IceGatherer {
                     if let Ok(addr) = socket.local_addr() {
                         self.register_bound(&socket);
 
-                        if self.push_host_with_external_srflx(addr, ip, None) {
-                            // host + external server-reflexive pushed
-                        } else if let Some(ext_ip) = &self.config.external_ip
-                            && let Ok(parsed_ip) = ext_ip.parse::<IpAddr>()
-                        {
-                            if !ip.is_loopback() {
-                                let mut ext_addr = addr;
-                                ext_addr.set_ip(parsed_ip);
-                                let mut cand = IceCandidate::host(ext_addr, 1);
-                                cand.related_address = Some(addr);
+                        if !self.push_host_with_external_srflx(addr, ip, None) {
+                            for cand in self.host_candidates(addr, ip, addr.port(), 1) {
                                 self.push_candidate(cand);
-                            } else {
-                                self.push_candidate(IceCandidate::host(addr, 1));
                             }
-                        } else if ip.is_unspecified() {
-                            // If bound to 0.0.0.0 and no external_ip, try to find a reachable local IP for the candidate
-                            let mut cand_addr = addr;
-                            if let Ok(local_ip) = get_local_ip() {
-                                cand_addr.set_ip(local_ip);
-                            }
-                            let mut cand = IceCandidate::host(cand_addr, 1);
-                            cand.related_address = Some(addr);
-                            self.push_candidate(cand);
-                        } else {
-                            self.push_candidate(IceCandidate::host(addr, 1));
                         }
                     }
                 }
                 Err(e) => {
-                    if self.config.bind_ip.is_some() {
+                    if !self.config.bind_ips.is_empty() {
                         debug!(
                             label = self.config.label.as_deref().unwrap_or("-"),
-                            "Failed to bind to requested bind_ip {}: {}", ip, e
+                            "Failed to bind to requested bind_ips {}: {}", ip, e
                         );
                     } else if !ip.is_loopback() && !ip.is_unspecified() {
                         debug!(
@@ -5769,40 +5848,7 @@ impl IceGatherer {
             return Ok(());
         }
 
-        let bind_ips = if let Some(bind_ip_str) = &self.config.bind_ip {
-            if let Ok(ip) = bind_ip_str.parse::<IpAddr>() {
-                vec![ip]
-            } else {
-                return Ok(());
-            }
-        } else {
-            let mut ips = Vec::new();
-            if self.config.ice_include_loopback_candidates {
-                ips.push(IpAddr::V4(core::net::Ipv4Addr::LOCALHOST));
-            }
-            #[cfg(feature = "std")]
-            use local_ip_address::list_afinet_netifas;
-            #[cfg(feature = "std")]
-            if let Ok(interfaces) = list_afinet_netifas() {
-                for (name, addr) in interfaces {
-                    if let IpAddr::V4(ip) = addr
-                        && !ip.is_loopback()
-                        && !ips.contains(&IpAddr::V4(ip))
-                    {
-                        if name.starts_with("utun")
-                            || name.starts_with("gif")
-                            || name.starts_with("stf")
-                            || name.starts_with("awdl")
-                            || name.starts_with("llw")
-                        {
-                            continue;
-                        }
-                        ips.push(IpAddr::V4(ip));
-                    }
-                }
-            }
-            ips
-        };
+        let bind_ips = self.bind_addresses();
 
         // One passive TCP listener per local IP (first free port in range). Binding the
         // entire range per PeerConnection exhausts the pool after a single session.
@@ -6541,7 +6587,15 @@ impl IceSocketWrapper {
         }
     }
 
+    /// Receive one packet. IPv4 sources of a dual-stack socket come as IPv4
+    /// (see [`crate::transports::canonical_addr`]).
     pub async fn recv_from(&self, buf: &mut [u8]) -> RtcResult<(usize, SocketAddr)> {
+        self.recv_from_raw(buf)
+            .await
+            .map(|(len, addr)| (len, crate::transports::canonical_addr(addr)))
+    }
+
+    async fn recv_from_raw(&self, buf: &mut [u8]) -> RtcResult<(usize, SocketAddr)> {
         match self {
             IceSocketWrapper::Platform(s) => s.recv_from(buf).await.map_err(|e| e.into()),
             IceSocketWrapper::Udp(s) => s.recv_from(buf).await.map_err(|e| e.into()),

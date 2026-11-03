@@ -57,6 +57,9 @@ pub static DTLS_MONITOR_ITERATIONS: crate::platform::atomic64::AtomicU64 =
 
 pub mod transports;
 
+#[cfg(all(test, feature = "std"))]
+mod dual_stack_tests;
+
 pub use config::{
     ApplicationCapability, AudioCapability, BundlePolicy, CertificateConfig,
     ExternalIpCandidateType, IceCredentialType, IceServer, IceTcpPolicy, IceTransportPolicy,

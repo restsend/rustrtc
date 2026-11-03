@@ -80,7 +80,7 @@ fn test_config(turn_url: &str, username: &str, password: &str) -> RtcConfigurati
         ice_servers: turn_ice_servers(turn_url, username, password),
         // One host candidate per peer (loopback) so the delayed host path is
         // a single pair, keeping the timing within the nomination grace window.
-        bind_ip: Some("127.0.0.1".to_string()),
+        bind_ips: vec!["127.0.0.1".parse().unwrap()],
         ice_connection_timeout: Duration::from_secs(20),
         ice_disconnect_threshold: Duration::from_secs(10),
         ..Default::default()

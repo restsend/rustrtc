@@ -5749,8 +5749,8 @@ impl PeerConnectionInner {
             desc.session.origin = origin;
         } else {
             desc.session.origin = default_origin();
-            if let Some(ext_ip) = &self.config.external_ip {
-                desc.session.origin.unicast_address = ext_ip.clone();
+            if let Some(&ext_ip) = self.config.external_ips.first() {
+                desc.session.origin.set_unicast_ip(ext_ip);
             }
             desc.session.origin.session_version += 1;
         }
@@ -5764,12 +5764,6 @@ impl PeerConnectionInner {
             desc.session
                 .attributes
                 .push(Attribute::new("msid-semantic", Some("WMS *".into())));
-        }
-
-        if connectivity.is_direct()
-            && let Some(ext_ip) = &self.config.external_ip
-        {
-            desc.session.connection = Some(format!("IN IP4 {}", ext_ip));
         }
 
         for (
@@ -5891,17 +5885,16 @@ impl PeerConnectionInner {
                     };
                     let local = transport.local_addr()?;
                     section.port = local.port();
+                    // The T.38 socket is IPv4 (bound on 0.0.0.0).
                     let ip = self
                         .config
-                        .external_ip
-                        .clone()
-                        .or_else(|| {
-                            crate::transports::get_local_ip()
-                                .ok()
-                                .map(|i| i.to_string())
-                        })
-                        .unwrap_or_else(|| "127.0.0.1".to_string());
-                    section.connection = Some(format!("IN IP4 {}", ip));
+                        .external_ips
+                        .iter()
+                        .copied()
+                        .find(IpAddr::is_ipv4)
+                        .or_else(|| crate::transports::get_local_ip().ok())
+                        .unwrap_or(IpAddr::V4(core::net::Ipv4Addr::LOCALHOST));
+                    section.connection = Some(crate::sdp::connection_address(ip));
                 }
             } else if connectivity == Connectivity::Ice {
                 section.connection = Some("IN IP4 0.0.0.0".to_string());
@@ -5955,15 +5948,10 @@ impl PeerConnectionInner {
                 // direct socket setup publishes candidates synchronously.
                 let _ = self.ice_gathering_state.send(IceGatheringState::Complete);
                 let candidates = section_ice_transport.local_candidates();
-                local_rtcp_addr = section_ice_transport.local_rtcp_addr();
-                if let Some(cand) = candidates
-                    .iter()
-                    .filter(|c| c.component == 1)
-                    .find(|c| !c.address.ip().is_loopback())
-                    .or_else(|| candidates.iter().find(|c| c.component == 1))
-                {
+                if let Some(cand) = section_ice_transport.default_candidate() {
+                    local_rtcp_addr = section_ice_transport.local_rtcp_addr(&cand);
                     section.port = cand.address.port();
-                    let conn = format!("IN IP4 {}", cand.address.ip());
+                    let conn = crate::sdp::connection_address(cand.address.ip());
                     if desc.session.connection.is_none() {
                         desc.session.connection = Some(conn.clone());
                     }
@@ -6158,6 +6146,15 @@ impl PeerConnectionInner {
                 section.port = 0;
             }
             desc.media_sections.push(section);
+        }
+        // A direct transport's session c= is the first section's (set
+        // above). No section set one (all rejected): an external address,
+        // so the description still has a c= for every section.
+        if connectivity.is_direct()
+            && desc.session.connection.is_none()
+            && let Some(&ext_ip) = self.config.external_ips.first()
+        {
+            desc.session.connection = Some(crate::sdp::connection_address(ext_ip));
         }
 
         if !desc.media_sections.is_empty() {
@@ -6840,7 +6837,7 @@ fn default_origin() -> Origin {
     origin.session_id = now;
     origin.session_version = now;
     if let Ok(ip) = get_local_ip() {
-        origin.unicast_address = ip.to_string();
+        origin.set_unicast_ip(ip);
     }
     origin
 }
@@ -9164,6 +9161,11 @@ impl PeerConnection {
     pub fn ice_transport_for_test(&self) -> &crate::transports::ice::IceTransport {
         &self.inner.ice_transport
     }
+
+    /// The primary RTP transport, for unit tests of its media path.
+    pub fn rtp_transport_for_test(&self) -> Option<Arc<RtpTransport>> {
+        self.inner.rtp_transport.lock().clone()
+    }
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -9531,7 +9533,7 @@ mod tests {
             let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let mut config = RtcConfiguration::default();
             config.transport_mode = TransportMode::Rtp;
-            config.bind_ip = Some("127.0.0.1".into());
+            config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
             config.rtcp_mux_policy = crate::RtcpMuxPolicy::Require;
             let pc = PeerConnection::new(config);
             let (_source, track, _feedback) =
@@ -11808,7 +11810,7 @@ a=mid:0
         use crate::TransportMode;
         let mut config = RtcConfiguration::default();
         config.transport_mode = TransportMode::Rtp;
-        config.external_ip = Some("203.0.113.5".to_string());
+        config.external_ips = vec!["203.0.113.5".parse().unwrap()];
 
         let pc = PeerConnection::new(config);
         let transceiver = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
@@ -11848,7 +11850,7 @@ a=mid:0
         use crate::TransportMode;
         let mut config = RtcConfiguration::default();
         config.transport_mode = TransportMode::Rtp;
-        config.external_ip = Some("203.0.113.5".to_string());
+        config.external_ips = vec!["203.0.113.5".parse().unwrap()];
         config.external_port = Some(30000);
 
         let pc = PeerConnection::new(config);
@@ -11954,7 +11956,7 @@ a=mid:0
         use crate::TransportMode;
         let mut config = RtcConfiguration::default();
         config.transport_mode = TransportMode::Rtp;
-        config.external_ip = Some("203.0.113.5".to_string());
+        config.external_ips = vec!["203.0.113.5".parse().unwrap()];
         config.external_port = Some(30000);
         let pc = PeerConnection::new(config);
 
@@ -13517,7 +13519,7 @@ a=mid:0
         let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut config = RtcConfiguration::default();
         config.transport_mode = TransportMode::Rtp;
-        config.bind_ip = Some("127.0.0.1".into());
+        config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
         config.rtcp_mux_policy = crate::RtcpMuxPolicy::Require;
         let pc = PeerConnection::new(config);
         let (source, track, _feedback) = sample_track(crate::media::frame::MediaKind::Audio, 64);
@@ -14439,7 +14441,7 @@ a=sendrecv\r\n"
         config.transport_mode = TransportMode::Srtp;
         config.enable_ice_lite = true;
         config.enable_latching = true;
-        config.bind_ip = Some("127.0.0.1".to_string());
+        config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
         let pc = PeerConnection::new(config);
         let offer = SessionDescription::parse(SdpType::Offer, &remote_offer).unwrap();
         pc.set_remote_description(offer).await.unwrap();
@@ -14802,7 +14804,7 @@ a=rtpmap:8 PCMA/8000\r\n";
         let mut config = RtcConfiguration::default();
         config.transport_mode = TransportMode::Rtp;
         config.enable_latching = true;
-        config.bind_ip = Some("127.0.0.1".to_string());
+        config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
 
         let pc = PeerConnection::new(config);
 
@@ -14893,7 +14895,7 @@ a=rtpmap:8 PCMA/8000\r\n";
         let mut config = RtcConfiguration::default();
         config.transport_mode = TransportMode::Rtp;
         config.enable_latching = true;
-        config.bind_ip = Some("127.0.0.1".to_string());
+        config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
 
         let pc = PeerConnection::new(config);
 
@@ -14973,7 +14975,7 @@ a=rtpmap:8 PCMA/8000\r\n";
         let mut config = RtcConfiguration::default();
         config.transport_mode = TransportMode::Rtp;
         config.enable_latching = true;
-        config.bind_ip = Some("127.0.0.1".to_string());
+        config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
 
         let pc = PeerConnection::new(config);
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 8000);
@@ -15064,7 +15066,7 @@ a=rtpmap:8 PCMA/8000\r\n";
         let mut config = RtcConfiguration::default();
         config.transport_mode = TransportMode::Rtp;
         config.enable_latching = true;
-        config.bind_ip = Some("127.0.0.1".to_string());
+        config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
 
         let pc = PeerConnection::new(config);
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 8000);
@@ -15160,7 +15162,7 @@ a=rtpmap:8 PCMA/8000\r\n";
 
         let mut config = RtcConfiguration::default();
         config.transport_mode = TransportMode::Rtp;
-        config.bind_ip = Some("127.0.0.1".to_string());
+        config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
 
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::RecvOnly);
@@ -16121,7 +16123,7 @@ a=mid:0
         let mut config = RtcConfiguration::default();
         config.transport_mode = TransportMode::Rtp;
         config.enable_latching = true;
-        config.bind_ip = Some("127.0.0.1".to_string());
+        config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
 
         let pc = PeerConnection::new(config);
 

@@ -19,7 +19,7 @@ fn external() -> IpAddr {
 
 fn config(typ: Option<ExternalIpCandidateType>) -> RtcConfiguration {
     let mut config = RtcConfiguration {
-        external_ip: Some(EXTERNAL.to_string()),
+        external_ips: vec![EXTERNAL.parse().unwrap()],
         ..RtcConfiguration::default()
     };
     if let Some(typ) = typ {
@@ -46,6 +46,10 @@ async fn gather(config: RtcConfiguration, transport: &str) -> Result<Vec<IceCand
         .local_candidates()
         .into_iter()
         .filter(|c| c.transport == transport && !c.address.ip().is_loopback())
+        // The IPv4 candidates: an external address maps only its own family.
+        // IPv6 interfaces (gathered too) keep their addresses; the
+        // dual-stack unit tests cover them.
+        .filter(|c| c.address.is_ipv4())
         .collect())
 }
 
@@ -95,7 +99,7 @@ async fn server_reflexive_keeps_the_passive_tcp_host_candidate() -> Result<()> {
         .ice_transport()
         .local_candidates()
         .into_iter()
-        .filter(|c| !c.address.ip().is_loopback())
+        .filter(|c| !c.address.ip().is_loopback() && c.address.is_ipv4())
         .collect();
     let tcp: Vec<IceCandidate> = all
         .iter()
@@ -174,7 +178,7 @@ fn assert_host_and_srflx(candidates: Vec<IceCandidate>) {
 #[tokio::test]
 async fn peers_connect_over_the_host_candidate() -> Result<()> {
     let pc1 = PeerConnection::new(RtcConfiguration {
-        external_ip: Some(EXTERNAL.to_string()),
+        external_ips: vec![EXTERNAL.parse().unwrap()],
         external_ip_candidate_type: ExternalIpCandidateType::ServerReflexive,
         ..RtcConfiguration::default()
     });
@@ -219,12 +223,12 @@ async fn server_reflexive_with_mdns_obfuscates_only_the_host() -> Result<()> {
     Ok(())
 }
 
-/// An `external_ip` of the other address family is never paired with the
-/// socket: the host candidate alone is advertised.
+/// An external address of the other family is never paired with an IPv4
+/// socket: its host candidate alone is advertised.
 #[tokio::test]
 async fn server_reflexive_skips_an_external_ip_of_the_other_family() -> Result<()> {
     let config = RtcConfiguration {
-        external_ip: Some("2001:db8::5".to_string()),
+        external_ips: vec!["2001:db8::5".parse().unwrap()],
         external_ip_candidate_type: ExternalIpCandidateType::ServerReflexive,
         ..RtcConfiguration::default()
     };

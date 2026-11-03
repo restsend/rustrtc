@@ -102,7 +102,10 @@ impl SharedUdpPort {
                             if len == 0 {
                                 continue;
                             }
-                            port.dispatch(&buf[..len], peer_addr);
+                            port.dispatch(
+                                &buf[..len],
+                                crate::transports::canonical_addr(peer_addr),
+                            );
                         }
                         Err(e) => {
                             if port.shutting_down.load(Ordering::Relaxed) {
@@ -312,7 +315,7 @@ pub(crate) async fn acquire(
         // Platform socket adapter — `acquire` is std-gated until then.
         #[cfg(feature = "std")]
         let socket: Arc<dyn UdpSocket> = {
-            let sock = tokio::net::UdpSocket::bind(bind_addr).await.map_err(|e| {
+            let sock = crate::transports::bind_udp(bind_addr).map_err(|e| {
                 RtcError::Internal(format!("bind shared UDP socket {bind_addr}: {e}"))
             })?;
             Arc::new(tokio_impl::TokioUdpSocket::new(sock))
