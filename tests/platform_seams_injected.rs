@@ -24,16 +24,20 @@ fn keep(fut: BoxedTask) {
     std::mem::forget(fut);
 }
 
+/// The task spawner is process-global state (`platform::task::SPAWN_FN`), and
+/// sibling tests in this binary run in parallel — the same constraint that
+/// keeps the sleep-seam contract in a single test. Both spawner shapes are
+/// therefore exercised in ONE serial test: install `set_spawn_fn`, assert the
+/// fn-pointer path, then install `set_spawner` and assert the dyn path sees
+/// every spawn (a parallel sibling could otherwise overwrite the spawner
+/// between install and spawn and silently swallow the COUNT increments).
 #[test]
-fn spawn_via_set_spawn_fn_stores_tasks() {
+fn spawn_seams_fn_and_dyn_both_reach_the_spawner() {
     set_spawn_fn(keep);
     spawn(async {
         // never polled — just must not panic
     });
-}
 
-#[test]
-fn spawn_via_set_spawner_dyn_counts_tasks() {
     static COUNT: AtomicU32 = AtomicU32::new(0);
     // Closure capturing only a static → &'static coercion works, which is
     // what an embassy-executor adapter needs.
