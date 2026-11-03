@@ -108,91 +108,40 @@ The no_std wall clock is a logical clock (`platform::time::advance_ms` /
 DER (`Certificate::from_pkcs8_der`) — there is no certificate generation
 without `std`.
 
-## Benchmark (rustrtc vs webrtc-rs & pion) in 0.3.141
+## Benchmark (rustrtc vs webrtc-rs & pion) in 0.5.0
 
 **CPU:** `Intel(R) Core(TM) i7-9700T CPU @ 2.00GHz` (8 cores)  
 **OS:** `Debian 13, 6.12.101+deb13-amd64`  
-**Compiler:** `rustc 1.97.1 (8bab26f4f 2026-07-14)`, `go version go1.24.4 linux/amd64`
+**Compiler:** `rustc 1.99.0`, `go version go1.24.4 linux/amd64`  
+**Method:** `cargo run -r --example benchmark`, median of 3 runs (the host is a
+shared CI box, so the per-run `rustrtc/webrtc` ratio is the load-independent
+signal). Same host, script and peers as the 0.3.141 numbers published earlier.
 
 ```shell
-cargo run -r --example benchmark
-
-Comparison (Baseline: webrtc)
+Comparison (Baseline: webrtc) — median of 3
 Metric               | webrtc     | rustrtc    | pion      
 --------------------------------------------------------------------------------
-Duration (s)         | 10.07      | 10.24      | 10.07     
-Setup Latency (ms)   | 25.64      | 0.45       | 3.00      
-Throughput (MB/s)    | 165.98     | 549.04     | 169.58    
-Msg Rate (msg/s)     | 169967.13  | 562214.36  | 173647.96 
-CPU Usage (%)        | 677.95     | 739.62     | 555.20    
-Memory (MB)          | 44.00      | 21.00      | 48.00     
+Setup Latency (ms)   | 2.14       | 0.61       | 4.00      
+Throughput (MB/s)    | 104.28     | 504.51     | 132.57    
+Msg Rate (msg/s)     | 106783.25  | 516615.42  | 135748.96 
+CPU Usage (%)        | 487.40     | 580.55     | 547.40    
+Memory (MB)          | 42.00      | 21.00      | 47.00     
 --------------------------------------------------------------------------------
-
-Performance Charts
-==================
-
-Throughput (MB/s) (Higher is better)
-webrtc     | ████████████                             165.98
-rustrtc    | ████████████████████████████████████████ 549.04
-pion       | ████████████                             169.58
-
-Message Rate (msg/s) (Higher is better)
-webrtc     | ████████████                             169967.13
-rustrtc    | ████████████████████████████████████████ 562214.36
-pion       | ████████████                             173647.96
-
-Setup Latency (ms) (Lower is better)
-webrtc     | ████████████████████████████████████████ 25.64
-rustrtc    |                                          0.45
-pion       | ████                                     3.00
-
-CPU Usage (%) (Lower is better)
-webrtc     | ████████████████████████████████████     677.95
-rustrtc    | ████████████████████████████████████████ 739.62
-pion       | ████████████████████████████████████████ 555.20
-
-Memory (MB) (Lower is better)
-webrtc     | ████████████████████████████████████████ 44.00
-rustrtc    | █████████████████                        21.00
-pion       | ████████████████████████████████████████ 48.00
 ```
 
 **Key Findings:**
 
-- **Throughput**: `rustrtc` is ~3.3× faster than `webrtc-rs` and ~3.2× faster than `pion`.
-- **Memory**: `rustrtc` uses ~52% less memory than `webrtc-rs` and ~56% less than `pion`.
-- **Setup latency**: 0.45 ms — orders of magnitude faster than `webrtc-rs` (25.6 ms) and ~6.7×
-  faster than `pion` (3.0 ms).
-- **Efficiency per CPU**: 0.74 MB/s per CPU-percent vs 0.31 (pion) and 0.24 (webrtc-rs) —
-  `rustrtc` delivers ~2.3× more throughput per unit of CPU.
+- **Throughput**: `rustrtc` is ~4.8× faster than `webrtc-rs` and ~3.8× faster than
+  `pion` (per-run ratios: 3.87–5.12× and 3.05–3.84×).
+- **Memory**: `rustrtc` uses ~50% less memory than both peers.
+- **Setup latency**: 0.61 ms — ~3.5× faster than `webrtc-rs` (2.14 ms) and ~6.6×
+  faster than `pion` (4.0 ms).
+- **Efficiency per CPU**: 0.87 MB/s per CPU-percent vs 0.24 (pion) and 0.21
+  (webrtc-rs) — `rustrtc` delivers ~3.6× more throughput per unit of CPU.
+- **Stable across releases**: the `webrtc-rs` ratio series is 2.95× (0.3.114) →
+  3.3× (0.3.141) → **3.9× (0.5.0)**, with the TWCC/GCC pipeline active in every run.
 
-**No regression with the new stack:** this run has the TWCC/GCC pipeline **active**
-(`enable_gcc = true`: transport-cc sequence stamping on every outbound packet plus
-receiver-side TWCC feedback generation), and throughput still holds 3.3× / 3.2× over
-`webrtc-rs` / `pion`. ICE restart, mDNS candidate obfuscation, and the VP9 codec are
-likewise pure add-ons — the ratios above are the stable signal across releases
-(0.3.114: 2.95× / 2.7×; 0.3.141: 3.3× / 3.2×).
-
-## Benchmark update in 0.5.0 (SRTP/SCTP crypto overhaul)
-
-Same host (`Intel(R) Core(TM) i7-9700T`, Debian 13, same script — `cargo run -r --example
-benchmark`), same peers (webrtc-rs 0.17 / pion via go1.24.4), **median of 3 runs**; the
-host is a shared CI box, so the per-run `rustrtc/webrtc` ratio is the load-independent
-signal:
-
-| Metric              | 0.3.141 (README above) | 0.5.0 (median of 3) |
-|---------------------|------------------------|---------------------|
-| Throughput (MB/s)   | 549.04                 | **504.51** (403.77–577.78) |
-| vs `webrtc-rs`      | 3.31×                  | **3.92×** (3.87–5.12) |
-| vs `pion`           | 3.25×                  | **~3.7×** (3.05–3.84) |
-| MB/s per CPU%       | 0.74                   | **0.86** |
-| Setup latency (ms)  | 0.45                   | 0.50–0.61 (same) |
-| Memory (MB)         | 21                     | 20–22 (same) |
-
-The ratio series across releases stays monotonic: **2.95× (0.3.114) → 3.3× (0.3.141) →
-3.9× (0.5.0)**.
-
-### What changed under the hood
+### What changed under the hood in 0.5.0
 
 - **SRTP GCM on aarch64 runs hardware AES now**: `aes-gcm` was pinned to `aes 0.8`,
   which has no aarch64 hardware backend — every GCM packet ran fixslice software AES
@@ -207,7 +156,7 @@ The ratio series across releases stays monotonic: **2.95× (0.3.114) → 3.3× (
   rejected before any crypto work (`SrtpError::ReplayRejected`), with the window
   committed only after authentication so forged indices cannot poison it. Overhead
   below measurement noise.
-- **Datachannel throughput doubled** on the same host: SCTP benchmark 102 → 201 MB/s
+- **Datachannel throughput doubled** on this host: SCTP benchmark 102 → 201 MB/s
   (1 GB over a loopback WebRTC association), from the same record-layer crypto fix.
 - **Connection setup**: the DTLS certificate is generated once per process
   (was per PeerConnection) — 0.38 ms → 8.8 µs per connection (43×).
@@ -215,13 +164,12 @@ The ratio series across releases stays monotonic: **2.95× (0.3.114) → 3.3× (
 Micro-benchmarks live in `examples/`: `gcm_backend_bench` (SRTP crypto backends,
 session roundtrip, frame batch), `sctp_benchmark` (datachannel throughput),
 `cert_cache_bench` (setup), `aes_block_probe` / `dual_stack_probe` (platform probes).
-
 ## Usage
 
 Here is a simple example of how to create a `PeerConnection` and handle an offer:
 
 ```rust
-use rustrtc::{PeerConnection, RtcConfiguration, SessionDescription, SdpType};
+use rustrtc::{PeerConnection, RtcConfiguration};
 
 #[tokio::main]
 async fn main() {
@@ -242,7 +190,7 @@ async fn main() {
     });
 
     // Create an offer
-    let offer = pc.create_offer().unwrap();
+    let offer = pc.create_offer().await.unwrap();
     pc.set_local_description(offer).unwrap();
 
     // Wait for ICE gathering to complete
@@ -263,9 +211,9 @@ All configuration goes through `RtcConfiguration` (or its builder `RtcConfigurat
 - **`ice_servers`** — STUN/TURN server list.
 - **`ice_transport_policy`** — `All` or `Relay`.
 - **`rtp_start_port` / `rtp_end_port`** — Restrict RTP/ICE to a port range.
-- **`external_ip`** — Override the external IP for ICE candidates (NAT scenarios).
-- **`external_ip_candidate_type`** — How ICE advertises `external_ip`: `Host` (default) replaces the host candidate's address; `ServerReflexive` keeps the host candidate and adds `external_ip` as a srflx candidate on the same socket (1:1 NAT, RFC 8445 §5.1.1.2). WebRTC mode only.
-- **`bind_ip`** — Bind to a specific local IP.
+- **`external_ips`** — Public addresses to advertise instead of the local ones (1:1 NAT, a router that forwards the RTP ports), at most one per family (IPv4 + IPv6). A candidate takes the external address of its family, and so do `c=` and `o=`; a family with none advertises the local address.
+- **`external_ip_candidate_type`** — How ICE advertises `external_ips`: `Host` (default) replaces the host candidate's address; `ServerReflexive` keeps the host candidate and adds the external address as a srflx candidate on the same socket (1:1 NAT, RFC 8445 §5.1.1.2). WebRTC mode only.
+- **`bind_ips`** — Local addresses to bind media sockets on, one socket each (e.g. `["::"]` for one dual-stack socket, or `["127.0.0.1", "::1"]` for one socket per family). Empty: chosen automatically (WebRTC: every interface; RTP and SRTP: the default route's address).
 - **`disable_ipv6`** — Disable IPv6 candidate gathering.
 - **`enable_ice_lite`** — Enable ICE Lite mode.
 - **`ice_tcp_policy`** — `IceTcpPolicy::Disabled` (default), `IceTcpPolicy::Enabled`, or `IceTcpPolicy::PassiveOnly`. Controls ICE TCP candidate support per RFC 6544.
@@ -470,26 +418,3 @@ Streams a video file (`examples/static/output.ivf`) via RTP to a UDP port, which
 ## License
 
 This project is licensed under the MIT License.
-
-### Optional packet-stage diagnostics
-
-Enable the `diagnostics` Cargo feature to record packet-stage counts, bytes and
-monotonic first/last observation ages. `PeerConnection::packet_diagnostics()`
-returns typed ICE, TURN, DTLS-state, RTP/SRTP, listener and send observations.
-`IceTransport::diagnostic_snapshot()` and `RtpTransport::diagnostic_snapshot()`
-provide JSON views of the same counters for existing consumers.
-
-Detailed recording is off by default: stage counters have no clock or atomic
-updates, TURN history is empty, and deferred-send observation is inactive.
-Snapshots report `enabled: false`; existing transport totals remain available.
-When enabled, recording adds clock reads and relaxed atomic updates at packet
-boundaries. Snapshots are cumulative observations, not atomic transactions across
-stages. They do not include payloads, keys, ICE credentials or TURN auth data.
-TURN history retains at most eight request attempts.
-
-Diagnostics never emit logs or run a polling task. Consumers choose when to read
-and must rate-limit their own output. The optional deferred-send observer is
-invoked only after `mark_stopping()` and must remain nonblocking, rate-limit any
-output and avoid retaining its owning connection or transport. It observes
-completion without delaying, draining or cancelling sends. Recording is independent
-of codec, application, call-center policy and deployment environment.
