@@ -41,6 +41,17 @@ impl StunMessage {
         }
     }
 
+    /// An error response to a Binding request (RFC 8489 §14.8 ERROR-CODE),
+    /// e.g. 487 Role Conflict (RFC 8445 §7.3.1.1).
+    pub fn binding_error_response(transaction_id: [u8; 12], code: u16, reason: &str) -> Self {
+        Self {
+            class: StunClass::ErrorResponse,
+            method: StunMethod::Binding,
+            transaction_id,
+            attributes: vec![StunAttribute::ErrorCode(code, reason.to_string())],
+        }
+    }
+
     pub fn allocate_request(transaction_id: [u8; 12], attributes: Vec<StunAttribute>) -> Self {
         Self {
             class: StunClass::Request,
@@ -94,6 +105,8 @@ pub enum StunAttribute {
     XorMappedAddress(SocketAddr),
     ChannelNumber(u16),
     Data(Vec<u8>),
+    /// ERROR-CODE: the code (300..=699) and its reason phrase.
+    ErrorCode(u16, String),
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +122,10 @@ pub struct StunDecoded {
     pub nonce: Option<String>,
     pub data: Option<Vec<u8>>,
     pub use_candidate: bool,
+    /// The tie-breaker of ICE-CONTROLLING: the sender checks as controlling.
+    pub ice_controlling: Option<u64>,
+    /// The tie-breaker of ICE-CONTROLLED: the sender checks as controlled.
+    pub ice_controlled: Option<u64>,
     /// Value of the LIFETIME attribute (0x000D), if present (TURN Allocate /
     /// Refresh responses). Honored per RFC 5766 §2.2 — the server may grant a
     /// lifetime shorter than the one requested by the client.
@@ -226,6 +243,12 @@ fn append_attribute(buffer: &mut Vec<u8>, attr: &StunAttribute, tx_id: &[u8; 12]
             buffer.extend_from_slice(&[0u8; 2]); // Padding
         }
         StunAttribute::Data(value) => append_raw_attribute(buffer, 0x0013, value),
+        StunAttribute::ErrorCode(code, reason) => {
+            let mut value = vec![0, 0, (code / 100) as u8, (code % 100) as u8];
+            value.extend_from_slice(reason.as_bytes());
+            append_raw_attribute(buffer, 0x0009, &value);
+            return;
+        }
     }
     pad_four_bytes(buffer);
 }
@@ -328,6 +351,8 @@ fn decode_stun_message(bytes: &[u8]) -> RtcResult<StunDecoded> {
     let mut nonce = None;
     let mut data = None;
     let mut use_candidate = false;
+    let mut ice_controlling = None;
+    let mut ice_controlled = None;
     let mut lifetime = None;
     while offset + 4 <= bytes.len() {
         let typ = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
@@ -381,6 +406,16 @@ fn decode_stun_message(bytes: &[u8]) -> RtcResult<StunDecoded> {
             0x0025 => {
                 use_candidate = true;
             }
+            0x802A | 0x8029 if value.len() == 8 => {
+                let mut tie_breaker = [0u8; 8];
+                tie_breaker.copy_from_slice(value);
+                let tie_breaker = Some(u64::from_be_bytes(tie_breaker));
+                if typ == 0x802A {
+                    ice_controlling = tie_breaker;
+                } else {
+                    ice_controlled = tie_breaker;
+                }
+            }
             _ => {}
         }
         offset += len;
@@ -398,6 +433,8 @@ fn decode_stun_message(bytes: &[u8]) -> RtcResult<StunDecoded> {
         nonce,
         data,
         use_candidate,
+        ice_controlling,
+        ice_controlled,
         lifetime,
     })
 }
@@ -515,5 +552,32 @@ mod tests {
             0x90, 0x70, 0x1c, 0x9d, 0xb4, 0xd9,
         ];
         assert_eq!(hmac_sha1(key, data), expected);
+    }
+
+    /// ERROR-CODE and the ICE role attributes round-trip; the error
+    /// response is a Binding error response (class 0x0110).
+    #[test]
+    fn test_role_conflict_error_and_role_attributes() {
+        let id = [7u8; 12];
+        let bytes = StunMessage::binding_error_response(id, 487, "Role Conflict")
+            .encode(Some(b"pwd"), true)
+            .unwrap();
+        assert_eq!(u16::from_be_bytes([bytes[0], bytes[1]]), 0x0111);
+        let decoded = StunMessage::decode(&bytes).unwrap();
+        assert_eq!(decoded.class, StunClass::ErrorResponse);
+        assert_eq!(decoded.method, StunMethod::Binding);
+        assert_eq!(decoded.error_code, Some(487));
+
+        let mut request = StunMessage::binding_request(id, None);
+        request.attributes = vec![StunAttribute::IceControlled(0x0102_0304_0506_0708)];
+        let decoded = StunMessage::decode(&request.encode(None, false).unwrap()).unwrap();
+        assert_eq!(decoded.ice_controlled, Some(0x0102_0304_0506_0708));
+        assert_eq!(decoded.ice_controlling, None);
+        request.attributes = vec![StunAttribute::IceControlling(9)];
+        let decoded = StunMessage::decode(&request.encode(None, false).unwrap()).unwrap();
+        assert_eq!(
+            (decoded.ice_controlling, decoded.ice_controlled),
+            (Some(9), None)
+        );
     }
 }

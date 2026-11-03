@@ -3727,6 +3727,28 @@ async fn handle_stun_request(
     addr: SocketAddr,
     inner: Arc<IceTransportInner>,
 ) {
+    // Role conflict (RFC 8445 §7.3.1.1). An ICE-lite agent is always
+    // controlled (§6.1.1), so a full agent must control it. One that checks
+    // as controlled too (mediastreamer2 keeps that role when it answers our
+    // offer, ignoring a=ice-lite) gets 487 Role Conflict: it takes the
+    // controlling role (§7.2.5.1), checks again and nominates. Else nobody
+    // nominates, and the media path stays the c= one.
+    if inner.config.connectivity() == Connectivity::IceLite && msg.ice_controlled.is_some() {
+        let response =
+            StunMessage::binding_error_response(msg.transaction_id, 487, "Role Conflict");
+        let password = inner.local_parameters.lock().password.clone();
+        if let Ok(bytes) = response.encode(Some(password.as_bytes()), true)
+            && let Err(e) = sender.send_to(&bytes, addr).await
+        {
+            debug!("Failed to send STUN 487 to {}: {}", addr, e);
+        }
+        debug!(
+            "ICE-lite: 487 Role Conflict to a controlled check from {}",
+            addr
+        );
+        return;
+    }
+
     let response = StunMessage::binding_success_response(msg.transaction_id, addr);
 
     #[cfg(any(test, feature = "simulator"))]
