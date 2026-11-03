@@ -661,103 +661,17 @@ pub mod task {
 
     /// Spawns a detached task through the injected spawner. Panics if the
     /// embedder never installed one.
-    ///
-    /// NOTE(leak-diag, local patch): the future is wrapped in [`Tracked`] so
-    /// `task_stats()` / `task_loc_stats()` can report detached tasks that
-    /// never complete — on this backend spawn has no abort, so a parked task
-    /// keeps its buffers forever. Upstreamable as a diagnostic.
-    #[track_caller]
     pub fn spawn<F>(fut: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let loc = core::panic::Location::caller();
         let spawner = SPAWN_FN.lock();
         let Some(spawner) = spawner.as_ref() else {
             panic!("platform::task::set_spawn_fn not called");
         };
         match spawner {
-            Spawner::Fn(f) => f(Box::new(Tracked::new(Box::new(fut), (loc.file(), loc.line())))),
-            Spawner::Dyn(f) => f(Box::new(Tracked::new(Box::new(fut), (loc.file(), loc.line())))),
-        }
-    }
-
-    static TASKS_SPAWNED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-    static TASKS_LIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-    /// `(spawned, live)` detached-task counters. `live > 0` after a call's
-    /// teardown means a spawned future parked forever (no abort on this
-    /// backend) and its captured buffers are retained.
-    pub fn task_stats() -> (usize, usize) {
-        use core::sync::atomic::Ordering;
-        (
-            TASKS_SPAWNED.load(Ordering::Relaxed),
-            TASKS_LIVE.load(Ordering::Relaxed),
-        )
-    }
-
-    /// Per-callsite live-task counts (leak-diag, local patch).
-    pub fn task_loc_stats() -> alloc::vec::Vec<(&'static str, u32, usize)> {
-        LOC_TABLE
-            .lock()
-            .iter()
-            .map(|e| (e.0, e.1, e.2))
-            .collect()
-    }
-
-    fn loc_add(file: &'static str, line: u32) {
-        let mut t = LOC_TABLE.lock();
-        for e in t.iter_mut() {
-            if e.0 == file && e.1 == line {
-                e.2 += 1;
-                return;
-            }
-        }
-        t.push((file, line, 1));
-    }
-
-    fn loc_sub(file: &'static str, line: u32) {
-        let mut t = LOC_TABLE.lock();
-        for e in t.iter_mut() {
-            if e.0 == file && e.1 == line {
-                e.2 -= 1;
-                return;
-            }
-        }
-    }
-
-    type LocTable = alloc::vec::Vec<(&'static str, u32, usize)>;
-    static LOC_TABLE: crate::platform::sync::Mutex<LocTable> =
-        crate::platform::sync::Mutex::new(alloc::vec::Vec::new());
-
-    /// Wraps a spawned task to observe completion (leak-diag, local patch).
-    struct Tracked(Pin<Box<dyn Future<Output = ()> + Send>>, (&'static str, u32));
-
-    impl Tracked {
-        fn new(t: Box<dyn Future<Output = ()> + Send>, loc: (&'static str, u32)) -> Self {
-            use core::sync::atomic::Ordering;
-            TASKS_SPAWNED.fetch_add(1, Ordering::Relaxed);
-            TASKS_LIVE.fetch_add(1, Ordering::Relaxed);
-            loc_add(loc.0, loc.1);
-            Self(Pin::from(t), loc)
-        }
-    }
-
-    impl Future for Tracked {
-        type Output = ();
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            match self.0.as_mut().poll(cx) {
-                Poll::Ready(()) => {
-                    core::sync::atomic::AtomicUsize::fetch_sub(
-                        &TASKS_LIVE,
-                        1,
-                        core::sync::atomic::Ordering::Relaxed,
-                    );
-                    loc_sub(self.1.0, self.1.1);
-                    Poll::Ready(())
-                }
-                Poll::Pending => Poll::Pending,
-            }
+            Spawner::Fn(f) => f(Box::new(fut)),
+            Spawner::Dyn(f) => f(Box::new(fut)),
         }
     }
 
