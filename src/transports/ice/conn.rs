@@ -752,6 +752,15 @@ impl IceConn {
 
     fn do_try_send(&self, socket: IceSocketWrapper, buf: &[u8]) -> RtcResult<usize> {
         let remote = *self.remote_addr.read();
+        self.do_try_send_to(socket, buf, remote)
+    }
+
+    fn do_try_send_to(
+        &self,
+        socket: IceSocketWrapper,
+        buf: &[u8],
+        remote: SocketAddr,
+    ) -> RtcResult<usize> {
         if remote.port() == 0 {
             return Err(RtcError::Internal(format!("Remote address not set")));
         }
@@ -895,39 +904,47 @@ impl IceConn {
         }
     }
 
-    pub async fn send_rtcp(&self, buf: &[u8]) -> RtcResult<usize> {
+    /// The socket and address for RTCP: without rtcp-mux, the RTCP socket
+    /// and the peer's RTCP address; else the RTP ones.
+    fn rtcp_route(&self) -> (Option<IceSocketWrapper>, SocketAddr) {
         let rtcp_addr = *self.remote_rtcp_addr.read();
-        let remote = if let Some(rtcp_addr) = rtcp_addr {
-            rtcp_addr
-        } else {
-            *self.remote_addr.read()
-        };
-
-        if remote.port() == 0 {
-            return Err(RtcError::Internal(format!("Remote address not set")));
-        }
-
+        let remote = rtcp_addr.unwrap_or_else(|| *self.remote_addr.read());
         #[allow(unused_mut)]
         let mut socket_rx = if rtcp_addr.is_some() {
             self.rtcp_socket_rx.clone()
         } else {
             self.socket_rx.clone()
         };
-        let mut socket_opt = socket_rx.borrow().clone();
-        if socket_opt.is_none() {
-            socket_opt = socket_rx.borrow_and_update().clone();
+        let mut socket = socket_rx.borrow().clone();
+        if socket.is_none() {
+            socket = socket_rx.borrow_and_update().clone();
         }
-
-        if socket_opt.is_none() && rtcp_addr.is_some() {
+        if socket.is_none() && rtcp_addr.is_some() {
             #[allow(unused_mut)]
             let mut fallback_rx = self.socket_rx.clone();
-            socket_opt = fallback_rx.borrow().clone();
-            if socket_opt.is_none() {
-                socket_opt = fallback_rx.borrow_and_update().clone();
+            socket = fallback_rx.borrow().clone();
+            if socket.is_none() {
+                socket = fallback_rx.borrow_and_update().clone();
             }
         }
+        (socket, remote)
+    }
 
-        if let Some(socket) = socket_opt {
+    /// [`Self::send_rtcp`] without waiting (the close path): the same
+    /// socket and address.
+    pub fn try_send_rtcp(&self, buf: &[u8]) -> RtcResult<usize> {
+        match self.rtcp_route() {
+            (Some(socket), remote) => self.do_try_send_to(socket, buf, remote),
+            (None, _) => Err(RtcError::Internal("No selected socket".into())),
+        }
+    }
+
+    pub async fn send_rtcp(&self, buf: &[u8]) -> RtcResult<usize> {
+        let (socket, remote) = self.rtcp_route();
+        if remote.port() == 0 {
+            return Err(RtcError::Internal(format!("Remote address not set")));
+        }
+        if let Some(socket) = socket {
             let n = socket.send_to(buf, remote).await?;
             self.tx_packets.fetch_add(1, Ordering::Relaxed);
             self.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
