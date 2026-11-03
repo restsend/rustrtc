@@ -967,7 +967,44 @@ impl RtpTransport {
     }
 
     /// Returns `Ok(0)` without sending while the direction stops this SSRC.
-    pub async fn send_rtp(&self, mut packet: RtpPacket) -> RtcResult<usize> {
+    pub async fn send_rtp(&self, packet: RtpPacket) -> RtcResult<usize> {
+        self.send_prepared_rtp(packet, None).await
+    }
+
+    /// Zero-allocation variant of [`send_rtp`]: SRTP-protects the packet into
+    /// `output` (caller-owned, sized `srtp.protected_rtp_len(&packet)`) and
+    /// sends it. This is the primitive for frame-scoped batch senders: fill
+    /// one buffer per RTP packet (e.g. slots backing a `sendmmsg` iovec
+    /// array), call once per slot, never touch the allocator on the hot path.
+    ///
+    /// Returns `Ok(0)` without sending while the direction stops this SSRC.
+    pub async fn send_rtp_into(&self, packet: RtpPacket, output: &mut [u8]) -> RtcResult<usize> {
+        self.send_prepared_rtp(packet, Some(output)).await
+    }
+
+    /// Run `f` with the SRTP session locked exactly once — the batch
+    /// primitive behind frame-scoped sends. Use with
+    /// [`SrtpSession::protect_rtp`](crate::srtp::SrtpSession::protect_rtp)
+    /// writing into caller-owned buffers; per-packet cost is then just the
+    /// context lookup plus crypto.
+    ///
+    /// Returns `None` when no SRTP session is established yet; callers check
+    /// [`RtpTransport::has_srtp`](Self::has_srtp) / `srtp_required` policy for
+    /// whether that means buffer-and-retry or drop.
+    pub fn with_srtp_session<R>(&self, f: impl FnOnce(&mut SrtpSession) -> R) -> Option<R> {
+        let session = self.srtp_session.lock().as_ref().cloned()?;
+        let mut srtp = session.lock();
+        Some(f(&mut srtp))
+    }
+
+    /// Shared tail of [`send_rtp`] / [`send_rtp_into`]: direction policy,
+    /// egress hooks, first-packet marker, abs-send-time injection, SRTP
+    /// protect (into the caller buffer when given) and the transport send.
+    async fn send_prepared_rtp(
+        &self,
+        mut packet: RtpPacket,
+        output: Option<&mut [u8]>,
+    ) -> RtcResult<usize> {
         if !self.rtp_send_allowed_for(packet.header.ssrc) {
             return Ok(0);
         }
@@ -993,43 +1030,69 @@ impl RtpTransport {
             }
         }
 
-        let protected = {
-            // Release the outer guard immediately; the inner SRTP guard is
-            // dropped after protection and before awaiting the transport send.
+        enum SendBuf<'a> {
+            Caller(&'a mut [u8]),
+            Owned(Vec<u8>),
+        }
+
+        // Protect with the SRTP guard held; the guard is dropped before the
+        // awaited transport send below.
+        // The session Arc lives only inside this block so it is released
+        // before the awaited transport send below (key material must not
+        // outlive protection by a network RTT when the peer is closing).
+        let (send_buf, protected_len): (SendBuf<'_>, usize) = {
             let session = self.srtp_session.lock().as_ref().cloned();
-            match session {
-                Some(session) => {
-                    let mut srtp = session.lock();
-                    let mut protected = vec![0; srtp.protected_rtp_len(&packet)];
-                    srtp.protect_rtp(&packet, &mut protected).inspect_err(|_| {
+            if let Some(session) = session.as_ref() {
+            let mut srtp = session.lock();
+            let len = srtp.protected_rtp_len(&packet);
+            match output {
+                Some(out) => {
+                    if out.len() != len {
+                        return Err(RtcError::InvalidState(format!(
+                            "send_rtp_into: buffer size mismatch, need {len} bytes, got {}",
+                            out.len()
+                        )));
+                    }
+                    srtp.protect_rtp(&packet, out).inspect_err(|_| {
                         self.srtp_protect_failures.fetch_add(1, Ordering::Relaxed);
                     })?;
-                    protected
+                    (SendBuf::Caller(out), len)
                 }
                 None => {
-                    if self.srtp_required {
-                        self.srtp_dropped_no_session.fetch_add(1, Ordering::Relaxed);
-                        debug!(
-                            "RtpTransport: SRTP required but session not ready, dropping RTP send"
-                        );
-                        return Err(RtcError::InvalidState(
-                            "SRTP required but session not ready".into(),
-                        ));
-                    }
-                    packet.marshal()?
+                    let mut owned = vec![0; len];
+                    srtp.protect_rtp(&packet, &mut owned).inspect_err(|_| {
+                        self.srtp_protect_failures.fetch_add(1, Ordering::Relaxed);
+                    })?;
+                    (SendBuf::Owned(owned), len)
                 }
             }
+        } else {
+            if self.srtp_required {
+                self.srtp_dropped_no_session.fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    "RtpTransport: SRTP required but session not ready, dropping RTP send"
+                );
+                return Err(RtcError::InvalidState(
+                    "SRTP required but session not ready".into(),
+                ));
+            }
+            let owned = packet.marshal()?;
+            let len = owned.len();
+            (SendBuf::Owned(owned), len)
+        }
         };
 
-        match self.transport.send(&protected).await {
+        let protected: &[u8] = match &send_buf {
+            SendBuf::Caller(out) => out,
+            SendBuf::Owned(owned) => owned,
+        };
+        match self.transport.send(protected).await {
             Ok(n) => {
-                if n > 0 {
-                }
                 if is_first {
                     self.transport.mark_first_outbound();
                     trace!(
                         "RtpTransport: first SRTP packet sent ({} bytes)",
-                        protected.len()
+                        protected_len
                     );
                 }
                 Ok(n)
@@ -1037,8 +1100,7 @@ impl RtpTransport {
             Err(e) => {
                 debug!(
                     "RtpTransport: failed to send SRTP packet ({} bytes): {}",
-                    protected.len(),
-                    e
+                    protected_len, e
                 );
                 Err(e)
             }
