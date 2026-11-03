@@ -226,6 +226,9 @@ pub trait RtpSenderInterceptor: Send + Sync {
     /// Carries the outgoing SSRC and the compact NTP timestamp (middle 32 bits)
     /// so the receiver can compute RTT from LSR/DLSR on the return path.
     fn on_sr_sent(&self, _ssrc: u32, _compact_ntp: u32) {}
+    /// Fires after the sender's RTCP loop sent a report: an SR, or an RR
+    /// while it does not send RTP.
+    fn on_report_sent(&self) {}
     async fn on_rtcp_received(&self, _packet: &RtcpPacket, _transport: Arc<RtpTransport>) {}
     /// Reception report blocks to attach to an outgoing Sender Report (RFC 3550).
     fn reception_report_blocks(&self) -> Vec<crate::rtp::ReportBlock> {
@@ -8329,6 +8332,10 @@ impl RtpSender {
                 core::time::Duration::from_secs(3),
             );
             rtcp_interval.set_missed_tick_behavior(crate::platform::task::MissedTickBehavior::Skip);
+            // Packets sent at the last two reports: we are a sender (an SR)
+            // when we sent RTP since the report before the last (RFC 3550
+            // §6.4); else an RR.
+            let mut sent_at_reports = [0u32; 2];
             // seam select5 takes Unpin futures; std's Notified is !Unpin
             let mut notified = core::pin::pin!(stop_rx.notified());
 
@@ -8362,9 +8369,8 @@ impl RtpSender {
                         }
                         // All send paths account at the transport success boundary.
                         let (packet_count, octet_count) = send_stats.snapshot();
-                        if packet_count == 0 {
-                            continue;
-                        }
+                        let is_sender = packet_count != sent_at_reports[0];
+                        sent_at_reports = [sent_at_reports[1], packet_count];
                         let rtp_timestamp = timeline.timestamp();
                         let mut report_blocks = Vec::new();
                         for interceptor in &*interceptors {
@@ -8374,6 +8380,31 @@ impl RtpSender {
                         {
                             let mut seen = alloc::collections::BTreeSet::new();
                             report_blocks.retain(|b| seen.insert(b.ssrc));
+                        }
+                        let sdes = crate::rtp::SourceDescription::cname(ssrc, &cname);
+                        if !is_sender {
+                            // Not sending (yet, or on hold): an RR, when
+                            // there is something to report.
+                            if report_blocks.is_empty() {
+                                continue;
+                            }
+                            let rr = crate::rtp::ReceiverReport {
+                                sender_ssrc: ssrc,
+                                report_blocks,
+                            };
+                            if let Err(e) = transport
+                                .send_rtcp(&[
+                                    RtcpPacket::ReceiverReport(rr),
+                                    RtcpPacket::SourceDescription(sdes),
+                                ])
+                                .await
+                            {
+                                trace!("Failed to send Receiver Report: {}", e);
+                            }
+                            for interceptor in &*interceptors {
+                                interceptor.on_report_sent();
+                            }
+                            continue;
                         }
                         let report = Self::build_sender_report(
                             ssrc,
@@ -8386,7 +8417,6 @@ impl RtpSender {
 
                         let compact_ntp = report.compact_ntp();
                         // A compound packet: the SR, then our CNAME (RFC 3550 §6.1).
-                        let sdes = crate::rtp::SourceDescription::cname(ssrc, &cname);
                         if let Err(e) = transport
                             .send_rtcp(&[
                                 RtcpPacket::SenderReport(report),
@@ -8398,6 +8428,7 @@ impl RtpSender {
                         }
                         for interceptor in &*interceptors {
                             interceptor.on_sr_sent(ssrc, compact_ntp);
+                            interceptor.on_report_sent();
                         }
                     }
                     crate::platform::select::Which5::D(rtcp) => {

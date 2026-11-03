@@ -291,6 +291,11 @@ pub struct StatsCollector {
     /// anything: the SSRC an RR carries as its sender's, and the CNAME of
     /// the SDES that goes with it (see `add_local_source`).
     local_source: Mutex<Option<(u32, Arc<str>)>>,
+    /// When a sender's RTCP loop last sent a report (SR or RR). While a
+    /// loop reports, its reports carry our report blocks, and the receive
+    /// path sends no RR of its own: one participant, one report per
+    /// interval (RFC 3550 §6.4).
+    sender_report_at: Mutex<Option<Instant>>,
 }
 
 /// Bound a per-SSRC stats map so long-lived SSRC churn (re-INVITE, simulcast
@@ -475,8 +480,29 @@ impl StatsCollector {
         size as u64
     }
 
+    /// A sender's RTCP loop sent a report.
+    pub(crate) fn record_sender_report(&self) {
+        *self.sender_report_at.lock() = Some(Instant::now());
+    }
+
+    /// A sender of ours reports: its RTCP loop reported, or it sent RTP,
+    /// within two report intervals. Its SRs carry the report blocks; an RR
+    /// is only for a participant that does not send (RFC 3550 §6.4).
+    fn sender_reports(&self) -> bool {
+        let recent = |t: Instant| t.elapsed() < 2 * RR_MIN_INTERVAL;
+        self.sender_report_at.lock().is_some_and(recent)
+            || self
+                .local_outbound
+                .lock()
+                .values()
+                .any(|o| recent(o.last_seen))
+    }
+
     fn maybe_receiver_report(&self, _feedback_ssrc: u32) -> Option<RtcpPacket> {
         let n = self.packets_since_rr.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.sender_reports() {
+            return None;
+        }
         let due = {
             let last = self.last_rr_sent.lock();
             match *last {
@@ -523,6 +549,10 @@ impl RtpSenderInterceptor for StatsCollector {
 
     fn on_sr_sent(&self, ssrc: u32, compact_ntp: u32) {
         self.record_sr_sent(ssrc, compact_ntp);
+    }
+
+    fn on_report_sent(&self) {
+        self.record_sender_report();
     }
 
     fn reception_report_blocks(&self) -> Vec<ReportBlock> {
@@ -781,7 +811,9 @@ mod tests {
 
     /// A peer connection with senders but no `add_local_source` call site
     /// reachable: the RR falls back to the SSRC we actually send with
-    /// (the only source before #77), never 0.
+    /// (the only source before #77), never 0. That is once our sender has
+    /// stopped: while it sends, its SRs carry the report blocks and no RR
+    /// goes (RFC 3550 §6.4).
     #[tokio::test]
     async fn rr_sender_ssrc_falls_back_to_the_first_outbound() {
         let collector = StatsCollector::new();
@@ -803,6 +835,16 @@ mod tests {
             .await;
         header.sequence_number = 50;
         header.timestamp = 50 * 160;
+        let packet = RtpPacket::new(header.clone(), vec![0u8; 160]);
+        assert!(
+            collector.observe_packet(&packet, 8000).is_none(),
+            "we send: our SRs report, no RR"
+        );
+        // Our sender stops for two intervals (real time: the platform
+        // Instant cannot be set back).
+        tokio::time::sleep(2 * RR_MIN_INTERVAL + Duration::from_millis(100)).await;
+        header.sequence_number = 51;
+        header.timestamp = 51 * 160;
         let packet = RtpPacket::new(header, vec![0u8; 160]);
         report = report.or(collector.observe_packet(&packet, 8000));
         match report {
