@@ -610,8 +610,8 @@ async fn test_ice_lite_stun_response() -> Result<()> {
     let (ice_lite, runner) = IceTransport::new(config);
     tokio::spawn(runner);
 
-    // Set up for RTP mode - bind socket via setup_direct_rtp_offer
-    let local_addr = ice_lite.setup_direct_rtp_offer().await?;
+    // Set up for RTP mode - bind socket via setup_direct_rtp_offer_with_rtcp
+    let local_addr = ice_lite.setup_direct_rtp_offer_with_rtcp(false).await?;
 
     // Give the transport time to fully initialize
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -749,7 +749,7 @@ async fn test_ice_lite_connectivity_establishment() -> Result<()> {
     tokio::spawn(full_runner);
 
     // ICE-lite sets up direct RTP socket
-    let _lite_addr = ice_lite.setup_direct_rtp_offer().await?;
+    let _lite_addr = ice_lite.setup_direct_rtp_offer_with_rtcp(false).await?;
 
     // Exchange ICE parameters
     let lite_params = ice_lite.local_parameters();
@@ -3468,7 +3468,10 @@ async fn test_rtp_mode_upnp_disabled() {
     let (transport, _runner) = IceTransport::new(config);
 
     // Setup direct RTP (offer side)
-    let local_addr = transport.setup_direct_rtp_offer().await.unwrap();
+    let local_addr = transport
+        .setup_direct_rtp_offer_with_rtcp(false)
+        .await
+        .unwrap();
 
     // Should have a local candidate
     let candidates = transport.local_candidates();
@@ -3495,10 +3498,10 @@ async fn test_rtp_mode_upnp_enabled_graceful() {
     let (transport, _runner) = IceTransport::new(config);
 
     // Setup direct RTP (offer side) - UPnP will fail in test env but should be graceful
-    let result = transport.setup_direct_rtp_offer().await;
+    let result = transport.setup_direct_rtp_offer_with_rtcp(false).await;
     assert!(
         result.is_ok(),
-        "setup_direct_rtp_offer should succeed even if UPnP fails"
+        "setup_direct_rtp_offer_with_rtcp should succeed even if UPnP fails"
     );
 
     // Should have a local candidate

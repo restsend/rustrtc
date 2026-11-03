@@ -1859,13 +1859,10 @@ impl IceTransport {
         Ok(local_candidate.address)
     }
 
-    /// Set up a direct UDP socket for RTP mode (offer side, no remote addr yet).
-    /// Binds a socket and registers the local candidate, but does NOT set the
-    /// selected pair or transition to Connected.
-    pub async fn setup_direct_rtp_offer(&self) -> RtcResult<SocketAddr> {
-        self.setup_direct_rtp_offer_with_rtcp(false).await
-    }
-
+    /// Set up a direct UDP socket for RTP mode (offer side, no remote addr yet),
+    /// and an RTCP socket next to it when `bind_rtcp`. Binds and registers the
+    /// local candidates, but does NOT set the selected pair or transition to
+    /// Connected.
     pub(crate) async fn setup_direct_rtp_offer_with_rtcp(
         &self,
         bind_rtcp: bool,
@@ -1975,8 +1972,8 @@ impl IceTransport {
     }
 
     /// Complete the RTP direct connection by setting the remote address.
-    /// Call after setup_direct_rtp_offer when the answer arrives with the remote address.
-    pub fn complete_direct_rtp(&self, remote_addr: SocketAddr) {
+    /// Call after setup_direct_rtp_offer_with_rtcp when the answer arrives with the remote address.
+    pub(crate) fn complete_direct_rtp(&self, remote_addr: SocketAddr) {
         let remote_candidate = IceCandidate::host(remote_addr, 1);
         // Of the peer's family when we have one (a re-INVITE can change it).
         let locals: Vec<_> = self

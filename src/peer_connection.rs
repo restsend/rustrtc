@@ -4353,7 +4353,7 @@ impl PeerConnection {
     pub async fn wait_for_gathering_complete(&self) {
         if self.config().connectivity.is_direct() {
             // Direct transport: no ICE gathering needed. Gathering completes
-            // synchronously when setup_direct_rtp_offer is called.
+            // synchronously when setup_direct_rtp_offer_with_rtcp is called.
             return;
         }
         let _ = self.inner.ice_transport.start_gathering();
@@ -5696,7 +5696,7 @@ impl PeerConnectionInner {
         let mux_required = self.rtcp_mux_required();
 
         // Full ICE gathers; a direct transport binds its socket per m-line
-        // below (setup_direct_rtp_offer).
+        // below (setup_direct_rtp_offer_with_rtcp).
         if connectivity == Connectivity::Ice {
             self.ice_transport
                 .start_gathering()
@@ -12361,7 +12361,7 @@ a=mid:0
             .build();
         transceiver.set_sender(Some(sender));
 
-        // Create offer (offerer path: setup_direct_rtp_offer)
+        // Create offer (offerer path: setup_direct_rtp_offer_with_rtcp)
         let offer = pc.create_offer().await.unwrap();
         pc.set_local_description(offer).unwrap();
 
