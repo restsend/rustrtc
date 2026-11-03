@@ -294,9 +294,9 @@ async fn test_t38_fax_call_over_peerconnection() {
     let _ = env_logger::builder().is_test(true).try_init();
 
     let mut caller_config = make_t38_config();
-    caller_config.external_ip = Some("127.0.0.1".to_string());
+    caller_config.external_ips = vec!["127.0.0.1".parse().unwrap()];
     let mut callee_config = make_t38_config();
-    callee_config.external_ip = Some("127.0.0.1".to_string());
+    callee_config.external_ips = vec!["127.0.0.1".parse().unwrap()];
 
     let caller = PeerConnection::new(caller_config);
     let callee = PeerConnection::new(callee_config);
@@ -348,9 +348,9 @@ async fn test_t38_image_transceiver_added_after_transport_is_up() {
     let _ = env_logger::builder().is_test(true).try_init();
 
     let mut caller_config = make_t38_config();
-    caller_config.external_ip = Some("127.0.0.1".to_string());
+    caller_config.external_ips = vec!["127.0.0.1".parse().unwrap()];
     let mut callee_config = make_t38_config();
-    callee_config.external_ip = Some("127.0.0.1".to_string());
+    callee_config.external_ips = vec!["127.0.0.1".parse().unwrap()];
 
     let caller = PeerConnection::new(caller_config);
     let callee = PeerConnection::new(callee_config);

@@ -118,7 +118,7 @@ async fn test_rtp_latching() -> Result<()> {
     let mut config = RtcConfiguration::default();
     config.transport_mode = TransportMode::Rtp;
     config.enable_latching = true;
-    config.bind_ip = Some("0.0.0.0".to_string());
+    config.bind_ips = vec!["0.0.0.0".parse().unwrap()];
     config.rtp_start_port = Some(40000);
     config.rtp_end_port = Some(40100);
     let pc = PeerConnection::new(config);

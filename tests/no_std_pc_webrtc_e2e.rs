@@ -31,7 +31,7 @@ const KEY_DER: &[u8] = include_bytes!("fixtures/dtls_key.der");
 fn webrtc_agent(label: &str, start: u16, end: u16) -> PeerConnection {
     let mut config = RtcConfiguration::default();
     config.label = Some(label.to_string());
-    config.bind_ip = Some("127.0.0.1".to_string());
+    config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
     config.rtp_start_port = Some(start);
     config.rtp_end_port = Some(end);
     // Pre-provisioned DTLS certificate (factory DER; no generation on
