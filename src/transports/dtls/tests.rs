@@ -294,7 +294,9 @@ async fn test_dtls_handshake_fails_on_fingerprint_mismatch() -> Result<()> {
 
     let client_cert = generate_certificate()?;
     let server_cert = generate_certificate()?;
-    let wrong_cert = generate_certificate()?;
+    // The mismatch test needs a cert genuinely different from the shared
+    // process-wide one the server presents.
+    let wrong_cert = generate_unique_certificate()?;
 
     let (client_dtls, _client_rx, client_runner) = DtlsTransport::new(
         client_conn.clone(),

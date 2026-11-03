@@ -91,6 +91,8 @@ pub enum SrtpError {
     PacketTooShort,
     #[error("SRTP authentication failed")]
     AuthenticationFailed,
+    #[error("SRTP replay rejected (duplicate or out-of-window packet index)")]
+    ReplayRejected,
     #[error("SRTP internal error: {0}")]
     Internal(String),
 }

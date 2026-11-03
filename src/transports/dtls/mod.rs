@@ -11,7 +11,7 @@ pub mod x509_min;
 use crate::prelude::*;
 use aes_gcm::{
     Aes128Gcm, Nonce, Tag,
-    aead::{Aead, AeadInPlace, KeyInit, Payload},
+    aead::{AeadInOut, KeyInit},
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use core::fmt;
@@ -49,11 +49,43 @@ macro_rules! dtls_err {
 #[cfg(test)]
 pub(crate) use dtls_err;
 
-/// Generate a fresh self-signed DTLS certificate (EC keypair + PEM round-trip).
+/// Generate the process-wide self-signed DTLS certificate (EC keypair +
+/// PEM round-trip), shared by every [`crate::peer_connection::PeerConnection`].
+///
+/// ECDSA key generation plus self-signing costs milliseconds per call; media
+/// servers accept many connections per second, so the certificate is memoized
+/// process-wide (the same policy Chrome applies per browser session). The
+/// certificate lives in an `Arc`, so per-connection cost is one refcount bump.
 /// std-only: certificate *generation* needs rcgen. Embedded targets load a
-/// pre-provisioned DER cert + PKCS#8 key via [`Certificate::from_pkcs8_der`].
+/// pre-provisioned DER cert + PKCS#8 key via [`Certificate::from_pkcs8_der`];
+/// callers that need a fresh keypair per call use
+/// [`generate_unique_certificate`].
+/// Generate the process-wide self-signed DTLS certificate (EC keypair +
+/// PEM round-trip), shared by every [`crate::peer_connection::PeerConnection`].
+///
+/// ECDSA key generation plus self-signing costs milliseconds per call; media
+/// servers accept many connections per second, so the certificate is memoized
+/// process-wide (the same policy Chrome applies per browser session) and
+/// clones of the cached DER are handed out. std-only: certificate *generation*
+/// needs rcgen. Embedded targets load a pre-provisioned DER cert + PKCS#8 key
+/// via [`Certificate::from_pkcs8_der`]; callers that need a fresh keypair per
+/// call use [`generate_unique_certificate`].
 #[cfg(feature = "std")]
 pub fn generate_certificate() -> Result<Certificate> {
+    static SHARED_CERT: std::sync::OnceLock<Arc<Certificate>> = std::sync::OnceLock::new();
+    if let Some(cert) = SHARED_CERT.get() {
+        return Ok(cert.as_ref().clone());
+    }
+    let cert = Arc::new(generate_unique_certificate()?);
+    // Concurrent first callers may race; the winner's cert is shared and the
+    // loser keeps its own — both are valid, only sharing is in question.
+    Ok(SHARED_CERT.get_or_init(|| cert).as_ref().clone())
+}
+
+/// Generate a fresh self-signed DTLS certificate with a brand-new keypair.
+/// std-only (rcgen); see [`generate_certificate`] for the cached variant.
+#[cfg(feature = "std")]
+pub fn generate_unique_certificate() -> Result<Certificate> {
     let cert = generate_simple_self_signed(vec!["localhost".to_string()])
         .map_err(|e| dtls_err!("failed to generate DTLS certificate: {}", e))?;
     let key_der = cert.signing_key.serialize_der();
@@ -417,7 +449,7 @@ impl DtlsTransport {
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes[0..4].copy_from_slice(iv);
         nonce_bytes[4..12].copy_from_slice(&full_seq.to_be_bytes());
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = &Nonce::from(nonce_bytes);
 
         // AAD
         let mut aad = [0u8; 13];
@@ -428,10 +460,10 @@ impl DtlsTransport {
         aad[11..13].copy_from_slice(&(data.len() as u16).to_be_bytes());
 
         let tag = cipher
-            .encrypt_in_place_detached(
+            .encrypt_inout_detached(
                 nonce,
                 &aad,
-                &mut buf[payload_offset..payload_offset + payload_len],
+                (&mut buf[payload_offset..payload_offset + payload_len]).into(),
             )
             .map_err(|e| dtls_err!("Encryption failed: {}", e))?;
 
@@ -2255,8 +2287,8 @@ fn decrypt_record_with_cipher(
     nonce_bytes[0..4].copy_from_slice(iv);
     nonce_bytes[4..12].copy_from_slice(explicit_nonce);
 
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let tag = Tag::from_slice(tag_bytes);
+    let nonce = &Nonce::from(nonce_bytes);
+    let tag = Tag::try_from(tag_bytes).map_err(|_| dtls_err!("Invalid tag length"))?;
 
     let aad = make_aad(seq, content_type, version, ciphertext_len);
 
@@ -2264,7 +2296,7 @@ fn decrypt_record_with_cipher(
     buf.put_slice(ciphertext);
 
     cipher
-        .decrypt_in_place_detached(nonce, &aad, &mut buf, tag)
+        .decrypt_inout_detached(nonce, &aad, (&mut buf[..]).into(), &tag)
         .map_err(|e| dtls_err!("Decryption failed: {}", e))?;
 
     Ok(buf.freeze())
@@ -2293,23 +2325,21 @@ fn decrypt_record(
     nonce_bytes[0..4].copy_from_slice(iv);
     nonce_bytes[4..12].copy_from_slice(explicit_nonce);
 
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = &Nonce::from(nonce_bytes);
     let cipher = Aes128Gcm::new_from_slice(key).map_err(|_| dtls_err!("Invalid key length"))?;
 
     let plaintext_len = ciphertext.len() - 16;
     let aad = make_aad(seq, content_type, version, plaintext_len);
 
-    let decrypted_payload = cipher
-        .decrypt(
-            nonce,
-            Payload {
-                msg: ciphertext,
-                aad: &aad,
-            },
-        )
+    // Decrypt in place on a copy of the ciphertext (tag passed separately).
+    let mut buf = ciphertext.to_vec();
+    buf.truncate(plaintext_len);
+    let tag = Tag::try_from(&ciphertext[plaintext_len..]).map_err(|_| dtls_err!("Invalid tag length"))?;
+    cipher
+        .decrypt_inout_detached(nonce, &aad, (&mut buf[..]).into(), &tag)
         .map_err(|e| dtls_err!("Decryption failed: {}", e))?;
 
-    Ok(decrypted_payload)
+    Ok(buf)
 }
 
 fn encrypt_record(
@@ -2324,7 +2354,7 @@ fn encrypt_record(
     nonce_bytes[0..4].copy_from_slice(iv);
     nonce_bytes[4..12].copy_from_slice(&seq.to_be_bytes());
 
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = &Nonce::from(nonce_bytes);
     let cipher = Aes128Gcm::new_from_slice(key).map_err(|_| dtls_err!("Invalid key length"))?;
 
     let aad = make_aad(seq, content_type, version, payload.len());
@@ -2334,7 +2364,7 @@ fn encrypt_record(
     result.extend_from_slice(payload);
 
     let tag = cipher
-        .encrypt_in_place_detached(nonce, &aad, &mut result[8..])
+        .encrypt_inout_detached(nonce, &aad, (&mut result[8..]).into())
         .map_err(|e| dtls_err!("Encryption failed: {}", e))?;
 
     result.extend_from_slice(&tag);

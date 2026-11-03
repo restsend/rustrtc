@@ -7,7 +7,7 @@ use crate::{
 use aes::Aes128;
 use aes_gcm::{
     Aes128Gcm, Nonce,
-    aead::{Aead, AeadInPlace, KeyInit, Payload},
+    aead::{AeadInOut, KeyInit},
 };
 use alloc::collections::btree_map::Entry;
 use bytes::BytesMut;
@@ -153,7 +153,18 @@ pub struct SrtpSession {
     /// Adaptive inbound MKI mode for SRTCP (session-wide: one RTCP remote per
     /// session), settled on the first authenticated packet.
     rtcp_rx_mki_active: Option<bool>,
+    /// Coarse wall-clock sample reused for per-context `last_used` stamps.
+    /// Refreshed every [`NOW_SAMPLE_EVERY`] packets so the hot protect/
+    /// unprotect path avoids a clock read per packet. Staleness is bounded
+    /// by 128 packets of *session* traffic; eviction additionally requires
+    /// over 32 contexts AND 60s of inactivity, so this cannot evict a live
+    /// sparse stream in any realistic deployment.
+    now_sample_cache: Instant,
+    now_sample_count: u16,
 }
+
+/// How many packets share one [`Instant::now`] sample for `last_used`.
+const NOW_SAMPLE_EVERY: u16 = 128;
 
 /// Above this many per-SSRC contexts, stale ones (not seen for
 /// `SSRC_INACTIVITY_EVICT`) are evicted. Caps unbounded growth from SSRC churn
@@ -179,7 +190,21 @@ impl SrtpSession {
             rx_contexts: BTreeMap::new(),
             mki: MkiParams::default(),
             rtcp_rx_mki_active: None,
+            now_sample_cache: Instant::now(),
+            now_sample_count: 0,
         })
+    }
+
+    /// Reuse a coarse clock sample for `last_used` stamps (see the field
+    /// docs on [`SrtpSession::now_sample_cache`]).
+    #[inline]
+    fn now_sample(&mut self) -> Instant {
+        self.now_sample_count = self.now_sample_count.wrapping_add(1);
+        if self.now_sample_count >= NOW_SAMPLE_EVERY {
+            self.now_sample_count = 0;
+            self.now_sample_cache = Instant::now();
+        }
+        self.now_sample_cache
     }
 
     /// Configure the outbound MKI (RFC 4568): every protected RTP/SRTCP packet
@@ -231,28 +256,30 @@ impl SrtpSession {
     pub fn protect_rtp(&mut self, packet: &RtpPacket, output: &mut [u8]) -> SrtpResult<()> {
         let ssrc = packet.header.ssrc;
         self.evict_stale_tx(ssrc);
-        let mki = self.mki.clone();
+        let now = self.now_sample();
         let ctx = match self.tx_contexts.entry(ssrc) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => {
+                // MKI configuration is copied into the context once, at
+                // creation — never on the per-packet path.
                 let mut ctx = SrtpContext::new(
                     ssrc,
                     self.profile,
                     self.tx_keying.clone(),
                     SrtpDirection::Sender,
                 )?;
-                ctx.mki = mki;
+                ctx.mki = self.mki.clone();
                 e.insert(ctx)
             }
         };
-        ctx.last_used = Instant::now();
+        ctx.last_used = now;
         ctx.protect(packet, output)
     }
 
     pub fn unprotect_rtp(&mut self, packet: SrtpPacket) -> SrtpResult<RtpPacket> {
         let ssrc = packet.header.ssrc;
         self.evict_stale_rx(ssrc);
-        let mki = self.mki.clone();
+        let now = self.now_sample();
         let ctx = match self.rx_contexts.entry(ssrc) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => {
@@ -262,11 +289,11 @@ impl SrtpSession {
                     self.rx_keying.clone(),
                     SrtpDirection::Receiver,
                 )?;
-                ctx.mki = mki;
+                ctx.mki = self.mki.clone();
                 e.insert(ctx)
             }
         };
-        ctx.last_used = Instant::now();
+        ctx.last_used = now;
         ctx.unprotect(packet)
     }
 
@@ -277,7 +304,7 @@ impl SrtpSession {
         let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
 
         self.evict_stale_tx(ssrc);
-        let mki = self.mki.clone();
+        let now = self.now_sample();
         let ctx = match self.tx_contexts.entry(ssrc) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => {
@@ -287,11 +314,11 @@ impl SrtpSession {
                     self.tx_keying.clone(),
                     SrtpDirection::Sender,
                 )?;
-                ctx.mki = mki;
+                ctx.mki = self.mki.clone();
                 e.insert(ctx)
             }
         };
-        ctx.last_used = Instant::now();
+        ctx.last_used = now;
         ctx.protect_rtcp(packet)
     }
 
@@ -303,7 +330,7 @@ impl SrtpSession {
         let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
 
         self.evict_stale_rx(ssrc);
-        let mki = self.mki.clone();
+        let now = self.now_sample();
         let ctx = match self.rx_contexts.entry(ssrc) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => {
@@ -313,52 +340,42 @@ impl SrtpSession {
                     self.rx_keying.clone(),
                     SrtpDirection::Receiver,
                 )?;
-                ctx.mki = mki;
+                ctx.mki = self.mki.clone();
                 e.insert(ctx)
             }
         };
-        ctx.last_used = Instant::now();
+        ctx.last_used = now;
 
         // Adaptive inbound MKI, mirroring the RTP path: some deployed stacks
         // advertise `|...|1:1` in SDP but never send the MKI field, so try the
         // advertised length first, then fall back to no-MKI. The winning mode
-        // is cached session-wide (one RTCP remote per session).
+        // is cached session-wide (one RTCP remote per session), so the
+        // fallback attempt only ever happens on the first packet.
         let advertised_mki_len = self.mki.rx_len();
-        let candidates: Vec<usize> = match self.rtcp_rx_mki_active {
-            Some(true) => vec![advertised_mki_len],
-            Some(false) => vec![0],
-            None => {
-                let mut v = Vec::with_capacity(2);
-                if advertised_mki_len > 0 {
-                    v.push(advertised_mki_len);
-                }
-                v.push(0);
-                v
+        let (first, fallback): (usize, Option<usize>) = match self.rtcp_rx_mki_active {
+            Some(true) => (advertised_mki_len, None),
+            Some(false) => (0, None),
+            None if advertised_mki_len > 0 => (advertised_mki_len, Some(0)),
+            None => (0, None),
+        };
+        // A fallback retry needs the original bytes restored first (the GCM
+        // branch mutates the packet before verifying the tag). Snapshot only
+        // when a retry is actually possible — never on the steady-state path.
+        let original = if fallback.is_some() { packet.clone() } else { Vec::new() };
+
+        match ctx.unprotect_rtcp_with_mki(packet, first) {
+            Ok(()) => {
+                self.rtcp_rx_mki_active = Some(first > 0);
+                Ok(())
             }
-        };
-
-        let original = if candidates.len() > 1 {
-            packet.clone()
-        } else {
-            Vec::new()
-        };
-        let mut last_err = SrtpError::AuthenticationFailed;
-
-        for (idx, &mki_len) in candidates.iter().enumerate() {
-            match ctx.unprotect_rtcp_with_mki(packet, mki_len) {
-                Ok(()) => {
-                    self.rtcp_rx_mki_active = Some(mki_len > 0);
-                    return Ok(());
-                }
-                Err(e) => {
-                    last_err = e;
-                    if idx + 1 < candidates.len() {
-                        *packet = original.clone();
-                    }
-                }
+            Err(e) => {
+                let Some(mki_len) = fallback else { return Err(e) };
+                *packet = original;
+                ctx.unprotect_rtcp_with_mki(packet, mki_len)?;
+                self.rtcp_rx_mki_active = Some(mki_len > 0);
+                Ok(())
             }
         }
-        Err(last_err)
     }
 
     /// Evict stale transmit contexts once the map crosses the high-water mark.
@@ -416,6 +433,10 @@ pub struct SrtpContext {
     /// Reusable receive-side scratch buffer holding the reconstructed clear RTP
     /// header for authentication after the protected body has been split off.
     auth_scratch: Vec<u8>,
+    /// Anti-replay sliding windows (RFC 3711 §3.3.2): separate namespaces for
+    /// the RTP packet index and the SRTCP index, sharing one implementation.
+    rtp_replay: ReplayWindow,
+    rtcp_replay: ReplayWindow,
     /// Wall-clock time of the most recent protect/unprotect call, used to evict
     /// contexts for SSRCs that have gone away (prevents unbounded growth as
     /// SSRCs churn across a long call / relay).
@@ -437,6 +458,70 @@ impl fmt::Debug for SrtpContext {
             .field("direction", &self.direction)
             .field("rollover_counter", &self.rollover_counter)
             .finish()
+    }
+}
+
+/// 128-bit anti-replay sliding window (RFC 3711 §3.3.2), `libsrtp`-style.
+///
+/// Tracks the 128 packet indices at or below the highest authenticated index:
+/// bit `i` of `bits` is set once the packet at index `highest - i` has been
+/// accepted. Shared by the RTP and SRTCP receive paths (separate instances —
+/// their index namespaces are independent).
+///
+/// Two-phase use, which is what makes the window poison-proof: [`check`] runs
+/// before authentication and never mutates state (a forged packet can at most
+/// be rejected, never accepted into the window); [`commit`] runs only after
+/// authentication succeeded, so a forged "fresh" index cannot advance the
+/// window and crowd out legitimate ones.
+#[derive(Clone, Default)]
+struct ReplayWindow {
+    highest: u64,
+    bits: u128,
+    seeded: bool,
+}
+
+const REPLAY_WINDOW_BITS: u32 = 128;
+
+impl ReplayWindow {
+    /// Tentative duplicate/out-of-window check. No state mutation.
+    #[inline]
+    fn check(&self, index: u64) -> bool {
+        if !self.seeded {
+            return true;
+        }
+        let delta = index.wrapping_sub(self.highest) as i64;
+        if delta > 0 {
+            return true;
+        }
+        let back = -(delta as i128);
+        if back == 0 || back >= REPLAY_WINDOW_BITS as i128 {
+            // Exact duplicate of the highest, or older than the window.
+            return false;
+        }
+        self.bits & (1u128 << back) == 0
+    }
+
+    /// Commit the index into the window. Call only after authentication
+    /// succeeded; `check` must have returned `true` for this index.
+    #[inline]
+    fn commit(&mut self, index: u64) {
+        if !self.seeded {
+            self.seeded = true;
+            self.highest = index;
+            self.bits = 1;
+            return;
+        }
+        let delta = index.wrapping_sub(self.highest) as i64;
+        if delta <= 0 {
+            self.bits |= 1u128 << -(delta as i128);
+            return;
+        }
+        if delta >= REPLAY_WINDOW_BITS as i64 {
+            self.bits = 1;
+        } else {
+            self.bits = (self.bits << delta) | 1;
+        }
+        self.highest = index;
     }
 }
 
@@ -515,6 +600,8 @@ impl SrtpContext {
             last_sequence: None,
             rtcp_index: 0,
             auth_scratch: Vec::new(),
+            rtp_replay: ReplayWindow::default(),
+            rtcp_replay: ReplayWindow::default(),
             last_used: Instant::now(),
             mki: MkiParams::default(),
             rx_mki_active: None,
@@ -602,26 +689,25 @@ impl SrtpContext {
                 .ok_or(SrtpError::UnsupportedProfile)?;
 
             // AAD = Header (8 bytes) || Index (4 bytes, WITH E-bit)
-            let mut aad = Vec::with_capacity(12);
-            aad.extend_from_slice(&packet[..8]);
-            aad.extend_from_slice(&index_with_e.to_be_bytes());
+            let mut aad = [0u8; 12];
+            aad[..8].copy_from_slice(&packet[..8]);
+            aad[8..12].copy_from_slice(&index_with_e.to_be_bytes());
 
-            // Payload = Packet body (after header)
-            let payload_data = &packet[8..];
-
-            let payload = Payload {
-                msg: payload_data,
-                aad: &aad,
-            };
-
-            let ciphertext = cipher
-                .encrypt(Nonce::from_slice(&nonce), payload)
+            // Encrypt the payload in place. Final layout:
+            // Header || Ciphertext || Tag || Index || [MKI]
+            let payload_len = packet.len() - 8;
+            let tag_len = self._profile.tag_len();
+            packet.resize(8 + payload_len + tag_len + 4, 0);
+            let tag = cipher
+                .encrypt_inout_detached(
+                    &Nonce::from(nonce),
+                    &aad,
+                    (&mut packet[8..8 + payload_len]).into(),
+                )
                 .map_err(|_| SrtpError::AuthenticationFailed)?;
-
-            // Reconstruct packet: Header || Ciphertext || Index || [MKI]
-            packet.truncate(8);
-            packet.extend_from_slice(&ciphertext);
-            packet.extend_from_slice(&index_with_e.to_be_bytes());
+            packet[8 + payload_len..8 + payload_len + tag_len].copy_from_slice(tag.as_ref());
+            let index_pos = 8 + payload_len + tag_len;
+            packet[index_pos..index_pos + 4].copy_from_slice(&index_with_e.to_be_bytes());
             if let Some((value, _)) = self.mki.tx.as_ref() {
                 packet.extend_from_slice(&value[..mki_len]);
             }
@@ -677,6 +763,11 @@ impl SrtpContext {
                 index_bytes[3],
             ]);
             let index = index_with_e & 0x7FFF_FFFF;
+            // Tentative anti-replay check before decryption (see the RTP
+            // path); the window bit is committed after authentication.
+            if !self.rtcp_replay.check(index as u64) {
+                return Err(SrtpError::ReplayRejected);
+            }
 
             let nonce = self.build_gcm_rtcp_nonce(index);
             let cipher = self
@@ -685,31 +776,37 @@ impl SrtpContext {
                 .ok_or(SrtpError::UnsupportedProfile)?;
 
             // AAD = Header (8 bytes) || Index (4 bytes, WITH E-bit)
-            let mut aad = Vec::with_capacity(12);
-            aad.extend_from_slice(&packet[..8]);
-            aad.extend_from_slice(&index_with_e.to_be_bytes());
+            let mut aad = [0u8; 12];
+            aad[..8].copy_from_slice(&packet[..8]);
+            aad[8..12].copy_from_slice(&index_with_e.to_be_bytes());
 
-            // Ciphertext = Packet body (after header, before index).
-            // Note: Tag is appended to ciphertext in GCM encrypt output.
-            let ciphertext_and_tag = &packet[8..index_start];
+            let ciphertext_len = index_start - 8 - tag_len;
+            let tag: aes_gcm::Tag = packet[8 + ciphertext_len..8 + ciphertext_len + tag_len]
+                .try_into()
+                .map_err(|_| SrtpError::Internal("invalid GCM tag length".to_string()))?;
 
-            let payload = Payload {
-                msg: ciphertext_and_tag,
-                aad: &aad,
-            };
-
-            let plaintext = cipher
-                .decrypt(Nonce::from_slice(&nonce), payload)
+            // Decrypt in place: move Ciphertext to the front of the buffer
+            // (tag stripped — it is passed separately and verified first),
+            // drop the trailing Index/[MKI] bytes, then hand the Vec to the
+            // AEAD API. Avoids the old per-packet plaintext allocation.
+            let mut header = [0u8; 8];
+            header.copy_from_slice(&packet[..8]);
+            packet.copy_within(8..8 + ciphertext_len, 0);
+            packet.truncate(ciphertext_len);
+            cipher
+                .decrypt_inout_detached(&Nonce::from(nonce), &aad, packet.as_mut_slice().into(), &tag)
                 .map_err(|_| SrtpError::AuthenticationFailed)?;
 
-            // Replay check (only after successful authentication)
+            // Reconstruct packet: Header || Plaintext
+            let plaintext_len = packet.len();
+            packet.resize(8 + plaintext_len, 0);
+            packet.copy_within(0..plaintext_len, 8);
+            packet[..8].copy_from_slice(&header);
+
+            self.rtcp_replay.commit(index as u64);
             if index > self.rtcp_index {
                 self.rtcp_index = index;
             }
-
-            // Reconstruct packet: Header || Plaintext
-            packet.truncate(8);
-            packet.extend_from_slice(&plaintext);
 
             return Ok(());
         }
@@ -743,13 +840,21 @@ impl SrtpContext {
         let e_bit = (index_with_e & 0x8000_0000) != 0;
         let index = index_with_e & 0x7FFF_FFFF;
 
-        // Replay check (only after successful authentication)
-        if index > self.rtcp_index {
-            self.rtcp_index = index;
+        // Tentative anti-replay check. The tag was already verified above,
+        // so the commit right after the (conditional) decryption below is
+        // safe; the check itself just rejects duplicates/out-of-window
+        // indices before touching the payload.
+        if !self.rtcp_replay.check(index as u64) {
+            return Err(SrtpError::ReplayRejected);
         }
 
         if e_bit && packet.len() > 8 {
             self.cipher_rtcp(packet, index);
+        }
+
+        self.rtcp_replay.commit(index as u64);
+        if index > self.rtcp_index {
+            self.rtcp_index = index;
         }
 
         Ok(())
@@ -846,7 +951,7 @@ impl SrtpContext {
             let (body, trailer) = protected_body.split_at_mut(body_len);
             let (tag_output, mki_output) = trailer.split_at_mut(tag_len);
             let tag = cipher
-                .encrypt_in_place_detached(Nonce::from_slice(&nonce), header, body)
+                .encrypt_inout_detached(&Nonce::from(nonce), header, body.into())
                 .map_err(|_| SrtpError::AuthenticationFailed)?;
             if let Some((value, _)) = self.mki.tx.as_ref() {
                 mki_output.copy_from_slice(&value[..mki_len]);
@@ -886,42 +991,37 @@ impl SrtpContext {
         // negotiated MKI length first, then fall back to no-MKI — some
         // deployed stacks advertise `|...|1:1` in SDP (e.g. rustrtc
         // ≤ 0.3.138, restsend/sipbot builds) but never actually send the
-        // MKI field. The winning mode is cached per SSRC.
-        let candidates: Vec<usize> = match self.rx_mki_active {
-            Some(true) => vec![advertised_mki_len],
-            Some(false) => vec![0],
-            None => {
-                let mut v = Vec::with_capacity(2);
-                if advertised_mki_len > 0 {
-                    v.push(advertised_mki_len);
-                }
-                v.push(0);
-                v
-            }
+        // MKI field. The winning mode is cached per SSRC, so the fallback
+        // attempt only ever happens on the first packet of a stream.
+        let (first, fallback): (usize, Option<usize>) = match self.rx_mki_active {
+            Some(true) => (advertised_mki_len, None),
+            Some(false) => (0, None),
+            None if advertised_mki_len > 0 => (advertised_mki_len, Some(0)),
+            None => (0, None),
         };
-
-        let original_body = if candidates.len() > 1 {
+        // A fallback retry needs the original bytes restored first (the GCM
+        // branch truncates `body` before verifying the tag). Snapshot the
+        // body only when a retry is actually possible — never on the
+        // steady-state path.
+        let original_body = if fallback.is_some() {
             packet.body.clone()
         } else {
             BytesMut::new()
         };
-        let mut last_err = SrtpError::AuthenticationFailed;
 
-        for (idx, &mki_len) in candidates.iter().enumerate() {
-            match self.unprotect_with_mki(&mut packet, mki_len) {
-                Ok(unprotected) => {
-                    self.rx_mki_active = Some(mki_len > 0);
-                    return Ok(unprotected);
-                }
-                Err(e) => {
-                    last_err = e;
-                    if idx + 1 < candidates.len() {
-                        packet.body = original_body.clone();
-                    }
-                }
+        match self.unprotect_with_mki(&mut packet, first) {
+            Ok(unprotected) => {
+                self.rx_mki_active = Some(first > 0);
+                Ok(unprotected)
+            }
+            Err(e) => {
+                let Some(mki_len) = fallback else { return Err(e) };
+                packet.body = original_body;
+                let unprotected = self.unprotect_with_mki(&mut packet, mki_len)?;
+                self.rx_mki_active = Some(mki_len > 0);
+                Ok(unprotected)
             }
         }
-        Err(last_err)
     }
 
     /// Attempt the unprotect of `packet` assuming an inbound MKI field of
@@ -940,6 +1040,15 @@ impl SrtpContext {
 
         let sequence_number = packet.header.sequence_number;
         let roc = self.estimate_roc(sequence_number);
+        let index = ((roc as u64) << 16) | sequence_number as u64;
+        // Tentative anti-replay check (RFC 3711 §3.3): duplicates and
+        // out-of-window indices are dropped before any crypto work. This
+        // does not mutate state, so forged packets cannot pollute the
+        // window; the window bit is committed only after authentication
+        // succeeded (see `commit` below).
+        if !self.rtp_replay.check(index) {
+            return Err(SrtpError::ReplayRejected);
+        }
         packet.marshal_header_into(&mut self.auth_scratch);
 
         if let SrtpProfile::AeadAes128Gcm = self._profile {
@@ -950,13 +1059,15 @@ impl SrtpContext {
                 .ok_or(SrtpError::UnsupportedProfile)?;
             // RFC 7714: header || ciphertext || tag || [MKI].
             let split = packet.body.len() - tag_len - mki_len;
-            let tag = aes_gcm::Tag::clone_from_slice(&packet.body[split..split + tag_len]);
+            let tag: aes_gcm::Tag = packet.body[split..split + tag_len]
+                .try_into()
+                .map_err(|_| SrtpError::Internal("invalid GCM tag length".to_string()))?;
             packet.body.truncate(split);
             cipher
-                .decrypt_in_place_detached(
-                    Nonce::from_slice(&nonce),
+                .decrypt_inout_detached(
+                    &Nonce::from(nonce),
                     &self.auth_scratch,
-                    &mut packet.body,
+                    (&mut packet.body[..]).into(),
                     &tag,
                 )
                 .map_err(|_| SrtpError::AuthenticationFailed)?;
@@ -999,6 +1110,7 @@ impl SrtpContext {
         } else {
             0
         };
+        self.rtp_replay.commit(index);
         self.update(sequence_number, roc);
         Ok(RtpPacket {
             header: packet.header.clone(),
@@ -1235,6 +1347,121 @@ mod tests {
         assert_eq!(raw.len(), packet.header.encoded_len() + 3 + 10);
     }
 
+    fn protect_seq(session: &mut SrtpSession, seq: u16) -> BytesMut {
+        let packet = sample_packet(seq);
+        let mut raw = BytesMut::zeroed(session.protected_rtp_len(&packet));
+        session.protect_rtp(&packet, &mut raw).unwrap();
+        raw
+    }
+
+    fn unprotect_raw(session: &mut SrtpSession, raw: BytesMut) -> SrtpResult<RtpPacket> {
+        session.unprotect_rtp(SrtpPacket::parse(raw).unwrap())
+    }
+
+    fn rtcp_protected_pair(profile: SrtpProfile) -> Vec<Vec<u8>> {
+        let mut tx = SrtpSession::new(profile, material(), material()).unwrap();
+        (0..2)
+            .map(|i| {
+                let mut p = srtp_rtcp_packet(0x1234 + i as u32);
+                tx.protect_rtcp(&mut p).unwrap();
+                p
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rtp_replay_duplicate_rejected() {
+        let mut tx = SrtpSession::new(SrtpProfile::AeadAes128Gcm, material(), material()).unwrap();
+        let mut rx = SrtpSession::new(SrtpProfile::AeadAes128Gcm, material(), material()).unwrap();
+        let raw = protect_seq(&mut tx, 1);
+        unprotect_raw(&mut rx, raw.clone()).unwrap();
+        let err = unprotect_raw(&mut rx, raw).unwrap_err();
+        assert!(matches!(err, SrtpError::ReplayRejected));
+        // Session keeps working for fresh packets.
+        unprotect_raw(&mut rx, protect_seq(&mut tx, 2)).unwrap();
+    }
+
+    #[test]
+    fn rtp_reorder_within_window_accepted() {
+        let mut tx = SrtpSession::new(SrtpProfile::AeadAes128Gcm, material(), material()).unwrap();
+        let mut rx = SrtpSession::new(SrtpProfile::AeadAes128Gcm, material(), material()).unwrap();
+        for seq in [10u16, 8, 9, 7, 11] {
+            unprotect_raw(&mut rx, protect_seq(&mut tx, seq)).unwrap();
+        }
+    }
+
+    #[test]
+    fn rtp_replay_window_slides() {
+        let mut tx = SrtpSession::new(SrtpProfile::AeadAes128Gcm, material(), material()).unwrap();
+        let mut rx = SrtpSession::new(SrtpProfile::AeadAes128Gcm, material(), material()).unwrap();
+        // Advance the highest index to 200; the window now covers 73..=200.
+        unprotect_raw(&mut rx, protect_seq(&mut tx, 10)).unwrap();
+        unprotect_raw(&mut rx, protect_seq(&mut tx, 200)).unwrap();
+        // A late packet inside the window still passes.
+        unprotect_raw(&mut rx, protect_seq(&mut tx, 180)).unwrap();
+        // Index 10 is now older than the window: rejected even though it was
+        // never seen before (and a plain replay of 200 is rejected as a dup).
+        let err = unprotect_raw(&mut rx, protect_seq(&mut tx, 10)).unwrap_err();
+        assert!(matches!(err, SrtpError::ReplayRejected));
+        let err = unprotect_raw(&mut rx, protect_seq(&mut tx, 200)).unwrap_err();
+        assert!(matches!(err, SrtpError::ReplayRejected));
+    }
+
+    #[test]
+    fn forged_packet_does_not_advance_window() {
+        let mut tx = SrtpSession::new(SrtpProfile::AeadAes128Gcm, material(), material()).unwrap();
+        let mut rx = SrtpSession::new(SrtpProfile::AeadAes128Gcm, material(), material()).unwrap();
+        unprotect_raw(&mut rx, protect_seq(&mut tx, 1)).unwrap();
+
+        // A forged packet with a fresh index fails authentication and must
+        // NOT consume its index (else it could crowd out the real packet).
+        let mut forged = protect_seq(&mut tx, 2);
+        let last = forged.len() - 1;
+        forged[last] ^= 0xff;
+        let err = unprotect_raw(&mut rx, forged).unwrap_err();
+        assert!(matches!(err, SrtpError::AuthenticationFailed));
+
+        // The real packet for that index is still accepted.
+        unprotect_raw(&mut rx, protect_seq(&mut tx, 2)).unwrap();
+
+        // Same for a far-future forged index.
+        let mut forged = protect_seq(&mut tx, 150);
+        let last = forged.len() - 1;
+        forged[last] ^= 0xff;
+        assert!(unprotect_raw(&mut rx, forged).is_err());
+        unprotect_raw(&mut rx, protect_seq(&mut tx, 3)).unwrap();
+    }
+
+    #[test]
+    fn rtp_rollover_old_epoch_rejected() {
+        let mut tx = SrtpSession::new(SrtpProfile::AeadAes128Gcm, material(), material()).unwrap();
+        let mut rx = SrtpSession::new(SrtpProfile::AeadAes128Gcm, material(), material()).unwrap();
+        unprotect_raw(&mut rx, protect_seq(&mut tx, 65535)).unwrap();
+        // ROC rolls over: index becomes (1 << 16) | 1.
+        unprotect_raw(&mut rx, protect_seq(&mut tx, 1)).unwrap();
+        // A previous-epoch packet far below the window edge is rejected.
+        let err = unprotect_raw(&mut rx, protect_seq(&mut tx, 60000)).unwrap_err();
+        assert!(matches!(err, SrtpError::ReplayRejected));
+        // A previous-epoch packet within the window is a legitimate reorder.
+        unprotect_raw(&mut rx, protect_seq(&mut tx, 65534)).unwrap();
+    }
+
+    #[test]
+    fn rtcp_replay_rejected_and_reorder_ok() {
+        for profile in [SrtpProfile::AeadAes128Gcm, SrtpProfile::Aes128Sha1_80] {
+            let packets = rtcp_protected_pair(profile);
+            let mut rx = SrtpSession::new(profile, material(), material()).unwrap();
+            // Higher index first, then the earlier one: a legitimate
+            // in-window reorder.
+            rx.unprotect_rtcp(&mut packets[1].clone()).unwrap();
+            rx.unprotect_rtcp(&mut packets[0].clone()).unwrap();
+            // Replaying the higher-index packet is a duplicate.
+            let err = rx.unprotect_rtcp(&mut packets[1].clone()).unwrap_err();
+            assert!(matches!(err, SrtpError::ReplayRejected));
+        }
+    }
+
+    #[test]
     #[test]
     fn roc_rollover_handling() {
         let mut sender =

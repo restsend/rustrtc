@@ -34,7 +34,7 @@ sha1 = "0.11.0"
 sha2 = "0.11.0"
 md5 = { package = "md-5", version = "0.11.0" }
 p256 = { version = "0.13.2", optional = true, default-features = false, features = ["alloc", "ecdh", "ecdsa", "pkcs8"] }
-aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
+aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc"] }
 futures = { version = "0.3.32", default-features = false, features = ["alloc"] }
 crc32fast = { version = "1.5.0", default-features = false }
 base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
@@ -69,6 +69,7 @@ rustls = { version = "0.23", default-features = false, features = [
     "tls12",
     "logging",
 ] }
+ring = "0.17.14"
 hyper-rustls = { version = "0.27", default-features = false, features = [
     "http1",
     "tls12",
