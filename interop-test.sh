@@ -44,10 +44,11 @@ bad() { echo "  ✗ $1"; FAIL=$((FAIL+1)); }
 step "1/4 rustrtc 单测 + pion-Rust 互操作 (interop_webrtc)"
 cd "$SCRIPT_DIR"
 cargo test -p rustrtc 2>&1 | tail -3 | grep -E "test result" || true
-if cargo test -p rustrtc --test interop_webrtc 2>&1 | grep -q "4 passed"; then
-  ok "interop_webrtc 4/4 (ICE/DTLS 握手 + VP8 echo + PLI)"
+RESULT=$(cargo test -p rustrtc --test interop_webrtc 2>&1 | grep -E "test result")
+if echo "$RESULT" | grep -q " 0 failed" && ! echo "$RESULT" | grep -q " 0 passed"; then
+  ok "interop_webrtc (ICE/DTLS 握手 + VP8 echo + PLI): $RESULT"
 else
-  bad "interop_webrtc 未全部通过"
+  bad "interop_webrtc 未全部通过: $RESULT"
 fi
 
 # 编译 pion 互操作二进制
@@ -59,7 +60,7 @@ cargo build -p rustrtc --example interop_pion 2>&1 | tail -1 >/dev/null && ok "i
 # ── 3. pion (Go) ↔ rustrtc 双向互操作 ───────────────────────────
 step "3/4 pion (Go) ↔ rustrtc 双向 DataChannel + 视频"
 # 3a. pion client → rustrtc server
-"$SCRIPT_DIR/../../target/debug/examples/interop_pion" server 127.0.0.1:$PBX_HTTP > /tmp/rustrtc-interop-server.log 2>&1 &
+"$SCRIPT_DIR/target/debug/examples/interop_pion" server 127.0.0.1:$PBX_HTTP > /tmp/rustrtc-interop-server.log 2>&1 &
 RUSTRTC_SERVER_PID=$!
 # 等 server 就绪(轮询端口,最多 15s)
 for _ in $(seq 1 15); do
@@ -88,7 +89,7 @@ sleep 1
 /tmp/interop_pion_client -mode server -addr 127.0.0.1:$PBX_HTTP > /tmp/rustrtc-interop-pionserver.log 2>&1 &
 PION_SERVER_PID=$!
 sleep 1
-"$SCRIPT_DIR/../../target/debug/examples/interop_pion" client 127.0.0.1:$PBX_HTTP > /tmp/rustrtc-interop-rustclient.log 2>&1 &
+"$SCRIPT_DIR/target/debug/examples/interop_pion" client 127.0.0.1:$PBX_HTTP > /tmp/rustrtc-interop-rustclient.log 2>&1 &
 RUST_CLIENT_PID=$!
 RUST_OK=0
 for _ in $(seq 1 40); do
@@ -116,7 +117,7 @@ if ! command -v node >/dev/null 2>&1 || [ ! -d "$E2E_DIR/node_modules" ]; then
 fi
 
 # rustrtc server + CORS 代理 + 静态页服务
-"$SCRIPT_DIR/../../target/debug/examples/interop_pion" server 127.0.0.1:$PBX_HTTP > /tmp/rustrtc-interop-server.log 2>&1 &
+"$SCRIPT_DIR/target/debug/examples/interop_pion" server 127.0.0.1:$PBX_HTTP > /tmp/rustrtc-interop-server.log 2>&1 &
 RUSTRTC_SERVER_PID=$!
 for _ in $(seq 1 15); do
   if grep -q "Listening on" /tmp/rustrtc-interop-server.log 2>/dev/null; then break; fi
