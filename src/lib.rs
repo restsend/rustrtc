@@ -61,10 +61,10 @@ pub mod transports;
 mod dual_stack_tests;
 
 pub use config::{
-    ApplicationCapability, AudioCapability, BundlePolicy, CertificateConfig, Connectivity,
-    ExternalIpCandidateType, IceCredentialType, IceServer, IceTcpPolicy, IceTransportPolicy,
-    Keying, MediaCapabilities, RecorderInterceptors, RtcConfiguration, RtcConfigurationBuilder,
-    RtcpMuxPolicy, T38Capability, T38FaxRateManagement, T38UdpEC, VideoCapability,
+    ApplicationCapability, AudioCapability, BundlePolicy, Connectivity, ExternalIpCandidateType,
+    IceCredentialType, IceServer, IceTcpPolicy, IceTransportPolicy, Keying, MediaCapabilities,
+    RecorderInterceptors, RtcConfiguration, RtcConfigurationBuilder, RtcpMuxPolicy, T38Capability,
+    T38FaxRateManagement, T38UdpEC, VideoCapability,
 };
 pub use errors::{RtcError, RtcResult, SdpError, SdpResult};
 #[cfg(feature = "std")]

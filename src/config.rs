@@ -202,15 +202,6 @@ pub enum ExternalIpCandidateType {
     ServerReflexive,
 }
 
-/// Tracks user-supplied certificate material.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct CertificateConfig {
-    /// Certificate chain in PEM (leaf first, then intermediates).
-    pub pem_chain: Vec<String>,
-    /// Matching private key in PEM (PKCS#8 or SEC1).
-    pub private_key_pem: Option<String>,
-}
-
 /// One audio codec offered in SDP, with its parameters.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AudioCapability {
@@ -621,10 +612,6 @@ pub struct RtcConfiguration {
     pub bundle_policy: BundlePolicy,
     /// RTP/RTCP multiplexing policy. See [`RtcpMuxPolicy`].
     pub rtcp_mux_policy: RtcpMuxPolicy,
-    /// Unused: vestigial from the W3C `RTCConfiguration.certificates`
-    /// mirror. DTLS-SRTP key material goes in `dtls_certificate`; nothing
-    /// reads this field.
-    pub certificates: Vec<CertificateConfig>,
     /// How the media path is found.
     pub connectivity: Connectivity,
     /// How the SRTP keys are exchanged.
@@ -912,7 +899,6 @@ impl PartialEq for RtcConfiguration {
             && self.ice_transport_policy == other.ice_transport_policy
             && self.bundle_policy == other.bundle_policy
             && self.rtcp_mux_policy == other.rtcp_mux_policy
-            && self.certificates == other.certificates
             && self.connectivity == other.connectivity
             && self.keying == other.keying
             && self.webrtc_extensions == other.webrtc_extensions
@@ -1014,7 +1000,6 @@ impl RtcConfiguration {
             ice_transport_policy: IceTransportPolicy::default(),
             bundle_policy,
             rtcp_mux_policy,
-            certificates: Vec::new(),
             connectivity,
             keying,
             webrtc_extensions,
@@ -1225,13 +1210,6 @@ impl RtcConfigurationBuilder {
     /// Set the RTP/RTCP multiplexing policy. See [`RtcpMuxPolicy`].
     pub fn rtcp_mux_policy(mut self, policy: RtcpMuxPolicy) -> Self {
         self.inner.rtcp_mux_policy = policy;
-        self
-    }
-
-    /// Append a certificate (see
-    /// [`RtcConfiguration::certificates`] — currently unused).
-    pub fn certificate(mut self, cert: CertificateConfig) -> Self {
-        self.inner.certificates.push(cert);
         self
     }
 
