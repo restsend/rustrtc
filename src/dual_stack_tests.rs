@@ -397,7 +397,9 @@ use tokio::net::UdpSocket;
 const PEER_PWD: &str = "phonepasswordphonepassword";
 
 /// A full-ICE peer (like Linphone) on a direct transport: its sockets,
-/// one RTP (and RTCP without rtcp-mux) per family.
+/// one RTP (and RTCP without rtcp-mux) per family. Only
+/// `ice_lite_nomination_moves_media_to_the_other_family` (Linux) drives it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct IcePeer {
     v4: UdpSocket,
     v6: UdpSocket,
@@ -406,6 +408,7 @@ struct IcePeer {
 }
 
 impl IcePeer {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     async fn new(rtcp_mux: bool) -> Self {
         let rtcp = |ip: &'static str| async move {
             if rtcp_mux {
@@ -428,6 +431,7 @@ impl IcePeer {
 
     /// Its offer: `c=` of `default` (true: IPv4), candidates of both
     /// families.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn offer(&self, keying: Keying, default_v4: bool, version: u32) -> String {
         let default = if default_v4 { &self.v4 } else { &self.v6 };
         let mut sdp = peer_offer(keying, Self::addr(default), version, self.v4_rtcp.is_none());
@@ -537,6 +541,7 @@ async fn answer_check(socket: &UdpSocket, msg: &StunDecoded, from: SocketAddr) {
 
 /// Answer the node's checks on `socket` for a while (it verifies a new
 /// nominated path with a round trip before it moves media there).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 async fn serve_checks(socket: &UdpSocket) {
     let mut buf = [0u8; 1500];
     while let Ok(Ok((n, from))) =

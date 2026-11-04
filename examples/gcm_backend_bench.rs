@@ -32,7 +32,7 @@ fn report(name: &str, elapsed: std::time::Duration) {
 }
 
 fn aes_gcm_crate(key: &[u8; 16]) {
-    use aes_gcm::aead::{AeadInPlace, KeyInit};
+    use aes_gcm::aead::{AeadInOut, KeyInit};
     use aes_gcm::{Aes128Gcm, Nonce};
     use rustrtc::rtp::{RtpHeader, RtpPacket};
 
@@ -42,11 +42,13 @@ fn aes_gcm_crate(key: &[u8; 16]) {
     // Warmup + roundtrip correctness check.
     {
         let mut buf = vec![0u8; PAYLOAD];
-        let nonce = Nonce::from_slice(&[7u8; 12]);
-        let tag = cipher.encrypt_in_place_detached(nonce, &aad, &mut buf).unwrap();
+        let nonce = Nonce::from([7u8; 12]);
+        let tag = cipher
+            .encrypt_inout_detached(&nonce, &aad, (&mut buf[..]).into())
+            .unwrap();
         assert_eq!(tag.len(), 16);
         cipher
-            .decrypt_in_place_detached(nonce, &aad, &mut buf, &tag)
+            .decrypt_inout_detached(&nonce, &aad, (&mut buf[..]).into(), &tag)
             .unwrap();
         assert_eq!(buf.len(), PAYLOAD);
     }
@@ -58,7 +60,7 @@ fn aes_gcm_crate(key: &[u8; 16]) {
         nonce[4..12].copy_from_slice(&(i as u64).to_be_bytes());
         let mut buf = black_box(vec![0u8; PAYLOAD]);
         let tag = cipher
-            .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, &mut buf)
+            .encrypt_inout_detached(&Nonce::from(nonce), &aad, (&mut buf[..]).into())
             .unwrap();
         black_box(&tag);
         black_box(buf.len());
@@ -68,21 +70,21 @@ fn aes_gcm_crate(key: &[u8; 16]) {
     // Decrypt (unprotect): fixed nonce, real tag, in place on a cloned input.
     let mut base = vec![0u8; PAYLOAD];
     let tag = cipher
-        .encrypt_in_place_detached(Nonce::from_slice(&[7u8; 12]), &aad, &mut base)
+        .encrypt_inout_detached(&Nonce::from([7u8; 12]), &aad, (&mut base[..]).into())
         .unwrap();
     let start = Instant::now();
     for _ in 0..ITERS {
         let mut buf = black_box(base.clone());
         cipher
-            .decrypt_in_place_detached(Nonce::from_slice(&[7u8; 12]), &aad, &mut buf, &tag)
+            .decrypt_inout_detached(&Nonce::from([7u8; 12]), &aad, (&mut buf[..]).into(), &tag)
             .unwrap();
         black_box(buf.len());
     }
     let dec = start.elapsed();
 
     println!("--- aes-gcm 0.10 (rustrtc SRTP path) ---");
-    report("encrypt_in_place_detached", enc);
-    report("decrypt_in_place_detached", dec);
+    report("encrypt_inout_detached", enc);
+    report("decrypt_inout_detached", dec);
 
     // Session-level path: SrtpSession::protect_rtp/unprotect_rtp (what
     // rtp_transport actually calls — includes context lookup, MKI handling,

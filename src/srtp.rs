@@ -1462,7 +1462,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn roc_rollover_handling() {
         let mut sender =
             SrtpSession::new(SrtpProfile::Aes128Sha1_80, material(), material()).unwrap();

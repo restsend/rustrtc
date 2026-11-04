@@ -13,7 +13,7 @@ fn main() {
     let aes = aes::Aes128::new_from_slice(&key).unwrap();
 
     // Single block
-    let mut block = aes::Block::clone_from_slice(&[0u8; 16]);
+    let mut block = aes::Block::default();
     let start = Instant::now();
     for _ in 0..ITERS {
         aes.encrypt_block(&mut block);
@@ -26,7 +26,7 @@ fn main() {
     );
 
     // 75 blocks in one call (≈1200 B payload)
-    let mut blocks = vec![aes::Block::clone_from_slice(&[0u8; 16]); BLOCKS];
+    let mut blocks = vec![aes::Block::default(); BLOCKS];
     let start = Instant::now();
     for _ in 0..ITERS {
         aes.encrypt_blocks(&mut blocks);
