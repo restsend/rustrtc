@@ -80,8 +80,8 @@ async fn drain_until(
 async fn e2e_loopback_large_bidirectional_transfer() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let pc1 = Arc::new(PeerConnection::new(RtcConfiguration::default()));
-    let pc2 = Arc::new(PeerConnection::new(RtcConfiguration::default()));
+    let pc1 = Arc::new(PeerConnection::new(RtcConfiguration::webrtc()));
+    let pc2 = Arc::new(PeerConnection::new(RtcConfiguration::webrtc()));
 
     let dc1 = pc1.create_data_channel(
         "e2e",
@@ -172,8 +172,8 @@ async fn e2e_loopback_large_bidirectional_transfer() -> Result<()> {
 async fn e2e_loopback_many_small_messages_no_loss() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let pc1 = Arc::new(PeerConnection::new(RtcConfiguration::default()));
-    let pc2 = Arc::new(PeerConnection::new(RtcConfiguration::default()));
+    let pc1 = Arc::new(PeerConnection::new(RtcConfiguration::webrtc()));
+    let pc2 = Arc::new(PeerConnection::new(RtcConfiguration::webrtc()));
 
     let dc1 = pc1.create_data_channel(
         "small",

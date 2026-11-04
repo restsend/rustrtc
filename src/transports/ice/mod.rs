@@ -1086,7 +1086,7 @@ impl IceTransportRunner {
             || state == IceTransportState::Disconnected
             || state == IceTransportState::Completed
         {
-            if inner.config.connectivity() == Connectivity::Ice {
+            if inner.config.connectivity == Connectivity::Ice {
                 let last_nanos = inner.last_received_nanos.load(Ordering::Relaxed);
                 let now_nanos = inner.created_at.elapsed().as_nanos() as u64;
                 let elapsed = Duration::from_nanos(now_nanos.saturating_sub(last_nanos));
@@ -1826,91 +1826,9 @@ impl IceTransport {
         Ok(())
     }
 
-    pub async fn start_direct(&self, remote_addr: SocketAddr) -> RtcResult<()> {
-        self.start_gathering()?;
-        self.start_keepalive();
-
-        // Wait for a suitable local candidate
-        // If remote is not loopback, we prefer a non-loopback local candidate to avoid os error 49 (EADDRNOTAVAIL)
-        let mut rx = self.subscribe_candidates();
-        let start = Instant::now();
-        let timeout_dur = Duration::from_secs(2);
-
-        let is_suitable = |c: &IceCandidate| -> bool {
-            if !remote_addr.ip().is_loopback() && c.address.ip().is_loopback() {
-                return false;
-            }
-            true
-        };
-
-        let mut best_local: Option<IceCandidate> = None;
-
-        // 1. Check existing candidates
-        {
-            let candidates = self.inner.gatherer.local_candidates();
-            for c in candidates {
-                if is_suitable(&c) {
-                    best_local = Some(c);
-                    break;
-                }
-            }
-        }
-
-        // 2. If not found, wait for more
-        if best_local.is_none() {
-            loop {
-                let remaining = timeout_dur
-                    .checked_sub(start.elapsed())
-                    .unwrap_or(Duration::ZERO);
-                if remaining.is_zero() {
-                    break;
-                }
-
-                match with_timeout(remaining, rx.recv()).await {
-                    Ok(Ok(c)) => {
-                        if is_suitable(&c) {
-                            best_local = Some(c);
-                            break;
-                        }
-                    }
-                    _ => break,
-                }
-            }
-        }
-
-        // 3. Fallback to any candidate
-        let local = if let Some(best) = best_local {
-            best
-        } else if let Some(first) = self.inner.gatherer.local_candidates().first() {
-            first.clone()
-        } else {
-            return Err(RtcError::Internal(format!(
-                "No local candidates gathered for direct connection"
-            )));
-        };
-
-        let remote = IceCandidate::host(remote_addr, 1);
-        let pair = IceCandidatePair::new(local, remote);
-
-        // Commit the pair+socket atomically (see `commit_selected_pair`);
-        // the socket was just bound and registered, so it always resolves.
-        let selected = {
-            let _selection = self.inner.selection_lock.lock();
-            commit_selected_pair(&self.inner, &pair, None)
-        };
-        if selected {
-            let _ = self.inner.set_state(IceTransportState::Connected);
-        }
-        Ok(())
-    }
-
     /// Set up a direct UDP socket for RTP mode without any ICE gathering,
     /// STUN lookups, or connectivity checks.
     /// Binds a single socket, registers it, and marks the transport as connected.
-    pub async fn setup_direct_rtp(&self, remote_addr: SocketAddr) -> RtcResult<SocketAddr> {
-        self.setup_direct_rtp_with_rtcp(remote_addr, false).await
-    }
-
     pub(crate) async fn setup_direct_rtp_with_rtcp(
         &self,
         remote_addr: SocketAddr,
@@ -1941,13 +1859,10 @@ impl IceTransport {
         Ok(local_candidate.address)
     }
 
-    /// Set up a direct UDP socket for RTP mode (offer side, no remote addr yet).
-    /// Binds a socket and registers the local candidate, but does NOT set the
-    /// selected pair or transition to Connected.
-    pub async fn setup_direct_rtp_offer(&self) -> RtcResult<SocketAddr> {
-        self.setup_direct_rtp_offer_with_rtcp(false).await
-    }
-
+    /// Set up a direct UDP socket for RTP mode (offer side, no remote addr yet),
+    /// and an RTCP socket next to it when `bind_rtcp`. Binds and registers the
+    /// local candidates, but does NOT set the selected pair or transition to
+    /// Connected.
     pub(crate) async fn setup_direct_rtp_offer_with_rtcp(
         &self,
         bind_rtcp: bool,
@@ -2057,8 +1972,8 @@ impl IceTransport {
     }
 
     /// Complete the RTP direct connection by setting the remote address.
-    /// Call after setup_direct_rtp_offer when the answer arrives with the remote address.
-    pub fn complete_direct_rtp(&self, remote_addr: SocketAddr) {
+    /// Call after setup_direct_rtp_offer_with_rtcp when the answer arrives with the remote address.
+    pub(crate) fn complete_direct_rtp(&self, remote_addr: SocketAddr) {
         let remote_candidate = IceCandidate::host(remote_addr, 1);
         // Of the peer's family when we have one (a re-INVITE can change it).
         let locals: Vec<_> = self
@@ -3755,7 +3670,7 @@ async fn handle_stun_request(
     // offer, ignoring a=ice-lite) gets 487 Role Conflict: it takes the
     // controlling role (§7.2.5.1), checks again and nominates. Else nobody
     // nominates, and the media path stays the c= one.
-    if inner.config.connectivity() == Connectivity::IceLite && msg.ice_controlled.is_some() {
+    if inner.config.connectivity == Connectivity::IceLite && msg.ice_controlled.is_some() {
         let response =
             StunMessage::binding_error_response(msg.transaction_id, 487, "Role Conflict");
         let password = inner.local_parameters.lock().password.clone();
@@ -3854,7 +3769,7 @@ async fn handle_stun_request(
     // nominated pair: retargeting it onto an address the peer never nominated
     // blackholes media while consent keepalives still flow on the original
     // socket.
-    if inner.config.enable_latching && inner.config.connectivity().is_direct() {
+    if inner.config.enable_latching && inner.config.connectivity.is_direct() {
         // Decide AND commit under the lock: reading the current pair before
         // taking it would race a concurrent selection commit (e.g.
         // USE-CANDIDATE) and let a latching pair derived from the stale
@@ -5220,7 +5135,7 @@ impl IceGatherer {
         if !self.config.bind_ips.is_empty() {
             return self.config.bind_ips.clone();
         }
-        if self.config.connectivity().is_direct() {
+        if self.config.connectivity.is_direct() {
             // A direct transport: prefer a LAN IP if available. Binding to
             // 0.0.0.0 on macOS can lead to "No route to host" (os error 65)
             // if the destination is on a LAN segment but the OS picks a wrong
@@ -5277,7 +5192,7 @@ impl IceGatherer {
     fn external_as_srflx(&self, bind_ip: IpAddr) -> bool {
         self.config.external_ip_candidate_type
             == crate::config::ExternalIpCandidateType::ServerReflexive
-            && self.config.connectivity() == Connectivity::Ice
+            && self.config.connectivity == Connectivity::Ice
             && self.config.ice_transport_policy == IceTransportPolicy::All
             && !bind_ip.is_loopback()
             && !self.config.external_ips.is_empty()
@@ -6654,7 +6569,7 @@ mod bind_socket_retry_tests {
     fn gatherer(start: u16, end: u16) -> IceGatherer {
         let (candidate_tx, _) = broadcast::channel(1);
         let (socket_tx, _socket_rx) = crate::platform::sync::mpsc::unbounded_channel();
-        let mut config = RtcConfiguration::default();
+        let mut config = RtcConfiguration::webrtc();
         config.rtp_start_port = Some(start);
         config.rtp_end_port = Some(end);
         IceGatherer::new(config, candidate_tx, socket_tx)

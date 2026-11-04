@@ -49,7 +49,7 @@ pub mod t38;
 /// connections. A parked monitor advances a handful of times per session;
 /// the clone-notification busy-loop that starved TURN read tasks advanced
 /// thousands of times per second. Downstream integration tests assert the
-/// delta over an idle hold window (see `monitor_ice_and_dtls`).
+/// delta over an idle hold window (see `monitor_transport`).
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub static DTLS_MONITOR_ITERATIONS: crate::platform::atomic64::AtomicU64 =
@@ -61,11 +61,10 @@ pub mod transports;
 mod dual_stack_tests;
 
 pub use config::{
-    ApplicationCapability, AudioCapability, BundlePolicy, CertificateConfig,
+    ApplicationCapability, AudioCapability, BundlePolicy, CertificateConfig, Connectivity,
     ExternalIpCandidateType, IceCredentialType, IceServer, IceTcpPolicy, IceTransportPolicy,
-    MediaCapabilities, RecorderInterceptors, RtcConfiguration, RtcConfigurationBuilder,
-    RtcpMuxPolicy, SdpCompatibilityMode, T38Capability, T38FaxRateManagement, T38UdpEC,
-    TransportMode, VideoCapability,
+    Keying, MediaCapabilities, RecorderInterceptors, RtcConfiguration, RtcConfigurationBuilder,
+    RtcpMuxPolicy, T38Capability, T38FaxRateManagement, T38UdpEC, VideoCapability,
 };
 pub use errors::{RtcError, RtcResult, SdpError, SdpResult};
 #[cfg(feature = "std")]

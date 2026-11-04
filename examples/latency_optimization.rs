@@ -55,7 +55,7 @@ async fn main() {
 }
 
 async fn run_single_iteration() -> Option<u128> {
-    let config = RtcConfiguration::default();
+    let config = RtcConfiguration::webrtc();
     let pc1 = PeerConnection::new(config.clone());
     let pc2 = PeerConnection::new(config);
 

@@ -1,6 +1,6 @@
 #![cfg(not(feature = "std"))]
 
-//! G1 capstone: full WebRTC transport mode (`TransportMode::WebRtc` —
+//! G1 capstone: full WebRTC (`Connectivity::Ice` + `Keying::Dtls` —
 //! ICE + DTLS-SRTP) under no_std. Two no_std `PeerConnection`s, each with a
 //! pre-provisioned DTLS certificate, run the complete flow against the mock
 //! runtime: offer/answer (fingerprint + full ICE candidates), STUN
@@ -29,7 +29,7 @@ const CERT_DER: &[u8] = include_bytes!("fixtures/dtls_cert.der");
 const KEY_DER: &[u8] = include_bytes!("fixtures/dtls_key.der");
 
 fn webrtc_agent(label: &str, start: u16, end: u16) -> PeerConnection {
-    let mut config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::webrtc();
     config.label = Some(label.to_string());
     config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
     config.rtp_start_port = Some(start);

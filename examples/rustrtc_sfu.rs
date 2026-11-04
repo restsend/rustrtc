@@ -165,7 +165,7 @@ async fn session(
 
         // New connection
         info!("New connection for user {}", req.user_id);
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         let pc = PeerConnection::new(config);
 
         let peer_id = std::time::SystemTime::now()

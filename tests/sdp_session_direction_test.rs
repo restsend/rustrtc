@@ -3,7 +3,7 @@
 //! RFC 8866 §6.7 (RFC 4566 §6): a direction attribute at session level
 //! applies to every media section that does not carry its own.
 use rustrtc::sdp::{Direction, SdpType, SessionDescription};
-use rustrtc::{MediaKind, PeerConnection, RtcConfiguration, TransceiverDirection, TransportMode};
+use rustrtc::{MediaKind, PeerConnection, RtcConfiguration, TransceiverDirection};
 
 fn sdp(session_direction: Option<&str>, media_directions: &[Option<&str>]) -> String {
     let mut out = String::from("v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n");
@@ -98,8 +98,7 @@ fn reparsing_our_serialization_keeps_the_direction() {
 async fn a_session_level_hold_is_answered_recvonly() {
     for initial in [Some("sendonly"), None] {
         let pc = PeerConnection::new(RtcConfiguration {
-            transport_mode: TransportMode::Rtp,
-            ..RtcConfiguration::default()
+            ..RtcConfiguration::sip()
         });
         for session_direction in [initial, Some("sendonly")] {
             let raw = sdp(session_direction, &[None]);
@@ -126,8 +125,7 @@ async fn a_session_level_hold_is_answered_recvonly() {
 #[tokio::test]
 async fn a_session_level_direction_in_the_answer_applies() {
     let pc = PeerConnection::new(RtcConfiguration {
-        transport_mode: TransportMode::Rtp,
-        ..RtcConfiguration::default()
+        ..RtcConfiguration::sip()
     });
     let t = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
     let offer = pc.create_offer().await.expect("offer");

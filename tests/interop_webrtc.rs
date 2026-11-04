@@ -28,7 +28,7 @@ async fn interop_ice_dtls_handshake() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
     // 1. Create RustRTC PeerConnection (Offerer)
-    let rust_config = RtcConfiguration::default();
+    let rust_config = RtcConfiguration::webrtc();
     let rust_pc = PeerConnection::new(rust_config);
 
     // Add a transceiver to trigger ICE gathering
@@ -119,7 +119,7 @@ async fn interop_vp8_echo() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
     // 1. Create RustRTC PeerConnection (Offerer)
-    let rust_config = RtcConfiguration::default();
+    let rust_config = RtcConfiguration::webrtc();
     let rust_pc = PeerConnection::new(rust_config);
 
     // Add a transceiver for Video
@@ -304,7 +304,7 @@ async fn interop_vp8_echo_with_pli() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
     // 1. Create RustRTC PeerConnection (Offerer)
-    let rust_config = RtcConfiguration::default();
+    let rust_config = RtcConfiguration::webrtc();
     let rust_pc = PeerConnection::new(rust_config);
 
     // Add a transceiver for Video
@@ -488,7 +488,7 @@ async fn interop_ice_close_triggers_pc_close() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
     // 1. Create RustRTC PeerConnection (Offerer)
-    let rust_config = RtcConfiguration::default();
+    let rust_config = RtcConfiguration::webrtc();
     let rust_pc = PeerConnection::new(rust_config);
 
     // Add a transceiver to trigger ICE gathering
@@ -608,7 +608,7 @@ async fn interop_third_party_controlling_rustrtc_controlled() -> Result<()> {
     let _ = webrtc_pc.add_track(audio_track).await?;
 
     // 2. rustrtc PeerConnection (answerer / controlled).
-    let rust_pc = PeerConnection::new(RtcConfiguration::default());
+    let rust_pc = PeerConnection::new(RtcConfiguration::webrtc());
     rust_pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
 
     // 3. Third-party offer -> rustrtc.

@@ -41,8 +41,7 @@ fn create_minimal_sdp(sdp_type: SdpType, mid: &str, direction: Direction) -> Ses
 /// Test 1: Offerer timing - parameters should apply when answer is received
 #[tokio::test]
 async fn test_reinvite_offerer_timing() {
-    let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Rtp;
+    let config = RtcConfiguration::sip();
     let pc = PeerConnection::new(config);
 
     // Initial negotiation
@@ -110,8 +109,7 @@ async fn test_reinvite_offerer_timing() {
 /// Test 2: Answerer timing - parameters should apply when offer is received
 #[tokio::test]
 async fn test_reinvite_answerer_timing() {
-    let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Rtp;
+    let config = RtcConfiguration::sip();
     let pc = PeerConnection::new(config);
 
     // Simulate being the answerer - receive initial offer
@@ -150,8 +148,7 @@ async fn test_reinvite_answerer_timing() {
 /// Test 3: SSRC change detection
 #[tokio::test]
 async fn test_ssrc_change_detection() {
-    let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Rtp;
+    let config = RtcConfiguration::sip();
     let pc = PeerConnection::new(config);
 
     // Initial negotiation
@@ -185,8 +182,7 @@ async fn test_ssrc_change_detection() {
 /// Test 4: Direction change - SendRecv to SendOnly (hold)
 #[tokio::test]
 async fn test_direction_change_hold() {
-    let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Rtp;
+    let config = RtcConfiguration::sip();
     let pc = PeerConnection::new(config);
 
     pc.add_transceiver(
@@ -216,8 +212,7 @@ async fn test_direction_change_hold() {
 /// Test 5: Direction change - SendOnly to SendRecv (unhold)
 #[tokio::test]
 async fn test_direction_change_unhold() {
-    let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Rtp;
+    let config = RtcConfiguration::sip();
     let pc = PeerConnection::new(config);
 
     // Initial negotiation with SendOnly
@@ -245,8 +240,7 @@ async fn test_direction_change_unhold() {
 /// Test 6: Direction change - SendRecv to Inactive
 #[tokio::test]
 async fn test_direction_change_inactive() {
-    let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Rtp;
+    let config = RtcConfiguration::sip();
     let pc = PeerConnection::new(config);
 
     // Initial negotiation
@@ -271,8 +265,7 @@ async fn test_direction_change_inactive() {
 /// Test 7: Multiple parameter changes in one reinvite
 #[tokio::test]
 async fn test_combined_parameter_changes() {
-    let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Rtp;
+    let config = RtcConfiguration::sip();
     let pc = PeerConnection::new(config);
 
     // Initial negotiation
@@ -330,8 +323,7 @@ async fn test_combined_parameter_changes() {
 /// Test 8: Reject reinvite in invalid state (glare detection)
 #[tokio::test]
 async fn test_glare_detection() {
-    let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Rtp;
+    let config = RtcConfiguration::sip();
     let pc = PeerConnection::new(config);
 
     // Initial negotiation
@@ -364,8 +356,7 @@ async fn test_glare_detection() {
 /// Test 9: Multiple sequential reinvites
 #[tokio::test]
 async fn test_sequential_reinvites() {
-    let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Rtp;
+    let config = RtcConfiguration::sip();
     let pc = PeerConnection::new(config);
 
     // Initial negotiation
@@ -422,8 +413,7 @@ async fn test_sequential_reinvites() {
 /// Test 10: Extmap ID changes
 #[tokio::test]
 async fn test_extmap_changes_in_reinvite() {
-    let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Rtp;
+    let config = RtcConfiguration::sip();
     let pc = PeerConnection::new(config);
 
     // Add transceiver first (answerer must have transceiver to receive remote offer)
@@ -499,8 +489,7 @@ async fn test_extmap_changes_in_reinvite() {
 /// Test 11: Reinvite updates RTP remote address
 #[tokio::test]
 async fn test_reinvite_updates_remote_addr() {
-    let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Rtp;
+    let config = RtcConfiguration::sip();
     let pc = PeerConnection::new(config);
 
     // Initial negotiation as answerer
@@ -564,8 +553,7 @@ async fn test_reinvite_updates_remote_addr() {
 /// Helper: an RTP-mode peer connection with an audio sender, so offers are
 /// not downgraded for lack of a track.
 fn rtp_pc_with_audio_sender() -> PeerConnection {
-    let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Rtp;
+    let config = RtcConfiguration::sip();
     let pc = PeerConnection::new(config);
     let (_source, track, _) =
         rustrtc::media::track::sample_track(rustrtc::media::MediaKind::Audio, 10);
@@ -685,8 +673,7 @@ async fn test_reoffer_keeps_locally_initiated_hold() {
 /// track, re-offers `recvonly` (what we can do), not `sendonly` or `inactive`.
 #[tokio::test]
 async fn test_reoffer_from_remote_created_transceiver_without_sender() {
-    let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Rtp;
+    let config = RtcConfiguration::sip();
     let pc = PeerConnection::new(config);
     assert_eq!(
         answer_remote_offer(&pc, Direction::SendOnly).await,
@@ -913,9 +900,14 @@ async fn test_answer_directions_for_mid_less_m_lines() {
 /// T.38 (`m=image`) answers follow the same rule, in both SIP transport modes.
 #[tokio::test]
 async fn test_image_answer_combines_offer_with_local_direction() {
-    for mode in [TransportMode::Rtp, TransportMode::Srtp] {
-        let mut config = RtcConfiguration::default();
-        config.transport_mode = mode.clone();
+    for mode in [
+        (Connectivity::Sdp, Keying::None),
+        (Connectivity::Sdp, Keying::Sdes),
+    ] {
+        let mut config = RtcConfiguration::sip();
+        config.connectivity = mode.0;
+        config.keying = mode.1;
+        config.webrtc_extensions = mode.0 == Connectivity::Ice;
         let pc = PeerConnection::new(config);
         let raw = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nc=IN IP4 127.0.0.1\r\n\
                    m=image 40000 udptl t38\r\na=T38FaxVersion:0\r\na=sendrecv\r\n";

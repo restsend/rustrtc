@@ -58,7 +58,7 @@ async fn offer(Json(payload): Json<OfferRequest>) -> impl IntoResponse {
     }
 
     let offer_sdp = SessionDescription::parse(SdpType::Offer, &payload.sdp).unwrap();
-    let config = RtcConfiguration::default();
+    let config = RtcConfiguration::webrtc();
     let pc = Arc::new(PeerConnection::new(config));
     let use_ping_pong = payload.ping_pong;
 

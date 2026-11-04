@@ -29,8 +29,7 @@ async fn main() {
     println!("=== RTP Mode Track Event Example ===\n");
 
     // Configure PeerConnection for RTP mode (like SIP)
-    let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Rtp;
+    let config = RtcConfiguration::sip();
 
     let pc = Arc::new(PeerConnection::new(config));
     println!("✓ Created PeerConnection in RTP mode");

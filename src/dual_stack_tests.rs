@@ -3,12 +3,15 @@
 
 use crate::peer_connection::{PeerConnection, TransceiverDirection};
 use crate::sdp::{MediaKind, SdpType, SessionDescription};
-use crate::{RtcConfiguration, TransportMode};
+use crate::{Connectivity, Keying, RtcConfiguration};
 
-fn config(mode: TransportMode) -> RtcConfiguration {
-    let mut config = RtcConfiguration::default();
-    config.transport_mode = mode;
-    config
+fn config(connectivity: Connectivity, keying: Keying) -> RtcConfiguration {
+    RtcConfiguration {
+        connectivity,
+        keying,
+        webrtc_extensions: connectivity == Connectivity::Ice,
+        ..RtcConfiguration::sip()
+    }
 }
 
 /// Our offer, as text.
@@ -30,18 +33,18 @@ fn line<'a>(sdp: &'a str, prefix: &str) -> &'a str {
 /// (Loopback is never mapped to the external address; `o=` is.)
 #[tokio::test]
 async fn direct_offer_writes_ip6_for_ipv6() {
-    for mode in [TransportMode::Rtp, TransportMode::Srtp] {
-        let mut cfg = config(mode.clone());
+    for keying in [Keying::None, Keying::Sdes] {
+        let mut cfg = config(Connectivity::Sdp, keying);
         cfg.bind_ips = vec![ip("::1")];
         let sdp = offer(cfg.clone()).await;
-        assert_eq!(line(&sdp, "c="), "c=IN IP6 ::1", "{mode:?}:\n{sdp}");
+        assert_eq!(line(&sdp, "c="), "c=IN IP6 ::1", "{keying:?}:\n{sdp}");
 
         cfg.external_ips = vec![ip("2001:db8::1")];
         let sdp = offer(cfg).await;
-        assert_eq!(line(&sdp, "c="), "c=IN IP6 ::1", "{mode:?}:\n{sdp}");
+        assert_eq!(line(&sdp, "c="), "c=IN IP6 ::1", "{keying:?}:\n{sdp}");
         assert!(
             line(&sdp, "o=").ends_with(" IN IP6 2001:db8::1"),
-            "{mode:?}:\n{sdp}"
+            "{keying:?}:\n{sdp}"
         );
         SessionDescription::parse(SdpType::Offer, &sdp).expect("our offer parses");
     }
@@ -50,13 +53,16 @@ async fn direct_offer_writes_ip6_for_ipv6() {
 /// IPv4 stays `IN IP4`.
 #[tokio::test]
 async fn direct_offer_writes_ip4_for_ipv4() {
-    for mode in [TransportMode::Rtp, TransportMode::Srtp] {
-        let mut cfg = config(mode.clone());
+    for keying in [Keying::None, Keying::Sdes] {
+        let mut cfg = config(Connectivity::Sdp, keying);
         cfg.bind_ips = vec![ip("127.0.0.1")];
         cfg.external_ips = vec![ip("192.0.2.1")];
         let sdp = offer(cfg).await;
-        assert_eq!(line(&sdp, "c="), "c=IN IP4 127.0.0.1", "{mode:?}:\n{sdp}");
-        assert!(line(&sdp, "o=").ends_with(" IN IP4 192.0.2.1"), "{mode:?}");
+        assert_eq!(line(&sdp, "c="), "c=IN IP4 127.0.0.1", "{keying:?}:\n{sdp}");
+        assert!(
+            line(&sdp, "o=").ends_with(" IN IP4 192.0.2.1"),
+            "{keying:?}"
+        );
     }
 }
 
@@ -94,7 +100,7 @@ async fn gathered_offer(config: RtcConfiguration) -> String {
 /// the same port, with each family's external address.
 #[tokio::test]
 async fn dual_stack_socket_has_a_candidate_per_family() {
-    let mut cfg = config(TransportMode::WebRtc);
+    let mut cfg = config(Connectivity::Ice, Keying::Dtls);
     cfg.bind_ips = vec![ip("::")];
     cfg.external_ips = vec![ip("192.0.2.1"), ip("2001:db8::1")];
     let sdp = gathered_offer(cfg).await;
@@ -117,7 +123,7 @@ async fn dual_stack_socket_has_a_candidate_per_family() {
 /// family: the default route's IPv4 address and a reachable IPv6 one.
 #[tokio::test]
 async fn dual_stack_socket_without_external_ips_advertises_local_addresses() {
-    let mut cfg = config(TransportMode::WebRtc);
+    let mut cfg = config(Connectivity::Ice, Keying::Dtls);
     cfg.bind_ips = vec![ip("::")];
     let sdp = gathered_offer(cfg).await;
     let cands = candidates(&sdp);
@@ -138,7 +144,7 @@ async fn dual_stack_socket_without_external_ips_advertises_local_addresses() {
 /// Only one family has an external address: it maps that family only.
 #[tokio::test]
 async fn external_ip_maps_only_its_own_family() {
-    let mut cfg = config(TransportMode::WebRtc);
+    let mut cfg = config(Connectivity::Ice, Keying::Dtls);
     cfg.bind_ips = vec![ip("::")];
     cfg.external_ips = vec![ip("192.0.2.1")];
     let cands = candidates(&gathered_offer(cfg).await);
@@ -148,7 +154,7 @@ async fn external_ip_maps_only_its_own_family() {
     }
 
     // A socket of one family never takes the other family's address.
-    let mut cfg = config(TransportMode::WebRtc);
+    let mut cfg = config(Connectivity::Ice, Keying::Dtls);
     cfg.bind_ips = vec![ip("0.0.0.0")];
     cfg.external_ips = vec![ip("2001:db8::1")];
     let cands = candidates(&gathered_offer(cfg).await);
@@ -159,7 +165,7 @@ async fn external_ip_maps_only_its_own_family() {
 /// Two bind addresses, two sockets: a candidate on each.
 #[tokio::test]
 async fn one_socket_per_bind_address() {
-    let mut cfg = config(TransportMode::WebRtc);
+    let mut cfg = config(Connectivity::Ice, Keying::Dtls);
     cfg.bind_ips = vec![ip("127.0.0.1"), ip("::1")];
     let cands = candidates(&gathered_offer(cfg).await);
     assert_eq!(
@@ -172,7 +178,7 @@ async fn one_socket_per_bind_address() {
 /// address, and each family's external address as srflx.
 #[tokio::test]
 async fn external_ips_as_srflx_per_family() {
-    let mut cfg = config(TransportMode::WebRtc);
+    let mut cfg = config(Connectivity::Ice, Keying::Dtls);
     cfg.bind_ips = vec![ip("::")];
     cfg.external_ips = vec![ip("192.0.2.1"), ip("2001:db8::1")];
     cfg.external_ip_candidate_type = crate::ExternalIpCandidateType::ServerReflexive;
@@ -201,9 +207,9 @@ async fn external_ips_as_srflx_per_family() {
 /// the answer lists a candidate for each family.
 #[tokio::test]
 async fn direct_transport_lists_both_families_with_ice_lite() {
-    for mode in [TransportMode::Rtp, TransportMode::Srtp] {
-        let mut cfg = config(mode.clone());
-        cfg.enable_ice_lite = true;
+    for keying in [Keying::None, Keying::Sdes] {
+        let mut cfg = config(Connectivity::Sdp, keying);
+        cfg.connectivity = Connectivity::IceLite;
         cfg.bind_ips = vec![ip("::")];
         cfg.external_ips = vec![ip("192.0.2.1"), ip("2001:db8::1")];
         let sdp = offer(cfg).await;
@@ -213,24 +219,19 @@ async fn direct_transport_lists_both_families_with_ice_lite() {
             .filter(|c| c.2 == "host")
             .map(|c| c.0)
             .collect();
-        assert!(rtp.contains(&ip("192.0.2.1")), "{mode:?}:\n{sdp}");
-        assert!(rtp.contains(&ip("2001:db8::1")), "{mode:?}:\n{sdp}");
+        assert!(rtp.contains(&ip("192.0.2.1")), "{keying:?}:\n{sdp}");
+        assert!(rtp.contains(&ip("2001:db8::1")), "{keying:?}:\n{sdp}");
     }
 }
 
 /// A peer's offer: audio to `addr`, `rtcp_mux` or a separate RTCP port, and
 /// for SRTP a key.
-fn peer_offer(
-    mode: &TransportMode,
-    addr: core::net::SocketAddr,
-    version: u32,
-    rtcp_mux: bool,
-) -> String {
+fn peer_offer(keying: Keying, addr: core::net::SocketAddr, version: u32, rtcp_mux: bool) -> String {
     let (family, ip) = match addr.ip() {
         core::net::IpAddr::V4(ip) => ("IP4", ip.to_string()),
         core::net::IpAddr::V6(ip) => ("IP6", ip.to_string()),
     };
-    let profile = if *mode == TransportMode::Srtp {
+    let profile = if keying == Keying::Sdes {
         "RTP/SAVP"
     } else {
         "RTP/AVP"
@@ -240,7 +241,7 @@ fn peer_offer(
          m=audio {} {profile} 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n",
         addr.port()
     );
-    if *mode == TransportMode::Srtp {
+    if keying == Keying::Sdes {
         sdp += "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:a976SJLwniPcMiUP27gdcLYYcPm0bHZcghV84DsK\r\n";
     }
     if rtcp_mux {
@@ -295,19 +296,21 @@ fn direct_setups() -> Vec<(&'static str, Vec<core::net::IpAddr>, Vec<core::net::
 #[tokio::test]
 async fn answer_takes_the_family_of_the_offer() {
     for (setup, bind_ips, external_ips) in direct_setups() {
-        for mode in [TransportMode::Rtp, TransportMode::Srtp] {
+        for keying in [Keying::None, Keying::Sdes] {
             for ice_lite in [false, true] {
                 for rtcp_mux in [true, false] {
                     for remote in ["127.0.0.1:4000", "[::1]:4000"] {
                         let remote: core::net::SocketAddr = remote.parse().unwrap();
-                        let mut cfg = config(mode.clone());
-                        cfg.enable_ice_lite = ice_lite;
+                        let mut cfg = config(Connectivity::Sdp, keying);
+                        if ice_lite {
+                            cfg.connectivity = Connectivity::IceLite;
+                        }
                         cfg.bind_ips = bind_ips.clone();
                         cfg.external_ips = external_ips.clone();
                         let pc = PeerConnection::new(cfg);
-                        let sdp = answer(&pc, &peer_offer(&mode, remote, 1, rtcp_mux)).await;
+                        let sdp = answer(&pc, &peer_offer(keying, remote, 1, rtcp_mux)).await;
                         let what = format!(
-                            "{setup}, {mode:?}, lite {ice_lite}, mux {rtcp_mux}, offer from {remote}"
+                            "{setup}, {keying:?}, lite {ice_lite}, mux {rtcp_mux}, offer from {remote}"
                         );
                         let ours = media_addr(&sdp);
                         assert_eq!(ours.is_ipv4(), remote.is_ipv4(), "{what}:\n{sdp}");
@@ -335,9 +338,9 @@ async fn answer_takes_the_family_of_the_offer() {
 #[tokio::test]
 async fn offer_family_follows_prefer_ipv6() {
     for (setup, bind_ips, external_ips) in direct_setups() {
-        for mode in [TransportMode::Rtp, TransportMode::Srtp] {
+        for keying in [Keying::None, Keying::Sdes] {
             for prefer_ipv6 in [false, true] {
-                let mut cfg = config(mode.clone());
+                let mut cfg = config(Connectivity::Sdp, keying);
                 cfg.bind_ips = bind_ips.clone();
                 cfg.external_ips = external_ips.clone();
                 cfg.prefer_ipv6 = prefer_ipv6;
@@ -346,7 +349,7 @@ async fn offer_family_follows_prefer_ipv6() {
                 assert_eq!(
                     ours.is_ipv6(),
                     prefer_ipv6,
-                    "{setup}, {mode:?}, prefer_ipv6 {prefer_ipv6}:\n{sdp}"
+                    "{setup}, {keying:?}, prefer_ipv6 {prefer_ipv6}:\n{sdp}"
                 );
             }
         }
@@ -358,28 +361,28 @@ async fn offer_family_follows_prefer_ipv6() {
 #[tokio::test]
 async fn reinvite_changes_family() {
     for (setup, bind_ips, external_ips) in direct_setups() {
-        for mode in [TransportMode::Rtp, TransportMode::Srtp] {
-            let mut cfg = config(mode.clone());
+        for keying in [Keying::None, Keying::Sdes] {
+            let mut cfg = config(Connectivity::Sdp, keying);
             cfg.bind_ips = bind_ips.clone();
             cfg.external_ips = external_ips.clone();
             let pc = PeerConnection::new(cfg);
             let v4: core::net::SocketAddr = "127.0.0.1:4000".parse().unwrap();
             let v6: core::net::SocketAddr = "[::1]:4002".parse().unwrap();
-            let sdp = answer(&pc, &peer_offer(&mode, v4, 1, true)).await;
-            assert!(media_addr(&sdp).is_ipv4(), "{setup} {mode:?}:\n{sdp}");
-            let sdp = answer(&pc, &peer_offer(&mode, v6, 2, true)).await;
+            let sdp = answer(&pc, &peer_offer(keying, v4, 1, true)).await;
+            assert!(media_addr(&sdp).is_ipv4(), "{setup} {keying:?}:\n{sdp}");
+            let sdp = answer(&pc, &peer_offer(keying, v6, 2, true)).await;
             let ours = media_addr(&sdp);
-            assert!(ours.is_ipv6(), "{setup} {mode:?}:\n{sdp}");
+            assert!(ours.is_ipv6(), "{setup} {keying:?}:\n{sdp}");
             let pair = pc.ice_transport().get_selected_pair().unwrap();
             assert_eq!(
                 (pair.local.address, pair.remote.address),
                 (ours, v6),
-                "{setup} {mode:?}"
+                "{setup} {keying:?}"
             );
-            let sdp = answer(&pc, &peer_offer(&mode, v4, 3, true)).await;
+            let sdp = answer(&pc, &peer_offer(keying, v4, 3, true)).await;
             assert!(
                 media_addr(&sdp).is_ipv4(),
-                "{setup} {mode:?} back to IPv4:\n{sdp}"
+                "{setup} {keying:?} back to IPv4:\n{sdp}"
             );
             pc.close();
         }
@@ -425,9 +428,9 @@ impl IcePeer {
 
     /// Its offer: `c=` of `default` (true: IPv4), candidates of both
     /// families.
-    fn offer(&self, mode: &TransportMode, default_v4: bool, version: u32) -> String {
+    fn offer(&self, keying: Keying, default_v4: bool, version: u32) -> String {
         let default = if default_v4 { &self.v4 } else { &self.v6 };
-        let mut sdp = peer_offer(mode, Self::addr(default), version, self.v4_rtcp.is_none());
+        let mut sdp = peer_offer(keying, Self::addr(default), version, self.v4_rtcp.is_none());
         let rtcp_default = if default_v4 {
             &self.v4_rtcp
         } else {
@@ -585,18 +588,18 @@ async fn receives_media(socket: &UdpSocket, mut send: impl FnMut()) -> bool {
 #[tokio::test]
 async fn ice_lite_nomination_moves_media_to_the_other_family() {
     for (setup, bind_ips, external_ips) in direct_setups() {
-        for mode in [TransportMode::Rtp, TransportMode::Srtp] {
+        for keying in [Keying::None, Keying::Sdes] {
             for rtcp_mux in [true, false] {
                 for start_v4 in [true, false] {
-                    let what = format!("{setup}, {mode:?}, mux {rtcp_mux}, c= v4 {start_v4}");
+                    let what = format!("{setup}, {keying:?}, mux {rtcp_mux}, c= v4 {start_v4}");
                     let peer = IcePeer::new(rtcp_mux).await;
-                    let mut cfg = config(mode.clone());
-                    cfg.enable_ice_lite = true;
+                    let mut cfg = config(Connectivity::Sdp, keying);
+                    cfg.connectivity = Connectivity::IceLite;
                     cfg.enable_latching = true;
                     cfg.bind_ips = bind_ips.clone();
                     cfg.external_ips = external_ips.clone();
                     let pc = PeerConnection::new(cfg);
-                    let sdp = answer(&pc, &peer.offer(&mode, start_v4, 1)).await;
+                    let sdp = answer(&pc, &peer.offer(keying, start_v4, 1)).await;
                     let ice = our_ice(&sdp);
                     let ours = |comp: u16, v4: bool| {
                         ice.2
@@ -684,13 +687,13 @@ async fn check_from_the_other_family_does_not_latch() {
         let Ok(v6) = UdpSocket::bind(("::1", IcePeer::addr(&v4).port())).await else {
             continue;
         };
-        let mut cfg = config(TransportMode::Srtp);
-        cfg.enable_ice_lite = true;
+        let mut cfg = config(Connectivity::Sdp, Keying::Sdes);
+        cfg.connectivity = Connectivity::IceLite;
         cfg.enable_latching = true;
         cfg.bind_ips = bind_ips.clone();
         cfg.external_ips = external_ips.clone();
         let pc = PeerConnection::new(cfg);
-        let mut offer = peer_offer(&TransportMode::Srtp, IcePeer::addr(&v4), 1, true);
+        let mut offer = peer_offer(Keying::Sdes, IcePeer::addr(&v4), 1, true);
         offer += &format!("a=ice-ufrag:phon\r\na=ice-pwd:{PEER_PWD}\r\n");
         let sdp = answer(&pc, &offer).await;
         let ice = our_ice(&sdp);
@@ -713,13 +716,13 @@ async fn check_from_the_other_family_does_not_latch() {
 async fn rtp_latching_stays_in_the_socket_family() {
     let v4 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let v6 = UdpSocket::bind("[::1]:0").await.unwrap();
-    let mut cfg = config(TransportMode::Rtp);
+    let mut cfg = config(Connectivity::Sdp, Keying::None);
     cfg.enable_latching = true;
     cfg.bind_ips = vec![ip("127.0.0.1"), ip("::1")];
     let pc = PeerConnection::new(cfg);
     let sdp = answer(
         &pc,
-        &peer_offer(&TransportMode::Rtp, IcePeer::addr(&v4), 1, true),
+        &peer_offer(Keying::None, IcePeer::addr(&v4), 1, true),
     )
     .await;
     let ours = media_addr(&sdp);
@@ -752,7 +755,7 @@ async fn webrtc_gathers_ipv6_interfaces() {
     let Some(v6) = crate::transports::get_local_ipv6() else {
         return; // no IPv6 here
     };
-    let cands = candidates(&gathered_offer(config(TransportMode::WebRtc)).await);
+    let cands = candidates(&gathered_offer(config(Connectivity::Ice, Keying::Dtls)).await);
     assert!(cands.iter().any(|c| c.0.is_ipv4()), "{cands:?}");
     assert!(
         cands.iter().any(|c| c.0 == core::net::IpAddr::V6(v6)),
@@ -765,7 +768,7 @@ async fn webrtc_gathers_ipv6_interfaces() {
         "{cands:?}"
     );
 
-    let mut cfg = config(TransportMode::WebRtc);
+    let mut cfg = config(Connectivity::Ice, Keying::Dtls);
     cfg.disable_ipv6 = true;
     let cands = candidates(&gathered_offer(cfg).await);
     assert!(cands.iter().all(|c| c.0.is_ipv4()), "{cands:?}");

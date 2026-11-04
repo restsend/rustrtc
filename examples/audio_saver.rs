@@ -64,7 +64,7 @@ struct OfferResponse {
 async fn offer(Json(payload): Json<OfferRequest>) -> impl IntoResponse {
     let offer_sdp = SessionDescription::parse(SdpType::Offer, &payload.sdp).unwrap();
 
-    let mut config = RtcConfiguration::default();
+    let mut config = RtcConfiguration::webrtc();
     // Support both PCMU and OPUS to ensure we can negotiate something
     let mut caps = rustrtc::config::MediaCapabilities::default();
     caps.audio = vec![

@@ -11,12 +11,15 @@ use rustrtc::media::frame::{AudioFrame, MediaSample};
 use rustrtc::media::track::{SampleStreamSource, sample_track};
 use rustrtc::peer_connection::{RtpSender, RtpTransceiver};
 use rustrtc::{
-    MediaKind, PeerConnection, RtcConfiguration, RtpCodecParameters, SdpType, SessionDescription,
-    TransceiverDirection, TransportMode,
+    Connectivity, Keying, MediaKind, PeerConnection, RtcConfiguration, RtpCodecParameters, SdpType,
+    SessionDescription, TransceiverDirection,
 };
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// How the peers find the media path and key it.
+type Mode = (Connectivity, Keying);
 
 /// Where a peer binds and what it advertises.
 #[derive(Clone, Copy, Debug)]
@@ -62,12 +65,13 @@ impl Setup {
         }
     }
 
-    fn config(self, mode: &TransportMode, ice_lite: bool) -> RtcConfiguration {
+    fn config(self, (connectivity, keying): Mode) -> RtcConfiguration {
         let mut config = RtcConfiguration {
-            transport_mode: mode.clone(),
-            enable_ice_lite: ice_lite,
+            connectivity,
+            keying,
+            webrtc_extensions: connectivity == Connectivity::Ice,
             enable_latching: true,
-            ..RtcConfiguration::default()
+            ..RtcConfiguration::sip()
         };
         // Loopback is the address of each family here: the dual-stack socket
         // advertises it through `external_ips`.
@@ -137,9 +141,9 @@ async fn media_flows(source: SampleStreamSource, transceiver: &Arc<RtpTransceive
 /// Negotiate `offerer` and `answerer` and check audio both ways; for a
 /// direct transport, also the families of both `c=`.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-async fn call(offerer: Setup, answerer: Setup, mode: TransportMode, ice_lite: bool) -> Result<()> {
-    let (to_answerer, to_offerer) = talk(offerer, answerer, mode.clone(), ice_lite, true).await?;
-    let what = format!("{mode:?} lite {ice_lite}: {offerer:?} offers to {answerer:?}");
+async fn call(offerer: Setup, answerer: Setup, mode: Mode) -> Result<()> {
+    let (to_answerer, to_offerer) = talk(offerer, answerer, mode, true).await?;
+    let what = format!("{mode:?}: {offerer:?} offers to {answerer:?}");
     assert!(to_answerer, "{what}: offerer to answerer");
     assert!(to_offerer, "{what}: answerer to offerer");
     Ok(())
@@ -149,13 +153,12 @@ async fn call(offerer: Setup, answerer: Setup, mode: TransportMode, ice_lite: bo
 async fn talk(
     offerer: Setup,
     answerer: Setup,
-    mode: TransportMode,
-    ice_lite: bool,
+    mode: Mode,
     check_families: bool,
 ) -> Result<(bool, bool)> {
-    let what = format!("{mode:?} lite {ice_lite}: {offerer:?} offers to {answerer:?}");
-    let pc1 = PeerConnection::new(offerer.config(&mode, ice_lite));
-    let pc2 = PeerConnection::new(answerer.config(&mode, ice_lite));
+    let what = format!("{mode:?}: {offerer:?} offers to {answerer:?}");
+    let pc1 = PeerConnection::new(offerer.config(mode));
+    let pc2 = PeerConnection::new(answerer.config(mode));
     let t1 = pc1.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
     let t2 = pc2.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
     let source1 = install_sender(&t1, 1111);
@@ -180,7 +183,7 @@ async fn talk(
     )?)
     .await?;
 
-    if mode != TransportMode::WebRtc && check_families {
+    if mode.0 != Connectivity::Ice && check_families {
         let (offer_ip, answer_ip) = (media_ip(&offer), media_ip(&answer));
         assert_eq!(offer_ip.is_ipv4(), offerer.offers_v4(), "{what}: offer c=");
         assert_eq!(
@@ -239,7 +242,7 @@ fn pairs(ice: bool) -> Vec<(Setup, Setup)> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rtp_without_ice() -> Result<()> {
     for (offerer, answerer) in pairs(false) {
-        call(offerer, answerer, TransportMode::Rtp, false).await?;
+        call(offerer, answerer, (Connectivity::Sdp, Keying::None)).await?;
     }
     Ok(())
 }
@@ -248,7 +251,7 @@ async fn rtp_without_ice() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rtp_with_ice_lite() -> Result<()> {
     for (offerer, answerer) in pairs(false) {
-        call(offerer, answerer, TransportMode::Rtp, true).await?;
+        call(offerer, answerer, (Connectivity::IceLite, Keying::None)).await?;
     }
     Ok(())
 }
@@ -257,7 +260,7 @@ async fn rtp_with_ice_lite() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn srtp_without_ice() -> Result<()> {
     for (offerer, answerer) in pairs(false) {
-        call(offerer, answerer, TransportMode::Srtp, false).await?;
+        call(offerer, answerer, (Connectivity::Sdp, Keying::Sdes)).await?;
     }
     Ok(())
 }
@@ -266,7 +269,7 @@ async fn srtp_without_ice() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn srtp_with_ice_lite() -> Result<()> {
     for (offerer, answerer) in pairs(false) {
-        call(offerer, answerer, TransportMode::Srtp, true).await?;
+        call(offerer, answerer, (Connectivity::IceLite, Keying::Sdes)).await?;
     }
     Ok(())
 }
@@ -275,7 +278,7 @@ async fn srtp_with_ice_lite() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn webrtc_full_ice() -> Result<()> {
     for (offerer, answerer) in pairs(true) {
-        call(offerer, answerer, TransportMode::WebRtc, false).await?;
+        call(offerer, answerer, (Connectivity::Ice, Keying::Dtls)).await?;
     }
     Ok(())
 }
@@ -285,9 +288,11 @@ async fn webrtc_full_ice() -> Result<()> {
 /// family; the answer is then of no use to the offerer either).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_media_without_a_shared_family() -> Result<()> {
-    for mode in [TransportMode::Rtp, TransportMode::Srtp] {
-        let (to_answerer, to_offerer) =
-            talk(Setup::V4, Setup::V6, mode.clone(), false, false).await?;
+    for mode in [
+        (Connectivity::Sdp, Keying::None),
+        (Connectivity::Sdp, Keying::Sdes),
+    ] {
+        let (to_answerer, to_offerer) = talk(Setup::V4, Setup::V6, mode, false).await?;
         assert!(
             !(to_answerer && to_offerer),
             "{mode:?}: V4 to V6 can't talk"

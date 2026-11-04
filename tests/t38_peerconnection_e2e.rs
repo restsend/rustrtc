@@ -7,8 +7,7 @@ use rustrtc::*;
 
 /// Helper: create a configuration with T.38 fax capabilities.
 fn make_t38_config() -> RtcConfiguration {
-    let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Rtp;
+    let mut config = RtcConfiguration::sip();
     config.media_capabilities = Some(MediaCapabilities {
         audio: vec![AudioCapability::pcmu()],
         video: vec![],
@@ -220,8 +219,7 @@ async fn test_t38_offer_media_section_listing() {
 async fn test_t38_default_config_without_t38_caps() {
     // Even without explicit T.38 capabilities, the default should work
     let _ = env_logger::builder().is_test(true).try_init();
-    let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Rtp;
+    let mut config = RtcConfiguration::sip();
 
     let pc = PeerConnection::new(config);
     pc.add_transceiver(MediaKind::Image, TransceiverDirection::SendRecv);

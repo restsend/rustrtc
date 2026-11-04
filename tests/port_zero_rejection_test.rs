@@ -9,13 +9,13 @@ use rustrtc::media::frame::{AudioFrame, MediaSample};
 use rustrtc::media::track::{SampleStreamSource, sample_track};
 use rustrtc::peer_connection::RtpSender;
 use rustrtc::sdp::{Attribute, SessionDescription};
-use rustrtc::{PeerConnection, RtcConfiguration, RtpCodecParameters, TransportMode};
+use rustrtc::{Connectivity, Keying, PeerConnection, RtcConfiguration, RtpCodecParameters};
 use std::time::Duration;
 
-const MODES: [TransportMode; 3] = [
-    TransportMode::WebRtc,
-    TransportMode::Rtp,
-    TransportMode::Srtp,
+const MODES: [(Connectivity, Keying); 3] = [
+    (Connectivity::Ice, Keying::Dtls),
+    (Connectivity::Sdp, Keying::None),
+    (Connectivity::Sdp, Keying::Sdes),
 ];
 
 fn opus() -> RtpCodecParameters {
@@ -27,10 +27,12 @@ fn opus() -> RtpCodecParameters {
     }
 }
 
-fn pc(mode: TransportMode) -> PeerConnection {
+fn pc(mode: (Connectivity, Keying)) -> PeerConnection {
     PeerConnection::new(RtcConfiguration {
-        transport_mode: mode,
-        ..RtcConfiguration::default()
+        connectivity: mode.0,
+        keying: mode.1,
+        webrtc_extensions: mode.0 == Connectivity::Ice,
+        ..RtcConfiguration::sip()
     })
 }
 
@@ -113,7 +115,7 @@ type Call = (
 
 /// Both peers send `tracks` audio m= lines; pc1 offers.
 async fn call(
-    mode: TransportMode,
+    mode: (Connectivity, Keying),
     tracks: usize,
     edit_offer: fn(&mut SessionDescription),
     edit_answer: fn(&mut SessionDescription),
@@ -137,7 +139,13 @@ async fn offerer_sends_on(
     edit_offer: fn(&mut SessionDescription),
     edit_answer: fn(&mut SessionDescription),
 ) -> Result<Vec<bool>> {
-    let (pc1, _pc2, _pumps) = call(TransportMode::WebRtc, tracks, edit_offer, edit_answer).await?;
+    let (pc1, _pc2, _pumps) = call(
+        (Connectivity::Ice, Keying::Dtls),
+        tracks,
+        edit_offer,
+        edit_answer,
+    )
+    .await?;
     Ok(sends(&pc1).await)
 }
 
@@ -145,7 +153,10 @@ async fn offerer_sends_on(
 /// a plain RTP offer with one section still does not.
 #[tokio::test]
 async fn a_webrtc_offer_with_one_section_carries_a_bundle_group() -> Result<()> {
-    for (mode, grouped) in [(TransportMode::WebRtc, true), (TransportMode::Rtp, false)] {
+    for (mode, grouped) in [
+        ((Connectivity::Ice, Keying::Dtls), true),
+        ((Connectivity::Sdp, Keying::None), false),
+    ] {
         let pc = pc(mode.clone());
         let (_source, track, _) = sample_track(rustrtc::media::MediaKind::Audio, 100);
         pc.add_track(track, opus())?;
@@ -171,9 +182,9 @@ async fn media_flows_on_an_accepted_section() -> Result<()> {
 #[tokio::test]
 async fn no_rtp_after_the_answer_rejects_the_section() -> Result<()> {
     for mode in [
-        TransportMode::WebRtc,
-        TransportMode::Rtp,
-        TransportMode::Srtp,
+        (Connectivity::Ice, Keying::Dtls),
+        (Connectivity::Sdp, Keying::None),
+        (Connectivity::Sdp, Keying::Sdes),
     ] {
         let (pc1, pc2, _pumps) = call(mode.clone(), 1, |_| {}, reject).await?;
         assert_eq!(sends(&pc1).await, vec![false], "{mode:?}: offerer sent RTP");
@@ -190,7 +201,7 @@ async fn no_rtp_after_the_answer_rejects_the_section() -> Result<()> {
 /// well) rejects it.
 #[tokio::test]
 async fn no_rtp_on_a_section_we_offered_with_port_zero() -> Result<()> {
-    let (pc1, pc2, _pumps) = call(TransportMode::WebRtc, 1, reject, |_| {}).await?;
+    let (pc1, pc2, _pumps) = call((Connectivity::Ice, Keying::Dtls), 1, reject, |_| {}).await?;
     assert_eq!(sends(&pc1).await, vec![false], "offerer sent RTP");
     assert_eq!(sends(&pc2).await, vec![false], "answerer sent RTP");
     Ok(())
@@ -199,7 +210,7 @@ async fn no_rtp_on_a_section_we_offered_with_port_zero() -> Result<()> {
 /// RFC 3264 §8: a re-offer with a live port brings a rejected stream back.
 #[tokio::test]
 async fn media_resumes_when_a_reoffer_accepts_the_rejected_section() -> Result<()> {
-    let (pc1, pc2, _pumps) = call(TransportMode::WebRtc, 1, |_| {}, reject).await?;
+    let (pc1, pc2, _pumps) = call((Connectivity::Ice, Keying::Dtls), 1, |_| {}, reject).await?;
     assert_eq!(sends(&pc1).await, vec![false]);
     exchange(&pc1, &pc2, |_| {}, |_| {}).await?;
     assert_eq!(sends(&pc1).await, vec![true], "offerer did not resume");
@@ -243,7 +254,7 @@ async fn bundle_only_outside_a_bundle_group_is_rejected() -> Result<()> {
 /// once candidates have been gathered.
 #[tokio::test]
 async fn a_disabled_offered_stream_is_answered_with_port_zero() -> Result<()> {
-    let pc = pc(TransportMode::Rtp);
+    let pc = pc((Connectivity::Sdp, Keying::None));
     let raw = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nc=IN IP4 127.0.0.1\r\n\
                m=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n\
                m=audio 0 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
@@ -268,8 +279,8 @@ async fn a_disabled_offered_stream_is_answered_with_port_zero() -> Result<()> {
 /// never become the group's tag (RFC 9143 §7.3.2).
 #[tokio::test]
 async fn a_rejected_section_is_not_bundled_in_the_answer() -> Result<()> {
-    let pc1 = pc(TransportMode::WebRtc);
-    let pc2 = pc(TransportMode::WebRtc);
+    let pc1 = pc((Connectivity::Ice, Keying::Dtls));
+    let pc2 = pc((Connectivity::Ice, Keying::Dtls));
     for _ in 0..2 {
         let (_source, track, _) = sample_track(rustrtc::media::MediaKind::Audio, 100);
         pc1.add_track(track, opus())?;

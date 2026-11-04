@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 /// Test basic payload type map update functionality
 #[tokio::test]
 async fn test_payload_type_update() {
-    let _config = RtcConfiguration::default();
+    let _config = RtcConfiguration::webrtc();
     let transceiver = std::sync::Arc::new(peer_connection::RtpTransceiver::new_for_test(
         MediaKind::Audio,
         peer_connection::TransceiverDirection::SendRecv,
@@ -252,7 +252,7 @@ fn test_extract_extmap_from_sdp() {
 async fn test_reinvite_payload_change() {
     use rustrtc::sdp::{Attribute, MediaSection, SdpType, SessionDescription, SessionSection};
 
-    let _config = RtcConfiguration::default();
+    let _config = RtcConfiguration::webrtc();
     let _pc = PeerConnection::new(_config);
 
     // Create initial offer with PT 111

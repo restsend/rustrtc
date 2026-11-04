@@ -1,7 +1,7 @@
 #![cfg(not(feature = "std"))]
 
 //! G1 capstone: the PeerConnection delivery surface rtcembed targets —
-//! `TransportMode::Srtp` (SDES-SRTP, plan D6's embedded surface) — driven
+//! `Connectivity::Sdp` + `Keying::Sdes` (SDES-SRTP, plan D6's embedded surface) — driven
 //! end to end over the mock runtime: offer/answer with `a=crypto`
 //! negotiation, direct transport through the UDP bind factory, then SRTP
 //! protected media flowing PC1 → PC2 with payloads verified after
@@ -14,7 +14,7 @@ mod common;
 use std::sync::Arc;
 
 use common::{drive, drive_until, install_mock_platform};
-use rustrtc::config::{RtcConfiguration, TransportMode};
+use rustrtc::config::{Connectivity, Keying, RtcConfiguration};
 use rustrtc::media::MediaKind as TrackMediaKind;
 use rustrtc::media::MediaStreamTrack;
 use rustrtc::media::frame::{MediaSample, VideoFrame};
@@ -24,8 +24,8 @@ use rustrtc::peer_connection::{
 use rustrtc::sdp::MediaKind;
 
 fn srtp_agent(start: u16, end: u16) -> PeerConnection {
-    let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Srtp;
+    let mut config = RtcConfiguration::sip();
+    config.keying = Keying::Sdes;
     config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
     config.rtp_start_port = Some(start);
     config.rtp_end_port = Some(end);

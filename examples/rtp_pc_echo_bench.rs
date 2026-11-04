@@ -14,7 +14,7 @@ use rustrtc::peer_connection::RtpSender;
 use rustrtc::rtp::{RtpHeader, RtpPacket};
 use rustrtc::{
     PeerConnection, RtcConfiguration, RtpRewriteBridgeParams, SdpType, SessionDescription,
-    TransceiverDirection, TransportMode,
+    TransceiverDirection,
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -97,8 +97,7 @@ fn packets_per_tick(total_pps: u64) -> usize {
 }
 
 fn make_server_config() -> RtcConfiguration {
-    let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Rtp;
+    let mut config = RtcConfiguration::sip();
 
     let mut caps = rustrtc::config::MediaCapabilities::default();
     caps.audio = vec![rustrtc::config::AudioCapability {

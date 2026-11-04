@@ -142,8 +142,8 @@ async fn setup_echo_pair() -> Result<(
     std::sync::Arc<rustrtc::transports::sctp::DataChannel>,
     std::sync::Arc<rustrtc::transports::sctp::DataChannel>,
 )> {
-    let pc_a = PeerConnection::new(RtcConfiguration::default());
-    let pc_b = PeerConnection::new(RtcConfiguration::default());
+    let pc_a = PeerConnection::new(RtcConfiguration::webrtc());
+    let pc_b = PeerConnection::new(RtcConfiguration::webrtc());
 
     let dc_a = pc_a.create_data_channel(
         "restart",
@@ -245,7 +245,7 @@ async fn ice_restart_from_answerer_side_recovers() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restart_ice_rejects_non_stable_state() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
-    let pc = PeerConnection::new(RtcConfiguration::default());
+    let pc = PeerConnection::new(RtcConfiguration::webrtc());
     // Need an application transceiver so an offer can be built.
     pc.create_data_channel("x", None)?;
     // Drive to HaveLocalOffer via create_offer + set_local, where restart must

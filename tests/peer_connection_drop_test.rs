@@ -4,8 +4,8 @@
 //! it is connected (`PeerConnectionInner`'s Drop runs `close`).
 use rustrtc::config::MediaCapabilities;
 use rustrtc::{
-    MediaKind, PeerConnection, PeerConnectionState, RtcConfiguration, TransceiverDirection,
-    TransportMode,
+    Connectivity, Keying, MediaKind, PeerConnection, PeerConnectionState, RtcConfiguration,
+    TransceiverDirection,
 };
 use std::time::Duration;
 
@@ -59,12 +59,16 @@ async fn dropping_a_connected_peer_connection_closes_it() {
         pc.create_data_channel("dc", None).unwrap();
     };
     #[allow(unused_mut)]
-    let mut cases: Vec<(TransportMode, &dyn Fn(&PeerConnection), &str)> = vec![
-        (TransportMode::WebRtc, &audio, "audio"),
-        (TransportMode::WebRtc, &video, "video"),
-        (TransportMode::WebRtc, &audio_and_data, "audio+datachannel"),
-        (TransportMode::Rtp, &audio, "audio"),
-        (TransportMode::Srtp, &audio, "audio"),
+    let mut cases: Vec<((Connectivity, Keying), &dyn Fn(&PeerConnection), &str)> = vec![
+        ((Connectivity::Ice, Keying::Dtls), &audio, "audio"),
+        ((Connectivity::Ice, Keying::Dtls), &video, "video"),
+        (
+            (Connectivity::Ice, Keying::Dtls),
+            &audio_and_data,
+            "audio+datachannel",
+        ),
+        ((Connectivity::Sdp, Keying::None), &audio, "audio"),
+        ((Connectivity::Sdp, Keying::Sdes), &audio, "audio"),
     ];
     #[cfg(feature = "t38")]
     let audio_and_image = |pc: &PeerConnection| {
@@ -72,15 +76,21 @@ async fn dropping_a_connected_peer_connection_closes_it() {
         pc.add_transceiver(MediaKind::Image, TransceiverDirection::SendRecv);
     };
     #[cfg(feature = "t38")]
-    cases.push((TransportMode::Rtp, &audio_and_image, "audio+image"));
+    cases.push((
+        (Connectivity::Sdp, Keying::None),
+        &audio_and_image,
+        "audio+image",
+    ));
     for (mode, setup, kind) in cases {
         let config = || RtcConfiguration {
-            transport_mode: mode.clone(),
+            connectivity: mode.0,
+            keying: mode.1,
+            webrtc_extensions: mode.0 == Connectivity::Ice,
             media_capabilities: (kind == "audio+image").then(|| MediaCapabilities {
                 image: vec![Default::default()],
                 ..Default::default()
             }),
-            ..RtcConfiguration::default()
+            ..RtcConfiguration::sip()
         };
         let (pc1, pc2) = connected_pair(config, setup).await;
         // Handles the application may still hold do not keep the PC alive.

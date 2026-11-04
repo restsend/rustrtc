@@ -38,8 +38,8 @@ async fn signal_loopback(offerer: &PeerConnection, answerer: &PeerConnection) ->
 async fn buffered_amount_low_fires_once_after_drain() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let pc_a = PeerConnection::new(RtcConfiguration::default());
-    let pc_b = PeerConnection::new(RtcConfiguration::default());
+    let pc_a = PeerConnection::new(RtcConfiguration::webrtc());
+    let pc_b = PeerConnection::new(RtcConfiguration::webrtc());
 
     const THRESHOLD: usize = 64 * 1024;
     let dc_a = pc_a.create_data_channel(
@@ -146,8 +146,8 @@ async fn buffered_amount_low_fires_once_after_drain() -> Result<()> {
 async fn buffered_amount_zero_threshold_never_fires() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let pc_a = PeerConnection::new(RtcConfiguration::default());
-    let pc_b = PeerConnection::new(RtcConfiguration::default());
+    let pc_a = PeerConnection::new(RtcConfiguration::webrtc());
+    let pc_b = PeerConnection::new(RtcConfiguration::webrtc());
 
     let dc_a = pc_a.create_data_channel(
         "no-threshold",

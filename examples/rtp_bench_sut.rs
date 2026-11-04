@@ -9,7 +9,7 @@
 #![allow(clippy::zombie_processes)]
 use axum::{Router, extract::Json, response::IntoResponse, routing::post};
 use rustrtc::media::MediaStreamTrack;
-use rustrtc::{PeerConnection, RtcConfiguration, SdpType, SessionDescription, TransportMode};
+use rustrtc::{PeerConnection, RtcConfiguration, SdpType, SessionDescription};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -155,8 +155,7 @@ async fn start_forwarding(pc: PeerConnection, pt: u8, echo_addr: SocketAddr) {
 async fn offer(Json(payload): Json<OfferRequest>) -> impl IntoResponse {
     info!("Received offer");
 
-    let mut config = RtcConfiguration::default();
-    config.transport_mode = TransportMode::Rtp;
+    let mut config = RtcConfiguration::sip();
 
     let mut caps = rustrtc::config::MediaCapabilities::default();
     caps.audio = vec![rustrtc::config::AudioCapability {

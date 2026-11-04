@@ -83,7 +83,7 @@ fn test_config(turn_url: &str, username: &str, password: &str) -> RtcConfigurati
         bind_ips: vec!["127.0.0.1".parse().unwrap()],
         ice_connection_timeout: Duration::from_secs(20),
         ice_disconnect_threshold: Duration::from_secs(10),
-        ..Default::default()
+        ..RtcConfiguration::webrtc()
     }
 }
 

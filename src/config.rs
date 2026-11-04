@@ -86,34 +86,46 @@ pub enum IceTcpPolicy {
     PassiveOnly,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+/// Which m-lines of an offer have a transport of their own (RFC 9429
+/// §4.1.1). An offer with two or more m-lines proposes BUNDLE (RFC 8843):
+/// when the answer accepts it, all m-lines share one transport. The policy
+/// decides what a peer without BUNDLE gets. The other m-lines are offered
+/// bundle-only (port 0): such a peer rejects them. An answer to an offer
+/// without BUNDLE rejects the m-lines that the policy gives no transport.
+///
+/// Full ICE has one ICE agent: it always works as `MaxBundle`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BundlePolicy {
-    #[default]
+    /// A transport for the first m-line of each kind (audio, video, data).
+    /// A peer without BUNDLE gets one m-line of each kind.
     Balanced,
+    /// A transport for every m-line. A peer without BUNDLE gets them all.
     MaxCompat,
+    /// A transport for the first m-line only. A peer without BUNDLE gets
+    /// only the first m-line. RFC 9429 calls it "must-bundle".
     MaxBundle,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+/// RTP/RTCP multiplexing on one port (RFC 5761, RFC 9429 §4.1.1). Offers
+/// propose it with `a=rtcp-mux`; answers accept it when the offer has it.
+///
+/// Full ICE gathers no RTCP component: it always works as `Require`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RtcpMuxPolicy {
-    #[default]
+    /// The peer must multiplex. Offers also carry `a=rtcp-mux-only`
+    /// (RFC 8858) and reserve no RTCP port. A remote description with an
+    /// RTP m-line without `a=rtcp-mux` is an error.
     Require,
+    /// Offers reserve an RTCP port and advertise it with `a=rtcp`, for an
+    /// answer that does not multiplex (RFC 5761 §5.1.1). Use this for SIP
+    /// peers: many of them do not multiplex.
     Negotiate,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub enum TransportMode {
-    #[default]
-    WebRtc,
-    Srtp,
-    Rtp,
-}
-
-/// How the media path to the peer is found. Derived from
-/// [`TransportMode`] and `enable_ice_lite` by
-/// [`RtcConfiguration::connectivity`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Connectivity {
+/// How the media path to the peer is found. Any value works with any
+/// [`Keying`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Connectivity {
     /// The c=/m= address of the peer's SDP (corrected by latching, when on).
     /// A direct transport: no ICE agent.
     Sdp,
@@ -131,10 +143,10 @@ impl Connectivity {
     }
 }
 
-/// How the SRTP keys are exchanged. Derived from [`TransportMode`] by
-/// [`RtcConfiguration::keying`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Keying {
+/// How the SRTP keys are exchanged. Any value works with any
+/// [`Connectivity`]. Data channels (SCTP) need `Dtls`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Keying {
     /// Plain RTP (RTP/AVP).
     None,
     /// SDES, `a=crypto` (RFC 4568), RTP/SAVP.
@@ -484,18 +496,6 @@ fn default_buffer_stats_log_interval() -> core::time::Duration {
     core::time::Duration::from_secs(10)
 }
 
-/// Controls SDP generation compatibility for interoperability with legacy SIP endpoints.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum SdpCompatibilityMode {
-    /// Standard WebRTC / RFC-compliant SDP output (default).
-    #[default]
-    Standard,
-    /// Compatibility mode for legacy SIP endpoints (e.g. Linphone):
-    /// omits `a=mid` unless BUNDLE is active, omits `a=rtcp-mux`.
-    LegacySip,
-}
-
 fn default_enable_upnp() -> bool {
     false
 }
@@ -513,6 +513,12 @@ fn default_upnp_refresh_interval() -> core::time::Duration {
 }
 
 /// Primary configuration for a `PeerConnection`.
+///
+/// There is no default: start from the kind of peer,
+/// [`RtcConfiguration::webrtc`] or [`RtcConfiguration::sip`], and change
+/// what you need. They differ in `connectivity`, `keying`,
+/// `webrtc_extensions`, `rtcp_mux_policy` and `bundle_policy`; the other
+/// fields have the same values.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RtcConfiguration {
     pub ice_servers: Vec<IceServer>,
@@ -520,11 +526,23 @@ pub struct RtcConfiguration {
     pub bundle_policy: BundlePolicy,
     pub rtcp_mux_policy: RtcpMuxPolicy,
     pub certificates: Vec<CertificateConfig>,
-    pub transport_mode: TransportMode,
+    /// How the media path is found.
+    pub connectivity: Connectivity,
+    /// How the SRTP keys are exchanged.
+    pub keying: Keying,
+    /// The peer is a WebRTC endpoint (a browser, an SFU): offers claim
+    /// header extension ids for rid, repaired-rid and abs-send-time; with
+    /// `enable_gcc`, descriptions carry transport-cc and we send TWCC
+    /// feedback; descriptions carry `msid`. Answers echo the rid and
+    /// abs-send-time ids the remote offered either way. SIP peers do not use
+    /// these: set it to false for them. (sdes:mid goes with BUNDLE, see
+    /// [`BundlePolicy`].)
+    pub webrtc_extensions: bool,
     pub nack_buffer_size: usize,
     /// Enable the TWCC + GCC bandwidth-adaptation loop: stamp outgoing RTP
     /// with the transport-cc sequence-number extension, generate TWCC feedback
     /// for inbound streams, and expose a sender `target_bitrate` estimate.
+    /// Only with `webrtc_extensions`.
     /// Default: true (no in-library send-rate limiting; apps opt in via
     /// `RtpSender::subscribe_target_bitrate`).
     #[serde(default = "default_enable_gcc")]
@@ -548,8 +566,8 @@ pub struct RtcConfiguration {
     /// the remote peer to send RTP to the external port.
     ///
     /// Works independently or combined with `external_ips`.
-    /// Only applies in RTP/SRTP direct mode (`TransportMode::Rtp` /
-    /// `TransportMode::Srtp`). Not used in WebRTC mode.
+    /// Only applies to direct transports (`Connectivity::Sdp` /
+    /// `Connectivity::IceLite`). Not used with full ICE.
     pub external_port: Option<u16>,
     /// Local addresses to bind media sockets on: one socket on each. Empty:
     /// chosen for us (WebRTC: every interface; RTP and SRTP: the address of
@@ -631,8 +649,8 @@ pub struct RtcConfiguration {
     pub sctp_max_buffered_amount: usize,
     pub dtls_buffer_size: usize,
     /// Pre-provisioned DTLS leaf certificate (DER) + PKCS#8 private key.
-    /// Required for WebRtc mode without `std` (no certificate generation
-    /// on embedded); ignored in `Rtp` mode. When unset on `std`, a fresh
+    /// Required for DTLS keying without `std` (no certificate generation
+    /// on embedded); ignored with other keying. When unset on `std`, a fresh
     /// self-signed certificate is generated per connection.
     #[serde(skip)]
     pub dtls_certificate: Option<Arc<crate::transports::dtls::Certificate>>,
@@ -654,7 +672,6 @@ pub struct RtcConfiguration {
     pub tcp_port_range_end: Option<u16>,
     pub enable_latching: bool,
     pub probation_max_packets: Option<u8>,
-    pub enable_ice_lite: bool,
     /// When true, demote host candidates with private (RFC 1918) local IPs
     /// below server-reflexive candidates in the connectivity check ordering.
     /// This avoids DTLS handshake failures behind NATs where a host candidate
@@ -711,9 +728,6 @@ pub struct RtcConfiguration {
     /// is enabled. All `PeerConnection`s sharing this port must agree on it.
     #[serde(default)]
     pub ice_udp_mux_port: Option<u16>,
-    /// SDP generation compatibility mode.
-    #[serde(default)]
-    pub sdp_compatibility: SdpCompatibilityMode,
     #[serde(skip, default)]
     pub label: Option<String>,
     #[serde(skip, default)]
@@ -740,7 +754,9 @@ impl PartialEq for RtcConfiguration {
             && self.bundle_policy == other.bundle_policy
             && self.rtcp_mux_policy == other.rtcp_mux_policy
             && self.certificates == other.certificates
-            && self.transport_mode == other.transport_mode
+            && self.connectivity == other.connectivity
+            && self.keying == other.keying
+            && self.webrtc_extensions == other.webrtc_extensions
             && self.nack_buffer_size == other.nack_buffer_size
             && self.enable_gcc == other.enable_gcc
             && self.media_capabilities == other.media_capabilities
@@ -779,7 +795,6 @@ impl PartialEq for RtcConfiguration {
             && self.tcp_port_range_end == other.tcp_port_range_end
             && self.enable_latching == other.enable_latching
             && self.probation_max_packets == other.probation_max_packets
-            && self.enable_ice_lite == other.enable_ice_lite
             && self.prefer_srflx_over_natted_host == other.prefer_srflx_over_natted_host
             && self.enable_upnp == other.enable_upnp
             && self.upnp_lease_duration == other.upnp_lease_duration
@@ -792,7 +807,6 @@ impl PartialEq for RtcConfiguration {
             && self.ice_tcp_policy == other.ice_tcp_policy
             && self.ice_udp_mux == other.ice_udp_mux
             && self.ice_udp_mux_port == other.ice_udp_mux_port
-            && self.sdp_compatibility == other.sdp_compatibility
             && self.label == other.label
             && self.cname == other.cname
         // runtime_handle is intentionally omitted
@@ -802,37 +816,49 @@ impl PartialEq for RtcConfiguration {
 impl Eq for RtcConfiguration {}
 
 impl RtcConfiguration {
-    /// How the media path is found. `enable_ice_lite` applies to the direct
-    /// modes (RTP, SRTP); WebRTC always runs full ICE.
-    pub(crate) fn connectivity(&self) -> Connectivity {
-        match self.transport_mode {
-            TransportMode::WebRtc => Connectivity::Ice,
-            TransportMode::Rtp | TransportMode::Srtp if self.enable_ice_lite => {
-                Connectivity::IceLite
-            }
-            TransportMode::Rtp | TransportMode::Srtp => Connectivity::Sdp,
-        }
+    /// For a WebRTC peer (a browser, an SFU): full ICE, DTLS-SRTP, the
+    /// WebRTC header extensions, RTCP multiplexing required, one transport
+    /// for all m-lines (BUNDLE).
+    pub fn webrtc() -> Self {
+        Self::new(
+            Connectivity::Ice,
+            Keying::Dtls,
+            true,
+            RtcpMuxPolicy::Require,
+            BundlePolicy::MaxBundle,
+        )
     }
 
-    /// How the SRTP keys are exchanged.
-    pub(crate) fn keying(&self) -> Keying {
-        match self.transport_mode {
-            TransportMode::Rtp => Keying::None,
-            TransportMode::Srtp => Keying::Sdes,
-            TransportMode::WebRtc => Keying::Dtls,
-        }
+    /// For a SIP peer (a trunk, a phone, a PBX): the address of its SDP (no
+    /// ICE), plain RTP, no WebRTC header extensions, RTCP multiplexing when
+    /// the peer accepts it, a transport for each kind of media without
+    /// BUNDLE. Change `keying` for SDES-SRTP, `connectivity` for ICE-lite.
+    pub fn sip() -> Self {
+        Self::new(
+            Connectivity::Sdp,
+            Keying::None,
+            false,
+            RtcpMuxPolicy::Negotiate,
+            BundlePolicy::Balanced,
+        )
     }
-}
 
-impl Default for RtcConfiguration {
-    fn default() -> Self {
+    fn new(
+        connectivity: Connectivity,
+        keying: Keying,
+        webrtc_extensions: bool,
+        rtcp_mux_policy: RtcpMuxPolicy,
+        bundle_policy: BundlePolicy,
+    ) -> Self {
         Self {
             ice_servers: Vec::new(),
             ice_transport_policy: IceTransportPolicy::default(),
-            bundle_policy: BundlePolicy::default(),
-            rtcp_mux_policy: RtcpMuxPolicy::default(),
+            bundle_policy,
+            rtcp_mux_policy,
             certificates: Vec::new(),
-            transport_mode: TransportMode::default(),
+            connectivity,
+            keying,
+            webrtc_extensions,
             nack_buffer_size: 200,
             enable_gcc: default_enable_gcc(),
             media_capabilities: None,
@@ -871,7 +897,6 @@ impl Default for RtcConfiguration {
             tcp_port_range_end: None,
             enable_latching: false,
             probation_max_packets: None,
-            enable_ice_lite: false,
             prefer_srflx_over_natted_host: false,
             enable_upnp: default_enable_upnp(),
             enable_mdns: false,
@@ -885,7 +910,6 @@ impl Default for RtcConfiguration {
             ice_tcp_policy: IceTcpPolicy::default(),
             ice_udp_mux: false,
             ice_udp_mux_port: None,
-            sdp_compatibility: SdpCompatibilityMode::default(),
             label: None,
             cname: None,
             runtime_handle: None,
@@ -896,12 +920,6 @@ impl Default for RtcConfiguration {
 
 pub struct RtcConfigurationBuilder {
     inner: RtcConfiguration,
-}
-
-impl Default for RtcConfigurationBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 /// Wrapper for interceptor lists so that `RtcConfiguration` can still derive
@@ -950,9 +968,17 @@ impl PartialEq for RecorderInterceptors {
 impl Eq for RecorderInterceptors {}
 
 impl RtcConfigurationBuilder {
-    pub fn new() -> Self {
+    /// Start from [`RtcConfiguration::webrtc`].
+    pub fn webrtc() -> Self {
         Self {
-            inner: RtcConfiguration::default(),
+            inner: RtcConfiguration::webrtc(),
+        }
+    }
+
+    /// Start from [`RtcConfiguration::sip`].
+    pub fn sip() -> Self {
+        Self {
+            inner: RtcConfiguration::sip(),
         }
     }
 
@@ -963,11 +989,6 @@ impl RtcConfigurationBuilder {
 
     pub fn probation_max_packets(mut self, max: Option<u8>) -> Self {
         self.inner.probation_max_packets = max;
-        self
-    }
-
-    pub fn enable_ice_lite(mut self, enable: bool) -> Self {
-        self.inner.enable_ice_lite = enable;
         self
     }
 
@@ -1032,8 +1053,18 @@ impl RtcConfigurationBuilder {
         self
     }
 
-    pub fn transport_mode(mut self, mode: TransportMode) -> Self {
-        self.inner.transport_mode = mode;
+    pub fn connectivity(mut self, connectivity: Connectivity) -> Self {
+        self.inner.connectivity = connectivity;
+        self
+    }
+
+    pub fn keying(mut self, keying: Keying) -> Self {
+        self.inner.keying = keying;
+        self
+    }
+
+    pub fn webrtc_extensions(mut self, enable: bool) -> Self {
+        self.inner.webrtc_extensions = enable;
         self
     }
 
@@ -1129,7 +1160,7 @@ impl RtcConfigurationBuilder {
     }
 
     /// Pre-provisioned DTLS certificate (DER leaf + PKCS#8 key). Required
-    /// for WebRtc mode on no_std; on std a self-signed certificate is
+    /// for DTLS keying on no_std; on std a self-signed certificate is
     /// generated when this is unset.
     pub fn dtls_certificate(mut self, cert: Arc<crate::transports::dtls::Certificate>) -> Self {
         self.inner.dtls_certificate = Some(cert);
@@ -1245,11 +1276,6 @@ impl RtcConfigurationBuilder {
         self
     }
 
-    pub fn sdp_compatibility(mut self, mode: SdpCompatibilityMode) -> Self {
-        self.inner.sdp_compatibility = mode;
-        self
-    }
-
     pub fn cname(mut self, cname: String) -> Self {
         self.inner.cname = Some(cname);
         self
@@ -1300,14 +1326,14 @@ mod tests {
         // Two peer connections must not share SSRCs by default. (A false
         // failure needs two equal random u32s: 1 in 2^32.)
         assert_ne!(
-            RtcConfiguration::default().ssrc_start,
-            RtcConfiguration::default().ssrc_start
+            RtcConfiguration::webrtc().ssrc_start,
+            RtcConfiguration::webrtc().ssrc_start
         );
     }
 
     #[test]
     fn test_rtc_configuration_defaults() {
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         assert_eq!(config.ice_connection_timeout, Duration::from_secs(120));
         assert_eq!(config.ice_disconnect_threshold, Duration::from_secs(30));
         assert_eq!(config.ice_disconnect_grace, Duration::from_secs(60));
@@ -1326,7 +1352,7 @@ mod tests {
 
     #[test]
     fn test_rtc_configuration_builder() {
-        let config = RtcConfigurationBuilder::new()
+        let config = RtcConfigurationBuilder::webrtc()
             .stun_timeout(Duration::from_secs(10))
             .build();
         assert_eq!(config.stun_timeout, Duration::from_secs(10));
@@ -1336,7 +1362,7 @@ mod tests {
 
     #[test]
     fn test_buffer_config_builder() {
-        let config = RtcConfigurationBuilder::new()
+        let config = RtcConfigurationBuilder::webrtc()
             .rtp_buffer_capacity(200)
             .buffer_drop_strategy(BufferDropStrategy::DropOldest)
             .buffer_stats_log_interval(Duration::from_secs(5))
@@ -1348,7 +1374,7 @@ mod tests {
 
     #[test]
     fn test_sctp_builder_methods() {
-        let config = RtcConfigurationBuilder::new()
+        let config = RtcConfigurationBuilder::webrtc()
             .sctp_rto_initial(Duration::from_millis(500))
             .sctp_rto_min(Duration::from_millis(200))
             .sctp_rto_max(Duration::from_secs(10))
@@ -1376,7 +1402,7 @@ mod tests {
     #[test]
     fn test_turn_optimized_config() {
         // Verify a TURN-optimized configuration can be expressed cleanly
-        let config = RtcConfigurationBuilder::new()
+        let config = RtcConfigurationBuilder::webrtc()
             .sctp_rto_initial(Duration::from_millis(500))
             .sctp_rto_min(Duration::from_millis(100))
             .sctp_rto_max(Duration::from_secs(10))
@@ -1388,7 +1414,7 @@ mod tests {
             .build();
 
         // Verify the TURN-optimized values are more aggressive than defaults
-        let defaults = RtcConfiguration::default();
+        let defaults = RtcConfiguration::webrtc();
         assert!(config.sctp_rto_initial < defaults.sctp_rto_initial);
         assert!(config.sctp_rto_min < defaults.sctp_rto_min);
         assert!(config.sctp_rto_max < defaults.sctp_rto_max);
@@ -1401,19 +1427,21 @@ mod tests {
 
     #[test]
     fn test_external_port_defaults() {
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         assert_eq!(config.external_port, None);
     }
 
     #[test]
     fn test_external_port_builder() {
-        let config = RtcConfigurationBuilder::new().external_port(30000).build();
+        let config = RtcConfigurationBuilder::webrtc()
+            .external_port(30000)
+            .build();
         assert_eq!(config.external_port, Some(30000));
     }
 
     #[test]
     fn test_external_port_with_external_ip_builder() {
-        let config = RtcConfigurationBuilder::new()
+        let config = RtcConfigurationBuilder::webrtc()
             .external_ips(vec!["203.0.113.5".parse().unwrap()])
             .external_port(30000)
             .build();
@@ -1426,7 +1454,7 @@ mod tests {
 
     #[test]
     fn test_upnp_defaults() {
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         assert!(!config.enable_upnp, "UPnP should be disabled by default");
         assert_eq!(config.upnp_lease_duration, 3600);
         assert_eq!(config.upnp_refresh_interval, Duration::from_secs(30));
@@ -1434,7 +1462,7 @@ mod tests {
 
     #[test]
     fn test_upnp_builder_methods() {
-        let config = RtcConfigurationBuilder::new()
+        let config = RtcConfigurationBuilder::webrtc()
             .enable_upnp(false)
             .upnp_lease_duration(7200)
             .build();
@@ -1444,16 +1472,16 @@ mod tests {
 
     #[test]
     fn test_upnp_refresh_interval_builder() {
-        let config = RtcConfigurationBuilder::new()
+        let config = RtcConfigurationBuilder::webrtc()
             .upnp_refresh_interval(Duration::from_secs(60))
             .build();
         assert_eq!(config.upnp_refresh_interval, Duration::from_secs(60));
 
         // Refresh interval participates in PartialEq
-        let a = RtcConfigurationBuilder::new()
+        let a = RtcConfigurationBuilder::webrtc()
             .upnp_refresh_interval(Duration::from_secs(60))
             .build();
-        let b = RtcConfigurationBuilder::new()
+        let b = RtcConfigurationBuilder::webrtc()
             .upnp_refresh_interval(Duration::from_secs(120))
             .build();
         assert_ne!(a, b);
@@ -1462,7 +1490,7 @@ mod tests {
 
     #[test]
     fn test_upnp_optimized_config() {
-        let config = RtcConfigurationBuilder::new()
+        let config = RtcConfigurationBuilder::webrtc()
             .enable_upnp(true)
             .upnp_lease_duration(1800)
             .build();
@@ -1471,7 +1499,7 @@ mod tests {
         assert_eq!(config.upnp_lease_duration, 1800);
 
         // Verify defaults remain for other options
-        let defaults = RtcConfiguration::default();
+        let defaults = RtcConfiguration::webrtc();
         assert_eq!(
             config.ice_connection_timeout,
             defaults.ice_connection_timeout
@@ -1480,7 +1508,7 @@ mod tests {
 
     #[test]
     fn test_ice_udp_mux_defaults() {
-        let config = RtcConfiguration::default();
+        let config = RtcConfiguration::webrtc();
         assert!(
             !config.ice_udp_mux,
             "ICE UDP mux should be disabled by default"
@@ -1490,7 +1518,7 @@ mod tests {
 
     #[test]
     fn test_ice_udp_mux_builder_methods() {
-        let config = RtcConfigurationBuilder::new()
+        let config = RtcConfigurationBuilder::webrtc()
             .ice_udp_mux(true)
             .ice_udp_mux_port(30500)
             .build();

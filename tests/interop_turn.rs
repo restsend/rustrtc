@@ -57,7 +57,7 @@ async fn interop_turn_datachannel_test() -> Result<()> {
     println!("Fetched ICE servers: {:?}", ice_servers_config);
 
     // 2. Create RustRTC PeerConnection (Offerer) with TURN
-    let mut rust_config = RtcConfiguration::default();
+    let mut rust_config = RtcConfiguration::webrtc();
     for server in &ice_servers_config {
         let mut s = IceServer::new(server.urls.clone());
         if let (Some(u), Some(c)) = (&server.username, &server.credential) {

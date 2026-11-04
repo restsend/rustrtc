@@ -139,7 +139,7 @@ async fn handle_offer(
     source_addr: std::net::SocketAddr,
 ) -> Result<String> {
     let offer = SessionDescription::parse(SdpType::Offer, &offer_sdp)?;
-    let mut config = rustrtc::RtcConfiguration::default();
+    let mut config = rustrtc::RtcConfiguration::webrtc();
     let mut caps = rustrtc::config::MediaCapabilities::default();
     caps.audio = vec![rustrtc::config::AudioCapability {
         payload_type: 0,

@@ -118,7 +118,7 @@ fn ice_transport_constructs_without_std() {
     install_rng_counter();
     // rtcembed's bin/ua.rs shape: new() must work under no_std and hand
     // back the runner future.
-    let cfg = rustrtc::config::RtcConfiguration::default();
+    let cfg = rustrtc::config::RtcConfiguration::webrtc();
     let (transport, _runner) = rustrtc::transports::ice::IceTransport::new(cfg);
     assert_eq!(
         transport.state(),
@@ -131,7 +131,7 @@ fn ice_credentials_are_random_under_no_std() {
     install_rng_counter();
     // Regression guard for the old all-zero placeholder: ufrag/pwd and
     // tie-breaker must come from the injected source, not zeros.
-    let cfg = rustrtc::config::RtcConfiguration::default();
+    let cfg = rustrtc::config::RtcConfiguration::webrtc();
     let (transport, _runner) = rustrtc::transports::ice::IceTransport::new(cfg);
     let params = transport.local_parameters();
     assert_ne!(params.username_fragment, "");

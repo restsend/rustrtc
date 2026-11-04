@@ -14,11 +14,11 @@ async fn test_media_flow_and_pli() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
     // PC1: Publisher
-    let config1 = RtcConfiguration::default();
+    let config1 = RtcConfiguration::webrtc();
     let pc1 = PeerConnection::new(config1);
 
     // PC2: Receiver (SFU)
-    let config2 = RtcConfiguration::default();
+    let config2 = RtcConfiguration::webrtc();
     let pc2 = PeerConnection::new(config2);
 
     // PC1 adds a track

@@ -13,7 +13,6 @@ use rustrtc::media::MediaStreamTrack;
 use rustrtc::media::frame::{MediaSample, VideoFrame};
 use rustrtc::{
     MediaKind, PeerConnection, RtcConfiguration, RtpCodecParameters, TransceiverDirection,
-    TransportMode,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,13 +22,11 @@ async fn test_remote_addr_and_raw_packet() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
     // PC1: Publisher (RTP Mode)
-    let mut config1 = RtcConfiguration::default();
-    config1.transport_mode = TransportMode::Rtp;
+    let config1 = RtcConfiguration::sip();
     let pc1 = PeerConnection::new(config1);
 
     // PC2: Receiver (RTP Mode)
-    let mut config2 = RtcConfiguration::default();
-    config2.transport_mode = TransportMode::Rtp;
+    let config2 = RtcConfiguration::sip();
     let pc2 = PeerConnection::new(config2);
 
     // PC1 adds a track

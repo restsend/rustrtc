@@ -12,7 +12,8 @@ use rustrtc::media::track::{SampleStreamSource, sample_track};
 use rustrtc::peer_connection::RtpTransceiver;
 use rustrtc::sdp::Direction;
 use rustrtc::{
-    PeerConnection, RtcConfiguration, RtpCodecParameters, TransceiverDirection, TransportMode,
+    Connectivity, Keying, PeerConnection, RtcConfiguration, RtpCodecParameters,
+    TransceiverDirection,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,10 +27,12 @@ fn opus() -> RtpCodecParameters {
     }
 }
 
-fn pc(mode: TransportMode) -> PeerConnection {
+fn pc(mode: (Connectivity, Keying)) -> PeerConnection {
     PeerConnection::new(RtcConfiguration {
-        transport_mode: mode,
-        ..RtcConfiguration::default()
+        connectivity: mode.0,
+        keying: mode.1,
+        webrtc_extensions: mode.0 == Connectivity::Ice,
+        ..RtcConfiguration::sip()
     })
 }
 
@@ -101,7 +104,10 @@ async fn remote_receives(transceiver: &Arc<RtpTransceiver>) -> bool {
     )
 }
 
-async fn no_rtp_after_remote_answers(mode: TransportMode, direction: Direction) -> Result<()> {
+async fn no_rtp_after_remote_answers(
+    mode: (Connectivity, Keying),
+    direction: Direction,
+) -> Result<()> {
     let pc1 = pc(mode.clone());
     let pc2 = pc(mode.clone());
     let (source, track, _) = sample_track(rustrtc::media::MediaKind::Audio, 100);
@@ -125,14 +131,14 @@ async fn no_rtp_after_remote_answers(mode: TransportMode, direction: Direction) 
 
 #[tokio::test]
 async fn no_rtp_after_remote_answers_inactive_webrtc() -> Result<()> {
-    no_rtp_after_remote_answers(TransportMode::WebRtc, Direction::Inactive).await
+    no_rtp_after_remote_answers((Connectivity::Ice, Keying::Dtls), Direction::Inactive).await
 }
 
 #[tokio::test]
 async fn rtp_flows_when_the_remote_answers_recvonly_webrtc() -> Result<()> {
     // Guard: `recvonly` from the answerer means it receives — we send.
-    let pc1 = pc(TransportMode::WebRtc);
-    let pc2 = pc(TransportMode::WebRtc);
+    let pc1 = pc((Connectivity::Ice, Keying::Dtls));
+    let pc2 = pc((Connectivity::Ice, Keying::Dtls));
     let (source, track, _) = sample_track(rustrtc::media::MediaKind::Audio, 100);
     pc1.add_track(track, opus())?;
     exchange(&pc1, &pc2, Some(Direction::RecvOnly)).await?;
@@ -148,17 +154,17 @@ async fn rtp_flows_when_the_remote_answers_recvonly_webrtc() -> Result<()> {
 
 #[tokio::test]
 async fn no_rtp_after_remote_answers_sendonly_rtp() -> Result<()> {
-    no_rtp_after_remote_answers(TransportMode::Rtp, Direction::SendOnly).await
+    no_rtp_after_remote_answers((Connectivity::Sdp, Keying::None), Direction::SendOnly).await
 }
 
 #[tokio::test]
 async fn no_rtp_after_remote_answers_inactive_rtp() -> Result<()> {
-    no_rtp_after_remote_answers(TransportMode::Rtp, Direction::Inactive).await
+    no_rtp_after_remote_answers((Connectivity::Sdp, Keying::None), Direction::Inactive).await
 }
 
 /// The remote holds us (`sendonly` re-offer), we answer `recvonly` and stop
 /// sending; the remote resumes (`sendrecv` re-offer) and we send again.
-async fn remote_hold_and_resume(mode: TransportMode) -> Result<()> {
+async fn remote_hold_and_resume(mode: (Connectivity, Keying)) -> Result<()> {
     let pc1 = pc(mode.clone());
     let pc2 = pc(mode.clone());
     let (source, track, _) = sample_track(rustrtc::media::MediaKind::Audio, 100);
@@ -193,25 +199,25 @@ async fn remote_hold_and_resume(mode: TransportMode) -> Result<()> {
 
 #[tokio::test]
 async fn no_rtp_after_remote_answers_inactive_srtp() -> Result<()> {
-    no_rtp_after_remote_answers(TransportMode::Srtp, Direction::Inactive).await
+    no_rtp_after_remote_answers((Connectivity::Sdp, Keying::Sdes), Direction::Inactive).await
 }
 
 #[tokio::test]
 async fn remote_hold_and_resume_rtp() -> Result<()> {
-    remote_hold_and_resume(TransportMode::Rtp).await
+    remote_hold_and_resume((Connectivity::Sdp, Keying::None)).await
 }
 
 #[tokio::test]
 async fn remote_hold_and_resume_webrtc() -> Result<()> {
-    remote_hold_and_resume(TransportMode::WebRtc).await
+    remote_hold_and_resume((Connectivity::Ice, Keying::Dtls)).await
 }
 
 /// A transceiver whose negotiation forbids sending also gates a sender
 /// installed on it afterwards.
 #[tokio::test]
 async fn a_sender_installed_after_an_inactive_answer_stays_quiet() -> Result<()> {
-    let pc1 = pc(TransportMode::Rtp);
-    let pc2 = pc(TransportMode::Rtp);
+    let pc1 = pc((Connectivity::Sdp, Keying::None));
+    let pc2 = pc((Connectivity::Sdp, Keying::None));
     let (_first, track, _) = sample_track(rustrtc::media::MediaKind::Audio, 100);
     pc1.add_track(track, opus())?;
     exchange(&pc1, &pc2, Some(Direction::Inactive)).await?;
@@ -232,8 +238,8 @@ async fn a_sender_installed_after_an_inactive_answer_stays_quiet() -> Result<()>
 /// transport keeps sending.
 #[tokio::test]
 async fn one_held_stream_in_a_bundle_stops_alone() -> Result<()> {
-    let pc1 = pc(TransportMode::WebRtc);
-    let pc2 = pc(TransportMode::WebRtc);
+    let pc1 = pc((Connectivity::Ice, Keying::Dtls));
+    let pc2 = pc((Connectivity::Ice, Keying::Dtls));
     let (held, track, _) = sample_track(rustrtc::media::MediaKind::Audio, 100);
     pc1.add_track(track, opus())?;
     let (open, track, _) = sample_track(rustrtc::media::MediaKind::Audio, 100);
@@ -255,8 +261,8 @@ async fn one_held_stream_in_a_bundle_stops_alone() -> Result<()> {
 /// we send again over the restarted ICE session.
 #[tokio::test]
 async fn remote_hold_survives_our_ice_restart() -> Result<()> {
-    let pc1 = pc(TransportMode::WebRtc);
-    let pc2 = pc(TransportMode::WebRtc);
+    let pc1 = pc((Connectivity::Ice, Keying::Dtls));
+    let pc2 = pc((Connectivity::Ice, Keying::Dtls));
     let (source, track, _) = sample_track(rustrtc::media::MediaKind::Audio, 100);
     pc1.add_track(track, opus())?;
     let (_back, track, _) = sample_track(rustrtc::media::MediaKind::Audio, 100);
