@@ -9,14 +9,14 @@ A high-performance, full-stack real-time communication library — **WebRTC, RTP
 
 - **High performance** — ~3.9× faster than `webrtc-rs` and ~3.7× faster than `pion` (Go) in throughput, with ~52% less memory than `webrtc-rs` (see the benchmark below).
 - **Full protocol stack** — WebRTC, RTP, SRTP, and **T.38 fax** in a single library, plus **UPnP IGD** NAT traversal. Few moving parts, no missing pieces.
-- **Unified `PeerConnection` API** — one interface for every transport mode (`WebRtc` ICE/DTLS/SRTP, `Srtp`, `Rtp`, and T.38). No fragmented APIs.
+- **Unified `PeerConnection` API** — one interface for every transport combination (any `Connectivity` × any `Keying`, plus T.38). No fragmented APIs.
 - **WebRTC compliant** — interoperable with Chrome/WebRTC and pion; offer/answer, renegotiation, rollback, and standard SDP attributes.
 - **ICE restart** — `restart_ice()` for network migration / re-INVITE flows, with automatic detection of remote-initiated restarts (RFC 8445 §9).
 - **Complete media pipeline** — packetizer/depacketizer (VP8, VP9, H264, Opus, G.711/G.722/G.729), jitter buffer, NACK/RTX, FIR/PLI, TWCC, and REMB for audio and video.
 - **Bandwidth estimation (GCC)** — generates TWCC receiver feedback, stamps transport-wide sequence numbers on outbound RTP, and exposes a live `target_bitrate` estimate for encoder adaptation (`RtpSender::subscribe_target_bitrate`).
 - **Full ICE** — STUN, TURN (UDP + TCP), ICE Lite, ICE TCP (RFC 6544), single-port UDP mux for SFU/WHEP deployments, and **mDNS candidate obfuscation** (`enable_mdns`).
 - **NAT traversal & deployment** — RTP latching, UPnP IGD port mapping, and firewall-friendly port ranges (`rtp_start_port`/`rtp_end_port`).
-- **`no_std` / embassy-ready** — the full ICE/STUN/TURN + DTLS-SRTP + SDES media stack (WebRtc, Srtp, and Rtp transport modes) runs on any executor behind seven injected platform seams, end-to-end tested against a mock embedded runtime (`scripts/check-no_std.sh`).
+- **`no_std` / embassy-ready** — the full ICE/STUN/TURN + DTLS-SRTP + SDES media stack (any `Connectivity` × any `Keying`) runs on any executor behind seven injected platform seams, end-to-end tested against a mock embedded runtime (`scripts/check-no_std.sh`).
 - **Production extras** — RTP rewrite bridge (SSRC/PT/sequence remapping) and a WebRTC-compatible stats model.
 
 ## no_std / Embedded Support
@@ -234,7 +234,8 @@ Migration from `TransportMode`: `WebRtc` is `webrtc()`; `Rtp` is `sip()`; `Srtp`
 - **`rtp_start_port` / `rtp_end_port`** — Restrict RTP/ICE to a port range.
 - **`external_ips`** — Public addresses to advertise instead of the local ones (1:1 NAT, a router that forwards the RTP ports), at most one per family (IPv4 + IPv6). A candidate takes the external address of its family, and so do `c=` and `o=`; a family with none advertises the local address.
 - **`external_ip_candidate_type`** — How ICE advertises `external_ips`: `Host` (default) replaces the host candidate's address; `ServerReflexive` keeps the host candidate and adds the external address as a srflx candidate on the same socket (1:1 NAT, RFC 8445 §5.1.1.2). Full ICE only.
-- **`bind_ips`** — Local addresses to bind media sockets on, one socket each (e.g. `["::"]` for one dual-stack socket, or `["127.0.0.1", "::1"]` for one socket per family). Empty: chosen automatically (WebRTC: every interface; RTP and SRTP: the default route's address).
+- **`bind_ips`** — Local addresses to bind media sockets on, one socket each (e.g. `["::"]` for one dual-stack socket, or `["127.0.0.1", "::1"]` for one socket per family). Empty: chosen automatically (full ICE: every interface; a direct transport (`Connectivity::Sdp` / `Connectivity::IceLite`): the address of the default route).
+- **`external_port`** — Advertise this fixed port in the SDP `m=` line and candidates instead of the local bind port (NAT port forwarding: external 30000 → local 20000). Works alone or with `external_ips`. Direct transports only; not used with full ICE.
 - **`disable_ipv6`** — Disable IPv6 candidate gathering.
 - **`ice_tcp_policy`** — `IceTcpPolicy::Disabled` (default), `IceTcpPolicy::Enabled`, or `IceTcpPolicy::PassiveOnly`. Controls ICE TCP candidate support per RFC 6544.
 - **`ice_udp_mux`** / **`ice_udp_mux_port`** — Share a single UDP socket across many `PeerConnection`s (single-port multiplexing for SFU/WHEP). Set `ice_udp_mux = true` and `ice_udp_mux_port = <port>`; incoming packets are demuxed by the server ufrag in the STUN Binding Request, then by remote source address.
@@ -295,7 +296,16 @@ Note: persistence-based latching is accident-robustness (stale NAT bindings, por
 - **`depacketizer_strategy`** — Pluggable per-kind depacketizer (e.g. `Vp9Depacketizer` for RFC 9628 VP9 reassembly).
 
 ### SCTP (Data Channels)
-- `sctp_rto_initial`, `sctp_rto_min`, `sctp_rto_max`, `sctp_max_association_retransmits`, `sctp_receive_window`, `sctp_heartbeat_interval`, `sctp_max_heartbeat_failures`, `sctp_max_burst`, `sctp_max_cwnd`
+Defaults from `RtcConfiguration::webrtc()` / `::sip()`:
+- `sctp_rto_initial` — initial retransmission timeout, 3 s
+- `sctp_rto_min` / `sctp_rto_max` — retransmission-timeout bounds, 200 ms / 60 s
+- `sctp_max_association_retransmits` — INIT/HEARTBEAT retransmits before abort, 20
+- `sctp_receive_window` — advertised receive window, 128 KB
+- `sctp_heartbeat_interval` / `sctp_max_heartbeat_failures` — idle-association probing, 15 s / 4 misses
+- `sctp_max_tsn_retransmits` — per-chunk retransmit limit before abort, 8
+- `sctp_max_burst` — packets per burst (0 = built-in heuristic)
+- `sctp_max_cwnd` — congestion-window ceiling, 256 KB
+- `sctp_max_buffered_amount` — per-channel send gate, 256 KB (0 = unbounded)
 
 ### RTP Buffer
 - `rtp_buffer_capacity` — Per-SSRC receive buffer capacity.

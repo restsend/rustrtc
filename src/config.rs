@@ -8,6 +8,7 @@ use crate::prelude::*;
 /// placeholder (embassy tasks are spawned by the embedder's executor).
 #[cfg(feature = "std")]
 pub type RuntimeHandle = tokio::runtime::Handle;
+/// no_std placeholder: nothing to pin, see the `std` variant.
 #[cfg(not(feature = "std"))]
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeHandle;
@@ -20,22 +21,32 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum IceCredentialType {
+    /// Long-term credentials: `username` + `credential` (a shared secret).
+    /// Serialized as `"password"`.
     #[default]
     Password,
+    /// OAuth 2.0 tokens per RFC 7635. Serialized as `"oauth"`.
     Oauth,
 }
 
 /// Mirrors the W3C `RTCIceServer` dictionary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IceServer {
+    /// Server URLs: `stun:host:port`, `turn:host:port?transport=udp`,
+    /// `turns:host:port` (TLS), `turns:host:port?transport=tcp`.
     pub urls: Vec<String>,
+    /// Username for TURN authentication (`credential_type` decides the
+    /// mechanism).
     pub username: Option<String>,
+    /// Secret or token matching `username`.
     pub credential: Option<String>,
+    /// Credential mechanism. Default: [`IceCredentialType::Password`].
     #[serde(default)]
     pub credential_type: IceCredentialType,
 }
 
 impl IceServer {
+    /// A server (or a list of URLs for one server) without credentials.
     pub fn new<T: Into<Vec<String>>>(urls: T) -> Self {
         Self {
             urls: urls.into(),
@@ -45,6 +56,7 @@ impl IceServer {
         }
     }
 
+    /// Set long-term credentials (see [`IceCredentialType::Password`]).
     pub fn with_credential(
         mut self,
         username: impl Into<String>,
@@ -55,6 +67,7 @@ impl IceServer {
         self
     }
 
+    /// Set the credential mechanism.
     pub fn credential_type(mut self, kind: IceCredentialType) -> Self {
         self.credential_type = kind;
         self
@@ -67,10 +80,15 @@ impl Default for IceServer {
     }
 }
 
+/// Which candidate types ICE may use.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum IceTransportPolicy {
+    /// All candidates: host, server-reflexive and relay. Serialized as
+    /// `"All"`.
     #[default]
     All,
+    /// Relay candidates only: media always flows through a TURN server.
+    /// Serialized as `"Relay"`.
     Relay,
 }
 
@@ -93,7 +111,8 @@ pub enum IceTcpPolicy {
 /// bundle-only (port 0): such a peer rejects them. An answer to an offer
 /// without BUNDLE rejects the m-lines that the policy gives no transport.
 ///
-/// Full ICE has one ICE agent: it always works as `MaxBundle`.
+/// Full ICE has one ICE agent: it always works as `MaxBundle`. Serialized
+/// as the variant name: `"Balanced"`, `"MaxCompat"`, `"MaxBundle"`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BundlePolicy {
     /// A transport for the first m-line of each kind (audio, video, data).
@@ -110,6 +129,7 @@ pub enum BundlePolicy {
 /// propose it with `a=rtcp-mux`; answers accept it when the offer has it.
 ///
 /// Full ICE gathers no RTCP component: it always works as `Require`.
+/// Serialized as the variant name: `"Require"`, `"Negotiate"`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RtcpMuxPolicy {
     /// The peer must multiplex. Offers also carry `a=rtcp-mux-only`
@@ -123,7 +143,8 @@ pub enum RtcpMuxPolicy {
 }
 
 /// How the media path to the peer is found. Any value works with any
-/// [`Keying`].
+/// [`Keying`]. Serialized as the variant name: `"Sdp"`, `"IceLite"`,
+/// `"Ice"`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Connectivity {
     /// The c=/m= address of the peer's SDP (corrected by latching, when on).
@@ -144,7 +165,8 @@ impl Connectivity {
 }
 
 /// How the SRTP keys are exchanged. Any value works with any
-/// [`Connectivity`]. Data channels (SCTP) need `Dtls`.
+/// [`Connectivity`]. Data channels (SCTP) need `Dtls`. Serialized as the
+/// variant name: `"None"`, `"Sdes"`, `"Dtls"`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Keying {
     /// Plain RTP (RTP/AVP).
@@ -155,11 +177,15 @@ pub enum Keying {
     Dtls,
 }
 
-/// Strategy for dropping packets when buffer is full.
+/// Strategy for dropping packets when the receive buffer is full.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum BufferDropStrategy {
+    /// Drop the packet that just arrived; keep the oldest buffered ones.
+    /// Serialized as `"DropNew"`.
     #[default]
     DropNew,
+    /// Drop the oldest buffered packet to make room. Serialized as
+    /// `"DropOldest"`.
     DropOldest,
 }
 
@@ -172,25 +198,34 @@ pub enum ExternalIpCandidateType {
     Host,
     /// Keep the host candidate on the bind address and advertise the
     /// external address of its family alongside it as a server-reflexive
-    /// candidate (1:1 NAT, RFC 8445 §5.1.1.2). WebRTC mode only.
+    /// candidate (1:1 NAT, RFC 8445 §5.1.1.2). Full ICE only.
     ServerReflexive,
 }
 
 /// Tracks user-supplied certificate material.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct CertificateConfig {
+    /// Certificate chain in PEM (leaf first, then intermediates).
     pub pem_chain: Vec<String>,
+    /// Matching private key in PEM (PKCS#8 or SEC1).
     pub private_key_pem: Option<String>,
 }
 
-/// Configuration for audio/video codecs and parameters.
+/// One audio codec offered in SDP, with its parameters.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AudioCapability {
+    /// RTP payload type to offer (0-96 static, 96-127 dynamic).
     pub payload_type: u8,
+    /// Encoding name as it appears in `a=rtpmap` (e.g. `"opus"`, `"PCMU"`).
     pub codec_name: String,
+    /// RTP timestamp clock rate in Hz (e.g. 48000 for Opus, 8000 for PCMU).
     pub clock_rate: u32,
+    /// Number of audio channels (`a=rtpmap` channels part; Opus is 2).
     pub channels: u8,
+    /// `a=fmtp` parameters without the `a=fmtp:<pt> ` prefix.
     pub fmtp: Option<String>,
+    /// RTCP feedback types to offer in `a=rtcp-fb` (e.g. `"nack"`,
+    /// `"ccm fir"`). Empty: none.
     pub rtcp_fbs: Vec<String>,
 }
 
@@ -208,10 +243,13 @@ impl Default for AudioCapability {
 }
 
 impl AudioCapability {
+    /// Opus, payload type 111, 48 kHz stereo, `minptime=10;useinbandfec=1;
+    /// stereo=1` (the default `AudioCapability`).
     pub fn opus() -> Self {
         Self::default()
     }
 
+    /// G.711 µ-law, payload type 0, 8 kHz mono.
     pub fn pcmu() -> Self {
         Self {
             payload_type: 0,
@@ -223,6 +261,7 @@ impl AudioCapability {
         }
     }
 
+    /// G.711 A-law, payload type 8, 8 kHz mono.
     pub fn pcma() -> Self {
         Self {
             payload_type: 8,
@@ -234,6 +273,8 @@ impl AudioCapability {
         }
     }
 
+    /// G.722, payload type 9, 8 kHz (the RTP clock rate for G.722 is 8000
+    /// despite sampling at 16 kHz, per RFC 3551).
     pub fn g722() -> Self {
         Self {
             payload_type: 9,
@@ -245,6 +286,7 @@ impl AudioCapability {
         }
     }
 
+    /// G.729, payload type 18, 8 kHz mono.
     pub fn g729() -> Self {
         Self {
             payload_type: 18,
@@ -256,6 +298,7 @@ impl AudioCapability {
         }
     }
 
+    /// DTMF tones (RFC 4733), payload type 101, `0-16` events.
     pub fn telephone_event() -> Self {
         Self {
             payload_type: 101,
@@ -268,12 +311,19 @@ impl AudioCapability {
     }
 }
 
+/// One video codec offered in SDP, with its parameters.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VideoCapability {
+    /// RTP payload type to offer.
     pub payload_type: u8,
+    /// Encoding name as it appears in `a=rtpmap` (e.g. `"VP8"`, `"VP9"`).
     pub codec_name: String,
+    /// RTP timestamp clock rate in Hz (90000 for all video codecs).
     pub clock_rate: u32,
+    /// `a=fmtp` parameters without the `a=fmtp:<pt> ` prefix.
     pub fmtp: Option<String>,
+    /// RTCP feedback types to offer in `a=rtcp-fb` (e.g. `"nack"`,
+    /// `"nack pli"`, `"transport-cc"`).
     pub rtcp_fbs: Vec<String>,
     /// Associated RTX payload type (RFC 4588). When set, SDP offers include
     /// `a=rtpmap:<pt> rtx/<clock_rate>` and `a=fmtp:<pt> apt=<primary>`.
@@ -302,6 +352,8 @@ impl Default for VideoCapability {
 }
 
 impl VideoCapability {
+    /// H.264 constrained-baseline, payload type 96, `packetization-mode=1;
+    /// profile-level-id=42e01f`, NACK/PLI/FIR feedback.
     pub fn h264() -> Self {
         Self {
             payload_type: 96,
@@ -352,8 +404,11 @@ impl VideoCapability {
     }
 }
 
+/// The data-channel m-line: the SCTP port we offer in `a=sctp-port`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApplicationCapability {
+    /// SCTP port number to offer (default 5000, the UDP-encapsulated
+    /// SCTP default per RFC 8261 §5).
     pub sctp_port: u16,
 }
 
@@ -363,11 +418,17 @@ impl Default for ApplicationCapability {
     }
 }
 
+/// T.38 fax rate management (SDP `T38FaxRateManagement`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum T38FaxRateManagement {
+    /// The receiving terminal trains with TCF and confirms in the C: line
+    /// of CFR (the ITU default; the peer sends training). Serialized as
+    /// `"transferredTCF"`.
     #[serde(rename = "transferredTCF")]
     #[default]
     TransferredTCF,
+    /// We train locally and skip the peer's TCF (robust on lossy links).
+    /// Serialized as `"localTCF"`.
     #[serde(rename = "localTCF")]
     LocalTCF,
 }
@@ -381,11 +442,16 @@ impl core::fmt::Display for T38FaxRateManagement {
     }
 }
 
+/// T.38 UDPTL error correction (SDP `T38UDPEC`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum T38UdpEC {
+    /// Redundancy coding: repeat the previous N primary packets verbatim.
+    /// Serialized as `"t38UDPRedundancy"`.
     #[serde(rename = "t38UDPRedundancy")]
     #[default]
     T38UDPRedundancy,
+    /// Forward error correction: parity data computed over a window of
+    /// packets. Serialized as `"t38UDPFEC"`.
     #[serde(rename = "t38UDPFEC")]
     T38UDPFEC,
 }
@@ -399,8 +465,10 @@ impl core::fmt::Display for T38UdpEC {
     }
 }
 
+/// One image (T.38 fax) codec offered in SDP, with its T.38 parameters.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct T38Capability {
+    /// RTP payload type to offer for the image media.
     pub payload_type: u8,
     /// T.38 version (0-3)
     pub version: u8,
@@ -414,6 +482,7 @@ pub struct T38Capability {
     pub max_datagram: u16,
     /// UDP error correction method
     pub udp_ec: T38UdpEC,
+    /// Extra `a=fmtp` parameters beyond the standard T.38 fields.
     pub fmtp: Option<String>,
 }
 
@@ -433,16 +502,26 @@ impl Default for T38Capability {
 }
 
 impl T38Capability {
+    /// The default T.38 profile: payload type 98, version 0, 14400 bps,
+    /// transferredTCF, 1024-byte buffer, 238-byte datagrams, redundancy EC.
     pub fn default_t38() -> Self {
         Self::default()
     }
 }
 
+/// Which audio, video, data and image codecs are offered in SDP.
+/// `None` (the default): built-ins — Opus + PCMU, VP8, an SCTP data
+/// section, no image.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MediaCapabilities {
+    /// Audio codecs to offer, in offer order.
     pub audio: Vec<AudioCapability>,
+    /// Video codecs to offer, in offer order.
     pub video: Vec<VideoCapability>,
+    /// Some: offer an `m=application` (data channel) section with this
+    /// SCTP port. `None`: no data-channel offer.
     pub application: Option<ApplicationCapability>,
+    /// Image (T.38 fax) codecs to offer, in offer order.
     pub image: Vec<T38Capability>,
 }
 
@@ -457,8 +536,12 @@ impl Default for MediaCapabilities {
     }
 }
 
+/// The pluggable per-media-kind RTP depacketizer factory.
 #[derive(Clone)]
 pub struct DepacketizerStrategy {
+    /// Builds the depacketizer for each received media kind. Default:
+    /// the built-in factory (VP8, H264, Opus; VP9 when the `vp9` feature
+    /// is on).
     pub factory: Arc<dyn DepacketizerFactory>,
 }
 
@@ -519,12 +602,28 @@ fn default_upnp_refresh_interval() -> core::time::Duration {
 /// what you need. They differ in `connectivity`, `keying`,
 /// `webrtc_extensions`, `rtcp_mux_policy` and `bundle_policy`; the other
 /// fields have the same values.
+///
+/// Note on serde: `connectivity`, `keying`, `webrtc_extensions`,
+/// `bundle_policy` and `rtcp_mux_policy` have no defaults — a serialized
+/// config must carry all five, so a config file written before 0.6 fails
+/// to deserialize and must be migrated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RtcConfiguration {
+    /// STUN/TURN servers for candidate gathering (full ICE only; direct
+    /// transports gather no server candidates). Empty: host candidates
+    /// only.
     pub ice_servers: Vec<IceServer>,
+    /// Which candidate types ICE may use. Default:
+    /// [`IceTransportPolicy::All`].
     pub ice_transport_policy: IceTransportPolicy,
+    /// Which m-lines of an offer have a transport of their own. See
+    /// [`BundlePolicy`].
     pub bundle_policy: BundlePolicy,
+    /// RTP/RTCP multiplexing policy. See [`RtcpMuxPolicy`].
     pub rtcp_mux_policy: RtcpMuxPolicy,
+    /// Unused: vestigial from the W3C `RTCConfiguration.certificates`
+    /// mirror. DTLS-SRTP key material goes in `dtls_certificate`; nothing
+    /// reads this field.
     pub certificates: Vec<CertificateConfig>,
     /// How the media path is found.
     pub connectivity: Connectivity,
@@ -538,6 +637,8 @@ pub struct RtcConfiguration {
     /// these: set it to false for them. (sdes:mid goes with BUNDLE, see
     /// [`BundlePolicy`].)
     pub webrtc_extensions: bool,
+    /// Size of the per-SSRC NACK retransmission-request buffer, in
+    /// packets (default 200): how far back lost-sequence tracking looks.
     pub nack_buffer_size: usize,
     /// Enable the TWCC + GCC bandwidth-adaptation loop: stamp outgoing RTP
     /// with the transport-cc sequence-number extension, generate TWCC feedback
@@ -547,6 +648,9 @@ pub struct RtcConfiguration {
     /// `RtpSender::subscribe_target_bitrate`).
     #[serde(default = "default_enable_gcc")]
     pub enable_gcc: bool,
+    /// Which audio, video, data and image codecs to offer. `None` (the
+    /// default): the built-in codec set (Opus + PCMU, VP8, SCTP data,
+    /// no image). See [`MediaCapabilities`].
     pub media_capabilities: Option<MediaCapabilities>,
     /// Public addresses to advertise instead of the local ones (1:1 NAT, a
     /// router that forwards the RTP ports), at most one per family. A
@@ -570,23 +674,26 @@ pub struct RtcConfiguration {
     /// `Connectivity::IceLite`). Not used with full ICE.
     pub external_port: Option<u16>,
     /// Local addresses to bind media sockets on: one socket on each. Empty:
-    /// chosen for us (WebRTC: every interface; RTP and SRTP: the address of
-    /// the default route). A socket on `::` serves IPv4 and IPv6
+    /// chosen for us (full ICE: every interface; a direct transport: the
+    /// address of the default route). A socket on `::` serves IPv4 and IPv6
     /// (`IPV6_V6ONLY` off), and has a candidate for each family: the
     /// external address of the family, else the local address of its
     /// default route. A socket on a given address serves its family only.
     pub bind_ips: Vec<IpAddr>,
-    /// Our offers on a direct transport (RTP, SRTP) put an IPv6 candidate in
+    /// Our offers on a direct transport (see [`Connectivity`]) put an IPv6 candidate in
     /// `c=` and the `m=` port when there is one; else IPv4 goes first. An
     /// answer takes the family of the offer (RFC 6157 §4.1), and once a pair
     /// is selected, later descriptions keep its family. Default: false.
     #[serde(default)]
     pub prefer_ipv6: bool,
+    /// Do not gather or use IPv6 candidates or addresses. Default: false.
     pub disable_ipv6: bool,
     /// The SSRC of the first sender; later senders count up from it. Random
     /// by default, as RFC 3550 §8.1 asks: a fixed start gives every peer
     /// connection the same SSRCs.
     pub ssrc_start: u32,
+    /// Timeout for one STUN transaction to a server (retransmission
+    /// schedule ends here). Default 5 s.
     pub stun_timeout: core::time::Duration,
     /// Upper bound on STUN/TURN *server* candidate gathering. A slow or hung
     /// server must not delay the offer past this: candidates that arrived in
@@ -607,6 +714,10 @@ pub struct RtcConfiguration {
     /// and tunnel use cases should raise this (e.g. 500 ms) so relay
     /// stays a true last resort.
     pub nomination_grace: core::time::Duration,
+    /// Timeout without any STUN response before the ICE transport goes
+    /// to `Failed` (the hard failure threshold; see
+    /// `ice_disconnect_threshold` for the recoverable path). Default
+    /// 120 s.
     pub ice_connection_timeout: core::time::Duration,
     /// How long without receiving any packet (STUN/DTLS/SCTP) before the ICE
     /// transport is demoted from `Connected` to `Disconnected`.
@@ -632,21 +743,38 @@ pub struct RtcConfiguration {
     /// Set to 0 to tear down immediately on ICE Disconnected.
     /// Default: 60s
     pub ice_disconnect_grace: core::time::Duration,
+    /// Initial SCTP retransmission timeout (RFC 9294 RTO). Default 3 s.
     pub sctp_rto_initial: core::time::Duration,
+    /// Lower bound of the SCTP retransmission timeout. Default 200 ms.
     pub sctp_rto_min: core::time::Duration,
+    /// Upper bound of the SCTP retransmission timeout. Default 60 s.
     pub sctp_rto_max: core::time::Duration,
+    /// SCTP retransmissions of the INIT/HEARTBEAT chunk before the
+    /// association is declared dead. Default 20.
     pub sctp_max_association_retransmits: u32,
+    /// SCTP advertised receiver window in bytes. Default 128 KB.
     pub sctp_receive_window: usize,
+    /// Interval between SCTP HEARTBEAT chunks on idle associations.
+    /// Default 15 s.
     pub sctp_heartbeat_interval: core::time::Duration,
+    /// Missed HEARTBEAT acks before an idle association is declared dead.
+    /// Default 4.
     pub sctp_max_heartbeat_failures: u32,
+    /// How often one DATA chunk is retransmitted before the association
+    /// aborts. Default 8.
     pub sctp_max_tsn_retransmits: u32,
+    /// Cap on DATA chunks sent per CWND window ("burst control"); 0 uses
+    /// the built-in heuristic. Default 0.
     pub sctp_max_burst: usize,
+    /// Congestion-window ceiling in bytes. Default 256 KB.
     pub sctp_max_cwnd: usize,
     /// Per-data-channel send-side buffered-amount limit in bytes (sum of
     /// in-flight + queued payload bytes). The sender blocks when the total
     /// exceeds this threshold, bounding per-channel peak RSS regardless of
     /// peer speed. Default 256 KB;  0 disables the gate (unbounded).
     pub sctp_max_buffered_amount: usize,
+    /// DTLS record read-buffer size in bytes. Default 2048 (fits a full
+    /// MTU record).
     pub dtls_buffer_size: usize,
     /// Pre-provisioned DTLS leaf certificate (DER) + PKCS#8 private key.
     /// Required for DTLS keying without `std` (no certificate generation
@@ -654,8 +782,16 @@ pub struct RtcConfiguration {
     /// self-signed certificate is generated per connection.
     #[serde(skip)]
     pub dtls_certificate: Option<Arc<crate::transports::dtls::Certificate>>,
+    /// Lower bound of the UDP port range for media sockets (RTP/ICE).
+    /// `None`: any ephemeral port.
     pub rtp_start_port: Option<u16>,
+    /// Upper bound of the UDP port range for media sockets (RTP/ICE).
+    /// `None`: any ephemeral port.
     pub rtp_end_port: Option<u16>,
+    /// Gather UDP host candidates on the local interfaces (with
+    /// [`IceTransportPolicy::All`]). Default: true. When false, offers
+    /// carry only server-reflexive, relay and ICE-TCP candidates — local
+    /// IPs stay out of the SDP.
     pub ice_gather_udp_hosts: bool,
     /// Whether to gather and advertise loopback (127.0.0.1 / ::1) host
     /// candidates when no explicit `bind_ips` are configured.
@@ -668,9 +804,22 @@ pub struct RtcConfiguration {
     /// explicit `bind_ips = [127.0.0.1]` is unaffected by this flag.
     #[serde(default)]
     pub ice_include_loopback_candidates: bool,
+    /// Lower bound of the TCP listen range for passive ICE-TCP candidates
+    /// (with [`IceTcpPolicy::Enabled`]/[`IceTcpPolicy::PassiveOnly`]).
+    /// `None`: OS-assigned.
     pub tcp_port_range_start: Option<u16>,
+    /// Upper bound of the TCP listen range for passive ICE-TCP candidates.
+    /// `None`: OS-assigned.
     pub tcp_port_range_end: Option<u16>,
+    /// Detect the peer's real media address from the first arriving
+    /// packets, and send there — for peers whose SDP address is wrong
+    /// (behind symmetric NAT). Direct transports
+    /// ([`Connectivity::Sdp`] / [`Connectivity::IceLite`]) only; see the
+    /// README's RTP Latching section. Default: false.
     pub enable_latching: bool,
+    /// packets to observe before committing a latched address; `None`
+    /// (the default) uses the built-in budget. A single packet never
+    /// moves the egress address.
     pub probation_max_packets: Option<u8>,
     /// When true, demote host candidates with private (RFC 1918) local IPs
     /// below server-reflexive candidates in the connectivity check ordering.
@@ -701,12 +850,18 @@ pub struct RtcConfiguration {
     /// the default lease (3600s) without inbound path loss.
     #[serde(default = "default_upnp_refresh_interval")]
     pub upnp_refresh_interval: core::time::Duration,
+    /// Per-media-kind RTP depacketizer factory (see
+    /// [`DepacketizerStrategy`]). Default: the built-in factory.
     #[serde(skip, default)]
     pub depacketizer_strategy: DepacketizerStrategy,
+    /// Per-SSRC receive (jitter) buffer capacity in packets. Default 100.
     #[serde(default = "default_rtp_buffer_capacity")]
     pub rtp_buffer_capacity: usize,
+    /// What to drop when the receive buffer is full. Default:
+    /// [`BufferDropStrategy::DropNew`].
     #[serde(default)]
     pub buffer_drop_strategy: BufferDropStrategy,
+    /// How often to log receive-buffer occupancy stats. Default 10 s.
     #[serde(default = "default_buffer_stats_log_interval")]
     pub buffer_stats_log_interval: core::time::Duration,
     /// Controls ICE TCP candidate support (RFC 6544).
@@ -728,8 +883,12 @@ pub struct RtcConfiguration {
     /// is enabled. All `PeerConnection`s sharing this port must agree on it.
     #[serde(default)]
     pub ice_udp_mux_port: Option<u16>,
+    /// Free-form label for this connection (logs, diagnostics). Not
+    /// serialized.
     #[serde(skip, default)]
     pub label: Option<String>,
+    /// RTCP SDES CNAME to advertise. `None`: derived from the SSRC /
+    /// random. Not serialized.
     #[serde(skip, default)]
     pub cname: Option<String>,
     /// Runtime handle for spawning internal tasks (ICE runner, DTLS, RTCP,
@@ -918,6 +1077,9 @@ impl RtcConfiguration {
     }
 }
 
+/// Builder over [`RtcConfiguration`]. Start from the kind of peer,
+/// [`RtcConfigurationBuilder::webrtc`] or [`RtcConfigurationBuilder::sip`],
+/// chain the setters you need, then [`RtcConfigurationBuilder::build`].
 pub struct RtcConfigurationBuilder {
     inner: RtcConfiguration,
 }
@@ -927,8 +1089,10 @@ pub struct RtcConfigurationBuilder {
 /// are opaque and only compared by count.
 #[derive(Clone, Default)]
 pub struct RecorderInterceptors {
+    /// Fire on every incoming RTP packet, pre-depacketize.
     #[cfg(feature = "std")]
     pub receivers: Vec<Arc<dyn RtpReceiverInterceptor>>,
+    /// Fire on every outgoing RTP packet, post seq/timestamp rewrite.
     #[cfg(feature = "std")]
     pub senders: Vec<Arc<dyn RtpSenderInterceptor>>,
 }
@@ -982,41 +1146,52 @@ impl RtcConfigurationBuilder {
         }
     }
 
+    /// See [`RtcConfiguration::enable_latching`].
     pub fn enable_latching(mut self, enable: bool) -> Self {
         self.inner.enable_latching = enable;
         self
     }
 
+    /// See [`RtcConfiguration::probation_max_packets`].
     pub fn probation_max_packets(mut self, max: Option<u8>) -> Self {
         self.inner.probation_max_packets = max;
         self
     }
 
+    /// See [`RtcConfiguration::prefer_srflx_over_natted_host`].
     pub fn prefer_srflx_over_natted_host(mut self, enable: bool) -> Self {
         self.inner.prefer_srflx_over_natted_host = enable;
         self
     }
 
+    /// Enable UPnP IGD automatic port mapping (default false).
     pub fn enable_upnp(mut self, enable: bool) -> Self {
         self.inner.enable_upnp = enable;
         self
     }
 
+    /// Advertise host candidates via mDNS (default false). See
+    /// [`RtcConfiguration::enable_mdns`].
     pub fn enable_mdns(mut self, enable: bool) -> Self {
         self.inner.enable_mdns = enable;
         self
     }
 
+    /// Enable the TWCC + GCC bandwidth-adaptation loop (default true).
+    /// Only with `webrtc_extensions`. See
+    /// [`RtcConfiguration::enable_gcc`].
     pub fn enable_gcc(mut self, enable: bool) -> Self {
         self.inner.enable_gcc = enable;
         self
     }
 
+    /// UPnP port-mapping lease duration in seconds (default 3600).
     pub fn upnp_lease_duration(mut self, duration_secs: u32) -> Self {
         self.inner.upnp_lease_duration = duration_secs;
         self
     }
 
+    /// UPnP gateway discovery timeout (default 1 s).
     pub fn upnp_discovery_timeout(mut self, timeout: core::time::Duration) -> Self {
         self.inner.upnp_discovery_timeout = timeout;
         self
@@ -1028,96 +1203,130 @@ impl RtcConfigurationBuilder {
         self
     }
 
+    /// Append a STUN/TURN server. Full ICE only.
     pub fn ice_server(mut self, server: IceServer) -> Self {
         self.inner.ice_servers.push(server);
         self
     }
 
+    /// Which candidate types ICE may use (default all). See
+    /// [`IceTransportPolicy`].
     pub fn ice_transport_policy(mut self, policy: IceTransportPolicy) -> Self {
         self.inner.ice_transport_policy = policy;
         self
     }
 
+    /// Set which m-lines get their own transport. See [`BundlePolicy`].
     pub fn bundle_policy(mut self, policy: BundlePolicy) -> Self {
         self.inner.bundle_policy = policy;
         self
     }
 
+    /// Set the RTP/RTCP multiplexing policy. See [`RtcpMuxPolicy`].
     pub fn rtcp_mux_policy(mut self, policy: RtcpMuxPolicy) -> Self {
         self.inner.rtcp_mux_policy = policy;
         self
     }
 
+    /// Append a certificate (see
+    /// [`RtcConfiguration::certificates`] — currently unused).
     pub fn certificate(mut self, cert: CertificateConfig) -> Self {
         self.inner.certificates.push(cert);
         self
     }
 
+    /// Set how the media path is found. See [`Connectivity`].
     pub fn connectivity(mut self, connectivity: Connectivity) -> Self {
         self.inner.connectivity = connectivity;
         self
     }
 
+    /// Set how the SRTP keys are exchanged. See [`Keying`].
     pub fn keying(mut self, keying: Keying) -> Self {
         self.inner.keying = keying;
         self
     }
 
+    /// The peer is a WebRTC endpoint (rid / abs-send-time / transport-cc
+    /// extensions, `msid`). See [`RtcConfiguration::webrtc_extensions`].
     pub fn webrtc_extensions(mut self, enable: bool) -> Self {
         self.inner.webrtc_extensions = enable;
         self
     }
 
+    /// Set which codecs to offer (replaces the built-in set).
+    /// See [`MediaCapabilities`].
     pub fn media_capabilities(mut self, capabilities: MediaCapabilities) -> Self {
         self.inner.media_capabilities = Some(capabilities);
         self
     }
 
+    /// Set the public addresses to advertise (1:1 NAT, port forwarding).
+    /// See [`RtcConfiguration::external_ips`].
     pub fn external_ips(mut self, ips: Vec<IpAddr>) -> Self {
         self.inner.external_ips = ips;
         self
     }
 
+    /// Set how `external_ips` are advertised in ICE candidates. See
+    /// [`ExternalIpCandidateType`].
     pub fn external_ip_candidate_type(mut self, typ: ExternalIpCandidateType) -> Self {
         self.inner.external_ip_candidate_type = typ;
         self
     }
 
+    /// Advertise this fixed port in the SDP `m=` line and candidates (NAT
+    /// port forwarding). Direct transports only. See
+    /// [`RtcConfiguration::external_port`].
     pub fn external_port(mut self, port: u16) -> Self {
         self.inner.external_port = Some(port);
         self
     }
 
+    /// Bind media sockets on these addresses. See
+    /// [`RtcConfiguration::bind_ips`].
     pub fn bind_ips(mut self, ips: Vec<IpAddr>) -> Self {
         self.inner.bind_ips = ips;
         self
     }
 
+    /// Prefer an IPv6 candidate in `c=`/`m=` on direct transports
+    /// (default false). See [`RtcConfiguration::prefer_ipv6`].
     pub fn prefer_ipv6(mut self, prefer: bool) -> Self {
         self.inner.prefer_ipv6 = prefer;
         self
     }
 
+    /// Disable IPv6 gathering (default false). See
+    /// [`RtcConfiguration::disable_ipv6`].
     pub fn disable_ipv6(mut self, disable: bool) -> Self {
         self.inner.disable_ipv6 = disable;
         self
     }
 
+    /// Fix the first sender's SSRC (random by default). See
+    /// [`RtcConfiguration::ssrc_start`].
     pub fn ssrc_start(mut self, start: u32) -> Self {
         self.inner.ssrc_start = start;
         self
     }
 
+    /// STUN transaction timeout (default 5 s). See
+    /// [`RtcConfiguration::stun_timeout`].
     pub fn stun_timeout(mut self, timeout: core::time::Duration) -> Self {
         self.inner.stun_timeout = timeout;
         self
     }
 
+    /// Upper bound on server candidate gathering (default unbounded).
+    /// See [`RtcConfiguration::ice_gather_timeout`].
     pub fn ice_gather_timeout(mut self, timeout: core::time::Duration) -> Self {
         self.inner.ice_gather_timeout = timeout;
         self
     }
 
+    /// Nomination (USE-CANDIDATE) check timeout (default 10 s). See
+    /// [`RtcConfiguration::nomination_timeout`].
     pub fn nomination_timeout(mut self, timeout: core::time::Duration) -> Self {
         self.inner.nomination_timeout = timeout;
         self
@@ -1130,12 +1339,16 @@ impl RtcConfigurationBuilder {
         self
     }
 
+    /// Set the UDP port range for media sockets (RTP/ICE). See
+    /// [`RtcConfiguration::rtp_start_port`].
     pub fn rtp_port_range(mut self, start: u16, end: u16) -> Self {
         self.inner.rtp_start_port = Some(start);
         self.inner.rtp_end_port = Some(end);
         self
     }
 
+    /// Gather UDP host candidates (default true). See
+    /// [`RtcConfiguration::ice_gather_udp_hosts`].
     pub fn ice_gather_udp_hosts(mut self, enable: bool) -> Self {
         self.inner.ice_gather_udp_hosts = enable;
         self
@@ -1148,12 +1361,16 @@ impl RtcConfigurationBuilder {
         self
     }
 
+    /// Set the TCP listen range for passive ICE-TCP candidates. See
+    /// [`RtcConfiguration::tcp_port_range_start`].
     pub fn tcp_port_range(mut self, start: u16, end: u16) -> Self {
         self.inner.tcp_port_range_start = Some(start);
         self.inner.tcp_port_range_end = Some(end);
         self
     }
 
+    /// DTLS record read-buffer size in bytes (default 2048). See
+    /// [`RtcConfiguration::dtls_buffer_size`].
     pub fn dtls_buffer_size(mut self, size: usize) -> Self {
         self.inner.dtls_buffer_size = size;
         self
@@ -1167,36 +1384,51 @@ impl RtcConfigurationBuilder {
         self
     }
 
+    /// SCTP initial retransmission timeout (default 3 s). See
+    /// [`RtcConfiguration::sctp_rto_initial`].
     pub fn sctp_rto_initial(mut self, duration: core::time::Duration) -> Self {
         self.inner.sctp_rto_initial = duration;
         self
     }
 
+    /// SCTP retransmission-timeout lower bound (default 200 ms). See
+    /// [`RtcConfiguration::sctp_rto_min`].
     pub fn sctp_rto_min(mut self, duration: core::time::Duration) -> Self {
         self.inner.sctp_rto_min = duration;
         self
     }
 
+    /// SCTP retransmission-timeout upper bound (default 60 s). See
+    /// [`RtcConfiguration::sctp_rto_max`].
     pub fn sctp_rto_max(mut self, duration: core::time::Duration) -> Self {
         self.inner.sctp_rto_max = duration;
         self
     }
 
+    /// INIT/HEARTBEAT retransmissions before the association aborts
+    /// (default 20). See
+    /// [`RtcConfiguration::sctp_max_association_retransmits`].
     pub fn sctp_max_association_retransmits(mut self, count: u32) -> Self {
         self.inner.sctp_max_association_retransmits = count;
         self
     }
 
+    /// SCTP advertised receive window in bytes (default 128 KB). See
+    /// [`RtcConfiguration::sctp_receive_window`].
     pub fn sctp_receive_window(mut self, size: usize) -> Self {
         self.inner.sctp_receive_window = size;
         self
     }
 
+    /// SCTP HEARTBEAT interval on idle associations (default 15 s). See
+    /// [`RtcConfiguration::sctp_heartbeat_interval`].
     pub fn sctp_heartbeat_interval(mut self, duration: core::time::Duration) -> Self {
         self.inner.sctp_heartbeat_interval = duration;
         self
     }
 
+    /// Missed HEARTBEAT acks before an idle association aborts (default
+    /// 4). See [`RtcConfiguration::sctp_max_heartbeat_failures`].
     pub fn sctp_max_heartbeat_failures(mut self, count: u32) -> Self {
         self.inner.sctp_max_heartbeat_failures = count;
         self
@@ -1228,36 +1460,50 @@ impl RtcConfigurationBuilder {
         self
     }
 
+    /// ICE hard-failure timeout (default 120 s). See
+    /// [`RtcConfiguration::ice_connection_timeout`].
     pub fn ice_connection_timeout(mut self, timeout: core::time::Duration) -> Self {
         self.inner.ice_connection_timeout = timeout;
         self
     }
 
+    /// Connected → Disconnected inactivity threshold (default 30 s). See
+    /// [`RtcConfiguration::ice_disconnect_threshold`].
     pub fn ice_disconnect_threshold(mut self, threshold: core::time::Duration) -> Self {
         self.inner.ice_disconnect_threshold = threshold;
         self
     }
 
+    /// Time in `Disconnected` before teardown (default 60 s). See
+    /// [`RtcConfiguration::ice_disconnect_grace`].
     pub fn ice_disconnect_grace(mut self, grace: core::time::Duration) -> Self {
         self.inner.ice_disconnect_grace = grace;
         self
     }
 
+    /// Per-SSRC receive buffer capacity in packets (default 100). See
+    /// [`RtcConfiguration::rtp_buffer_capacity`].
     pub fn rtp_buffer_capacity(mut self, capacity: usize) -> Self {
         self.inner.rtp_buffer_capacity = capacity;
         self
     }
 
+    /// What to drop when the receive buffer is full. See
+    /// [`BufferDropStrategy`].
     pub fn buffer_drop_strategy(mut self, strategy: BufferDropStrategy) -> Self {
         self.inner.buffer_drop_strategy = strategy;
         self
     }
 
+    /// Receive-buffer stats log interval (default 10 s). See
+    /// [`RtcConfiguration::buffer_stats_log_interval`].
     pub fn buffer_stats_log_interval(mut self, interval: core::time::Duration) -> Self {
         self.inner.buffer_stats_log_interval = interval;
         self
     }
 
+    /// Set ICE TCP candidate support (RFC 6544; default disabled). See
+    /// [`IceTcpPolicy`].
     pub fn ice_tcp_policy(mut self, policy: IceTcpPolicy) -> Self {
         self.inner.ice_tcp_policy = policy;
         self
@@ -1276,6 +1522,8 @@ impl RtcConfigurationBuilder {
         self
     }
 
+    /// Set the RTCP SDES CNAME to advertise (default: derived). See
+    /// [`RtcConfiguration::cname`].
     pub fn cname(mut self, cname: String) -> Self {
         self.inner.cname = Some(cname);
         self
@@ -1305,6 +1553,7 @@ impl RtcConfigurationBuilder {
         self
     }
 
+    /// Finish the builder.
     pub fn build(self) -> RtcConfiguration {
         self.inner
     }
