@@ -9,7 +9,7 @@ readme = "README.md"
 keywords = ["rtp", "srtp", "webrtc", "fax", "turn"]
 categories = ["network-programming"]
 license = "MIT"
-exclude = ["flamegraph.svg","examples", "tests", "rustrtc_sfu.png", "output.ulaw"]
+exclude = ["flamegraph.svg","examples", "tests", "docs", "rustrtc_sfu.png", "output.ulaw"]
 
 [dependencies]
 anyhow = { version = "1", optional = true }
