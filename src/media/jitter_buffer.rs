@@ -647,7 +647,7 @@ fn is_newer(seq: u16, last: u16) -> bool {
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
-    use crate::media::frame::AudioFrame;
+    use crate::media::frame::{AudioFrame, VideoFrame};
     use crate::rtp::{RtpHeader, RtpPacket};
     use bytes::Bytes;
     use core::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -678,6 +678,14 @@ mod tests {
             data: Bytes::from(vec![0u8; 160]),
             raw_packet: Some(packet),
             source_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5004)),
+            ..Default::default()
+        })
+    }
+
+    fn make_video_sample(seq: u16) -> MediaSample {
+        MediaSample::Video(VideoFrame {
+            sequence_number: Some(seq),
+            rtp_timestamp: seq as u32 * 3000,
             ..Default::default()
         })
     }
@@ -867,6 +875,16 @@ mod tests {
     }
 
     #[test]
+    fn tick_plays_video_samples_in_order() {
+        let mut jb = playout();
+        for seq in [2, 1, 3] {
+            jb.push(make_video_sample(seq));
+        }
+        assert_eq!(ticks(&mut jb, 3), [S(1), S(2), S(3)]);
+        assert_eq!(jb.stats().played, 3);
+    }
+
+    #[test]
     fn tick_reports_a_gap_with_later_samples_as_lost() {
         let mut jb = playout();
         for seq in [1, 2, 4, 6] {
@@ -1000,6 +1018,57 @@ mod tests {
         // 65534 is the oldest, not 0
         assert_eq!(get_seq(jb.pop().unwrap()), 65535);
         assert_eq!(jb.stats().dropped, 1);
+    }
+
+    #[test]
+    fn duplicate_sample_is_dropped_without_replacing_the_buffered_copy() {
+        let mut jb = playout();
+        let mut first = make_sample(1);
+        if let MediaSample::Audio(ref mut f) = first {
+            f.data = Bytes::from_static(&[1]);
+        }
+        let mut duplicate = make_sample(1);
+        if let MediaSample::Audio(ref mut f) = duplicate {
+            f.data = Bytes::from_static(&[2]);
+        }
+        jb.push(first);
+        jb.push(duplicate);
+        jb.push(make_sample(2));
+
+        assert_eq!(jb.stats().duplicates, 1);
+        match jb.tick() {
+            Playout::Sample(MediaSample::Audio(f)) => assert_eq!(f.data.as_ref(), &[1]),
+            _ => panic!("expected the first copy of the sample"),
+        }
+    }
+
+    #[test]
+    fn stats_survive_a_stream_reset() {
+        let mut jb = playout();
+        jb.push(make_sample_with_ssrc(1, 1, 160));
+        jb.push(make_sample_with_ssrc(2, 1, 320));
+        assert_eq!(jb.stats().received, 2);
+        assert_eq!(ticks(&mut jb, 2), [S(1), S(2)]);
+        assert_eq!(jb.stats().played, 2);
+
+        jb.push(make_sample_with_ssrc(3, 2, 100));
+        assert_eq!(jb.stats().resets, 1);
+        assert_eq!(jb.stats().received, 3);
+        assert_eq!(
+            jb.stats().played,
+            2,
+            "a reset clears the stream, not the counters"
+        );
+        assert_eq!(jb.len(), 1);
+        assert_eq!(tick(&mut jb), Idle, "the new stream must rebuffer first");
+    }
+
+    #[test]
+    fn tick_on_an_empty_buffer_is_idle() {
+        let mut jb = playout();
+        assert_eq!(ticks(&mut jb, 3), [Idle, Idle, Idle]);
+        assert_eq!(jb.stats().played, 0);
+        assert_eq!((jb.stats().lost, jb.stats().underruns), (0, 0));
     }
 
     #[test]

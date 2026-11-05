@@ -12824,6 +12824,50 @@ a=mid:0
         assert!(rtpmaps.contains(&"114 opus/48000/2".to_string()));
     }
 
+    /// A payload number can mean a different codec locally than in the offer
+    /// (we use 111 for opus, this offer uses it for G722). The answer must
+    /// follow the offer's mapping, not just reuse the number.
+    #[tokio::test]
+    async fn initial_answer_follows_the_offers_payload_type_mapping() {
+        let pc = sip_audio_pc();
+        let remote_offer = "v=0\r\n\
+            o=- 1 1 IN IP4 10.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 10.0.0.1\r\n\
+            m=audio 8000 RTP/AVP 111 97\r\n\
+            a=rtpmap:111 G722/8000\r\n\
+            a=rtpmap:97 telephone-event/8000\r\n\
+            a=fmtp:97 0-15\r\n\
+            a=sendrecv\r\n";
+        let desc = SessionDescription::parse(SdpType::Offer, remote_offer).unwrap();
+        pc.set_remote_description(desc).await.unwrap();
+
+        let answer = pc.create_answer().await.unwrap();
+        let audio = answer.first_audio_section().expect("answer audio section");
+
+        assert_eq!(
+            audio.formats,
+            vec!["111".to_string(), "97".to_string()],
+            "got:\n{}",
+            answer.to_sdp_string()
+        );
+        let rtpmaps = rtpmaps(audio);
+        assert!(rtpmaps.contains(&"111 G722/8000".to_string()));
+        assert!(
+            !rtpmaps.contains(&"111 opus/48000/2".to_string()),
+            "answer kept our local codec for the offer's payload type, got:\n{}",
+            answer.to_sdp_string()
+        );
+        assert!(
+            audio.attributes.iter().any(|attr| {
+                attr.key == "fmtp" && attr.value.as_deref() == Some("97 0-15")
+            }),
+            "the answer should keep the offered telephone-event fmtp, got:\n{}",
+            answer.to_sdp_string()
+        );
+    }
+
     #[tokio::test]
     async fn reinvite_answer_audio_codecs_follow_remote_offer_subset() {
         use crate::config::MediaCapabilities;
