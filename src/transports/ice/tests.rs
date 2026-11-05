@@ -5588,14 +5588,23 @@ async fn silent_remote_relay_candidate_still_gets_probed_and_connects() -> Resul
 }
 
 /// Regression test for the multi-homed dual-nomination media hijack
-/// (production 2026-09-30, call 3bslinsis8fvtrj85ld1): a Controlled agent
-/// that already has a nominated, media-carrying pair must NOT follow a
-/// second USE-CANDIDATE unless the new path proves a round trip.
+/// (production 2026-09-30, call 3bslinsis8fvtrj85ld1) and the controlled-side
+/// nomination blackhole (2026-11-05, relay-only caller + NAT'd media leg):
+/// a Controlled agent that already has a nominated, media-carrying pair
+/// selects a second USE-CANDIDATE pair only once that path's triggered check
+/// answers (RFC 8445 §7.3.1.5) — and the check RETRIES, so the nomination
+/// converges as soon as the path proves a round trip instead of being
+/// permanently refused.
 ///
-/// Case 1: a silent second path (never answers the verification check) must
-///         NOT divert the selected pair.
-/// Case 2: a responsive second path (answers the verification) MUST be
-///         followed — legitimate browser path-failover keeps working.
+/// Case 1: a silent second path must NOT divert the selected pair, and the
+///         nomination must converge once the path starts answering — a lost
+///         probe or a cold NAT binding must not lock media onto the
+///         abandoned pair forever (RFC 8445 §8.1.2).
+/// Case 2: a responsive second path MUST be followed — legitimate browser
+///         path-failover keeps working.
+/// Case 3: a STUN retransmission of the same USE-CANDIDATE (and a fresh
+///         nomination for a path already being verified) must not strand the
+///         pending verification — the nomination still converges.
 #[tokio::test]
 #[serial]
 async fn second_nomination_requires_path_verification() -> Result<()> {
@@ -5627,8 +5636,9 @@ async fn second_nomination_requires_path_verification() -> Result<()> {
         Ok(msg.encode(Some(pwd.as_bytes()), true)?)
     };
 
-    // ── Case 1: silent path ──────────────────────────────────────────────
+    // ── Case 1: silent path defers, then converges once it answers ──────
     let silent = UdpSocket::bind("127.0.0.1:0").await?;
+    let silent_addr = silent.local_addr()?;
     silent
         .send_to(&use_candidate_request()?, agent_addr)
         .await?;
@@ -5637,10 +5647,36 @@ async fn second_nomination_requires_path_verification() -> Result<()> {
         .get_selected_pair()
         .expect("selected pair after silent nomination");
     assert_ne!(
-        sel.remote.address,
-        silent.local_addr()?,
-        "unverified second path must not divert the selected pair"
+        sel.remote.address, silent_addr,
+        "a nomination must not divert media before its path answers the triggered check"
     );
+
+    // The triggered check RETRIES (RFC 8445 §7.3.1.5). Answer it now: the
+    // nomination must converge — a lost probe or a cold NAT binding must not
+    // lock media onto the abandoned pair forever.
+    let answerer = tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        loop {
+            let Ok((n, from)) = silent.recv_from(&mut buf).await else {
+                continue;
+            };
+            let Ok(m) = StunMessage::decode(&buf[..n]) else {
+                continue;
+            };
+            if m.class == StunClass::Request && m.method == StunMethod::Binding {
+                let resp = StunMessage::binding_success_response(m.transaction_id, from);
+                if let Ok(bytes) = resp.encode(None, true) {
+                    let _ = silent.send_to(&bytes, from).await;
+                }
+            }
+        }
+    });
+    wait_selected_remote(&controlled, silent_addr, Duration::from_secs(15))
+        .await
+        .expect(
+            "deferred nomination must converge once its path answers (retrying triggered check)",
+        );
+    answerer.abort();
 
     // ── Case 2: responsive path ──────────────────────────────────────────
     let good = UdpSocket::bind("127.0.0.1:0").await?;
@@ -5683,7 +5719,87 @@ async fn second_nomination_requires_path_verification() -> Result<()> {
         switched.remote.address, good_addr,
         "responsive path must be followed after verification"
     );
+
+    // ── Case 3: retransmission / duplicate nomination must not strand the
+    // pending verification. A repeat USE-CANDIDATE used to re-bump
+    // `nomination_generation`, invalidating the in-flight verifier (its
+    // captured generation went stale and the commit was rejected).
+    let dup = UdpSocket::bind("127.0.0.1:0").await?;
+    let dup_addr = dup.local_addr()?;
+    let first = use_candidate_request()?;
+    dup.send_to(&first, agent_addr).await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // STUN retransmission of the same transaction id.
+    dup.send_to(&first, agent_addr).await?;
+    // A fresh USE-CANDIDATE naming the same path.
+    dup.send_to(&use_candidate_request()?, agent_addr).await?;
+
+    let answerer = tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        loop {
+            let Ok((n, from)) = dup.recv_from(&mut buf).await else {
+                continue;
+            };
+            let Ok(m) = StunMessage::decode(&buf[..n]) else {
+                continue;
+            };
+            if m.class == StunClass::Request && m.method == StunMethod::Binding {
+                let resp = StunMessage::binding_success_response(m.transaction_id, from);
+                if let Ok(bytes) = resp.encode(None, true) {
+                    let _ = dup.send_to(&bytes, from).await;
+                }
+            }
+        }
+    });
+    wait_selected_remote(&controlled, dup_addr, Duration::from_secs(15))
+        .await
+        .expect("nomination must converge despite retransmission and duplicate nomination");
+    answerer.abort();
+
     let _ = initial;
+    Ok(())
+}
+
+/// The keepalive must follow the adopted nomination path: once a second
+/// nomination's triggered check answers and the pair is committed, consent
+/// keepalives (RFC 7675) go out of the socket that received the nomination —
+/// keeping that path's NAT binding alive. Keepalives stuck on the abandoned
+/// socket let the nominated path's binding expire and the media blackholes.
+#[tokio::test]
+#[serial]
+async fn keepalive_follows_adopted_nomination_path() -> Result<()> {
+    let (controlling, controlled) =
+        setup_host_pair(RtcConfiguration::webrtc(), RtcConfiguration::webrtc()).await;
+    wait_for_selected_pair(&controlled, Duration::from_secs(5)).await?;
+
+    let agent_addr = controlled
+        .local_candidates()
+        .iter()
+        .find(|c| c.transport == "udp" && c.component == 1)
+        .map(|c| c.address)
+        .expect("controlled udp host candidate");
+
+    // A controlling peer re-nominates a new path and answers its checks.
+    let peer = UdpSocket::bind("127.0.0.1:0").await?;
+    let peer_addr = peer.local_addr()?;
+    send_renomination_and_verify(&peer, peer_addr, agent_addr).await?;
+    wait_selected_remote(&controlled, peer_addr, Duration::from_secs(5)).await?;
+
+    // The very next keepalive tick must send out of the adopted path.
+    IceTransportRunner::run_keepalive_tick(&controlled.inner).await;
+
+    let mut buf = [0u8; 1500];
+    let (n, _from) = timeout(Duration::from_secs(3), peer.recv_from(&mut buf))
+        .await
+        .expect("timed out waiting for a keepalive on the adopted path")?;
+    let m = StunMessage::decode(&buf[..n])?;
+    assert_eq!(
+        m.class,
+        StunClass::Request,
+        "the packet on the adopted path must be a STUN keepalive request"
+    );
+    assert_eq!(m.method, StunMethod::Binding);
+    let _ = controlling;
     Ok(())
 }
 
@@ -6922,5 +7038,373 @@ async fn ipv6_media_sockets_set_v6only_explicitly() -> Result<()> {
 
     let one = crate::transports::bind_udp("[::1]:0".parse()?)?;
     assert!(socket2::SockRef::from(&one).only_v6()?);
+    Ok(())
+}
+
+// ── NAT-emulated end-to-end regression (issue 2026-11-05) ───────────────────
+
+/// Counts packets handed to the ICE data receiver (the media path).
+#[derive(Clone, Default)]
+struct RtpCounter(Arc<core::sync::atomic::AtomicU64>);
+
+impl RtpCounter {
+    fn load(&self) -> u64 {
+        self.0.load(core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+struct CountingReceiver {
+    count: RtpCounter,
+}
+
+#[async_trait::async_trait]
+impl PacketReceiver for CountingReceiver {
+    async fn receive(&self, _packet: Bytes, _addr: SocketAddr, _buf: &mut Vec<u8>) {
+        self.count
+            .0
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// One-sided UDP NAT emulator (issue 2026-11-05-ice-nat-prflx-media-blackhole):
+///
+/// ```text
+/// controlling (outside)           NAT emulator                controlled (inside)
+///        A ──→ public mapping M_i ──(binding fresh?)──→  inside socket s_i
+///        A ←── source rewritten to M_i ←── s_i outbound ──→  (via E_A socket)
+/// ```
+///
+/// - Every inside socket gets its own public mapping, like a real NAT; the
+///   inside peer's outbound packets get their source rewritten to the
+///   mapping's public form, so the outside peer learns the NAT-rewritten
+///   sources exactly like the production relay-only caller did.
+/// - Inside outbound refreshes its mapping's binding; inbound to a mapping
+///   whose binding has been quiet for `idle_timeout` is dropped (binding
+///   expiry — the kill switch behind the production blackhole).
+/// - `up_after[i]` keeps mapping i silent until then (both directions), so a
+///   test can settle the first path before a second one appears.
+struct NatEmulator {
+    /// Public forms of the inside sockets (candidates handed to A).
+    public_addrs: Vec<SocketAddr>,
+    /// The single outside address B sends to (candidate handed to B).
+    outside_addr: SocketAddr,
+    /// Per-mapping drop counters (bindings expired / not yet up).
+    dropped: Vec<Arc<core::sync::atomic::AtomicU64>>,
+}
+
+struct NatMapping {
+    sock: Arc<UdpSocket>,
+    inside: SocketAddr,
+    up_at: tokio::time::Instant,
+    last_outbound: std::sync::Mutex<Option<tokio::time::Instant>>,
+}
+
+impl NatEmulator {
+    async fn spawn(
+        inside_addrs: Vec<SocketAddr>,
+        outside_peer: SocketAddr,
+        idle_timeout: Duration,
+        up_after: Vec<Duration>,
+    ) -> Result<Self> {
+        let e_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        let outside_addr = e_a.local_addr()?;
+        let t0 = tokio::time::Instant::now();
+        let mut mappings: Vec<Arc<NatMapping>> = Vec::new();
+        let mut public_addrs = Vec::new();
+        let mut dropped = Vec::new();
+        for (i, inside) in inside_addrs.iter().enumerate() {
+            let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+            public_addrs.push(sock.local_addr()?);
+            dropped.push(Arc::new(core::sync::atomic::AtomicU64::new(0)));
+            mappings.push(Arc::new(NatMapping {
+                sock,
+                inside: *inside,
+                up_at: t0 + *up_after.get(i).unwrap_or(&Duration::ZERO),
+                last_outbound: std::sync::Mutex::new(None),
+            }));
+        }
+
+        // Inbound: A → M_i → s_i (only while the binding is fresh and up).
+        for (i, m) in mappings.iter().enumerate() {
+            let e_a = e_a.clone();
+            let m = m.clone();
+            let idle = idle_timeout;
+            let drops = dropped[i].clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1500];
+                loop {
+                    let Ok((n, _src)) = m.sock.recv_from(&mut buf).await else {
+                        continue;
+                    };
+                    let fresh = m
+                        .last_outbound
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .map(|t| t.elapsed() < idle)
+                        .unwrap_or(false);
+                    if !(fresh && tokio::time::Instant::now() >= m.up_at) {
+                        drops.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                    let _ = e_a.send_to(&buf[..n], m.inside).await;
+                }
+            });
+        }
+
+        // Outbound: s_i → E_A → A, source rewritten to the mapping M_i.
+        {
+            let e_a = e_a.clone();
+            let mappings = mappings.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1500];
+                loop {
+                    let Ok((n, src)) = e_a.recv_from(&mut buf).await else {
+                        continue;
+                    };
+                    let Some(m) = mappings.iter().find(|m| m.inside == src) else {
+                        continue;
+                    };
+                    *m.last_outbound.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(tokio::time::Instant::now());
+                    if tokio::time::Instant::now() < m.up_at {
+                        continue;
+                    }
+                    let _ = m.sock.send_to(&buf[..n], outside_peer).await;
+                }
+            });
+        }
+
+        Ok(Self {
+            public_addrs,
+            outside_addr,
+            dropped,
+        })
+    }
+}
+
+async fn pump_rtp(transport: IceTransport) {
+    // First byte ≥ 2: not STUN, so the ICE layer forwards it to the media
+    // receiver (0x80 = RTP v2).
+    let payload = [0x80u8; 20];
+    loop {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let Some(sock) = transport.get_selected_socket() else {
+            continue;
+        };
+        let Some(pair) = transport.get_selected_pair() else {
+            continue;
+        };
+        let _ = sock.send_to(&payload, pair.remote.address).await;
+    }
+}
+
+/// End-to-end regression for the 2026-11-05 production blackhole
+/// (relay-only caller behind TURN + NAT'd controlled media leg, where the
+/// same network worked with a browser but not with a rustrtc caller).
+///
+/// The controlled agent sits behind a one-sided UDP NAT (per-socket public
+/// mappings, source rewriting, binding idle expiry). The controlling agent
+/// ranks the second mapping's candidate highest, so the upgrade nomination
+/// lands on the deferred path — a different local socket than the pair the
+/// controlled side had already selected. The nomination must be adopted
+/// once its triggered check answers (RFC 8445 §7.3.1.5), and the adopted
+/// path must then carry bidirectional media for the whole soak: the NAT
+/// binding only survives because media/keepalives keep flowing through the
+/// adopted socket.
+///
+/// Regression modes this fails on:
+/// * a deferred nomination that is never adopted (selected pair never moves),
+/// * media or keepalives left on the abandoned socket (the adopted mapping
+///   expires mid-soak and RTP stalls),
+/// * selected_pair != nominated pair on either side.
+#[tokio::test]
+#[serial]
+async fn nat_deferred_nomination_media_soak() -> Result<()> {
+    let idle_timeout = Duration::from_secs(3);
+
+    // ── Controlled side: two host sockets behind the NAT ────────────────
+    let mut b_config = RtcConfiguration::webrtc();
+    b_config.bind_ips = vec![
+        "127.0.0.1".parse::<IpAddr>()?,
+        "127.0.0.1".parse::<IpAddr>()?,
+    ];
+    let (controlled, runner_b) = IceTransportBuilder::new(b_config)
+        .role(IceRole::Controlled)
+        .build();
+    tokio::spawn(runner_b);
+    let (controlling, runner_a) = IceTransportBuilder::new(RtcConfiguration::webrtc())
+        .role(IceRole::Controlling)
+        .build();
+    tokio::spawn(runner_a);
+
+    // Wait for gathering: two inside UDP host sockets expected.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline
+        && controlled
+            .local_candidates()
+            .iter()
+            .filter(|c| c.transport == "udp" && c.component == 1)
+            .count()
+            < 2
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let inside: Vec<SocketAddr> = controlled
+        .local_candidates()
+        .iter()
+        .filter(|c| c.transport == "udp" && c.component == 1)
+        .map(|c| c.address)
+        .take(2)
+        .collect();
+    assert_eq!(
+        inside.len(),
+        2,
+        "need two inside host sockets (bind_ips duplicated loopback)"
+    );
+
+    let a_addr = controlling
+        .local_candidates()
+        .iter()
+        .find(|c| c.transport == "udp" && c.component == 1)
+        .map(|c| c.address)
+        .expect("controlling udp host candidate");
+
+    // Mapping 2 stays down for the first second so the first path settles
+    // (and the controlled side commits it) alone.
+    let emulator = NatEmulator::spawn(
+        inside.clone(),
+        a_addr,
+        idle_timeout,
+        vec![Duration::ZERO, Duration::from_secs(1)],
+    )
+    .await?;
+
+    // SDP: A sees the NAT's public forms; the second mapping outranks the
+    // first so the upgrade nomination lands on the deferred path. B sees
+    // the single outside form.
+    for (i, public) in emulator.public_addrs.iter().enumerate() {
+        let mut cand = IceCandidate::host(*public, 1);
+        cand.priority = if i == 0 { 1_000 } else { 2_000 };
+        controlling.add_remote_candidate(cand);
+    }
+    controlled.add_remote_candidate(IceCandidate::host(emulator.outside_addr, 1));
+
+    // Start both agents (this triggers connectivity checks).
+    controlling
+        .start(controlled.local_parameters())
+        .await
+        .context("controlling.start")?;
+    controlled
+        .start(controlling.local_parameters())
+        .await
+        .context("controlled.start")?;
+
+    // ── Phase 1: connect on the first path ──────────────────────────────
+    timeout(Duration::from_secs(8), async {
+        while controlling.get_selected_pair().is_none() || controlled.get_selected_pair().is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .context("phase 1: no selected pair on either side")?;
+    let first = controlling.get_selected_pair().expect("selected pair");
+    assert_eq!(
+        first.remote.address, emulator.public_addrs[0],
+        "phase 1 must settle on the first mapping"
+    );
+
+    // ── Phase 2: late-trickle the second mapping; the upgrade nomination
+    // must land on the deferred path (the second socket) and be adopted ──
+    let mut m2 = IceCandidate::host(emulator.public_addrs[1], 1);
+    m2.priority = 2_000;
+    controlling.add_remote_candidate(m2.clone());
+
+    wait_selected_remote(&controlling, m2.address, Duration::from_secs(10))
+        .await
+        .context("controlling side never nominated/selected the second mapping")?;
+    // The controlled side's remote is the single outside form; adoption is
+    // observable in the LOCAL socket moving to the second inside socket.
+    let adopted = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(p) = controlled.get_selected_pair()
+                && p.local.address == inside[1]
+            {
+                return p;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .context("controlled side never adopted the deferred (second-socket) nomination")?;
+    assert_eq!(
+        adopted.remote.address, emulator.outside_addr,
+        "controlled selected pair must match the nominated 5-tuple"
+    );
+
+    // ── Phase 3: media soak — bidirectional RTP must keep flowing; the
+    // adopted NAT binding survives only because media/keepalives use it ──
+    let rx_at_a = RtpCounter::default();
+    let rx_at_b = RtpCounter::default();
+    controlling
+        .set_data_receiver(Arc::new(CountingReceiver {
+            count: rx_at_a.clone(),
+        }))
+        .await;
+    controlled
+        .set_data_receiver(Arc::new(CountingReceiver {
+            count: rx_at_b.clone(),
+        }))
+        .await;
+    let pump_a = tokio::spawn(pump_rtp(controlling.clone()));
+    let pump_b = tokio::spawn(pump_rtp(controlled.clone()));
+
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let a_mid = rx_at_a.load();
+    let b_mid = rx_at_b.load();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let a_end = rx_at_a.load();
+    let b_end = rx_at_b.load();
+
+    assert!(
+        a_end > 0 && b_end > 0,
+        "no media at all: a_rx={a_end} b_rx={b_end}"
+    );
+    assert!(
+        a_end >= a_mid + 20,
+        "B→A media stalled mid-soak (adopted NAT binding expired?): {a_mid} → {a_end}"
+    );
+    assert!(
+        b_end >= b_mid + 20,
+        "A→B media stalled mid-soak (adopted NAT binding expired?): {b_mid} → {b_end}"
+    );
+
+    // Selected pairs must still be the nominated ones after the soak.
+    assert_eq!(
+        controlling
+            .get_selected_pair()
+            .expect("selected pair")
+            .remote
+            .address,
+        m2.address,
+        "controlling selected pair must remain the nominated path after the soak"
+    );
+    assert_eq!(
+        controlled
+            .get_selected_pair()
+            .expect("selected pair")
+            .local
+            .address,
+        inside[1],
+        "controlled selected pair must remain the adopted path after the soak"
+    );
+
+    pump_a.abort();
+    pump_b.abort();
+    println!(
+        "NAT emulator drops: mapping1={} mapping2={}",
+        emulator.dropped[0].load(core::sync::atomic::Ordering::Relaxed),
+        emulator.dropped[1].load(core::sync::atomic::Ordering::Relaxed),
+    );
     Ok(())
 }

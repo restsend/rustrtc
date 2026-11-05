@@ -364,6 +364,15 @@ pub(crate) struct IceTransportInner {
     /// binding check times out, and the `!nominated` fallback then tore down
     /// a live, already-nominated session.
     nomination_lock: Mutex<()>,
+    /// In-flight controlled-side nomination path verification (the deferred
+    /// USE-CANDIDATE handling): `(transaction id, local socket address,
+    /// remote source)`. Deduplicates STUN retransmissions of one nomination
+    /// and fresh nominations for a path that already has a verifier retrying —
+    /// either would otherwise bump `nomination_generation` again and strand
+    /// the in-flight verifier (its captured generation goes stale and
+    /// `commit_verified_nomination` rejects the commit it raced to make).
+    nomination_verification:
+        crate::platform::sync::Mutex<Option<([u8; 12], SocketAddr, SocketAddr)>>,
     /// mDNS hostname advertising our host candidates (`enable_mdns`).
     mdns_hostname: Option<String>,
     /// Guards against overlapping `run_turn_refresh` invocations: the refresh
@@ -1458,6 +1467,7 @@ impl IceTransport {
             nomination_generation: crate::platform::atomic64::AtomicU64::new(0),
             selection_lock: crate::platform::sync::Mutex::new(()),
             nomination_lock: Mutex::new(()),
+            nomination_verification: crate::platform::sync::Mutex::new(None),
             mdns_hostname: {
                 #[cfg(feature = "std")]
                 {
@@ -1680,6 +1690,10 @@ impl IceTransport {
         self.inner
             .nomination_generation
             .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        // Drop any deferred-nomination dedup entry: the old verifier tasks
+        // exit on the generation bump above, and a post-restart nomination
+        // for the same path must not be swallowed by a stale entry.
+        *self.inner.nomination_verification.lock() = None;
         {
             let _selection = self.inner.selection_lock.lock();
             *self.inner.selected_pair.lock() = None;
@@ -3811,35 +3825,6 @@ async fn handle_stun_request(
                 let sender = &sender;
                 return;
             }
-            // A newer USE-CANDIDATE supersedes any pending path verification:
-            // the most recent nomination wins (RFC 8445 §8.1.1). Capture this
-            // nomination's generation so a deferred verifier can detect that it
-            // has since been superseded and must not move media (issue #55).
-            let use_candidate_generation = inner
-                .nomination_generation
-                .fetch_add(1, core::sync::atomic::Ordering::SeqCst)
-                + 1;
-            // The controlling agent is authoritative, but "authoritative"
-            // does not mean media should be diverted onto an unproven path.
-            // Two failure modes motivated the current design:
-            //
-            //   * Freezing on the first nomination (very old behaviour) broke
-            //     legitimate browser path-failover: a browser whose srflx path
-            //     died re-sends USE-CANDIDATE on its relay path, and a frozen
-            //     controlled agent kept sending DTLS to the abandoned address.
-            //   * Following every USE-CANDIDATE unconditionally let duplicate
-            //     or oscillating nominations (e.g. a browser nominating both
-            //     multi-homed host candidates of the server) divert the SRTP
-            //     downlink onto a path the peer never sends media on, so the
-            //     call keeps "flowing" on PBX counters while the user hears
-            //     nothing.
-            //
-            // The current behaviour follows the RFC 8445 intent while staying
-            // safe: the FIRST nomination is followed immediately; a later
-            // nomination on a different pair must pass a same-path round trip
-            // (see `verify_nominated_path`) before media is switched. Genuine
-            // failovers answer checks on the new path and converge within one
-            // RTT; dead paths never respond and are ignored.
             let local_addr: SocketAddr = match sender {
                 IceSocketWrapper::Platform(s) => s
                     .local_addr()
@@ -3862,6 +3847,62 @@ async fn handle_stun_request(
                 }
                 IceSocketWrapper::Turn(_, addr) => *addr,
             };
+
+            // Dedup, BEFORE any generation bump (see the bump below): a STUN
+            // retransmission of the nomination already being verified, or a
+            // fresh USE-CANDIDATE for a path that already has a verifier
+            // retrying, must not run this block again — re-bumping
+            // `nomination_generation` would strand the in-flight verifier
+            // (its captured generation goes stale and `commit_verified_nomination`
+            // rejects the commit it raced to make).
+            let duplicate_nomination = {
+                let pending = inner.nomination_verification.lock();
+                matches!(
+                    pending.as_ref(),
+                    Some((tx, local, remote))
+                        if *tx == msg.transaction_id
+                            || (*local, *remote) == (local_addr, addr)
+                )
+            };
+            if duplicate_nomination {
+                trace!(
+                    "Controlled agent ignoring duplicate USE-CANDIDATE for the path under verification {} -> {}",
+                    local_addr, addr
+                );
+                let _ = inner.set_state(IceTransportState::Connected);
+                let _ = inner.nomination_complete.send(Some(true));
+                return;
+            }
+
+            // The controlling agent is authoritative, but "authoritative"
+            // does not mean media should be diverted onto an unproven path.
+            // Two failure modes motivated the gated design:
+            //
+            //   * Freezing on the first nomination (very old behaviour) broke
+            //     legitimate browser path-failover: a browser whose srflx path
+            //     died re-sends USE-CANDIDATE on its relay path, and a frozen
+            //     controlled agent kept sending DTLS to the abandoned address.
+            //   * Following every USE-CANDIDATE unconditionally let duplicate
+            //     or oscillating nominations (e.g. a browser nominating both
+            //     multi-homed host candidates of the server) divert the SRTP
+            //     downlink onto a path the peer never sends media on, so the
+            //     call keeps "flowing" on PBX counters while the user hears
+            //     nothing.
+            //
+            // RFC 8445 §7.3.1.5 ties selection to the triggered check: the
+            // FIRST nomination is followed immediately (call setup must not
+            // wait), and a later nomination on a different pair selects that
+            // pair once its same-path check answers (see
+            // `verify_nominated_path`). The check now RETRIES until it
+            // answers or a newer nomination supersedes it: a one-shot probe
+            // whose failure permanently kept the current pair violated
+            // §8.1.2 whenever the probe was lost or the path's NAT binding
+            // had gone cold — both endpoints then sent media on different
+            // 5-tuples and the call blackholed while reporting connected.
+            // The retry probes double as keepalives for that path's NAT
+            // binding, which is what lets the nomination converge at all.
+            // The generation captured at spawn time keeps the latest
+            // nomination authoritative (RFC 8445 §8.1.1, issue #55).
 
             // The socket's candidate of the peer's family: a dual-stack socket
             // has one per family.
@@ -3902,7 +3943,22 @@ async fn handle_stun_request(
                         "Controlled agent keeping current pair (UseCandidate {} -> {})",
                         pair.local.address, pair.remote.address
                     );
+                    // Deliberately no generation bump and no change to any
+                    // pending verification here: a re-nomination of the pair
+                    // we already selected (STUN retransmission, consent
+                    // keepalive carrying USE-CANDIDATE, aggressive
+                    // nomination) must not strand — or veto — an in-flight
+                    // verification of the peer's newer nomination. If the
+                    // peer truly reverted to this pair, its next fresh
+                    // nomination re-commits it after the pending one.
                 } else if !has_selected {
+                    // A nomination that changes something: make it the most
+                    // recent (RFC 8445 §8.1.1). The bump invalidates any
+                    // deferred verifier spawned for an older nomination, so
+                    // a stale one can no longer move media (issue #55).
+                    inner
+                        .nomination_generation
+                        .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
                     // First nomination: follow immediately so call setup is
                     // never delayed.
                     debug!(
@@ -3913,57 +3969,111 @@ async fn handle_stun_request(
                     );
                     commit_selected_pair(&inner, &pair, Some(sender));
                 } else {
+                    let use_candidate_generation = inner
+                        .nomination_generation
+                        .fetch_add(1, core::sync::atomic::Ordering::SeqCst)
+                        + 1;
                     // A second nomination on a DIFFERENT pair while already
-                    // connected: verify the new path with a same-path round
-                    // trip before diverting media to it. A controlling peer
-                    // that genuinely switched (dead path → relay failover)
-                    // answers checks on the new path; duplicate or oscillating
-                    // nominations on dead paths never respond and are ignored,
-                    // keeping the working path (and its established DTLS/SRTP
-                    // session) intact.
+                    // connected: select it once its same-path triggered check
+                    // answers (RFC 8445 §7.3.1.5). The check RETRIES until it
+                    // answers or a newer nomination supersedes it — one lost
+                    // response must not permanently keep media on the
+                    // abandoned pair (the production blackhole where the
+                    // nominated path's NAT binding had gone cold by the time
+                    // the single probe went out).
                     debug!(
                         label = inner.config.label.as_deref().unwrap_or("-"),
-                        "Controlled agent deferring switch to newly nominated path {} -> {} until verified",
+                        "Controlled agent deferring switch to newly nominated path {} -> {} until its triggered check answers",
                         pair.local.address,
                         pair.remote.address
                     );
+                    *inner.nomination_verification.lock() =
+                        Some((msg.transaction_id, local_addr, addr));
                     let inner2 = inner.clone();
                     let sender2 = sender.clone();
                     let pair2 = pair.clone();
+                    let generation = use_candidate_generation;
+                    let tx_id = msg.transaction_id;
                     crate::platform::task::spawn(async move {
-                        let verified = verify_nominated_path(
-                            &sender2,
-                            addr,
-                            pair2.local.priority,
-                            inner2.clone(),
-                        )
-                        .await;
-                        if !verified {
-                            debug!(
-                                label = inner2.config.label.as_deref().unwrap_or("-"),
-                                "New nominated path {} -> {} failed verification; keeping current pair",
-                                pair2.local.address,
-                                pair2.remote.address
-                            );
-                        } else if commit_verified_nomination(
-                            &inner2,
-                            use_candidate_generation,
-                            &pair2,
-                            &sender2,
-                        ) {
-                            debug!(
-                                label = inner2.config.label.as_deref().unwrap_or("-"),
-                                "New nominated path verified, switching: {} -> {}",
-                                pair2.local.address,
-                                pair2.remote.address
-                            );
-                        } else {
-                            debug!(
-                                label = inner2.config.label.as_deref().unwrap_or("-"),
-                                "New nominated path {} -> {} verified but superseded by a newer nomination; keeping current pair",
-                                pair2.local.address,
-                                pair2.remote.address
-                            );
+                        let mut backoff = Duration::from_millis(500);
+                        let mut attempt: u64 = 0;
+                        loop {
+                            attempt += 1;
+                            let verified = verify_nominated_path(
+                                &sender2,
+                                addr,
+                                pair2.local.priority,
+                                inner2.clone(),
+                            )
+                            .await;
+                            if verified {
+                                if commit_verified_nomination(&inner2, generation, &pair2, &sender2)
+                                {
+                                    info!(
+                                        label = inner2.config.label.as_deref().unwrap_or("-"),
+                                        "Nominated path {} -> {} verified, switching (attempt {})",
+                                        pair2.local.address,
+                                        pair2.remote.address,
+                                        attempt
+                                    );
+                                } else {
+                                    debug!(
+                                        label = inner2.config.label.as_deref().unwrap_or("-"),
+                                        "Nominated path {} -> {} verified but superseded by a newer nomination; keeping current pair",
+                                        pair2.local.address,
+                                        pair2.remote.address
+                                    );
+                                }
+                                break;
+                            }
+                            // Superseded by a newer nomination or an ICE
+                            // restart, or the transport is done: stop probing.
+                            if inner2
+                                .nomination_generation
+                                .load(core::sync::atomic::Ordering::SeqCst)
+                                != generation
+                                || matches!(
+                                    *inner2.state.borrow(),
+                                    IceTransportState::Closed | IceTransportState::Failed
+                                )
+                            {
+                                debug!(
+                                    label = inner2.config.label.as_deref().unwrap_or("-"),
+                                    "Nominated path {} -> {} verification abandoned (superseded or transport closed)",
+                                    pair2.local.address,
+                                    pair2.remote.address
+                                );
+                                break;
+                            }
+                            if attempt == 1 {
+                                warn!(
+                                    label = inner2.config.label.as_deref().unwrap_or("-"),
+                                    "Nominated path {} -> {} did not answer its triggered check; retrying (the peer's nomination stays pending, RFC 8445 §7.3.1.5)",
+                                    pair2.local.address,
+                                    pair2.remote.address
+                                );
+                            } else {
+                                debug!(
+                                    label = inner2.config.label.as_deref().unwrap_or("-"),
+                                    "Nominated path {} -> {} triggered check attempt {} failed; retrying",
+                                    pair2.local.address,
+                                    pair2.remote.address,
+                                    attempt
+                                );
+                            }
+                            crate::platform::task::sleep(backoff).await;
+                            backoff = core::cmp::min(backoff * 2, Duration::from_secs(2));
+                        }
+                        // Clear the dedup entry only if it is still ours: a
+                        // newer nomination may have replaced it while this
+                        // verifier was running.
+                        let mut pending = inner2.nomination_verification.lock();
+                        if let Some((pending_tx, pending_local, pending_remote)) = pending.as_ref()
+                            && *pending_tx == tx_id
+                            && *pending_local == local_addr
+                            && *pending_remote == addr
+                        {
+                            *pending = None;
                         }
                     });
                 }
