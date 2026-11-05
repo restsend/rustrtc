@@ -6270,7 +6270,7 @@ impl PeerConnectionInner {
         mline: Mline,
     ) {
         section.apply_config(&self.config);
-        if let Some(caps) = self.reinvite_answer_audio_capabilities(&section.mid, kind, sdp_type) {
+        if let Some(caps) = self.answer_audio_capabilities(&section.mid, kind, sdp_type) {
             Self::apply_audio_capabilities(section, &caps);
         }
 
@@ -6396,17 +6396,13 @@ impl PeerConnectionInner {
             .unwrap_or_else(|| vec![default_caps])
     }
 
-    fn reinvite_answer_audio_capabilities(
+    fn answer_audio_capabilities(
         &self,
         mid: &str,
         kind: MediaKind,
         sdp_type: SdpType,
     ) -> Option<Vec<AudioCapability>> {
         if kind != MediaKind::Audio || sdp_type != SdpType::Answer {
-            return None;
-        }
-
-        if self.local_description.lock().is_none() {
             return None;
         }
 
@@ -12726,6 +12722,106 @@ a=mid:0
             "Answer without rtcp-mux must advertise the separate RTCP port, got:\n{}",
             sdp
         );
+    }
+
+    fn sip_audio_pc() -> PeerConnection {
+        use crate::config::MediaCapabilities;
+
+        let mut config = RtcConfiguration::sip();
+        config.media_capabilities = Some(MediaCapabilities {
+            audio: vec![
+                AudioCapability::opus(),
+                AudioCapability::g722(),
+                AudioCapability::telephone_event(),
+            ],
+            video: vec![],
+            application: None,
+            image: vec![],
+        });
+        let pc = PeerConnection::new(config);
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        pc
+    }
+
+    fn rtpmaps(section: &MediaSection) -> Vec<String> {
+        section
+            .attributes
+            .iter()
+            .filter(|attr| attr.key == "rtpmap")
+            .filter_map(|attr| attr.value.clone())
+            .collect()
+    }
+
+    /// The initial answer must use the offer's dynamic payload types too
+    /// (RFC 3264 6.1), not our configured ones - a peer that offered opus as
+    /// 114 drops packets stamped with our 111.
+    #[tokio::test]
+    async fn initial_answer_uses_offer_dynamic_payload_types() {
+        let pc = sip_audio_pc();
+        let remote_offer = "v=0\r\n\
+            o=- 1 1 IN IP4 10.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 10.0.0.1\r\n\
+            m=audio 8000 RTP/AVP 114 97\r\n\
+            a=rtpmap:114 opus/48000/2\r\n\
+            a=rtpmap:97 telephone-event/8000\r\n\
+            a=fmtp:97 0-15\r\n\
+            a=sendrecv\r\n";
+        let desc = SessionDescription::parse(SdpType::Offer, remote_offer).unwrap();
+        pc.set_remote_description(desc).await.unwrap();
+
+        let answer = pc.create_answer().await.unwrap();
+        let audio = answer.first_audio_section().expect("answer audio section");
+
+        assert_eq!(
+            audio.formats,
+            vec!["114".to_string(), "97".to_string()],
+            "got:\n{}",
+            answer.to_sdp_string()
+        );
+        let rtpmaps = rtpmaps(audio);
+        assert!(rtpmaps.contains(&"114 opus/48000/2".to_string()));
+        assert!(rtpmaps.contains(&"97 telephone-event/8000".to_string()));
+        assert!(
+            !rtpmaps
+                .iter()
+                .any(|v| v.starts_with("111 ") || v.starts_with("101 ")),
+            "answer must not use our own payload types, got:\n{}",
+            answer.to_sdp_string()
+        );
+    }
+
+    /// Static payload types may come without rtpmap (RFC 3551), e.g. from a
+    /// Voximplant SBC - they still match the configured codecs.
+    #[tokio::test]
+    async fn initial_answer_matches_static_payload_types_without_rtpmap() {
+        let pc = sip_audio_pc();
+        let remote_offer = "v=0\r\n\
+            o=VIMS 234 1 IN IP4 10.0.0.1\r\n\
+            s=VIMS\r\n\
+            t=0 0\r\n\
+            c=IN IP4 10.0.0.1\r\n\
+            m=audio 8000 RTP/AVP 9 114 0 8 100 18 101\r\n\
+            a=rtpmap:114 opus/48000/2\r\n\
+            a=rtpmap:100 ilbc/8000\r\n\
+            a=rtpmap:101 telephone-event/8000\r\n\
+            a=sendrecv\r\n";
+        let desc = SessionDescription::parse(SdpType::Offer, remote_offer).unwrap();
+        pc.set_remote_description(desc).await.unwrap();
+
+        let answer = pc.create_answer().await.unwrap();
+        let audio = answer.first_audio_section().expect("answer audio section");
+
+        assert_eq!(
+            audio.formats,
+            vec!["9".to_string(), "114".to_string(), "101".to_string()],
+            "got:\n{}",
+            answer.to_sdp_string()
+        );
+        let rtpmaps = rtpmaps(audio);
+        assert!(rtpmaps.contains(&"9 G722/8000".to_string()));
+        assert!(rtpmaps.contains(&"114 opus/48000/2".to_string()));
     }
 
     #[tokio::test]
