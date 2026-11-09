@@ -886,10 +886,13 @@ impl<T> mpsc_UnboundedReceiver<T> {
         MpscRecvFuture { rx: self }
     }
 
-    /// Non-blocking receive: `Ok(None)` = empty (channel still open).
+    /// Non-blocking receive: `Ok(Some)` = one queued item, `Ok(None)` =
+    /// empty (channel open or closed). The SCTP runner uses this to drain
+    /// packets queued behind the one that woke the select; a closed empty
+    /// channel simply stops the drain (`recv()` reports the close).
     pub fn try_recv(&mut self) -> Result<Option<T>, mpsc_SendError<T>> {
-        let _ = self; // shape parity
-        unimplemented!("try_recv is only used by std-side tests")
+        let mut state = self.inner.lock();
+        Ok(state.queue.pop_front())
     }
 }
 

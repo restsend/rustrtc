@@ -16,7 +16,7 @@ A high-performance, full-stack real-time communication library — **WebRTC, RTP
 - **Bandwidth estimation (GCC)** — generates TWCC receiver feedback, stamps transport-wide sequence numbers on outbound RTP, and exposes a live `target_bitrate` estimate for encoder adaptation (`RtpSender::subscribe_target_bitrate`).
 - **Full ICE** — STUN, TURN (UDP + TCP), ICE Lite, ICE TCP (RFC 6544), single-port UDP mux for SFU/WHEP deployments, and **mDNS candidate obfuscation** (`enable_mdns`).
 - **NAT traversal & deployment** — RTP latching, UPnP IGD port mapping, and firewall-friendly port ranges (`rtp_start_port`/`rtp_end_port`).
-- **`no_std` / embassy-ready** — the full ICE/STUN/TURN + DTLS-SRTP + SDES media stack (any `Connectivity` × any `Keying`) runs on any executor behind seven injected platform seams, end-to-end tested against a mock embedded runtime (`scripts/check-no_std.sh`).
+- **`no_std` / embassy-ready** — the full ICE/STUN/TURN + DTLS-SRTP + SDES media stack and SCTP data channels (any `Connectivity` × any `Keying`) run on any executor behind seven injected platform seams, end-to-end tested against a mock embedded runtime (`scripts/check-no_std.sh`).
 - **Production extras** — RTP rewrite bridge (SSRC/PT/sequence remapping) and a WebRTC-compatible stats model.
 
 ## no_std / Embedded Support
@@ -45,14 +45,13 @@ two no_std `PeerConnection`s negotiate SDES via offer/answer, connect over a
 loopback network, and exchange SRTP media with payload-order verification; a
 no_std DTLS 1.2 handshake runs against the `crypto-p256` reference backend.
 A full-WebRTC-mode integration suite (`no_std_pc_webrtc_e2e.rs`) drives the
-same flow through `PeerConnection` and is landing alongside executor-fidelity
-work in the test harness.
+same flow through `PeerConnection`, and `no_std_datachannel_e2e.rs` runs two
+no_std PCs through DCEP OPEN/ACK and binary `ctl`/`cmd` traffic on the mock
+executor.
 
 **Still std-only:** T.38/UDPTL, GCC/TWCC bandwidth estimation (the media
 modules compile, the PC pipeline uses a stub), ICE-TCP, UPnP, mDNS, and
-certificate *generation* (use `dtls_certificate` instead). SCTP/DataChannel
-compiles under no_std; its runtime e2e lands with the test-executor
-fidelity work in progress.
+certificate *generation* (use `dtls_certificate` instead).
 
 ### Gates
 

@@ -6570,11 +6570,21 @@ async fn test_post_nomination_upgrade_to_higher_priority_pair() -> Result<()> {
 async fn test_slower_higher_priority_pair_upgrades_after_nomination() -> Result<()> {
     // Manual setup (mirrors setup_host_pair) so the slow candidate is present
     // BEFORE checks start — no late-trickle re-arm may rescue the round.
-    let (controlling, runner_c) = IceTransportBuilder::new(RtcConfiguration::webrtc())
+    // Pin both agents to loopback: the relay proxy below is a loopback socket,
+    // and on a multi-homed host the default gatherer would otherwise only
+    // advertise LAN addresses (filtering the loopback remote candidate and
+    // making this test environment-dependent).
+    let mut cfg_c = RtcConfiguration::webrtc();
+    cfg_c.ice_include_loopback_candidates = true;
+    cfg_c.bind_ips = vec!["127.0.0.1".parse().unwrap()];
+    let (controlling, runner_c) = IceTransportBuilder::new(cfg_c)
         .role(IceRole::Controlling)
         .build();
     tokio::spawn(runner_c);
-    let (controlled, runner_d) = IceTransportBuilder::new(RtcConfiguration::webrtc())
+    let mut cfg_d = RtcConfiguration::webrtc();
+    cfg_d.ice_include_loopback_candidates = true;
+    cfg_d.bind_ips = vec!["127.0.0.1".parse().unwrap()];
+    let (controlled, runner_d) = IceTransportBuilder::new(cfg_d)
         .role(IceRole::Controlled)
         .build();
     tokio::spawn(runner_d);
@@ -6602,7 +6612,14 @@ async fn test_slower_higher_priority_pair_upgrades_after_nomination() -> Result<
         .local_candidates()
         .into_iter()
         .map(|c| c.address)
-        .next()
+        .find(|a| a.ip().is_loopback())
+        .or_else(|| {
+            controlled
+                .local_candidates()
+                .into_iter()
+                .map(|c| c.address)
+                .next()
+        })
         .context("controlled has no host candidate")?;
     let delay = Duration::from_millis(700);
     tokio::spawn(async move {
@@ -6622,7 +6639,18 @@ async fn test_slower_higher_priority_pair_upgrades_after_nomination() -> Result<
     });
 
     let mut slow = IceCandidate::host(proxy_addr, 1);
-    slow.priority = slow.priority.saturating_add(50_000);
+    // The pair must strictly outrank the fast path. The fast path's remote
+    // priority is one of the controlled host candidates, so derive the slow
+    // candidate's priority from their maximum (the fixed +50k was below the
+    // LAN host priority on multi-interface hosts and never triggered an
+    // upgrade).
+    let max_remote = controlled
+        .local_candidates()
+        .iter()
+        .map(|c| c.priority)
+        .max()
+        .unwrap_or(0);
+    slow.priority = max_remote.saturating_add(100_000);
     controlling.add_remote_candidate(slow);
 
     // Dead paths (partial unreachability): a closed port and a blackholed

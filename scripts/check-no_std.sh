@@ -25,11 +25,15 @@ cargo test --test platform_seams_strict --no-default-features
 cargo test --test no_std_ice_e2e --no-default-features
 cargo test --test no_std_pc_srtp_e2e --no-default-features
 
-echo "== [4/5] no_std DTLS e2e (crypto-p256 backend)"
+echo "== [4/6] no_std DTLS e2e (crypto-p256 backend)"
 cargo test --test no_std_dtls_e2e --no-default-features --features crypto-p256
 
-echo "== [5/5] cargo check --lib (std matrix guard)"
+echo "== [5/6] cargo check --lib (std matrix guard)"
 
 cargo check --lib
+
+echo "== [6/6] no_std WebRTC + data-channel e2e"
+cargo test --test no_std_pc_webrtc_e2e --no-default-features --features crypto-p256
+cargo test --test no_std_datachannel_e2e --no-default-features --features crypto-p256
 
 echo "all no_std gates passed"

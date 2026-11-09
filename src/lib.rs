@@ -93,8 +93,9 @@ pub use transports::ice::{
 };
 #[cfg(feature = "std")]
 pub use transports::rtp::{RtpRewriteBridgeOptions, RtpRewriteBridgeParams, RtpRewriteRule};
-#[cfg(feature = "std")]
-pub use transports::sctp::{DataChannelEvent, DataChannelState, SctpLinkStats};
+pub use transports::sctp::{
+    DataChannel, DataChannelConfig, DataChannelEvent, DataChannelState, SctpLinkStats,
+};
 #[cfg(feature = "std")]
 pub use transports::udptl::{UdtlConfig, UdtlReceiveBuffer, UdtlTransport};
 

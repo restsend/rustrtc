@@ -428,11 +428,27 @@ pub mod time {
             .as_millis() as u64
     }
 
+    /// Unit tests start the anchor-relative clock at zero, and several SCTP
+    /// tests fabricate `sent_time` ("now - 1.5s") to force a retransmit. When
+    /// the test runs within that window the subtraction saturates at zero,
+    /// making the fabricated TSN look *newer* than the RTO deadline and the
+    /// test fail. A non-zero test-only base keeps that arithmetic meaningful;
+    /// `elapsed()` applies the same base so durations stay correct.
+    #[cfg(all(test, feature = "std"))]
+    const TEST_CLOCK_BASE_MS: u64 = 10_000;
+    #[cfg(not(all(test, feature = "std")))]
+    const TEST_CLOCK_BASE_MS: u64 = 0;
+
+    #[cfg(feature = "std")]
+    fn now_ms() -> u64 {
+        monotonic_ms() + TEST_CLOCK_BASE_MS
+    }
+
     impl Instant {
         pub fn now() -> Self {
             #[cfg(feature = "std")]
             {
-                Self { ms: monotonic_ms() }
+                Self { ms: now_ms() }
             }
             #[cfg(not(feature = "std"))]
             {
@@ -448,7 +464,7 @@ pub mod time {
         pub fn elapsed(&self) -> core::time::Duration {
             #[cfg(feature = "std")]
             {
-                core::time::Duration::from_millis(monotonic_ms().saturating_sub(self.ms))
+                core::time::Duration::from_millis(now_ms().saturating_sub(self.ms))
             }
             #[cfg(not(feature = "std"))]
             {

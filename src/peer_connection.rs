@@ -41,11 +41,7 @@ use crate::transports::ice::{IceCandidate, IceGathererState, IceTransport};
 use crate::transports::rtp::{
     RtpRewriteBridgeOptions, RtpRewriteBridgeParams, RtpRewriteRule, RtpTransport,
 };
-#[cfg(feature = "std")]
 use crate::transports::sctp::{DataChannel, DataChannelConfig, SctpLinkStats, SctpTransport};
-#[cfg(not(feature = "std"))]
-#[cfg(not(feature = "std"))]
-use crate::transports::sctp::{DataChannel, SctpTransport};
 #[cfg(feature = "std")]
 use crate::transports::udptl::UdtlTransport;
 use crate::{AudioCapability, RtcConfiguration, VideoCapability};
@@ -4193,7 +4189,13 @@ impl PeerConnection {
         Ok(FaxEndpoint::new(transport, session))
     }
 
-    #[cfg(feature = "std")]
+    /// Create a DataChannel and attach it to an `m=application` transceiver.
+    ///
+    /// Available on `std` and `no_std`: SCTP/DCEP/PR-SCTP live in
+    /// `transports::sctp`, which compiles against the injected platform
+    /// seams. On `no_std` the DCEP OPEN is spawned through
+    /// `crate::platform::task::spawn` and retried once the association
+    /// reaches ESTABLISHED (see `SctpTransport`).
     pub fn create_data_channel(
         &self,
         label: &str,
@@ -4264,7 +4266,6 @@ impl PeerConnection {
         Ok(dc)
     }
 
-    #[cfg(feature = "std")]
     pub async fn send_data(&self, channel_id: u16, data: &[u8]) -> RtcResult<()> {
         let transport = self.inner.sctp_transport.lock().clone();
         if let Some(transport) = transport {
@@ -4277,7 +4278,6 @@ impl PeerConnection {
         }
     }
 
-    #[cfg(feature = "std")]
     pub async fn send_text(&self, channel_id: u16, data: impl AsRef<str>) -> RtcResult<()> {
         let transport = self.inner.sctp_transport.lock().clone();
         if let Some(transport) = transport {
@@ -4290,7 +4290,6 @@ impl PeerConnection {
         }
     }
 
-    #[cfg(feature = "std")]
     pub fn sctp_buffered_amount(&self) -> usize {
         let transport = self.inner.sctp_transport.lock().clone();
         if let Some(transport) = transport {
@@ -4304,7 +4303,6 @@ impl PeerConnection {
     /// has been established. Covers duration, rto (RTT estimate), sent/recv
     /// bytes, retransmits, heartbeat failures and association error count.
     /// Returns `None` when there is no SCTP transport (e.g. RTP-only sessions).
-    #[cfg(feature = "std")]
     pub fn sctp_diagnostic_info(&self) -> Option<String> {
         self.inner
             .sctp_transport
@@ -4316,7 +4314,6 @@ impl PeerConnection {
     /// Returns a snapshot of the SCTP transport's key link statistics, if an
     /// SCTP association has been established. Useful for structured periodic
     /// logging of bytes sent/received and round-trip time.
-    #[cfg(feature = "std")]
     pub fn sctp_link_stats(&self) -> Option<SctpLinkStats> {
         self.inner
             .sctp_transport
@@ -14157,8 +14154,24 @@ a=mid:0
             assert!(!sdp.contains("a=bundle-only"), "{policy:?}:\n{sdp}");
             let (audio, video) = (offer.media_sections[0].port, offer.media_sections[1].port);
             assert!(audio != 0 && video != 0 && audio != video, "{sdp}");
-            assert!(sdp.contains(&format!("a=rtcp:{}", audio + 1)), "{sdp}");
-            assert!(sdp.contains(&format!("a=rtcp:{}", video + 1)), "{sdp}");
+            // A dedicated RTCP port is reserved per m-line. It is *not*
+            // guaranteed to be port+1: under a parallel test run another
+            // socket may have taken the adjacent port, and the allocator
+            // then picks the next free one.
+            let rtcp_ports: Vec<u16> = sdp
+                .lines()
+                .filter_map(|l| l.strip_prefix("a=rtcp:"))
+                .filter_map(|p| p.split_whitespace().next())
+                .filter_map(|p| p.parse().ok())
+                .collect();
+            assert_eq!(rtcp_ports.len(), 2, "{sdp}");
+            assert!(
+                rtcp_ports
+                    .iter()
+                    .all(|p| *p != 0 && *p != audio && *p != video),
+                "{sdp}"
+            );
+            assert_ne!(rtcp_ports[0], rtcp_ports[1], "{sdp}");
             pc.close();
         }
     }
