@@ -62,7 +62,7 @@ fn two_no_std_pcs_run_full_webrtc_over_the_seams() {
     // PC1 sends video; PC2 receives.
     let (source, track, _) = rustrtc::media::track::sample_track(TrackMediaKind::Video, 100);
     let source = Arc::new(source);
-    let _sender: Arc<RtpSender> = pc1
+    let sender: Arc<RtpSender> = pc1
         .add_track(
             track,
             RtpCodecParameters {
@@ -90,6 +90,10 @@ fn two_no_std_pcs_run_full_webrtc_over_the_seams() {
     assert!(
         offer_sdp.contains("a=candidate:"),
         "WebRtc offers must carry ICE candidates:\n{offer_sdp}"
+    );
+    assert!(
+        offer_sdp.contains("transport-cc"),
+        "WebRtc offers must negotiate transport-cc for GCC:\n{offer_sdp}"
     );
     pc1.set_local_description(offer.clone())
         .expect("local offer");
@@ -144,6 +148,17 @@ fn two_no_std_pcs_run_full_webrtc_over_the_seams() {
     assert!(
         connected,
         "both PCs must reach Connected (ICE + DTLS + SRTP)"
+    );
+
+    // GCC/TWCC are no_std now: the sender's PeerConnection must expose the
+    // estimator downcast + watch subscription.
+    assert!(
+        sender.target_bitrate().is_some(),
+        "GCC estimator must be installed on the video sender"
+    );
+    assert!(
+        sender.subscribe_target_bitrate().is_some(),
+        "GCC target-bitrate watch must be available on the video sender"
     );
 
     // Media over the DTLS-SRTP channel, payload order verified.

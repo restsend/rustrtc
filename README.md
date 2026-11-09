@@ -49,9 +49,27 @@ same flow through `PeerConnection`, and `no_std_datachannel_e2e.rs` runs two
 no_std PCs through DCEP OPEN/ACK and binary `ctl`/`cmd` traffic on the mock
 executor.
 
-**Still std-only:** T.38/UDPTL, GCC/TWCC bandwidth estimation (the media
-modules compile, the PC pipeline uses a stub), ICE-TCP, UPnP, mDNS, and
-certificate *generation* (use `dtls_certificate` instead).
+**Still std-only:** T.38/UDPTL, ICE-TCP, UPnP, mDNS, and certificate
+*generation* (use `dtls_certificate` instead). GCC/TWCC run on no_std; the
+sender exposes `RtpSender::target_bitrate()` / `subscribe_target_bitrate()`
+for the encoder, and TWCC feedback is generated on the receiver on a 100 ms
+cadence.
+
+### Clock
+
+On `std` the wall clock is `CLOCK_MONOTONIC`. On `no_std` it is a logical
+counter advanced by `platform::time::advance_ms` until the embedder installs
+a hardware source:
+
+```rust
+rustrtc::platform::time::set_now_fn(|| {
+    esp_hal::time::Instant::now().duration_since_epoch().as_millis() as u64
+});
+```
+
+Install it once at boot. Without it the logical clock is frozen on real
+hardware, which stalls every `Instant`-delta consumer (GCC trendline,
+retransmit timers, TWCC cadence).
 
 ### Gates
 
@@ -93,6 +111,8 @@ rustrtc::platform::task::set_sleep_fn(|dur| {
         dur.as_millis() as u64,
     ))) as Pin<Box<dyn Future<Output = ()> + Send>>
 });
+// Clock — hardware monotonic ms (GCC/TWCC trendline, retransmit timers).
+rustrtc::platform::time::set_now_fn(now_ms);
 // Executor — spawn ICE/PC tasks onto esp-rtos/embassy.
 rustrtc::platform::task::set_spawn_fn(|fut| spawner.spawn(fut).ok());
 // UDP — embassy-net socket factory behind ICE candidates / direct RTP.

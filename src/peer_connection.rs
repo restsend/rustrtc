@@ -12,16 +12,10 @@ use crate::rtp::{
 };
 // sdp types straight from the module: the crate-root re-exports are
 // std-gated, the items themselves are not.
-#[cfg(feature = "std")]
 use crate::media::gcc::GccBandwidthEstimator;
-#[cfg(feature = "std")]
 use crate::media::twcc_feedback::TwccFeedbackGenerator;
 #[cfg(not(feature = "std"))]
 use crate::peer_connection::std_gated::UdtlTransport;
-#[cfg(not(feature = "std"))]
-use crate::peer_connection::std_gated::gcc::GccBandwidthEstimator;
-#[cfg(not(feature = "std"))]
-use crate::peer_connection::std_gated::twcc_feedback::TwccFeedbackGenerator;
 use crate::platform::atomic64::AtomicU64;
 use crate::sdp::{
     Attribute, Direction, MediaKind, MediaSection, Origin, SdpType, SessionDescription,
@@ -57,91 +51,18 @@ use futures::stream::{FuturesUnordered, StreamExt};
 #[cfg_attr(not(feature = "std"), allow(unused_imports))]
 use tracing::{Instrument, debug, debug_span, trace, warn};
 
-/// no_std stand-ins for the std-gated transports (plan D6: DTLS/SCTP/
-/// T.38/GCC-TWCC stay server-side; the embedded delivery surface is
-/// rtp/srtp). Shared code paths meet these types behind `Option`s that
-/// stay `None` in rtp/srtp mode, or through inert stub methods; the
-/// WebRtc-only code paths are `#[cfg(feature = "std")]` and fail fast
-/// with `RtcError::NotImplemented` on no_std.
+/// no_std stand-ins for the std-gated transports (plan D6). DTLS, SCTP and
+/// the GCC/TWCC congestion-control loop are no_std-ready and used directly;
+/// only T.38/UDPTL stays server-side. Shared code paths meet the remaining
+/// stub behind `Option`s that stay `None` in no_std builds, and the
+/// std-gated fax paths fail fast with `RtcError::NotImplemented` there.
 #[cfg(not(feature = "std"))]
 pub(crate) mod std_gated {
-    use crate::prelude::*;
-
-    // dtls: the real transports::dtls module is no_std-ready and is used
-    // directly (see the `use crate::transports::dtls` import above).
-
-    // The no_std stubs below mirror the std API surface so call sites compile
-    // unchanged; on no_std the wiring that constructs them is std-gated.
-    #[cfg_attr(not(feature = "std"), allow(dead_code))]
-    #[derive(Debug)]
-    pub struct SctpTransport;
-
-    #[cfg_attr(not(feature = "std"), allow(dead_code))]
-    impl SctpTransport {
-        /// Shared close path: no SCTP transport → no close reason.
-        pub fn close_reason(&self) -> Option<String> {
-            None
-        }
-
-        /// Shared close path: nothing to close.
-        pub fn close(&self) {}
-
-        /// Shared diagnostics: nothing to report.
-        pub fn diagnostic_info(&self) -> String {
-            String::new()
-        }
-    }
-
-    #[cfg_attr(not(feature = "std"), allow(dead_code))]
-    #[derive(Debug)]
-    pub struct DataChannel;
-
     /// Inert stand-in: T.38/UDPTL is server-side (plan D6); the field is
     /// always `None` on no_std because the only setters live in
     /// std-gated fax paths.
     #[derive(Debug)]
     pub struct UdtlTransport;
-
-    /// Inert stand-in for the datachannel setup API (std only).
-    #[cfg_attr(not(feature = "std"), allow(dead_code))]
-    #[derive(Debug, Default)]
-    pub struct DataChannelConfig;
-
-    pub mod twcc_feedback {
-        /// Inert stand-in: `enable_gcc` requires WebRtc mode (std only),
-        /// so the runtime gates never install it on no_std.
-        #[derive(Debug)]
-        pub struct TwccFeedbackGenerator;
-
-        impl TwccFeedbackGenerator {
-            pub fn new() -> Self {
-                TwccFeedbackGenerator
-            }
-
-            pub fn set_ext_id(&self, _id: u8) {}
-
-            pub fn set_feedback_ssrc(&self, _ssrc: u32) {}
-
-            pub async fn run_flush_loop<T>(&self, _transport: T) {}
-        }
-
-        impl crate::peer_connection::RtpSenderInterceptor for TwccFeedbackGenerator {}
-        impl crate::peer_connection::RtpReceiverInterceptor for TwccFeedbackGenerator {}
-    }
-
-    pub mod gcc {
-        /// Inert stand-in: see [`super::twcc_feedback::TwccFeedbackGenerator`].
-        #[derive(Debug)]
-        pub struct GccBandwidthEstimator;
-
-        impl GccBandwidthEstimator {
-            pub fn new() -> Self {
-                GccBandwidthEstimator
-            }
-        }
-
-        impl crate::peer_connection::RtpSenderInterceptor for GccBandwidthEstimator {}
-    }
 }
 
 fn section_has_rtx(section: &MediaSection) -> bool {
@@ -285,7 +206,6 @@ pub trait RtpSenderInterceptor: Send + Sync {
         None
     }
     /// Downcast hook for the GCC bandwidth estimator (GCC loop).
-    #[cfg(feature = "std")]
     fn as_gcc_stats(self: Arc<Self>) -> Option<Arc<GccBandwidthEstimator>> {
         None
     }
@@ -7662,36 +7582,20 @@ impl RtpSender {
     /// enabled AND a TWCC-feedback-producing peer is connected. Returns
     /// `None` when no estimator is installed.
     pub fn target_bitrate(&self) -> Option<u64> {
-        #[cfg(feature = "std")]
-        {
-            self.interceptors
-                .iter()
-                .find_map(|i| i.clone().as_gcc_stats().map(|g| g.target_bitrate()))
-        }
-        #[cfg(not(feature = "std"))]
-        {
-            let _ = &self.interceptors;
-            None
-        }
+        self.interceptors
+            .iter()
+            .find_map(|i| i.clone().as_gcc_stats().map(|g| g.target_bitrate()))
     }
 
     /// Subscribe to GCC target-bitrate changes (bps). Returns `None` when no
     /// estimator is installed. Applications driving an encoder should spawn a
     /// task on this receiver and adapt the encoder bitrate.
     pub fn subscribe_target_bitrate(&self) -> Option<watch::Receiver<u64>> {
-        #[cfg(feature = "std")]
-        {
-            self.interceptors.iter().find_map(|i| {
-                i.clone()
-                    .as_gcc_stats()
-                    .map(|g| g.subscribe_target_bitrate())
-            })
-        }
-        #[cfg(not(feature = "std"))]
-        {
-            let _ = &self.interceptors;
-            None
-        }
+        self.interceptors.iter().find_map(|i| {
+            i.clone()
+                .as_gcc_stats()
+                .map(|g| g.subscribe_target_bitrate())
+        })
     }
 
     /// Next sequence number the paced send loop will put on the wire.

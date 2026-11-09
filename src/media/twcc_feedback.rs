@@ -13,17 +13,18 @@
 //! the subset Chrome and pion emit in practice.
 
 use crate::prelude::*;
-use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
-use std::time::Instant;
+use alloc::collections::{BTreeMap, VecDeque};
+use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering};
+use crate::platform::atomic64::AtomicU64;
+use crate::platform::time::Instant;
 
-use parking_lot::Mutex;
+use crate::platform::sync::Mutex;
 
 use crate::rtp::{RtcpPacket, RtpPacket, TransportWideCc};
 use crate::transports::rtp::RtpTransport;
 
 /// How often pending feedback is flushed.
-const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const FLUSH_INTERVAL: core::time::Duration = core::time::Duration::from_millis(100);
 /// Flush early (burst tolerance) when this many packets are pending.
 const EARLY_FLUSH_PACKETS: usize = 200;
 /// Hard cap on statuses in one feedback packet (MTU safety: ~500 packets).
@@ -59,7 +60,7 @@ pub struct TwccFeedbackGenerator {
     /// Reference clock for arrival-time deltas.
     clock: Instant,
     /// Per-SSRC pending (seq, arrival_us) records, in arrival order.
-    pending: Mutex<HashMap<u32, VecDeque<PendingRecord>>>,
+    pending: Mutex<BTreeMap<u32, VecDeque<PendingRecord>>>,
     /// Diagnostics.
     pub packets_observed: AtomicU64,
     pub feedback_sent: AtomicU64,
@@ -78,7 +79,7 @@ impl TwccFeedbackGenerator {
             feedback_ssrc: AtomicU32::new(0),
             feedback_seq: AtomicU16::new(rand_u16()),
             clock: Instant::now(),
-            pending: Mutex::new(HashMap::new()),
+            pending: Mutex::new(BTreeMap::new()),
             packets_observed: AtomicU64::new(0),
             feedback_sent: AtomicU64::new(0),
         }
@@ -140,7 +141,7 @@ impl TwccFeedbackGenerator {
         let mut sent = 0;
         let records: Vec<(u32, VecDeque<PendingRecord>)> = {
             let mut pending = self.pending.lock();
-            pending.drain().collect()
+            core::mem::take(&mut *pending).into_iter().collect()
         };
         let feedback_ssrc = self.feedback_ssrc.load(Ordering::SeqCst);
         for (media_ssrc, queue) in records {
@@ -281,13 +282,14 @@ impl TwccFeedbackGenerator {
     /// Periodic flush loop; spawn per receiver transport. The loop holds the
     /// transport weakly and returns once every other `Arc` to it is dropped.
     pub async fn run_flush_loop(
-        self: std::sync::Arc<Self>,
-        transport: std::sync::Arc<RtpTransport>,
+        self: Arc<Self>,
+        transport: Arc<RtpTransport>,
     ) {
-        let weak_transport = std::sync::Arc::downgrade(&transport);
+        let weak_transport = Arc::downgrade(&transport);
         drop(transport);
-        let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut ticker =
+            crate::platform::task::interval_after(FLUSH_INTERVAL, FLUSH_INTERVAL);
+        ticker.set_missed_tick_behavior(crate::platform::task::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
             if self.pending_count() >= EARLY_FLUSH_PACKETS {
@@ -338,8 +340,8 @@ impl RtpReceiverInterceptor for TwccFeedbackGenerator {
     async fn on_packet_received(
         &self,
         packet: &RtpPacket,
-        _src_addr: std::net::SocketAddr,
-        _local_addr: std::net::SocketAddr,
+        _src_addr: core::net::SocketAddr,
+        _local_addr: core::net::SocketAddr,
     ) -> Option<RtcpPacket> {
         self.observe(packet);
         None

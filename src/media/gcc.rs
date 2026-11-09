@@ -17,11 +17,12 @@
 //! a watch channel for the owning application (encoder) to act on.
 
 use crate::prelude::*;
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use alloc::collections::VecDeque;
+use core::sync::atomic::Ordering;
+use crate::platform::atomic64::AtomicU64;
+use crate::platform::time::Instant;
 
-use parking_lot::Mutex;
+use crate::platform::sync::Mutex;
 
 use crate::rtp::{RtcpPacket, decode_twcc_feedback};
 
@@ -48,8 +49,8 @@ struct TrendSample {
 }
 
 pub struct GccBandwidthEstimator {
-    target_bitrate: tokio::sync::watch::Sender<u64>,
-    _bitrate_keeper: tokio::sync::watch::Receiver<u64>,
+    target_bitrate: crate::platform::sync::watch::Sender<u64>,
+    _bitrate_keeper: crate::platform::sync::watch::Receiver<u64>,
     samples: Mutex<VecDeque<TrendSample>>,
     last_update: Mutex<Instant>,
     /// Stats.
@@ -68,7 +69,7 @@ impl Default for GccBandwidthEstimator {
 
 impl GccBandwidthEstimator {
     pub fn new() -> Self {
-        let (tx, rx) = tokio::sync::watch::channel(START_BITRATE_BPS);
+        let (tx, rx) = crate::platform::sync::watch::channel(START_BITRATE_BPS);
         Self {
             target_bitrate: tx,
             _bitrate_keeper: rx,
@@ -86,7 +87,7 @@ impl GccBandwidthEstimator {
         *self.target_bitrate.borrow()
     }
 
-    pub fn subscribe_target_bitrate(&self) -> tokio::sync::watch::Receiver<u64> {
+    pub fn subscribe_target_bitrate(&self) -> crate::platform::sync::watch::Receiver<u64> {
         self.target_bitrate.subscribe()
     }
 
@@ -162,7 +163,7 @@ impl GccBandwidthEstimator {
             (current + add).min(MAX_BITRATE_BPS as f64)
         };
 
-        let _ = self.target_bitrate.send(next.round() as u64);
+        let _ = self.target_bitrate.send((next + 0.5) as u64);
     }
 
     /// Least-squares slope of the recv-delta trend over the window (ms/ms
@@ -213,14 +214,14 @@ impl RtpSenderInterceptor for GccBandwidthEstimator {
     async fn on_rtcp_received(
         &self,
         packet: &RtcpPacket,
-        _transport: std::sync::Arc<RtpTransport>,
+        _transport: Arc<RtpTransport>,
     ) {
         if let RtcpPacket::TransportWideCc(feedback) = packet {
             self.on_twcc_feedback(feedback);
         }
     }
 
-    fn as_gcc_stats(self: std::sync::Arc<Self>) -> Option<std::sync::Arc<GccBandwidthEstimator>> {
+    fn as_gcc_stats(self: Arc<Self>) -> Option<Arc<GccBandwidthEstimator>> {
         Some(self)
     }
 }

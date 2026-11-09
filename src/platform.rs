@@ -434,10 +434,8 @@ pub mod time {
     /// making the fabricated TSN look *newer* than the RTO deadline and the
     /// test fail. A non-zero test-only base keeps that arithmetic meaningful;
     /// `elapsed()` applies the same base so durations stay correct.
-    #[cfg(all(test, feature = "std"))]
-    const TEST_CLOCK_BASE_MS: u64 = 10_000;
-    #[cfg(not(all(test, feature = "std")))]
-    const TEST_CLOCK_BASE_MS: u64 = 0;
+    #[cfg(feature = "std")]
+    const TEST_CLOCK_BASE_MS: u64 = if cfg!(test) { 10_000 } else { 0 };
 
     #[cfg(feature = "std")]
     fn now_ms() -> u64 {
@@ -452,26 +450,15 @@ pub mod time {
             }
             #[cfg(not(feature = "std"))]
             {
-                Self {
-                    ms: NOW_MS.load(Ordering::Relaxed),
-                }
+                Self { ms: now_ms() }
             }
         }
 
         /// Duration elapsed since this instant.
-        /// std: monotonic delta. no_std: logical-clock delta
-        /// (advances only when [`advance_ms`]/[`set_now_ms`] run).
+        /// std: monotonic delta. no_std: hardware clock (or the logical
+        /// counter when no `set_now_fn` clock was installed).
         pub fn elapsed(&self) -> core::time::Duration {
-            #[cfg(feature = "std")]
-            {
-                core::time::Duration::from_millis(now_ms().saturating_sub(self.ms))
-            }
-            #[cfg(not(feature = "std"))]
-            {
-                core::time::Duration::from_millis(
-                    NOW_MS.load(Ordering::Relaxed).saturating_sub(self.ms),
-                )
-            }
+            core::time::Duration::from_millis(now_ms().saturating_sub(self.ms))
         }
 
         /// Duration elapsed since `earlier` (saturating at zero).
@@ -520,8 +507,41 @@ pub mod time {
     #[cfg(not(feature = "std"))]
     static NOW_MS: AtomicU64 = AtomicU64::new(0);
 
+    /// no_std only: injected hardware monotonic clock (milliseconds since
+    /// boot). Stored as a raw fn-pointer address so `Instant::now()` stays
+    /// lock-free and interrupt-safe.
+    #[cfg(not(feature = "std"))]
+    static NOW_FN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+    /// no_std only: installs a hardware monotonic-millisecond source. Once
+    /// set, [`Instant::now`]/[`Instant::elapsed`] read this instead of the
+    /// logical counter (which only moves when the embedder calls
+    /// [`advance_ms`]). Call once at boot, before any timer use.
+    ///
+    /// Without it the logical clock is frozen on real hardware, which breaks
+    /// every `Instant`-delta consumer (GCC trendline, retransmit timers,
+    /// TWCC cadence). `rtcembed` wires `esp_hal::time` here.
+    #[cfg(not(feature = "std"))]
+    pub fn set_now_fn(f: fn() -> u64) {
+        NOW_FN.store(f as usize, Ordering::Release);
+    }
+
+    /// no_std only: current clock in ms (injected fn, else the logical counter).
+    #[cfg(not(feature = "std"))]
+    fn now_ms() -> u64 {
+        let raw = NOW_FN.load(Ordering::Acquire);
+        if raw == 0 {
+            return NOW_MS.load(Ordering::Relaxed);
+        }
+        // SAFETY: only `set_now_fn` writes this slot, and only with a valid
+        // `fn() -> u64` pointer; the value is never cleared.
+        let f: fn() -> u64 = unsafe { core::mem::transmute::<usize, fn() -> u64>(raw) };
+        f()
+    }
+
     /// no_std only: advances the logical clock. The platform task calls this
-    /// periodically (WP3 wires embassy-time here).
+    /// periodically (WP3 wires embassy-time here). Ignored by `Instant` once
+    /// [`set_now_fn`] installed a hardware clock.
     #[cfg(not(feature = "std"))]
     pub fn advance_ms(ms: u64) {
         NOW_MS.fetch_add(ms.max(1), Ordering::Relaxed);

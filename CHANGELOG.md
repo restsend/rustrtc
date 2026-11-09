@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.6.4 — 2026-11-09
+
+no_std GCC/TWCC congestion control + an injectable hardware clock.
+
+### Added
+
+- `platform::time::set_now_fn(fn() -> u64)`: embedders inject a hardware
+  monotonic millisecond clock. Without it the no_std logical clock only moves
+  when `advance_ms` is called, which freezes every `Instant`-delta consumer
+  (GCC trendline, retransmit timers, TWCC cadence) on real hardware.
+- GCC and TWCC now compile and run without `std`:
+  - `media::gcc` / `media::twcc_feedback` lose their `std` module gates.
+  - `parking_lot::Mutex` → `platform::sync::Mutex` (parking_lot-compatible
+    guard API on both backends).
+  - `tokio::sync::watch` → `platform::sync::watch`.
+  - `tokio::time::interval` → `platform::task::interval_after` (the mock
+    executor drives it through the injected sleep factory).
+  - `std::time::Instant` → `platform::time::Instant`.
+  - `std::collections::HashMap` → `alloc::collections::BTreeMap`;
+    `AtomicU64` → `platform::atomic64::AtomicU64` (RV32/Xtensa have no 64-bit
+    atomics); `std::net::SocketAddr` → `core::net::SocketAddr`.
+  - Removed the inert `std_gated` GCC/TWCC stubs from `peer_connection`.
+  - `RtpSender::target_bitrate()` / `subscribe_target_bitrate()` and the
+    `as_gcc_stats` downcast are available on every target.
+- `tests/time_now_seam.rs`: injected clock drives `Instant::now()` deltas.
+- The no_std WebRTC e2e asserts `transport-cc` negotiation and the sender's
+  GCC estimator/watch; `scripts/check-no_std.sh` runs the clock-seam test.
+
+No API-breaking changes.
+
 ## 0.6.3 — 2026-11-09
 
 Patch release: no_std SCTP data channels are now usable end to end.

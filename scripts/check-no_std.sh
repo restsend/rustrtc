@@ -8,20 +8,21 @@
 set -e
 cd "$(dirname "$0")/.."
 
-echo "== [1/5] cargo check --lib --no-default-features"
+echo "== [1/6] cargo check --lib --no-default-features"
 cargo check --lib --no-default-features
 
-echo "== [2/5] cargo check --lib --no-default-features --target riscv32imac-unknown-none-elf"
+echo "== [2/6] cargo check --lib --no-default-features --target riscv32imac-unknown-none-elf"
 if rustup target list --installed | grep -q riscv32imac-unknown-none-elf; then
     cargo check --lib --no-default-features --target riscv32imac-unknown-none-elf
 else
     echo "   SKIP: target not installed (rustup target add riscv32imac-unknown-none-elf)"
 fi
 
-echo "== [3/5] cargo test --test platform_seams_* + no_std e2e --no-default-features"
+echo "== [3/6] cargo test --test platform_seams_* + no_std e2e --no-default-features"
 cargo test --test platform_seams_logical --no-default-features
 cargo test --test platform_seams_injected --no-default-features
 cargo test --test platform_seams_strict --no-default-features
+cargo test --test time_now_seam --no-default-features
 cargo test --test no_std_ice_e2e --no-default-features
 cargo test --test no_std_pc_srtp_e2e --no-default-features
 
