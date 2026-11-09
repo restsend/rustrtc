@@ -55,6 +55,11 @@ sender exposes `RtpSender::target_bitrate()` / `subscribe_target_bitrate()`
 for the encoder, and TWCC feedback is generated on the receiver on a 100 ms
 cadence.
 
+> **UPnP is intentionally std-only.** The no_std target exposes a UDP socket
+> seam only; IGD discovery/control needs SSDP multicast plus a TCP/SOAP HTTP
+> client. Embedded deployments should use TURN (no_std, UDP) or a direct LAN
+> path.
+
 ### Clock
 
 On `std` the wall clock is `CLOCK_MONOTONIC`. On `no_std` it is a logical
