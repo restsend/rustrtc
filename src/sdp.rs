@@ -1345,7 +1345,7 @@ impl MediaSection {
             .next()
             .ok_or_else(|| SdpError::Parse("media line missing kind".into()))?
             .parse()?;
-        let port = parts
+        let port: u16 = parts
             .next()
             .ok_or_else(|| SdpError::Parse("media line missing port".into()))?
             .parse()
@@ -1354,7 +1354,9 @@ impl MediaSection {
             .next()
             .ok_or_else(|| SdpError::Parse("media line missing protocol".into()))?;
         let formats: Vec<String> = parts.map(|s| s.to_string()).collect();
-        if formats.is_empty() {
+        // Legacy SBCs/trunks sometimes omit <fmt> when declining a stream with port 0
+        // (e.g. `m=video 0 RTP/AVP`). Allow empty formats only on rejected sections.
+        if formats.is_empty() && port != 0 {
             return Err(SdpError::Parse("media line missing formats".into()));
         }
 
@@ -1392,13 +1394,18 @@ impl MediaSection {
     }
 
     fn write_lines(&self, out: &mut String, write_mid: bool) -> fmt::Result {
+        let formats_str = if self.formats.is_empty() {
+            "0".to_string()
+        } else {
+            self.formats.join(" ")
+        };
         write!(
             out,
             "m={} {} {} {}\r\n",
             self.kind.as_str(),
             self.port,
             self.protocol,
-            self.formats.join(" ")
+            formats_str
         )?;
         if let Some(connection) = &self.connection {
             write!(out, "c={}\r\n", connection)?;
@@ -2394,5 +2401,29 @@ a=mid:1\r\n";
         // no te at all
         let sdp = "v=0\r\nm=audio 40000 RTP/AVP 0\r\n";
         assert_eq!(first_non_dtmf_audio_pt(sdp), Some(0));
+    }
+
+    #[test]
+    fn test_rejected_mline_without_formats() {
+        let sdp = "v=0\r\n\
+            o=- 57997 57997 IN IP4 202.22.165.100\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            m=audio 27166 RTP/AVP 8 102\r\n\
+            c=IN IP4 202.22.165.100\r\n\
+            a=rtpmap:8 PCMA/8000\r\n\
+            a=sendrecv\r\n\
+            m=video 0 RTP/AVP\r\n\
+            a=sendrecv\r\n";
+
+        let desc = SessionDescription::parse(SdpType::Answer, sdp).unwrap();
+        assert_eq!(desc.media_sections.len(), 2);
+        assert_eq!(desc.media_sections[1].kind, MediaKind::Video);
+        assert_eq!(desc.media_sections[1].port, 0);
+        assert!(desc.media_sections[1].formats.is_empty());
+        assert!(desc.to_sdp_string().contains("m=video 0 RTP/AVP 0\r\n"));
+
+        let invalid_active = "v=0\r\nm=video 32558 RTP/AVP\r\n";
+        assert!(SessionDescription::parse(SdpType::Answer, invalid_active).is_err());
     }
 }
