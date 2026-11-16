@@ -88,11 +88,11 @@ pub struct RtpRewriteRule {
     /// SDES-MID RTP header extension id (the extmap id negotiated for
     /// `urn:ietf:params:rtp-hdrext:sdes:mid`). When set together with
     /// [`Self::sdes_mid`], packets rewritten by this rule get the MID
-    /// extension stamped so a WebRTC receiver (Chrome) can attribute them
+    /// extension stamped so a bundled SIP or WebRTC receiver can attribute them
     /// to the negotiated track regardless of SSRC. Payload-type-scoped:
     /// audio/DTMF rules carry the audio m-line's mid, video rules the
-    /// video m-line's mid. Only written when the bridge's
-    /// [`RtpRewriteBridgeOptions::strip_extensions`] is false.
+    /// video m-line's mid. Written after stripping source extensions, including
+    /// when [`RtpRewriteBridgeOptions::strip_extensions`] is true.
     pub sdes_mid_extension_id: Option<u8>,
     /// The destination leg's MID value for this m-line (e.g. "0" for the
     /// audio m-line, "1" for video).
@@ -387,15 +387,13 @@ impl RewriteBridge {
         }
         packet.header.timestamp = out_timestamp;
 
-        if !self.options.strip_extensions {
-            // Stamp the matched rule's SDES-MID (payload-type-scoped: audio
-            // rules carry the audio mid, video rules the video mid) so a
-            // WebRTC receiver attributes the packet to the right track.
-            if let Some(r) = &rule
-                && let (Some(ext_id), Some(mid)) = (r.sdes_mid_extension_id, &r.sdes_mid)
-            {
-                let _ = packet.header.set_extension(ext_id, mid.as_bytes());
-            }
+        // Source extensions may have been stripped above. The destination's
+        // negotiated MID is independent of those source extensions: bundled
+        // SIP peers (e.g. Linphone), as well as WebRTC peers, need it to demux.
+        if let Some(r) = &rule
+            && let (Some(ext_id), Some(mid)) = (r.sdes_mid_extension_id, &r.sdes_mid)
+        {
+            let _ = packet.header.set_extension(ext_id, mid.as_bytes());
         }
     }
 }
@@ -1552,6 +1550,43 @@ impl RtpTransport {
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
+    #[test]
+    fn rewrite_strips_source_extensions_but_stamps_negotiated_mid() {
+        for strip_extensions in [false, true] {
+            let bridge = RewriteBridge {
+                target: Weak::new(),
+                video_target: None,
+                video_payload_types: BTreeSet::new(),
+                options: RtpRewriteBridgeOptions { strip_extensions, ..Default::default() },
+                rules: [(9, "0"), (102, "1")].into_iter().map(|(pt, mid)| RtpRewriteRule {
+                    match_payload_type: Some(pt),
+                    fixed_out_ssrc: None,
+                    ssrc_offset: 0,
+                    out_payload_type: None,
+                    sdes_mid_extension_id: Some(4),
+                    sdes_mid: Some(mid.to_string()),
+                }).collect(),
+                streams: RefCell::new(BTreeMap::new()),
+                timelines: RefCell::new(BTreeMap::new()),
+            };
+            for (pt, mid) in [(9, "0"), (102, "1")] {
+                let mut packet = RtpPacket::new(
+                    crate::rtp::RtpHeader::new(pt, 1, 160, pt as u32), vec![1u8; 10],
+                );
+                packet.header.set_extension(1, b"source").unwrap();
+                packet.header.set_extension(4, b"wrong").unwrap();
+                bridge.rewrite_packet(&mut packet);
+                assert_eq!(packet.header.get_extension(4).unwrap().as_ref(), mid.as_bytes());
+                assert_eq!(packet.header.get_extension(1).is_none(), strip_extensions);
+            }
+            // A peer without a negotiated MID still receives no extensions.
+            let mut packet = RtpPacket::new(crate::rtp::RtpHeader::new(8, 1, 160, 8), vec![1u8]);
+            packet.header.set_extension(1, b"source").unwrap();
+            bridge.rewrite_packet(&mut packet);
+            assert_eq!(packet.header.extension.is_none(), strip_extensions);
+        }
+    }
+
     use super::*;
     use crate::transports::ice::conn::IceConn;
     use tokio::sync::mpsc;

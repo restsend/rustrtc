@@ -1761,7 +1761,7 @@ impl PeerConnection {
             let ours = &local.media_sections[local_idx];
             let theirs = &remote.media_sections[remote_idx];
             // RFC 3264 §6: a rejected (port 0) section carries no RTP or RTCP.
-            let rejected = section_rejected(&local, ours) || section_rejected(&remote, theirs);
+            let rejected = local.is_media_rejected(ours) || remote.is_media_rejected(theirs);
             transceiver.set_rejected(rejected);
             let permitted = !rejected
                 && matches!(ours.direction, Direction::SendRecv | Direction::SendOnly)
@@ -1842,7 +1842,7 @@ impl PeerConnection {
             let tag = group.first().copied();
             let unmuxed = desc.media_sections.iter().find(|section| {
                 matches!(section.kind, MediaKind::Audio | MediaKind::Video)
-                    && !section_rejected(&desc, section)
+                    && !desc.is_media_rejected(section)
                     && !(group.contains(&section.mid.as_str()) && Some(section.mid.as_str()) != tag)
                     && !has_rtcp_mux(section)
             });
@@ -3359,7 +3359,7 @@ impl PeerConnection {
                     transport: MlineTransport::Rejected,
                     bundled: false,
                 }
-            } else if in_group && !section_rejected(desc, section) {
+            } else if in_group && !desc.is_media_rejected(section) {
                 Mline {
                     transport: MlineTransport::Primary,
                     bundled: true,
@@ -5474,7 +5474,7 @@ impl PeerConnectionInner {
                 BundlePolicy::Balanced => !kinds_with_transport.contains(&section.kind),
                 BundlePolicy::MaxBundle => false,
             };
-            let transport = if section_rejected(offer, section) {
+            let transport = if offer.is_media_rejected(section) {
                 MlineTransport::Rejected
             } else if section.kind == MediaKind::Image {
                 MlineTransport::Own
@@ -6782,24 +6782,6 @@ fn mline_rtcp_mux(desc: &SessionDescription, mid: &str, index: usize) -> Option<
             .or_else(|| desc.media_sections.get(index).filter(|s| s.mid.is_empty()))
     };
     section.map(has_rtcp_mux)
-}
-
-/// RFC 3264 §6: a port-0 section is rejected, except a `bundle-only` non-tag
-/// section inside a BUNDLE group (RFC 9143 §7).
-fn section_rejected(desc: &SessionDescription, section: &MediaSection) -> bool {
-    let bundle_only = section.attributes.iter().any(|a| a.key == "bundle-only");
-    let bundled_non_tag = || {
-        desc.session.attributes.iter().any(|a| {
-            let mut mids = (a.value.as_deref())
-                .filter(|_| a.key == "group")
-                .and_then(|v| v.strip_prefix("BUNDLE "))
-                .unwrap_or_default()
-                .split_whitespace()
-                .skip(1);
-            mids.any(|mid| mid == section.mid)
-        })
-    };
-    section.port == 0 && !(bundle_only && bundled_non_tag())
 }
 
 fn default_origin() -> Origin {

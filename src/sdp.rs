@@ -46,6 +46,35 @@ impl SessionDescription {
         }
     }
 
+    /// Whether this SDP marks a media section as rejected/disabled by port.
+    /// A zero-port, bundle-only non-tag member is not rejected: in an offer
+    /// it requests shared transport; in an answer it is the RFC 8843 form
+    /// retained for compatibility (RFC 9143 section 7.4.1).
+    ///
+    /// This interprets this description only, not the outcome of negotiation.
+    /// An answer must still be checked against its offer, and media direction
+    /// is separate: an inactive section is not necessarily rejected.
+    pub fn is_media_rejected(&self, section: &MediaSection) -> bool {
+        if section.port != 0 {
+            return false;
+        }
+        if !section.is_bundle_only() {
+            return true;
+        }
+        let bundled_non_tag = self.session.attributes.iter().any(|attr| {
+            if attr.key != "group" {
+                return false;
+            }
+            let mut tokens = attr.value.as_deref().unwrap_or_default().split_whitespace();
+            if tokens.next() != Some("BUNDLE") {
+                return false;
+            }
+            // The first MID is the transport-bearing BUNDLE tag.
+            tokens.skip(1).any(|mid| mid == section.mid)
+        });
+        !bundled_non_tag
+    }
+
     /// Put `candidates` in each m-line, except a bundle-only one: it has
     /// no transport of its own (RFC 9429 §5.2.1).
     pub fn add_candidates(&mut self, candidates: &[String]) {
@@ -1584,6 +1613,41 @@ pub fn parse_bundle_mid_info(sdp: &str) -> Option<(u8, String, String)> {
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
+    #[test]
+    fn media_rejection_distinguishes_bundle_only_from_rejected_sections() {
+        let offered = "v=0\r\n\
+            o=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n\
+            a=group:BUNDLE audio video\r\n\
+            m=audio 5000 RTP/AVP 0\r\na=mid:audio\r\n\
+            m=video 0 RTP/AVP 102\r\na=mid:video\r\n\
+            a=bundle-only\r\na=rtpmap:102 H264/90000\r\n";
+        // Initial bundle-only offer and legacy RFC 8843 answer have the same
+        // port interpretation, but neither alone establishes a negotiation.
+        for kind in [SdpType::Offer, SdpType::Answer, SdpType::Pranswer] {
+            let desc = SessionDescription::parse(kind, offered).unwrap();
+            assert!(!desc.is_media_rejected(&desc.media_sections[1]));
+            for rejected in [
+                offered.replace("a=bundle-only\r\n", ""),
+                offered.replace("BUNDLE audio video", "BUNDLE audio"),
+                offered.replace("BUNDLE audio video", "BUNDLE video audio"),
+                offered.replace("BUNDLE audio video", "BUNDLE-other audio video"),
+            ] {
+                let desc = SessionDescription::parse(kind, &rejected).unwrap();
+                assert!(desc.is_media_rejected(&desc.media_sections[1]));
+            }
+        }
+        // RFC 9143 accepted answer: shared nonzero port, no bundle-only flag.
+        let answer = offered.replace("m=video 0", "m=video 5000")
+            .replace("a=bundle-only\r\n", "");
+        let desc = SessionDescription::parse(SdpType::Answer, &answer).unwrap();
+        assert!(!desc.is_media_rejected(&desc.media_sections[1]));
+        // BUNDLE proposed in the offer does not rescue a rejected answer.
+        let answer = offered.replace("BUNDLE audio video", "BUNDLE audio")
+            .replace("a=bundle-only", "a=inactive");
+        let desc = SessionDescription::parse(SdpType::Answer, &answer).unwrap();
+        assert!(desc.is_media_rejected(&desc.media_sections[1]));
+    }
+
     use super::*;
 
     #[test]
