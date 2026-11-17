@@ -5141,7 +5141,6 @@ async fn monitor_transport(
         if dtls_rx.is_some() {
             crate::DTLS_MONITOR_ITERATIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
-        let grace_open = true;
         let __s0 = core::pin::pin!(&mut rtcp_loop);
         let __which = {
             let __s1 = core::pin::pin!(ice_state_rx.changed());
@@ -5151,11 +5150,7 @@ async fn monitor_transport(
                 }
                 None => crate::platform::select::Either::B(core::future::pending()),
             };
-            let __s3 = if grace_open {
-                crate::platform::select::Either::A(core::pin::pin!(grace_rx.recv()))
-            } else {
-                crate::platform::select::Either::B(core::future::pending::<Option<u64>>())
-            };
+            let __s3 = core::pin::pin!(grace_rx.recv());
             crate::platform::select::select4(__s0, __s1, __s2, __s3).await
         };
         // The PeerConnection is gone (its Drop closes the transports).
@@ -7870,15 +7865,7 @@ impl RtpSender {
                 let mut __tch = transport_change_rx.clone();
                 let __s0 = core::pin::pin!(&mut notified);
                 let __s1 = core::pin::pin!(__tch.changed());
-                // Conditional select! arm becomes either(ticker, pending):
-                // SRs only tick while samples are flowing and RTCP is on.
-                let __s2 = if packets_sent.load(Ordering::Relaxed) > 0
-                    && rtcp_enabled.load(Ordering::Relaxed)
-                {
-                    crate::platform::select::Either::A(core::pin::pin!(rtcp_interval.tick()))
-                } else {
-                    crate::platform::select::Either::B(core::future::pending::<()>())
-                };
+                let __s2 = core::pin::pin!(rtcp_interval.tick());
                 let __s3 = core::pin::pin!(rtcp_rx.recv());
                 let __s4 = core::pin::pin!(track.recv());
                 match crate::platform::select::select5(__s0, __s1, __s2, __s3, __s4).await {
@@ -7895,7 +7882,13 @@ impl RtpSender {
                         if transport_generation.load(Ordering::SeqCst) != generation {
                             break;
                         }
+                        if !rtcp_enabled.load(Ordering::Relaxed) {
+                            continue;
+                        }
                         let packet_count = packets_sent.load(Ordering::Relaxed);
+                        if packet_count == 0 {
+                            continue;
+                        }
 
                         let octet_count = octets_sent.load(Ordering::Relaxed);
                         let rtp_timestamp = last_rtp_timestamp.load(Ordering::Relaxed);
