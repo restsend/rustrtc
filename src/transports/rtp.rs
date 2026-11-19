@@ -320,8 +320,14 @@ impl ListenerRegistry {
     }
 
     fn register_mid(&mut self, mid: String, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
-        self.by_mid.insert(mid.clone(), tx.clone());
-        self.route_for_sender_mut(&tx).mid = Some(mid);
+        let previous = self.route_for_sender_mut(&tx).mid.replace(mid.clone());
+        if let Some(previous) = previous
+            && previous != mid
+            && self.by_mid.get(&previous).is_some_and(|route| route.same_channel(&tx))
+        {
+            self.by_mid.remove(&previous);
+        }
+        self.by_mid.insert(mid, tx);
     }
 
     fn register_payload_types(

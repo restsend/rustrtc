@@ -767,6 +767,7 @@ struct PeerConnectionInner {
     /// SDES: the `a=crypto` (local, remote) that keyed the direct transport of
     /// each m-line, by index (see `sdes_crypto`).
     sdes_keys: Mutex<BTreeMap<usize, (crate::sdp::CryptoAttribute, crate::sdp::CryptoAttribute)>>,
+    sdes_primary_index: Mutex<Option<usize>>,
     sctp_transport: Mutex<Option<Arc<SctpTransport>>>,
     data_channels: Arc<Mutex<Vec<Weak<DataChannel>>>>,
     event_tx: mpsc::UnboundedSender<QueuedEvent>,
@@ -1004,6 +1005,7 @@ impl PeerConnection {
             rtp_media_ice_transports: Mutex::new(BTreeMap::new()),
             rtp_media_transports: Mutex::new(BTreeMap::new()),
             sdes_keys: Mutex::new(BTreeMap::new()),
+            sdes_primary_index: Mutex::new(None),
             sctp_transport: Mutex::new(None),
             data_channels: Arc::new(Mutex::new(Vec::new())),
             event_tx,
@@ -1653,68 +1655,14 @@ impl PeerConnection {
             .any(|attr| attr.key == "ice-lite")
     }
 
-    pub fn set_local_description(&self, desc: SessionDescription) -> RtcResult<()> {
+    pub fn set_local_description(&self, mut desc: SessionDescription) -> RtcResult<()> {
         self.inner.validate_sdp_type(&desc.sdp_type)?;
 
-        // For Offerer: extract parameters from local offer (our intended changes)
-        // This allows Offerer to immediately update transceivers with new parameters
-        // that will be confirmed when answer is received
-        if desc.sdp_type == SdpType::Offer {
-            let is_reinvite = {
-                let local = self.inner.local_description.lock();
-                local.is_some()
-            };
-            if is_reinvite {
-                debug!("Offerer: extracting parameters from local reinvite offer");
-                // Extract parameters from our offer for transceivers
-                let transceivers = self.inner.transceivers.lock().clone();
-                for section in &desc.media_sections {
-                    let mut matched_transceiver = transceivers
-                        .iter()
-                        .find(|t| t.mid().as_ref() == Some(&section.mid))
-                        .cloned();
-
-                    // If not found by MID, try to match with mid-less transceiver (e.g. manual SDP)
-                    if matched_transceiver.is_none()
-                        && let Some(t) = transceivers
-                            .iter()
-                            .find(|t| t.mid().is_none() && t.kind() == section.kind)
-                    {
-                        t.set_mid(section.mid.clone());
-                        matched_transceiver = Some(t.clone());
-                    }
-
-                    if let Some(t) = matched_transceiver {
-                        let payload_map = Self::extract_payload_map(section);
-                        if !payload_map.is_empty() {
-                            let _ = t.update_payload_map(payload_map);
-                        }
-                        let extmap = Self::extract_extmap(section);
-                        let _ = t.update_extmap(extmap);
-                    }
-                }
-            } else {
-                // Initial offer: ensure MIDs are assigned if we match unassigned transceivers
-                // This covers manual SDP creation (skipped create_offer)
-                let transceivers = self.inner.transceivers.lock().clone();
-                for section in &desc.media_sections {
-                    if transceivers
-                        .iter()
-                        .any(|t| t.mid().as_ref() == Some(&section.mid))
-                    {
-                        continue;
-                    }
-                    // Assign to first matching unassigned transceiver
-                    if let Some(t) = transceivers
-                        .iter()
-                        .find(|t| t.mid().is_none() && t.kind() == section.kind)
-                    {
-                        t.set_mid(section.mid.clone());
-                    }
-                }
-            }
-        }
-
+        let previous_local = self.inner.local_description.lock().clone();
+        let remote = self.inner.remote_description.lock().clone();
+        self.inner
+            .reconcile_media_slots(&mut desc, previous_local.as_ref(), remote.as_ref(), false)?;
+        let is_reoffer = previous_local.is_some();
         {
             let state = &self.inner.signaling_state;
             match desc.sdp_type {
@@ -1748,18 +1696,44 @@ impl PeerConnection {
             }
         }
         let applies_answer = matches!(desc.sdp_type, SdpType::Answer | SdpType::Pranswer);
-        // The offer is accepted and its MIDs are assigned. It states our own
-        // direction: keep that as our preference, unless it is just what
-        // create_offer derived from the preference.
         if desc.sdp_type == SdpType::Offer {
-            let transceivers = self.inner.transceivers.lock().clone();
-            for section in &desc.media_sections {
-                if let Some(t) = transceivers
+            let transceivers = self.inner.transceivers.lock();
+            for (index, section) in desc.media_sections.iter().enumerate() {
+                let Some(t) = transceivers
                     .iter()
-                    .find(|t| t.mid().as_deref() == Some(section.mid.as_str()))
+                    .find(|t| t.kind() == section.kind && t.mline_index() == Some(index))
+                    .or_else(|| {
+                        transceivers.iter().find(|t| {
+                            t.kind() == section.kind
+                                && t.mline_index().is_none()
+                                && !section.mid.is_empty()
+                                && t.mid().as_ref() == Some(&section.mid)
+                        })
+                    })
+                    .or_else(|| {
+                        transceivers
+                            .iter()
+                            .find(|t| t.kind() == section.kind && t.mline_index().is_none())
+                    })
+                else {
+                    continue;
+                };
+                let had_slot = t.mline_index().is_some();
+                t.set_mline_index(Some(index));
+                let old_mid = t.mid();
+                if old_mid.is_none()
+                    || (!section.mid.is_empty() && old_mid.as_ref() != Some(&section.mid))
                 {
-                    t.record_offered_direction(section.direction.into());
+                    t.set_mid(section.mid.clone());
                 }
+                if had_slot || is_reoffer {
+                    let payload_map = Self::extract_payload_map(section);
+                    if !payload_map.is_empty() {
+                        let _ = t.update_payload_map(payload_map);
+                    }
+                    let _ = t.update_extmap(Self::extract_extmap(section));
+                }
+                t.record_offered_direction(section.direction.into());
             }
         }
         *self.inner.local_description.lock() = Some(desc);
@@ -1779,8 +1753,8 @@ impl PeerConnection {
         }
         if applies_answer {
             self.apply_negotiated_send_directions();
+            self.setup_sdes_media_transports();
         }
-        self.setup_sdes_media_transports();
         Ok(())
     }
 
@@ -1804,16 +1778,8 @@ impl PeerConnection {
         };
         // Audio/video only: T.38 (UDPTL) and data channels are not sent by
         // an RtpSender, and matched_rtp_media_sections skips them.
-        let local_sections = self.matched_rtp_media_sections(&local);
         for (transceiver, remote_idx) in self.matched_rtp_media_sections(&remote) {
-            let Some(local_idx) = local_sections
-                .iter()
-                .find(|(t, _)| Arc::ptr_eq(t, &transceiver))
-                .map(|(_, idx)| *idx)
-            else {
-                continue;
-            };
-            let ours = &local.media_sections[local_idx];
+            let Some(ours) = local.media_sections.get(remote_idx) else { continue };
             let theirs = &remote.media_sections[remote_idx];
             // RFC 3264 §6: a rejected (port 0) section carries no RTP or RTCP.
             let rejected = local.is_media_rejected(ours) || remote.is_media_rejected(theirs);
@@ -1863,7 +1829,7 @@ impl PeerConnection {
         }
     }
 
-    async fn apply_remote_description(&self, desc: SessionDescription) -> RtcResult<()> {
+    async fn apply_remote_description(&self, mut desc: SessionDescription) -> RtcResult<()> {
         self.inner.validate_sdp_type(&desc.sdp_type)?;
         let remote_dtls_fingerprint = if self.config().keying == Keying::Dtls {
             match desc.dtls_fingerprint() {
@@ -1911,6 +1877,13 @@ impl PeerConnection {
         }
 
         let previous_remote = self.inner.remote_description.lock().clone();
+        let local = self.inner.local_description.lock().clone();
+        self.inner.reconcile_media_slots(
+            &mut desc,
+            previous_remote.as_ref(),
+            local.as_ref(),
+            self.config().connectivity.is_direct() && !self.config().webrtc_extensions,
+        )?;
         let media_parameters_changed = previous_remote.as_ref().is_none_or(|previous| {
             previous.session.connection != desc.session.connection
                 || previous.session.attributes != desc.session.attributes
@@ -2120,56 +2093,40 @@ impl PeerConnection {
         // Create transceivers for new media sections in Offer
         if desc.sdp_type == SdpType::Offer {
             let mut transceivers = self.inner.transceivers.lock();
-            let mut used_indices = alloc::collections::BTreeSet::new();
-            for section in &desc.media_sections {
+            for (index, section) in desc.media_sections.iter().enumerate() {
+                // If a rejected slot was recycled with a different media kind,
+                // disassociate the old transceiver from this slot first.
+                for t in transceivers.iter() {
+                    if t.mline_index() == Some(index) && t.kind() != section.kind {
+                        t.set_mline_index(None);
+                    }
+                }
                 let mid = &section.mid;
-                let mut found_transceiver: Option<(usize, Arc<RtpTransceiver>)> = None;
-                let mut newly_matched = false;
-
-                // An empty MID is not an identity. Linphone omits a=mid from
-                // every m-line, so matching "" twice would apply both audio
-                // and video to the first transceiver.
-                if !mid.is_empty() {
-                    for (idx, t) in transceivers.iter().enumerate() {
-                        if used_indices.contains(&idx) {
-                            continue;
-                        }
-                        if t.kind() == section.kind
-                            && let Some(t_mid) = t.mid()
-                            && t_mid == *mid
-                        {
-                            found_transceiver = Some((idx, t.clone()));
-                            break;
-                        }
-                    }
-                }
-
-                if found_transceiver.is_none() {
-                    // Try to find a transceiver with no MID and same kind
-                    for (idx, t) in transceivers.iter().enumerate() {
-                        if !used_indices.contains(&idx)
-                            && t.mid().is_none()
-                            && t.kind() == section.kind
-                        {
-                            t.set_mid(mid.clone());
-                            found_transceiver = Some((idx, t.clone()));
-                            newly_matched = true;
-                            break;
-                        }
-                    }
-
-                    if found_transceiver.is_none()
-                        && mid.is_empty()
-                        && let Some((idx, t)) = transceivers.iter().enumerate().find(|(idx, t)| {
-                            !used_indices.contains(idx) && t.kind() == section.kind
+                let found_transceiver = transceivers
+                    .iter()
+                    .find(|t| t.kind() == section.kind && t.mline_index() == Some(index))
+                    .or_else(|| {
+                        transceivers.iter().find(|t| {
+                            t.kind() == section.kind
+                                && t.mline_index().is_none()
+                                && !mid.is_empty()
+                                && t.mid().as_ref() == Some(mid)
                         })
-                    {
-                        found_transceiver = Some((idx, t.clone()));
+                    })
+                    .or_else(|| {
+                        transceivers
+                            .iter()
+                            .find(|t| t.kind() == section.kind && t.mline_index().is_none())
+                    })
+                    .cloned();
+                let mut newly_matched = false;
+                if let Some(t) = &found_transceiver {
+                    let old_mid = t.mid();
+                    newly_matched = t.mline_index().is_none() && old_mid.is_none();
+                    t.set_mline_index(Some(index));
+                    if old_mid.is_none() || (!mid.is_empty() && old_mid.as_ref() != Some(mid)) {
+                        t.set_mid(mid.clone());
                     }
-                }
-
-                if let Some((idx, _)) = &found_transceiver {
-                    used_indices.insert(*idx);
                 }
 
                 let mut ssrc = None;
@@ -2256,7 +2213,7 @@ impl PeerConnection {
                     transport.set_abs_send_time_extension_id(Some(id));
                 }
 
-                if let Some((_, t)) = found_transceiver {
+                if let Some(t) = found_transceiver {
                     // Update transceiver parameters
                     let payload_map = Self::extract_payload_map(section);
                     if !payload_map.is_empty() {
@@ -2264,7 +2221,7 @@ impl PeerConnection {
                     }
                     let extmap = Self::extract_extmap(section);
                     let _ = t.update_extmap(extmap);
-                        let direction: TransceiverDirection = section.direction.into();
+                    let direction: TransceiverDirection = section.direction.into();
                     t.set_remote_direction(direction);
 
                     if let Some(ssrc_val) = ssrc
@@ -2303,6 +2260,8 @@ impl PeerConnection {
                     *t.desired_direction.lock() = TransceiverDirection::SendRecv;
                     t.implicit_direction.store(true, Ordering::Relaxed);
                     t.set_mid(mid.clone());
+                    t.set_mline_index(Some(index));
+                    t.update_extmap(Self::extract_extmap(section))?;
 
                     let receiver_ssrc = ssrc.unwrap_or(0);
 
@@ -2382,7 +2341,6 @@ impl PeerConnection {
 
                     t.set_receiver(Some(receiver));
 
-                    used_indices.insert(transceivers.len());
                     transceivers.push(t.clone());
 
                     if ssrc.is_some() {
@@ -2397,6 +2355,10 @@ impl PeerConnection {
             for (t, section_idx) in self.matched_rtp_media_sections(&desc) {
                 let section = &desc.media_sections[section_idx];
                 let mid = &section.mid;
+
+                if !mid.is_empty() && t.mid().as_ref() != Some(mid) {
+                    t.set_mid(mid.clone());
+                }
 
                 // Update transceiver parameters
                 let payload_map = Self::extract_payload_map(section);
@@ -2492,7 +2454,9 @@ impl PeerConnection {
             self.configure_rtp_media_transports_from_remote(&desc, ufrag, pwd, candidates)
                 .await?;
         }
-        self.setup_sdes_media_transports();
+        if matches!(desc.sdp_type, SdpType::Answer | SdpType::Pranswer) {
+            self.setup_sdes_media_transports();
+        }
 
         // Refresh mux/RTCP routing after any remote description change.
         // If the transport already exists, this keeps the derived RTCP
@@ -2568,35 +2532,29 @@ impl PeerConnection {
         }
     }
 
-    /// Block until both the local and remote descriptions carry `a=crypto`
-    /// attributes (SDES negotiation complete), or the timeout expires.
+    /// Wait for the offer and answer keys of the primary transport.
     async fn wait_for_sdes_attributes(
         inner: &Arc<PeerConnectionInner>,
         timeout: core::time::Duration,
-    ) -> RtcResult<()> {
+    ) -> RtcResult<usize> {
         let deadline = crate::platform::time::Instant::now() + timeout;
         loop {
             {
                 let remote = inner.remote_description.lock();
                 let local = inner.local_description.lock();
-                let has_remote_crypto = remote
-                    .as_ref()
-                    .map(|d| {
-                        d.media_sections
-                            .iter()
-                            .any(|m| !m.get_crypto_attributes().is_empty())
-                    })
-                    .unwrap_or(false);
-                let has_local_crypto = local
-                    .as_ref()
-                    .map(|d| {
-                        d.media_sections
-                            .iter()
-                            .any(|m| !m.get_crypto_attributes().is_empty())
-                    })
-                    .unwrap_or(false);
-                if has_remote_crypto && has_local_crypto {
-                    return Ok(());
+                if let (Some(local), Some(remote)) = (local.as_ref(), remote.as_ref()) {
+                    let index = sdes_primary_index(local, remote);
+                    let local_ready = local
+                        .media_sections
+                        .get(index)
+                        .is_some_and(|m| !m.get_crypto_attributes().is_empty());
+                    let remote_ready = remote
+                        .media_sections
+                        .get(index)
+                        .is_some_and(|m| !m.get_crypto_attributes().is_empty());
+                    if local_ready && remote_ready {
+                        return Ok(index);
+                    }
                 }
             }
             if crate::platform::time::Instant::now() >= deadline {
@@ -2689,10 +2647,10 @@ impl PeerConnection {
                 // crypto attributes" and leave the leg permanently without SRTP
                 // (rustpbx issue #281 e2e flake). Wait for the negotiation to
                 // complete instead of failing the transport start.
-                Self::wait_for_sdes_attributes(&self.inner, core::time::Duration::from_secs(10))
-                    .await?;
-                // The primary transport: the keys of the first m-line.
-                self.setup_sdes(&rtp_transport, 0)?;
+                let index =
+                    Self::wait_for_sdes_attributes(&self.inner, core::time::Duration::from_secs(10))
+                        .await?;
+                self.setup_primary_sdes(&rtp_transport, index)?;
             }
             Keying::Dtls => {
                 let Some((_, dtls_loops)) = self
@@ -3076,8 +3034,7 @@ impl PeerConnection {
     }
 
     /// Key `rtp_transport` with SDES (RFC 4568), with the `a=crypto` of the
-    /// m-line at `index` (see `sdes_crypto`). The primary transport uses the
-    /// first m-line.
+    /// m-line at `index` (see `sdes_crypto`).
     fn setup_sdes(&self, rtp_transport: &Arc<RtpTransport>, index: usize) -> RtcResult<()> {
         let (tx_keying, rx_keying, profile, mki, keys) = {
             if let (Some(local), Some(remote)) = self.sdes_crypto(index) {
@@ -3143,10 +3100,16 @@ impl PeerConnection {
         Ok(())
     }
 
+    fn setup_primary_sdes(&self, transport: &Arc<RtpTransport>, index: usize) -> RtcResult<()> {
+        self.setup_sdes(transport, index)?;
+        *self.inner.sdes_primary_index.lock() = Some(index);
+        Ok(())
+    }
+
     /// SDES: key the per-m-line direct transports (non-BUNDLE video, ...)
-    /// that are not keyed yet, each with its own m-line's `a=crypto`. Runs
-    /// when a description is set: both descriptions are needed. The primary
-    /// transport is keyed in `start_transport`.
+    /// that are not keyed yet, each with its own m-line's `a=crypto`. An
+    /// answer completes the key negotiation for a newly added m-line.
+    /// The primary transport is first keyed in `start_transport`.
     ///
     /// A transport that has keys gets new ones when an offer/answer changes
     /// them: a peer can send a new key in a re-INVITE, and it starts to use
@@ -3158,9 +3121,9 @@ impl PeerConnection {
         let Some(remote) = self.inner.remote_description.lock().clone() else {
             return;
         };
-        if self.inner.local_description.lock().is_none() {
+        let Some(local) = self.inner.local_description.lock().clone() else {
             return;
-        }
+        };
         // Until the answer, an offer's keys are not agreed.
         let negotiated = *self.inner.signaling_state.borrow() == SignalingState::Stable;
         let keys_changed = |index: usize| {
@@ -3173,13 +3136,15 @@ impl PeerConnection {
         };
 
         let primary = self.inner.rtp_transport.lock().clone();
+        let index = sdes_primary_index(&local, &remote);
+        let previous_index = *self.inner.sdes_primary_index.lock();
         if let Some(primary) = primary
             && primary.has_srtp()
             && negotiated
-            && keys_changed(0)
+            && (previous_index != Some(index) || keys_changed(index))
         {
-            if let Err(e) = self.setup_sdes(&primary, 0) {
-                warn!("SDES keying of m-line 0 failed: {}", e);
+            if let Err(e) = self.setup_primary_sdes(&primary, index) {
+                warn!("SDES keying of m-line {} failed: {}", index, e);
             }
         }
 
@@ -3276,22 +3241,6 @@ impl PeerConnection {
         }
     }
 
-    fn bundle_tag_mid(desc: &SessionDescription) -> Option<String> {
-        desc.session
-            .attributes
-            .iter()
-            .find(|attr| attr.key == "group")
-            .and_then(|attr| attr.value.as_deref())
-            .and_then(|value| {
-                let mut parts = value.split_whitespace();
-                if parts.next() == Some("BUNDLE") {
-                    parts.next().map(ToString::to_string)
-                } else {
-                    None
-                }
-            })
-    }
-
     fn remote_rtp_addr_from_section(
         desc: &SessionDescription,
         section: &MediaSection,
@@ -3315,48 +3264,24 @@ impl PeerConnection {
         &self,
         desc: &SessionDescription,
     ) -> Vec<(Arc<RtpTransceiver>, usize)> {
-        let transceivers = self.inner.transceivers.lock().clone();
-        let mut used_indices = alloc::collections::BTreeSet::new();
+        let transceivers = self.inner.transceivers.lock();
         let mut matched = Vec::new();
-
-        for (section_idx, section) in desc.media_sections.iter().enumerate() {
-            if section.kind == MediaKind::Application || section.kind == MediaKind::Image {
+        for (index, section) in desc.media_sections.iter().enumerate() {
+            if !matches!(section.kind, MediaKind::Audio | MediaKind::Video) {
                 continue;
             }
-
-            let mut found: Option<(usize, Arc<RtpTransceiver>)> = None;
-            if !section.mid.is_empty() {
-                for (idx, t) in transceivers.iter().enumerate() {
-                    if used_indices.contains(&idx) {
-                        continue;
-                    }
-                    if let Some(t_mid) = t.mid()
-                        && t_mid == section.mid
-                    {
-                        found = Some((idx, t.clone()));
-                        break;
-                    }
-                }
-            }
-
-            if found.is_none() {
-                for (idx, t) in transceivers.iter().enumerate() {
-                    if used_indices.contains(&idx) {
-                        continue;
-                    }
-                    if t.kind() == section.kind {
-                        found = Some((idx, t.clone()));
-                        break;
-                    }
-                }
-            }
-
-            if let Some((idx, transceiver)) = found {
-                used_indices.insert(idx);
-                matched.push((transceiver, section_idx));
+            let transceiver = transceivers
+                .iter()
+                .find(|t| t.mline_index() == Some(index) && t.kind() == section.kind)
+                .or_else(|| {
+                    transceivers
+                        .get(index)
+                        .filter(|t| t.mline_index().is_none() && t.kind() == section.kind)
+                });
+            if let Some(t) = transceiver {
+                matched.push((t.clone(), index));
             }
         }
-
         matched
     }
 
@@ -3397,6 +3322,7 @@ impl PeerConnection {
         // the answer rejects still completes the transport we offered: it
         // sends nothing (`apply_negotiated_send_directions`).
         let group = bundle_group(desc);
+        let bundle_tag = bundle_tag_index(desc, &group);
         let answer_mlines =
             (desc.sdp_type == SdpType::Offer).then(|| self.inner.answer_mlines(desc));
         let local = self.inner.local_description.lock().clone();
@@ -3451,10 +3377,10 @@ impl PeerConnection {
                     .map(|(t, _, _)| t.clone())
                     .collect::<Vec<_>>(),
             );
-            let (transceiver, section_idx, _) = (bundled.iter())
-                .find(|(_, idx, _)| desc.media_sections[*idx].mid == group[0])
+            let (transceiver, fallback_idx, _) = (bundled.iter())
+                .find(|(_, idx, _)| Some(*idx) == bundle_tag)
                 .unwrap_or(&bundled[0]);
-            let section = &desc.media_sections[*section_idx];
+            let section = &desc.media_sections[bundle_tag.unwrap_or(*fallback_idx)];
             if let Some(remote_addr) = Self::remote_rtp_addr_from_section(desc, section) {
                 self.configure_rtp_media_transport(
                     transceiver,
@@ -3474,16 +3400,24 @@ impl PeerConnection {
             }
         }
 
+        let active_primary = matched.iter().any(|(_, index, mline)| {
+            mline.transport == MlineTransport::Primary
+                && !desc.is_media_rejected(&desc.media_sections[*index])
+        });
         for (transceiver, section_idx, mline) in &matched {
             if mline.bundled || !mline.has_transport() {
                 continue;
             }
             let section = &desc.media_sections[*section_idx];
+            let primary = mline.transport == MlineTransport::Primary;
+            if primary && active_primary && desc.is_media_rejected(section) {
+                continue;
+            }
             if let Some(remote_addr) = Self::remote_rtp_addr_from_section(desc, section) {
                 self.configure_rtp_media_transport(
                     transceiver,
                     section,
-                    mline.transport == MlineTransport::Primary,
+                    primary,
                     remote_addr,
                     ufrag.as_ref(),
                     pwd.as_ref(),
@@ -3778,13 +3712,9 @@ impl PeerConnection {
         desc: &SessionDescription,
         remote_rtp_addr: core::net::SocketAddr,
     ) -> Option<core::net::SocketAddr> {
-        let section = Self::bundle_tag_mid(desc)
-            .as_ref()
-            .and_then(|mid| {
-                desc.media_sections
-                    .iter()
-                    .find(|section| section.mid == *mid)
-            })
+        let group = bundle_group(desc);
+        let section = bundle_tag_index(desc, &group)
+            .map(|index| &desc.media_sections[index])
             .or_else(|| desc.media_sections.first())?;
         Self::remote_rtcp_addr_from_media_section(section, remote_rtp_addr)
     }
@@ -4423,7 +4353,6 @@ impl PeerConnection {
     async fn handle_reinvite(&self, new_desc: &SessionDescription) -> RtcResult<()> {
         debug!("Handling reinvite: updating RTP parameters");
 
-        // Extract RTP parameter changes for each media section
         for (t, section_idx) in self.matched_rtp_media_sections(new_desc) {
             let section = &new_desc.media_sections[section_idx];
             // Check SSRC change (indicates new track, not reinvite)
@@ -4515,11 +4444,7 @@ impl PeerConnection {
     /// runner task) survives until the next full close(), leaking resources
     /// across non-BUNDLE renegotiations.
     fn cleanup_orphaned_extra_transports(&self, new_desc: &SessionDescription) {
-        // Legacy SIP endpoints commonly omit a=mid. The transceivers still
-        // carry rustrtc's internal MIDs, so comparing those strings against an
-        // SDP containing only empty MIDs incorrectly removes every per-media
-        // transport. Reuse the one-to-one MID-or-kind matching used when
-        // configuring RTP transports and retain each matched transceiver.
+        // Rejected sections still occupy their negotiated slots.
         let live_transceiver_ids: alloc::collections::BTreeSet<u64> = self
             .matched_rtp_media_sections(new_desc)
             .into_iter()
@@ -4714,7 +4639,7 @@ impl PeerConnection {
             {
                 let parts: Vec<&str> = val.split_whitespace().collect();
                 if parts.len() >= 2
-                    && let Ok(id) = parts[0].parse::<u8>()
+                    && let Ok(id) = parts[0].split('/').next().unwrap_or_default().parse::<u8>()
                 {
                     extmap.insert(id, parts[1].to_string());
                 }
@@ -5473,8 +5398,7 @@ impl PeerConnectionInner {
         })
     }
 
-    /// The transport of an offer's m-lines (`sections`: the kind and MID of
-    /// each, in order).
+    /// The transport of an offer's m-lines in transceiver order.
     ///
     /// The first offer follows the bundle policy (RFC 9429 §5.2.1): the
     /// first m-line has the primary transport, the others have their own or
@@ -5482,43 +5406,66 @@ impl PeerConnectionInner {
     /// It proposes BUNDLE with two or more m-lines, and always with full ICE
     /// (a WebRTC offer always has a group). A later offer keeps what the
     /// last answer negotiated (RFC 9429 §5.2.2): its BUNDLE group shares the
-    /// primary transport, and new m-lines join it. Without a group, each
-    /// m-line keeps its transport; new m-lines follow the policy, and the
-    /// offer proposes BUNDLE again. An m-line is new when the last answer
+    /// primary transport, and new or reactivated m-lines join it. Without a
+    /// group, each m-line keeps its transport; new m-lines follow the policy,
+    /// and the offer proposes BUNDLE again. An m-line is new when the last answer
     /// has none at its index (m-lines are matched by position, RFC 3264
     /// §8). T.38 (image) has its own transport (UDPTL), never bundled.
-    fn offer_mlines(&self, sections: &[(MediaKind, String)]) -> Vec<Mline> {
+    fn offer_mlines(
+        &self,
+        sections: &[Arc<RtpTransceiver>],
+        answer: Option<&SessionDescription>,
+    ) -> Vec<Mline> {
         let direct = self.config.connectivity.is_direct();
-        let answer = self.previous_answer();
-        let known = |index: usize| {
-            answer
-                .as_ref()
-                .is_some_and(|a| index < a.media_sections.len())
+        let known = |index: usize| answer.is_some_and(|a| index < a.media_sections.len());
+        let group = answer.map(bundle_group).unwrap_or_default();
+        let media = || {
+            sections
+                .iter()
+                .enumerate()
+                .filter(|(_, transceiver)| transceiver.kind() != MediaKind::Image)
         };
-        let group = answer.as_ref().map(bundle_group).unwrap_or_default();
-        let media =
-            || (sections.iter().enumerate()).filter(|(_, (kind, _))| *kind != MediaKind::Image);
         let new_mlines = media().any(|(index, _)| !known(index));
         let bundle = new_mlines
             && group.is_empty()
-            && (!direct || media().count() > 1)
-            && media().all(|(_, (_, mid))| !mid.is_empty());
+            && (!direct
+                || (self.config.bundle_policy != BundlePolicy::Disabled && media().count() > 1))
+            && media().all(|(_, transceiver)| transceiver.mid().is_some_and(|mid| !mid.is_empty()));
 
         let mut mlines = Vec::with_capacity(sections.len());
         let mut have_primary = false;
         let mut kinds_with_transport = Vec::new();
-        for (index, (kind, mid)) in sections.iter().enumerate() {
-            if *kind == MediaKind::Image {
+        for (index, transceiver) in sections.iter().enumerate() {
+            let kind = transceiver.kind();
+            if kind == MediaKind::Image {
                 mlines.push(Mline {
                     transport: MlineTransport::Own,
                     bundled: false,
                 });
                 continue;
             }
+            // A rejected m-line has an index but no negotiated transport.
+            let was_rejected = answer.is_some_and(|answer| {
+                answer
+                    .media_sections
+                    .get(index)
+                    .is_some_and(|section| answer.is_media_rejected(section))
+            });
+            if (direct || !group.is_empty())
+                && was_rejected
+                && transceiver.desired_direction() == TransceiverDirection::Inactive
+            {
+                mlines.push(Mline {
+                    transport: MlineTransport::Rejected,
+                    bundled: false,
+                });
+                continue;
+            }
             let mline = if !group.is_empty() {
-                // The negotiated group, and new m-lines join it.
-                let bundled = !mid.is_empty() && (group.contains(&mid.as_str()) || !known(index));
-                let transport = if bundled || !have_primary || !direct {
+                let bundled = transceiver.mid().is_some_and(|mid| {
+                    !mid.is_empty() && (group.contains(&mid.as_str()) || !known(index) || was_rejected)
+                });
+                let transport = if bundled || !direct {
                     MlineTransport::Primary
                 } else {
                     MlineTransport::Own
@@ -5527,8 +5474,8 @@ impl PeerConnectionInner {
             } else {
                 let own = direct
                     && match self.config.bundle_policy {
-                        BundlePolicy::MaxCompat => true,
-                        BundlePolicy::Balanced => !kinds_with_transport.contains(kind),
+                        BundlePolicy::MaxCompat | BundlePolicy::Disabled => true,
+                        BundlePolicy::Balanced => !kinds_with_transport.contains(&kind),
                         BundlePolicy::MaxBundle => false,
                     };
                 let transport = if !have_primary {
@@ -5550,7 +5497,7 @@ impl PeerConnectionInner {
             };
             have_primary = true;
             if mline.has_transport() {
-                kinds_with_transport.push(*kind);
+                kinds_with_transport.push(kind);
             }
             mlines.push(mline);
         }
@@ -5565,21 +5512,24 @@ impl PeerConnectionInner {
     fn answer_mlines(&self, offer: &SessionDescription) -> Vec<Mline> {
         let direct = self.config.connectivity.is_direct();
         let group = bundle_group(offer);
+        let bundle_tag = bundle_tag_index(offer, &group);
         let mut mlines = Vec::with_capacity(offer.media_sections.len());
         let mut have_primary = false;
         let mut kinds_with_transport = Vec::new();
         for section in &offer.media_sections {
-            let bundled = !section.mid.is_empty() && group.contains(&section.mid.as_str());
+            let bundled = bundle_tag.is_some() && group.contains(&section.mid.as_str());
             let own = match self.config.bundle_policy {
-                BundlePolicy::MaxCompat => true,
+                BundlePolicy::MaxCompat | BundlePolicy::Disabled => true,
                 BundlePolicy::Balanced => !kinds_with_transport.contains(&section.kind),
                 BundlePolicy::MaxBundle => false,
             };
-            let transport = if offer.is_media_rejected(section) {
+            let transport = if offer.is_media_rejected(section)
+                || (section.port == 0 && !bundled)
+            {
                 MlineTransport::Rejected
             } else if section.kind == MediaKind::Image {
                 MlineTransport::Own
-            } else if bundled || (group.is_empty() && !have_primary) {
+            } else if bundled || (bundle_tag.is_none() && !have_primary) {
                 MlineTransport::Primary
             } else if direct && own {
                 MlineTransport::Own
@@ -5608,10 +5558,7 @@ impl PeerConnectionInner {
     where
         F: Fn(TransceiverDirection) -> TransceiverDirection,
     {
-        let transceivers = {
-            let list = self.transceivers.lock();
-            list.iter().cloned().collect::<Vec<_>>()
-        };
+        let transceivers = self.transceivers.lock().clone();
         if transceivers.is_empty() {
             return Err(RtcError::InvalidState(
                 "cannot build SDP with no transceivers".into(),
@@ -5625,88 +5572,64 @@ impl PeerConnectionInner {
             self.previous_answer()
         };
 
-        let (ordered_transceivers, mlines) = if sdp_type == SdpType::Answer {
+        let (sections, mlines, offered_bundle_tag) = if sdp_type == SdpType::Answer {
             let remote_guard = self.remote_description.lock();
             let remote = remote_guard.as_ref().ok_or_else(|| {
                 RtcError::InvalidState("create_answer called without remote description".into())
             })?;
 
-            let mut ordered = Vec::new();
-            let mut used_indices = alloc::collections::BTreeSet::new();
-            for (section_idx, section) in remote.media_sections.iter().enumerate() {
-                let mid = &section.mid;
-                let mut found: Option<(usize, Arc<RtpTransceiver>)> = None;
-
-                // 1) Prefer exact MID match when remote provides MID.
-                if !mid.is_empty() {
-                    for (idx, t) in transceivers.iter().enumerate() {
-                        if used_indices.contains(&idx) {
-                            continue;
-                        }
-                        if let Some(t_mid) = t.mid()
-                            && t_mid == *mid
-                        {
-                            found = Some((idx, t.clone()));
-                            break;
-                        }
-                    }
-                }
-
-                // 2) Interop fallback for MID-less sections:
-                // pick first unused same-kind transceiver.
-                if found.is_none() && mid.is_empty() {
-                    for (idx, t) in transceivers.iter().enumerate() {
-                        if used_indices.contains(&idx) {
-                            continue;
-                        }
-                        if t.kind() == section.kind {
-                            found = Some((idx, t.clone()));
-                            break;
-                        }
-                    }
-                }
-
-                if let Some((idx, t)) = found {
-                    used_indices.insert(idx);
-                    ordered.push((
-                        t,
-                        mline_rtcp_mux(remote, mid, section_idx),
-                        Some(TransceiverDirection::from(section.direction)),
-                    ));
-                } else {
-                    return Err(RtcError::Internal(format!(
-                        "No transceiver found for mid {} in answer generation",
-                        mid
-                    )));
+            let mut answer_sections = Vec::with_capacity(remote.media_sections.len());
+            for (index, section) in remote.media_sections.iter().enumerate() {
+                let t = transceivers
+                    .iter()
+                    .find(|t| t.mline_index() == Some(index) && t.kind() == section.kind)
+                    .or_else(|| {
+                        transceivers
+                            .get(index)
+                            .filter(|t| t.mline_index().is_none() && t.kind() == section.kind)
+                    })
+                    .ok_or_else(|| RtcError::Internal(format!("No transceiver for SDP slot {index}")))?;
+                answer_sections.push((
+                    t.clone(),
+                    mline_rtcp_mux(remote, &section.mid, index),
+                    Some(TransceiverDirection::from(section.direction)),
+                ));
+            }
+            let bundle_tag = bundle_tag_index(remote, &bundle_group(remote))
+                .map(|index| remote.media_sections[index].mid.clone());
+            (answer_sections, self.answer_mlines(remote), bundle_tag)
+        } else {
+            // JSEP §5.2.2 (libwebrtc GetMediaSessionOptionsForOffer):
+            // existing m-line slots first, then newly added unassociated transceivers.
+            let existing_slots = self
+                .local_description
+                .lock()
+                .as_ref()
+                .map_or(0, |d| d.media_sections.len())
+                .max(
+                    self.remote_description
+                        .lock()
+                        .as_ref()
+                        .map_or(0, |d| d.media_sections.len()),
+                );
+            let mut offer_transceivers = Vec::with_capacity(transceivers.len());
+            for index in 0..existing_slots {
+                if let Some(t) = transceivers.iter().find(|t| t.mline_index() == Some(index)) {
+                    offer_transceivers.push(t.clone());
                 }
             }
-            (ordered, self.answer_mlines(remote))
-        } else {
-            // For Offer, we must ensure MIDs and sort by them to maintain m-line stability
-            // This handles cases where transceivers were added out-of-order relative to their
-            // assigned MIDs (e.g. reused from previous negotiations)
             for t in &transceivers {
+                if t.mline_index().is_none() {
+                    offer_transceivers.push(t.clone());
+                }
+            }
+            for t in &offer_transceivers {
                 self.ensure_mid(t);
             }
 
-            let mut ordered = transceivers.clone();
-            ordered.sort_by(|a, b| {
-                let mid_a = a.mid().unwrap_or_default();
-                let mid_b = b.mid().unwrap_or_default();
-
-                // Try to sort numerically if possible ("0", "1", "10")
-                // otherwise lexicographically ("0", "1", "a")
-                match (mid_a.parse::<u64>(), mid_b.parse::<u64>()) {
-                    (Ok(na), Ok(nb)) => na.cmp(&nb),
-                    _ => mid_a.cmp(&mid_b),
-                }
-            });
-            let sections: Vec<(MediaKind, String)> = (ordered.iter())
-                .map(|t| (t.kind(), t.mid().unwrap_or_default()))
-                .collect();
-            let mlines = self.offer_mlines(&sections);
-            let ordered = ordered.into_iter().map(|t| (t, None, None)).collect();
-            (ordered, mlines)
+            let mlines = self.offer_mlines(&offer_transceivers, previous_answer.as_ref());
+            let offer_sections = offer_transceivers.into_iter().map(|t| (t, None, None)).collect();
+            (offer_sections, mlines, None)
         };
 
         let connectivity = self.config.connectivity;
@@ -5764,8 +5687,11 @@ impl PeerConnectionInner {
                 .push(Attribute::new("msid-semantic", Some("WMS *".into())));
         }
 
+        let previous_bundle_tag = previous_answer
+            .as_ref()
+            .and_then(|answer| bundle_group(answer).first().copied());
         for (media_index, ((transceiver, offered_rtcp_mux, offered_direction), mline)) in
-            ordered_transceivers
+            sections
                 .into_iter()
                 .zip(mlines.iter().copied())
                 .enumerate()
@@ -5777,8 +5703,11 @@ impl PeerConnectionInner {
             // unless the last negotiation of the m-line refused it. A first
             // offer that does not require it reserves an RTCP port, for an
             // answer that refuses it.
-            let previous_rtcp_mux = (previous_answer.as_ref())
-                .and_then(|answer| mline_rtcp_mux(answer, &mid, media_index));
+            let bundle_tag = previous_bundle_tag.filter(|_| mline.bundled);
+            let previous_rtcp_mux = previous_answer.as_ref().and_then(|answer| {
+                let transport_mid = bundle_tag.unwrap_or(&mid);
+                mline_rtcp_mux(answer, transport_mid, media_index)
+            });
             let first_offer_of_mline = sdp_type != SdpType::Answer && previous_rtcp_mux.is_none();
             let (rtcp_mux, rtcp_port) = match offered_rtcp_mux.or(previous_rtcp_mux) {
                 Some(mux) => (mux, !mux),
@@ -5800,28 +5729,7 @@ impl PeerConnectionInner {
             };
 
             // Check if remote side expects us to send (for B2BUA scenarios)
-            let remote_expects_media = if sdp_type == SdpType::Answer {
-                let remote_guard = self.remote_description.lock();
-                if let Some(remote) = remote_guard.as_ref() {
-                    // Find the matching remote section by mid
-                    remote
-                        .media_sections
-                        .iter()
-                        .find(|section| section.mid == mid)
-                        .map(|section| {
-                            // Remote expects media if their direction is sendrecv or sendonly
-                            matches!(
-                                section.direction,
-                                crate::sdp::Direction::SendRecv | crate::sdp::Direction::SendOnly
-                            )
-                        })
-                        .unwrap_or(false)
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
+            let remote_expects_media = offered_direction.is_some_and(|direction| direction.sends());
 
             // A transceiver the remote offer created and the application never
             // configured offers to send only once it has a sender. A direction
@@ -6015,7 +5923,14 @@ impl PeerConnectionInner {
                 }
             }
 
-            self.populate_media_capabilities(&mut section, transceiver.kind(), sdp_type, mline);
+            self.populate_media_capabilities(
+                media_index,
+                &mut section,
+                transceiver.kind(),
+                sdp_type,
+                mline,
+                bundle_tag,
+            );
             // Transport attributes, only on an m-line with a transport
             // (RFC 9429 §5.2.1). a=rtcp-mux-only only in a first offer
             // (RFC 8858 §4).
@@ -6115,7 +6030,13 @@ impl PeerConnectionInner {
                 );
             }
 
-            if keying == Keying::Sdes {
+            if keying == Keying::Sdes
+                && rtp_media
+                && mline.has_transport()
+                && (sdp_type != SdpType::Answer
+                    || !mline.bundled
+                    || offered_bundle_tag.as_deref() == Some(section.mid.as_str()))
+            {
                 // RFC 4568 §7.1.2: an answer echoes the selected offer
                 // crypto's suite and tag (and lifetime); we deliberately do
                 // NOT echo (or advertise) an MKI — see negotiate_sdes_mki.
@@ -6128,8 +6049,9 @@ impl PeerConnectionInner {
                     if let Some(c) = remote_desc.as_ref().and_then(|remote| {
                         remote
                             .media_sections
-                            .iter()
-                            .flat_map(|m| m.get_crypto_attributes())
+                            .get(media_index)?
+                            .get_crypto_attributes()
+                            .into_iter()
                             .find(|c| map_crypto_suite(&c.crypto_suite).is_ok())
                     }) {
                         suite = c.crypto_suite.clone();
@@ -6191,14 +6113,19 @@ impl PeerConnectionInner {
             }
         }
 
-        // BUNDLE (RFC 8843): an answer keeps the offered group, also with
-        // one m-line; strict agents such as Chrome reject an answer that
-        // removes an m-line from an established group. Rejected m-lines are
-        // not in it (RFC 9143 §7.3.2).
-        let mids: Vec<&str> = (desc.media_sections.iter().zip(&mlines))
-            .filter(|(_, mline)| mline.bundled)
-            .map(|(section, _)| section.mid.as_str())
-            .collect();
+        // BUNDLE group order selects the transport and is independent of
+        // SDP m-line order (RFC 9143 §7.3.1).
+        let mut mids: Vec<&str> = Vec::new();
+        if let Some(tag) = offered_bundle_tag.as_deref().or(previous_bundle_tag)
+            && desc.media_sections.iter().zip(&mlines).any(|(s, m)| m.bundled && s.mid == tag)
+        {
+            mids.push(tag);
+        }
+        for (section, mline) in desc.media_sections.iter().zip(&mlines) {
+            if mline.bundled && !mids.contains(&section.mid.as_str()) {
+                mids.push(section.mid.as_str());
+            }
+        }
         if !mids.is_empty() {
             let value = format!("BUNDLE {}", mids.join(" "));
             desc.session
@@ -6280,27 +6207,182 @@ impl PeerConnectionInner {
         }
     }
 
+    fn reconcile_media_slots(
+        &self,
+        desc: &mut SessionDescription,
+        same_side: Option<&SessionDescription>,
+        opposite_side: Option<&SessionDescription>,
+        allow_omitted_video: bool,
+    ) -> RtcResult<()> {
+        let is_offer = desc.sdp_type == SdpType::Offer;
+        let (established, other) = if is_offer {
+            // Either side can carry the latest slots from the last exchange.
+            if same_side.map_or(0, |d| d.media_sections.len())
+                >= opposite_side.map_or(0, |d| d.media_sections.len())
+            {
+                (same_side, opposite_side)
+            } else {
+                (opposite_side, same_side)
+            }
+        } else {
+            (opposite_side, None)
+        };
+        let Some(established) = established else {
+            return Ok(());
+        };
+
+        let expected = established.media_sections.len();
+        let actual = desc.media_sections.len();
+        let count_error = || {
+            RtcError::InvalidConfiguration(format!(
+                "SDP {:?} has {actual} media sections; expected {}{expected}",
+                desc.sdp_type,
+                if is_offer { "at least " } else { "" },
+            ))
+        };
+        let restore_video = allow_omitted_video && !is_offer && established.sdp_type == SdpType::Offer;
+        if (actual < expected && !restore_video) || (actual > expected && !is_offer) {
+            return Err(count_error());
+        }
+
+        let mut rejected_mids = Vec::new();
+        for (index, old) in established.media_sections.iter().enumerate() {
+            // A SIP answer can omit a rejected video line. Keep the original
+            // slot so a subsequent re-INVITE can reactivate it in place.
+            if restore_video && desc.media_sections.len() < expected && old.kind == MediaKind::Video
+                && desc.media_sections.get(index).is_none_or(|new| {
+                    new.kind != MediaKind::Video
+                        || (!new.mid.is_empty() && new.mid != old.mid
+                            && established.media_sections[index + 1..].iter().any(|later| {
+                                later.kind == MediaKind::Video && later.mid == new.mid
+                            }))
+                })
+            {
+                desc.media_sections.insert(index, MediaSection {
+                    port: 0,
+                    protocol: old.protocol.clone(),
+                    formats: old.formats.clone(),
+                    direction: Direction::Inactive,
+                    ..MediaSection::new(old.kind, old.mid.clone())
+                });
+                rejected_mids.push(old.mid.as_str());
+            }
+            let Some(new) = desc.media_sections.get(index) else {
+                return Err(count_error());
+            };
+            // RFC 3264 §8.2 / JSEP §5.2.2: an offer may recycle a rejected slot.
+            let recycled = is_offer
+                && !desc.is_media_rejected(new)
+                && (established.is_media_rejected(old)
+                    || other.is_some_and(|d| {
+                        d.media_sections
+                            .get(index)
+                            .is_some_and(|s| d.is_media_rejected(s))
+                    }));
+            if !recycled && old.kind != new.kind {
+                return Err(RtcError::InvalidConfiguration(format!(
+                    "Media kind changed at SDP slot {index}"
+                )));
+            }
+            // JSEP uses stable MIDs. Direct SIP peers may rename or omit them.
+            if !recycled && self.config.webrtc_extensions && old.mid != new.mid {
+                return Err(RtcError::InvalidConfiguration(format!(
+                    "MID changed at SDP slot {index}"
+                )));
+            }
+        }
+        if !rejected_mids.is_empty() {
+            desc.session.attributes.retain_mut(|attribute| {
+                let Some(value) = attribute.value.as_mut().filter(|_| attribute.key == "group") else {
+                    return true;
+                };
+                let mut tokens = value.split_whitespace();
+                if tokens.next() != Some("BUNDLE") {
+                    return true;
+                }
+                let mids: Vec<_> = tokens.filter(|mid| !rejected_mids.contains(mid)).collect();
+                if mids.is_empty() {
+                    return false;
+                }
+                *value = format!("BUNDLE {}", mids.join(" "));
+                true
+            });
+        }
+        Ok(())
+    }
+
     fn populate_media_capabilities(
         &self,
+        media_index: usize,
         section: &mut MediaSection,
         kind: MediaKind,
         sdp_type: SdpType,
         mline: Mline,
+        previous_bundle_tag: Option<&str>,
     ) {
         section.apply_config(&self.config);
-        if let Some(caps) = self.answer_audio_capabilities(&section.mid, kind, sdp_type) {
-            Self::apply_audio_capabilities(section, &caps);
+        let remote = self.remote_description.lock();
+        let remote_section = remote.as_ref().and_then(|sdp| sdp.media_sections.get(media_index));
+        if sdp_type == SdpType::Answer && let Some(offered) = remote_section {
+            match kind {
+                MediaKind::Audio => {
+                    let caps = Self::derive_answer_audio_capabilities(
+                        offered, &Self::configured_audio_capabilities(&self.config),
+                    );
+                    if !caps.is_empty() {
+                        Self::apply_audio_capabilities(section, &caps);
+                    }
+                }
+                MediaKind::Video => {
+                    strip_rtx_from_section(section);
+                    Self::merge_remote_rtx_into_answer(section, offered);
+                }
+                _ => {}
+            }
         }
 
-        // Answerer: strip any local-config RTX (apply_config may inject it), then
-        // echo only RTX from the remote offer when apt= maps to an answered primary PT.
-        if sdp_type == SdpType::Answer && kind == MediaKind::Video {
-            strip_rtx_from_section(section);
-            self.merge_remote_rtx_into_answer(section);
+        let bundle_tag_section = mline
+            .bundled
+            .then(|| {
+                let tag = previous_bundle_tag?;
+                remote.as_ref()?.media_sections.iter().find(|s| s.mid == tag)
+            })
+            .flatten();
+        let mut used_extmap_ids: alloc::collections::BTreeSet<u8> = remote_section
+            .map(PeerConnection::extract_extmap)
+            .unwrap_or_default()
+            .into_keys()
+            .collect();
+        if mline.bundled
+            && let Some(remote_desc) = remote.as_ref()
+        {
+            // RFC 8843 §9.2: bundled m-lines share one extmap ID namespace.
+            // A newly added bundled m-line (where `remote_section` is None)
+            // must not claim an ID already mapped to another URI on an
+            // existing bundled m-line.
+            for existing in &remote_desc.media_sections {
+                used_extmap_ids.extend(PeerConnection::extract_extmap(existing).into_keys());
+            }
         }
-
-        // Browsers reject descriptions with duplicate extension ids.
-        let mut used_extmap_ids = self.get_remote_extmap_ids(&section.mid);
+        let bundled_extmap_id = |uri: &str| {
+            Self::remote_extmap_id(remote_section, uri).or_else(|| {
+                let id = Self::remote_extmap_id(bundle_tag_section, uri)?;
+                // The ID is shared across BUNDLE; its direction is per m-line.
+                id.split('/').next().map(str::to_string)
+            })
+        };
+        let sdes_mid_id = if mline.bundled {
+            bundled_extmap_id(crate::sdp::SDES_MID_URI)
+        } else {
+            None
+        };
+        if let Some(id) = sdes_mid_id
+            .as_deref()
+            .and_then(|id| id.split('/').next())
+            .and_then(|id| id.parse::<u8>().ok())
+        {
+            used_extmap_ids.insert(id);
+        }
 
         // Offers claim ids for WebRTC header extensions (rid, abs-send-time)
         // only with `webrtc_extensions`: SIP peers do not use them. Answers
@@ -6308,7 +6390,9 @@ impl PeerConnectionInner {
 
         // Add extmap for Video
         if kind == MediaKind::Video {
-            let (mut rid_id, mut repaired_rid_id) = self.get_remote_video_extmap_ids(&section.mid);
+            let mut rid_id = bundled_extmap_id("urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id");
+            let mut repaired_rid_id =
+                bundled_extmap_id("urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id");
 
             if sdp_type == SdpType::Offer && self.config.webrtc_extensions {
                 // If not found in remote (new transceiver), use defaults
@@ -6324,8 +6408,7 @@ impl PeerConnectionInner {
         }
 
         // Add abs-send-time extmap
-        let mut abs_send_time_id =
-            self.get_remote_extmap_id(&section.mid, crate::sdp::ABS_SEND_TIME_URI);
+        let mut abs_send_time_id = bundled_extmap_id(crate::sdp::ABS_SEND_TIME_URI);
         if sdp_type == SdpType::Offer
             && abs_send_time_id.is_none()
             && self.config.webrtc_extensions
@@ -6342,8 +6425,7 @@ impl PeerConnectionInner {
         // Add transport-cc extmap (TWCC sequence numbers + feedback) when the
         // GCC loop is enabled. Answers echo the remote id; offers claim one.
         if self.config.enable_gcc && self.config.webrtc_extensions {
-            let mut transport_cc_id =
-                self.get_remote_extmap_id(&section.mid, crate::sdp::TRANSPORT_CC_URI);
+            let mut transport_cc_id = bundled_extmap_id(crate::sdp::TRANSPORT_CC_URI);
             if sdp_type == SdpType::Offer && transport_cc_id.is_none() {
                 transport_cc_id = Some(Self::claim_free_extmap_id(&mut used_extmap_ids, 5));
             }
@@ -6360,9 +6442,12 @@ impl PeerConnectionInner {
         // proposes BUNDLE claims an id; an answer echoes the remote id when
         // it accepts BUNDLE.
         if mline.bundled {
-            let mut sdes_mid_id = self.get_remote_extmap_id(&section.mid, crate::sdp::SDES_MID_URI);
+            let mut sdes_mid_id = sdes_mid_id;
             if sdp_type == SdpType::Offer && sdes_mid_id.is_none() {
-                sdes_mid_id = Some(Self::claim_free_extmap_id(&mut used_extmap_ids, 4));
+                // Linphone keeps the initial direct RTP bundle's MID ID
+                // when it later offers to add video, using ID 1 in that SDP.
+                let preferred_id = if self.config.connectivity.is_direct() { 1 } else { 4 };
+                sdes_mid_id = Some(Self::claim_free_extmap_id(&mut used_extmap_ids, preferred_id));
             }
             if let Some(id) = sdes_mid_id {
                 section.attributes.push(crate::sdp::Attribute::new(
@@ -6412,47 +6497,6 @@ impl PeerConnectionInner {
                 }
             })
             .unwrap_or_else(|| vec![default_caps])
-    }
-
-    fn answer_audio_capabilities(
-        &self,
-        mid: &str,
-        kind: MediaKind,
-        sdp_type: SdpType,
-    ) -> Option<Vec<AudioCapability>> {
-        if kind != MediaKind::Audio || sdp_type != SdpType::Answer {
-            return None;
-        }
-
-        let remote = self.remote_description.lock();
-        let remote_desc = remote.as_ref()?;
-        let remote_section = if mid.is_empty() {
-            remote_desc
-                .media_sections
-                .iter()
-                .find(|section| section.kind == kind)
-        } else {
-            remote_desc
-                .media_sections
-                .iter()
-                .find(|section| section.kind == kind && section.mid == mid)
-                // Peers that omit a=mid on re-INVITEs (plain SIP SDP) leave
-                // this section without a matching mid even though the local
-                // transceiver carries one. Fall back to a kind match — the
-                // single-audio-stream case is unambiguous — so the answer
-                // still follows the NEW offer instead of re-advertising the
-                // original negotiation.
-                .or_else(|| {
-                    remote_desc
-                        .media_sections
-                        .iter()
-                        .find(|section| section.kind == kind)
-                })
-        }?;
-
-        let local_caps = Self::configured_audio_capabilities(&self.config);
-        let caps = Self::derive_answer_audio_capabilities(remote_section, &local_caps);
-        if caps.is_empty() { None } else { Some(caps) }
     }
 
     fn derive_answer_audio_capabilities(
@@ -6523,24 +6567,7 @@ impl PeerConnectionInner {
 
     /// Echo remote-offered RTX payload types into a local answer when the
     /// associated primary PT is present in the answer media section.
-    fn merge_remote_rtx_into_answer(&self, section: &mut MediaSection) {
-        let remote = self.remote_description.lock();
-        let Some(desc) = remote.as_ref() else {
-            return;
-        };
-        let Some(remote_section) = desc
-            .media_sections
-            .iter()
-            .find(|s| s.mid == section.mid)
-            .or_else(|| {
-                desc.media_sections
-                    .iter()
-                    .find(|s| s.kind == MediaKind::Video)
-            })
-        else {
-            return;
-        };
-
+    fn merge_remote_rtx_into_answer(section: &mut MediaSection, remote_section: &MediaSection) {
         let apt_map = crate::rtx::extract_rtx_apt_map_from_attrs(&remote_section.attributes);
         if apt_map.is_empty() {
             return;
@@ -6572,53 +6599,15 @@ impl PeerConnectionInner {
         }
     }
 
-    fn get_remote_video_extmap_ids(&self, mid: &str) -> (Option<String>, Option<String>) {
-        let rid_id =
-            self.get_remote_extmap_id(mid, "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id");
-        let repaired_rid_id = self.get_remote_extmap_id(
-            mid,
-            "urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id",
-        );
-        (rid_id, repaired_rid_id)
-    }
-
-    fn get_remote_extmap_id(&self, mid: &str, uri: &str) -> Option<String> {
-        let remote = self.remote_description.lock();
-        if let Some(desc) = &*remote {
-            let remote_section = desc.media_sections.iter().find(|s| s.mid == mid)?;
-            for attr in &remote_section.attributes {
-                if attr.key != "extmap" {
-                    continue;
-                }
-                let val = attr.value.as_ref()?;
-                if val.contains(uri)
-                    && let Some(id_str) = val.split_whitespace().next()
-                {
-                    return Some(id_str.to_string());
-                }
+    fn remote_extmap_id(section: Option<&MediaSection>, uri: &str) -> Option<String> {
+        section?.attributes.iter().find_map(|attr| {
+            if attr.key != "extmap" {
+                return None;
             }
-        }
-        None
-    }
-
-    /// All extension ids the remote has mapped on the given m-line.
-    fn get_remote_extmap_ids(&self, mid: &str) -> alloc::collections::BTreeSet<u8> {
-        let mut ids = alloc::collections::BTreeSet::new();
-        let remote = self.remote_description.lock();
-        if let Some(desc) = &*remote
-            && let Some(remote_section) = desc.media_sections.iter().find(|s| s.mid == mid)
-        {
-            for attr in &remote_section.attributes {
-                if attr.key == "extmap"
-                    && let Some(val) = &attr.value
-                    && let Some(id_str) = val.split_whitespace().next()
-                    && let Ok(id) = id_str.parse::<u8>()
-                {
-                    ids.insert(id);
-                }
-            }
-        }
-        ids
+            let mut fields = attr.value.as_deref()?.split_whitespace();
+            let id = fields.next()?;
+            (fields.next()? == uri).then(|| id.to_string())
+        })
     }
 
     /// Pick `preferred` if free, otherwise the lowest free one-byte
@@ -6866,6 +6855,26 @@ fn bundle_group(desc: &SessionDescription) -> Vec<&str> {
         .unwrap_or_default()
 }
 
+fn bundle_tag_index(desc: &SessionDescription, group: &[&str]) -> Option<usize> {
+    let find_section = |mid: &&str| {
+        desc.media_sections.iter().position(|section| {
+            section.mid == *mid && section.port != 0 && section.kind != MediaKind::Image
+        })
+    };
+    if desc.sdp_type == SdpType::Offer {
+        group.iter().find_map(find_section)
+    } else {
+        group.first().and_then(find_section)
+    }
+}
+
+fn sdes_primary_index(local: &SessionDescription, remote: &SessionDescription) -> usize {
+    // The answer selects the BUNDLE transport. Without BUNDLE, keep the
+    // first m-line's existing primary transport assignment.
+    let answer = if local.sdp_type == SdpType::Offer { remote } else { local };
+    bundle_tag_index(answer, &bundle_group(answer)).unwrap_or(0)
+}
+
 fn has_rtcp_mux(section: &MediaSection) -> bool {
     section.attributes.iter().any(|a| a.key == "rtcp-mux")
 }
@@ -6876,7 +6885,7 @@ fn mline_rtcp_mux(desc: &SessionDescription, mid: &str, index: usize) -> Option<
     let group = bundle_group(desc);
     // A peer without a=mid has none: then the m-line at the same index.
     let section = if !mid.is_empty() && group.contains(&mid) {
-        desc.media_sections.iter().find(|s| s.mid == group[0])
+        bundle_tag_index(desc, &group).map(|index| &desc.media_sections[index])
     } else {
         (desc.media_sections.iter())
             .find(|s| !mid.is_empty() && s.mid == mid)
@@ -7097,6 +7106,8 @@ pub struct RtpTransceiver {
     /// offer, not by the application; cleared by [`Self::set_direction`].
     implicit_direction: AtomicBool,
     mid: Mutex<Option<String>>,
+    /// SDP `m=`-line slot index assigned during offer/answer association.
+    mline_index: Mutex<Option<usize>>,
     sender: Mutex<Option<Arc<RtpSender>>>,
     receiver: Mutex<Option<Arc<RtpReceiver>>>,
     rtp_transport: Mutex<Option<Weak<RtpTransport>>>,
@@ -7126,6 +7137,7 @@ impl RtpTransceiver {
             desired_direction: Mutex::new(direction),
             implicit_direction: AtomicBool::new(false),
             mid: Mutex::new(None),
+            mline_index: Mutex::new(None),
             sender: Mutex::new(None),
             receiver: Mutex::new(None),
             rtp_transport: Mutex::new(None),
@@ -7212,6 +7224,14 @@ impl RtpTransceiver {
 
     pub fn mid(&self) -> Option<String> {
         self.mid.lock().clone()
+    }
+
+    pub fn mline_index(&self) -> Option<usize> {
+        *self.mline_index.lock()
+    }
+
+    fn set_mline_index(&self, mline_index: Option<usize>) {
+        *self.mline_index.lock() = mline_index;
     }
 
     fn set_mid(&self, mid: String) {
@@ -14008,7 +14028,8 @@ a=mid:0
 
             assert!(sdp.contains("a=group:BUNDLE 0 1"), "{policy:?}:\n{sdp}");
             assert!(sdp.contains("a=mid:0") && sdp.contains("a=mid:1"), "{sdp}");
-            assert_eq!(sdp.matches(crate::sdp::SDES_MID_URI).count(), 2, "{sdp}");
+            let sip_mid = format!("a=extmap:1 {}", crate::sdp::SDES_MID_URI);
+            assert_eq!(sdp.matches(&sip_mid).count(), 2, "{sdp}");
             assert!(!sdp.contains("a=bundle-only"), "{policy:?}:\n{sdp}");
             let (audio, video) = (offer.media_sections[0].port, offer.media_sections[1].port);
             assert!(audio != 0 && video != 0 && audio != video, "{sdp}");
@@ -14032,6 +14053,160 @@ a=mid:0
             assert_ne!(rtcp_ports[0], rtcp_ports[1], "{sdp}");
             pc.close();
         }
+    }
+
+    #[tokio::test]
+    async fn direct_bundle_reoffer_appends_new_mline_after_named_mids() {
+        use crate::{BundlePolicy, RtcpMuxPolicy};
+
+        let config = direct_av_config(BundlePolicy::MaxCompat, RtcpMuxPolicy::Negotiate);
+        let offerer = PeerConnection::new(config.clone());
+        let answerer = PeerConnection::new(config);
+        offerer.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv).set_mid("vs".into());
+        offerer.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv).set_mid("as".into());
+        answerer.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        answerer.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
+
+        let offer = offerer.create_offer().await.unwrap();
+        assert_eq!(bundle_group(&offer), ["vs", "as"]);
+        offerer.set_local_description(offer.clone()).unwrap();
+        answerer.set_remote_description(offer).await.unwrap();
+        let answer = answerer.create_answer().await.unwrap();
+        answerer.set_local_description(answer.clone()).unwrap();
+        offerer.set_remote_description(answer).await.unwrap();
+
+        answerer.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv).set_mid("z".into());
+        answerer.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv).set_mid("a".into());
+        let reoffer = answerer.create_offer().await.unwrap();
+        let mids: Vec<_> = reoffer.media_sections.iter().map(|section| section.mid.as_str()).collect();
+        assert_eq!(mids, ["vs", "as", "z", "a"]);
+        assert_eq!(bundle_group(&reoffer), mids);
+
+        offerer.close();
+        answerer.close();
+    }
+
+    #[tokio::test]
+    async fn direct_bundle_reoffer_reactivates_rejected_video_in_place() {
+        use crate::{BundlePolicy, RtcpMuxPolicy};
+
+        let pc = PeerConnection::new(direct_av_config(
+            BundlePolicy::MaxCompat,
+            RtcpMuxPolicy::Negotiate,
+        ));
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        let video = pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
+        let mid_ext = format!("7 {}", crate::sdp::SDES_MID_URI);
+        let mut offer = pc.create_offer().await.unwrap();
+        for section in &mut offer.media_sections {
+            let mid = section
+                .attributes
+                .iter_mut()
+                .find(|attr| {
+                    attr.key == "extmap"
+                        && attr.value.as_deref().is_some_and(|value| {
+                            value.ends_with(crate::sdp::SDES_MID_URI)
+                        })
+                })
+                .unwrap();
+            mid.value = Some(mid_ext.clone());
+        }
+        pc.set_local_description(offer).unwrap();
+        let answer = format!(
+            "v=0\r\n\
+            o=- 1 1 IN IP4 127.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 127.0.0.1\r\n\
+            a=group:BUNDLE 0\r\n\
+            m=audio 5000 RTP/AVP 8\r\n\
+            a=mid:0\r\n\
+            a=rtpmap:8 PCMA/8000\r\n\
+            a=rtcp-mux\r\n\
+            a=extmap:{mid_ext}\r\n\
+            m=video 0 RTP/AVP 0\r\n\
+            a=mid:1\r\n\
+            a=inactive\r\n"
+        );
+        let answer = SessionDescription::parse(SdpType::Answer, &answer).unwrap();
+        pc.set_remote_description(answer).await.unwrap();
+
+        video.set_direction(TransceiverDirection::Inactive);
+        let audio_only = pc.create_offer().await.unwrap();
+        assert_eq!(bundle_group(&audio_only), ["0"]);
+        assert_eq!(audio_only.media_sections[1].mid, "1");
+        assert!(audio_only.is_media_rejected(&audio_only.media_sections[1]));
+
+        video.set_direction(TransceiverDirection::SendRecv);
+        let reoffer = pc.create_offer().await.unwrap();
+        assert_eq!(bundle_group(&reoffer), ["0", "1"]);
+        let [audio, video] = reoffer.media_sections.as_slice() else {
+            panic!("expected existing audio and video m-lines");
+        };
+        assert_eq!((audio.mid.as_str(), video.mid.as_str()), ("0", "1"));
+        assert_ne!(audio.port, 0);
+        assert_eq!(video.port, audio.port);
+        assert_eq!(video.direction, crate::sdp::Direction::SendRecv);
+        for section in [audio, video] {
+            assert!(has_rtcp_mux(section));
+            assert!(section.attributes.iter().all(|attr| attr.key != "rtcp"));
+            assert!(section.attributes.iter().any(|attr| {
+                attr.key == "extmap" && attr.value.as_deref() == Some(mid_ext.as_str())
+            }));
+        }
+        pc.close();
+    }
+
+    #[tokio::test]
+    async fn direct_bundle_reoffer_keeps_tag_and_unbundled_media() {
+        use crate::{BundlePolicy, RtcpMuxPolicy};
+
+        let pc = PeerConnection::new(direct_av_config(
+            BundlePolicy::MaxCompat,
+            RtcpMuxPolicy::Negotiate,
+        ));
+        let offer = "v=0\r\n\
+            o=- 1 1 IN IP4 127.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 127.0.0.1\r\n\
+            a=group:BUNDLE as\r\n\
+            m=video 5002 RTP/AVP 96\r\n\
+            a=mid:standalone\r\n\
+            a=rtpmap:96 H264/90000\r\n\
+            m=video 0 RTP/AVP 0\r\n\
+            a=mid:vs\r\n\
+            a=inactive\r\n\
+            m=audio 5000 RTP/AVP 8\r\n\
+            a=mid:as\r\n\
+            a=rtpmap:8 PCMA/8000\r\n\
+            a=rtcp-mux\r\n";
+        let offer = SessionDescription::parse(SdpType::Offer, offer).unwrap();
+        pc.set_remote_description(offer).await.unwrap();
+        let answer = pc.create_answer().await.unwrap();
+        let standalone_port = answer.media_sections[0].port;
+        assert_ne!(standalone_port, 0);
+        pc.set_local_description(answer).unwrap();
+
+        for transceiver in pc.get_transceivers() {
+            match transceiver.mid().as_deref() {
+                Some("standalone") => transceiver.set_direction(TransceiverDirection::Inactive),
+                Some("vs") => transceiver.set_direction(TransceiverDirection::RecvOnly),
+                _ => {}
+            }
+        }
+        let reoffer = pc.create_offer().await.unwrap();
+        assert_eq!(bundle_group(&reoffer), ["as", "vs"]);
+        let [standalone, video, audio] = reoffer.media_sections.as_slice() else {
+            panic!("expected the three original m-lines");
+        };
+        assert_eq!(standalone.mid, "standalone");
+        assert_eq!(standalone.port, standalone_port);
+        assert_eq!(standalone.direction, crate::sdp::Direction::Inactive);
+        assert_eq!((video.mid.as_str(), audio.mid.as_str()), ("vs", "as"));
+        assert_eq!(video.port, audio.port);
+        assert_ne!(audio.port, standalone_port);
+        pc.close();
     }
 
     /// `MaxBundle`: only the first m-line has a port; the others are
@@ -14665,6 +14840,215 @@ a=sendrecv\r\n"
             "media leaves from our RTP socket"
         );
         assert_ne!(pair.remote.address, rtcp_addr);
+        pc.close();
+    }
+
+    #[tokio::test]
+    async fn direct_bundle_reoffer_registers_mid_for_new_video() {
+        use crate::rtp::RtpHeader;
+        use tokio::{net::UdpSocket, time::timeout};
+
+        let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote_port = remote.local_addr().unwrap().port();
+        let mut config = direct_av_config(BundlePolicy::MaxCompat, RtcpMuxPolicy::Negotiate);
+        config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
+        let mut opus = AudioCapability::opus();
+        opus.payload_type = 96;
+        config.media_capabilities.as_mut().unwrap().audio = vec![opus];
+        let pc = PeerConnection::new(config);
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        let mid_ext = format!("7 {}", crate::sdp::SDES_MID_URI);
+        let initial_offer = format!(
+            "v=0\r\n\
+            o=- 1 1 IN IP4 127.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 127.0.0.1\r\n\
+            a=group:BUNDLE 0\r\n\
+            m=audio {remote_port} RTP/AVP 96\r\n\
+            a=mid:0\r\n\
+            a=rtpmap:96 opus/48000/2\r\n\
+            a=rtcp-mux\r\n\
+            a=extmap:{mid_ext}\r\n"
+        );
+        let offer = SessionDescription::parse(SdpType::Offer, &initial_offer).unwrap();
+        pc.set_remote_description(offer).await.unwrap();
+        pc.set_local_description(pc.create_answer().await.unwrap()).unwrap();
+        pc.wait_for_rtp_transport_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(pc.get_transceivers().len(), 1);
+
+        let audio = pc.get_transceivers()[0].clone();
+        let reoffer = initial_offer
+            .replace("o=- 1 1", "o=- 1 2")
+            .replace("a=group:BUNDLE 0\r\n", "a=group:BUNDLE as vs\r\n")
+            .replace("a=mid:0\r\n", "a=mid:as\r\n")
+            + &format!(
+                "m=video 0 RTP/AVP 96\r\n\
+                a=mid:vs\r\n\
+                a=rtpmap:96 H264/90000\r\n\
+                a=fmtp:96 packetization-mode=1;profile-level-id=42e01f\r\n\
+                a=bundle-only\r\n\
+                a=rtcp-mux\r\n\
+                a=extmap:{mid_ext}\r\n"
+            );
+        let offer = SessionDescription::parse(SdpType::Offer, &reoffer).unwrap();
+        pc.set_remote_description(offer).await.unwrap();
+        assert_eq!(pc.get_transceivers().len(), 2);
+        assert_eq!(audio.mid().as_deref(), Some("as"));
+        let (_video_source, video_track, _) = sample_track(crate::media::frame::MediaKind::Video, 8);
+        let sender = pc
+            .add_track(
+                video_track,
+                RtpCodecParameters {
+                    payload_type: 96,
+                    name: "H264".into(),
+                    clock_rate: 90_000,
+                    channels: 0,
+                },
+            )
+            .unwrap();
+        let answer = pc.create_answer().await.unwrap();
+        assert_eq!(bundle_group(&answer), ["as", "vs"]);
+        assert_eq!(answer.media_sections[0].formats, ["96"]);
+        assert_eq!(answer.media_sections[1].formats, ["96"]);
+        pc.set_local_description(answer).unwrap();
+
+        let (mid_id, mid) = sender
+            .sdes_mid()
+            .expect("late sender must inherit the offered MID");
+        assert_eq!((mid_id, mid.as_ref()), (7, "vs"));
+        let transport = sender.transport().unwrap();
+        transport.bridge_rewrite_rules_with_timelines(
+            transport.clone(),
+            None,
+            [96].into_iter().collect(),
+            RtpRewriteBridgeOptions { strip_extensions: true },
+            vec![
+                RtpRewriteRule::catch_all(RtpRewriteBridgeParams {
+                    out_ssrc: 1111,
+                    ..Default::default()
+                }),
+                RtpRewriteRule {
+                    match_payload_type: Some(96),
+                    out_payload_type: Some(97),
+                    out_ssrc: sender.ssrc(),
+                    sdes_mid_extension_id: Some(mid_id),
+                    sdes_mid: Some(mid.to_string()),
+                },
+            ],
+            Vec::new(),
+        );
+        let mut header = RtpHeader::new(96, 1, 9000, 4321);
+        header.set_extension(7, b"vs").unwrap();
+        let packet = RtpPacket::new(header, vec![0x65, 1, 2]);
+        remote
+            .send_to(&packet.marshal().unwrap(), transport.local_addr())
+            .await
+            .unwrap();
+        let mut buffer = [0; 1500];
+        let len = timeout(Duration::from_secs(2), remote.recv(&mut buffer))
+            .await
+            .expect("MID must route video even when audio uses the same PT")
+            .unwrap();
+        let forwarded = RtpPacket::parse(&buffer[..len]).unwrap();
+        assert_eq!(forwarded.header.ssrc, sender.ssrc());
+        assert_eq!(forwarded.header.payload_type, 97);
+        assert_eq!(forwarded.header.get_extension(7).unwrap().as_ref(), b"vs");
+        assert_eq!(forwarded.payload, packet.payload);
+        pc.close();
+    }
+
+    #[tokio::test]
+    async fn sip_offer_and_answer_keep_two_audio_slots_when_mids_change() {
+        let pc = PeerConnection::new(RtcConfiguration::sip());
+        let first = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        let second = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        let offer = pc.create_offer().await.unwrap();
+        pc.set_local_description(offer).unwrap();
+
+        // The peer uses the other slot's old MID; direction belongs to its m-line.
+        let sdp = "v=0\r\n\
+            o=- 1 1 IN IP4 127.0.0.1\r\n\
+            s=-\r\nt=0 0\r\nc=IN IP4 127.0.0.1\r\n\
+            m=audio 5000 RTP/AVP 8\r\na=mid:1\r\na=rtpmap:8 PCMA/8000\r\na=recvonly\r\n\
+            m=audio 5002 RTP/AVP 8\r\na=mid:0\r\na=rtpmap:8 PCMA/8000\r\na=sendonly\r\n";
+        pc.set_remote_description(SessionDescription::parse(SdpType::Answer, sdp).unwrap())
+            .await.unwrap();
+        assert!(first.send_permitted());
+        assert!(!second.send_permitted());
+
+        assert_eq!(first.mid().as_deref(), Some("1"));
+        assert_eq!(second.mid().as_deref(), Some("0"));
+        let reoffer = sdp.replace("a=mid:1", "a=mid:left").replace("a=mid:0", "a=mid:right");
+        pc.set_remote_description(SessionDescription::parse(SdpType::Offer, &reoffer).unwrap())
+            .await.unwrap();
+        assert_eq!(first.mid().as_deref(), Some("left"));
+        assert_eq!(second.mid().as_deref(), Some("right"));
+        let answer = pc.create_answer().await.unwrap();
+        assert_eq!(answer.media_sections[0].direction, Direction::SendOnly);
+        assert_eq!(answer.media_sections[1].direction, Direction::RecvOnly);
+        pc.close();
+    }
+
+    #[tokio::test]
+    async fn sip_bundle_reinvite_keeps_transceivers_when_peer_renames_mids() {
+        use crate::{BundlePolicy, RtcpMuxPolicy};
+
+        let pc = PeerConnection::new(direct_av_config(
+            BundlePolicy::MaxCompat,
+            RtcpMuxPolicy::Negotiate,
+        ));
+        let audio = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        let video = pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
+        let local_offer = pc.create_offer().await.unwrap();
+        assert_eq!(audio.mid().as_deref(), Some("0"));
+        assert_eq!(video.mid().as_deref(), Some("1"));
+        pc.set_local_description(local_offer).unwrap();
+
+        let answer = "v=0\r\n\
+            o=- 1 1 IN IP4 127.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 127.0.0.1\r\n\
+            a=group:BUNDLE 0\r\n\
+            m=audio 5000 RTP/AVP 8\r\n\
+            a=mid:0\r\n\
+            a=rtpmap:8 PCMA/8000\r\n\
+            a=rtcp-mux\r\n\
+            m=video 0 RTP/AVP 0\r\n\
+            a=inactive\r\n";
+        pc.set_remote_description(SessionDescription::parse(SdpType::Answer, answer).unwrap())
+            .await
+            .unwrap();
+
+        let reinvite = "v=0\r\n\
+            o=- 1 2 IN IP4 127.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 127.0.0.1\r\n\
+            a=group:BUNDLE as vs\r\n\
+            m=audio 5000 RTP/AVP 8\r\n\
+            a=mid:as\r\n\
+            a=rtpmap:8 PCMA/8000\r\n\
+            a=rtcp-mux\r\n\
+            m=video 0 RTP/AVP 102\r\n\
+            a=mid:vs\r\n\
+            a=rtpmap:102 H264/90000\r\n\
+            a=rtcp-mux\r\n\
+            a=bundle-only\r\n";
+        pc.set_remote_description(SessionDescription::parse(SdpType::Offer, reinvite).unwrap())
+            .await
+            .unwrap();
+        let local_answer = pc.create_answer().await.unwrap();
+        let transceivers = pc.get_transceivers();
+
+        assert_eq!(transceivers.len(), 2);
+        assert_eq!(audio.mid().as_deref(), Some("as"));
+        assert_eq!(video.mid().as_deref(), Some("vs"));
+        assert!(!local_answer.is_media_rejected(&local_answer.media_sections[1]));
+        assert_eq!(local_answer.media_sections[1].direction, Direction::SendRecv);
         pc.close();
     }
 
@@ -16187,6 +16571,128 @@ a=mid:0
         };
         assert!(extmap_value(crate::sdp::SDES_MID_URI).starts_with("3 "));
         assert!(!extmap_value(crate::sdp::ABS_SEND_TIME_URI).starts_with("3 "));
+    }
+
+    #[tokio::test]
+    async fn added_bundled_video_reoffer_keeps_consistent_extmap_ids() {
+        let mut config = RtcConfiguration::webrtc();
+        config.enable_gcc = true;
+        config.webrtc_extensions = true;
+        let pc = PeerConnection::new(config);
+        // Simulate Chrome's initial audio-only WebRTC offer where extmap IDs
+        // 1..=4 are already assigned to audio-level, abs-send-time,
+        // transport-cc, and sdes:mid.
+        let sdp_str = "v=0\r\n\
+                       o=- 1 1 IN IP4 127.0.0.1\r\n\
+                       s=-\r\n\
+                       t=0 0\r\n\
+                       a=group:BUNDLE 0\r\n\
+                       m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+                       c=IN IP4 0.0.0.0\r\n\
+                       a=mid:0\r\n\
+                       a=rtpmap:111 opus/48000/2\r\n\
+                       a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level\r\n\
+                       a=extmap:2 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time\r\n\
+                       a=extmap:3 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01\r\n\
+                       a=extmap:4 urn:ietf:params:rtp-hdrext:sdes:mid\r\n\
+                       a=rtcp-mux\r\n\
+                       a=setup:actpass\r\n\
+                       a=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n\
+                       a=ice-ufrag:abcd\r\n\
+                       a=ice-pwd:abcdefghijklmnopqrstuvwx\r\n\
+                       a=sendrecv\r\n";
+        let offer = SessionDescription::parse(SdpType::Offer, sdp_str).unwrap();
+        pc.set_remote_description(offer).await.unwrap();
+        let answer = pc.create_answer().await.unwrap();
+        pc.set_local_description(answer).unwrap();
+
+        pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
+        let reoffer = pc.create_offer().await.unwrap();
+        assert_eq!(bundle_group(&reoffer), ["0", "1"]);
+
+        // RFC 8843 §9.2: across all bundled m-lines, each extmap ID must map
+        // to at most one URI and each shared URI must keep its existing ID.
+        let mut id_to_uri: BTreeMap<u8, String> = BTreeMap::new();
+        for section in &reoffer.media_sections {
+            for (id, uri) in PeerConnection::extract_extmap(section) {
+                if let Some(existing) = id_to_uri.get(&id) {
+                    assert_eq!(
+                        existing, &uri,
+                        "conflicting extmap id {id} across bundled m-lines: {existing} vs {uri}"
+                    );
+                } else {
+                    id_to_uri.insert(id, uri);
+                }
+            }
+        }
+        let video_extmap = PeerConnection::extract_extmap(&reoffer.media_sections[1]);
+        assert_eq!(
+            video_extmap.get(&2).map(String::as_str),
+            Some(crate::sdp::ABS_SEND_TIME_URI)
+        );
+        assert_eq!(
+            video_extmap.get(&3).map(String::as_str),
+            Some(crate::sdp::TRANSPORT_CC_URI)
+        );
+        assert_eq!(
+            video_extmap.get(&4).map(String::as_str),
+            Some(crate::sdp::SDES_MID_URI)
+        );
+        pc.close();
+    }
+
+    #[tokio::test]
+    async fn bundle_policy_disabled_omits_bundle_on_direct_offer_but_accepts_remote_bundle() {
+        use crate::{BundlePolicy, RtcpMuxPolicy};
+
+        let pc = PeerConnection::new(direct_av_config(
+            BundlePolicy::Disabled,
+            RtcpMuxPolicy::Negotiate,
+        ));
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
+        let offer = pc.create_offer().await.unwrap();
+        assert!(bundle_group(&offer).is_empty(), "offer must not propose BUNDLE");
+        let [audio, video] = offer.media_sections.as_slice() else {
+            panic!("expected audio and video m-lines");
+        };
+        assert_ne!(audio.port, 0);
+        assert_ne!(video.port, 0);
+        assert_ne!(audio.port, video.port, "audio and video must have separate ports");
+        let sdp = offer.to_sdp_string();
+        assert!(!sdp.contains("a=group:BUNDLE"));
+        assert!(!sdp.contains("a=mid:"));
+        assert!(!sdp.contains(crate::sdp::SDES_MID_URI));
+        pc.close();
+
+        // Answering a remote BUNDLE offer must still accept BUNDLE.
+        let answerer = PeerConnection::new(direct_av_config(
+            BundlePolicy::Disabled,
+            RtcpMuxPolicy::Negotiate,
+        ));
+        let remote_offer = "v=0\r\n\
+            o=- 1 1 IN IP4 127.0.0.1\r\n\
+            s=-\r\n\
+            c=IN IP4 127.0.0.1\r\n\
+            t=0 0\r\n\
+            a=group:BUNDLE as vs\r\n\
+            m=audio 40000 RTP/AVP 111\r\n\
+            a=mid:as\r\n\
+            a=rtcp-mux\r\n\
+            a=rtpmap:111 opus/48000/2\r\n\
+            m=video 0 RTP/AVP 96\r\n\
+            a=mid:vs\r\n\
+            a=bundle-only\r\n\
+            a=rtcp-mux\r\n\
+            a=rtpmap:96 H264/90000\r\n";
+        answerer
+            .set_remote_description(SessionDescription::parse(SdpType::Offer, remote_offer).unwrap())
+            .await
+            .unwrap();
+        let answer = answerer.create_answer().await.unwrap();
+        assert_eq!(bundle_group(&answer), ["as", "vs"]);
+        assert_eq!(answer.media_sections[0].port, answer.media_sections[1].port);
+        answerer.close();
     }
 
     /// Regression: `close()` must release the per-call transceiver graph

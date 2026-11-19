@@ -123,6 +123,11 @@ pub enum BundlePolicy {
     /// A transport for the first m-line only. A peer without BUNDLE gets
     /// only the first m-line. RFC 9429 calls it "must-bundle".
     MaxBundle,
+    /// Do not propose BUNDLE in direct-transport offers: every m-line gets
+    /// its own transport with no `a=group:BUNDLE`, `a=mid`, or `sdes:mid`.
+    /// Answers still accept BUNDLE when the remote offer proposes it.
+    /// Full ICE ignores this and always bundles.
+    Disabled,
 }
 
 /// RTP/RTCP multiplexing on one port (RFC 5761, RFC 9429 §4.1.1). Offers
