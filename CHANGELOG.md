@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.6.6 — 2026-11-19
+
+H.265/HEVC payloads, faster SRTP, and a leaner SCTP send path.
+
+### Added
+
+- **H.265/HEVC RTP payload (RFC 7798)**: `H265Payloader`, `H265Packetizer` /
+  `H265Fragments` and `H265Depacketizer` handle Single NAL, AP (type 48) and
+  FU (type 49) with sequence/timestamp continuity checks;
+  `VideoCapability::h265()`, `h265_with_rtx(pt)` and
+  `h265_with_param_sets(vps, sps, pps)` (base64 `sprop-*` fmtp) advertise it
+  in SDP. No DONL (`sprop-max-don-diff=0`, the WebRTC default).
+
+### Changed
+
+- **SRTP AES-GCM now uses `ring` by default** (`srtp-ring`, part of the
+  default feature set): the 1200-byte protect path drops from ~628 ns to
+  ~306 ns per packet (1.8 → 3.7 GB/s). The wire format is unchanged (RFC 3711
+  vectors pass on both backends); `no_std` and
+  `--no-default-features --features std` keep the pure-Rust RustCrypto path.
+- **SCTP send path**: the DTLS hand-off is inline (the pump task/queue is
+  gone), and isolated small messages flush from the sender instead of waking
+  the run loop; large/batched sends keep the batched path.
+
+### Performance
+
+- Standalone libwebrtc (M150) vs rustrtc on the same host — data channels
+  (SCTP over DTLS): RTT p50 445–459 vs 326–376 µs; 64 KB throughput 59 vs
+  157–164 MB/s; 1 KB message rate 28.6k vs 140k msg/s; setup 126–131 vs
+  5–15 ms; PSS 13–18 vs 9–10 MB.
+- SRTP AES-GCM (protect/roundtrip, 1200 B, single core) against libsrtp (the
+  engine libwebrtc wraps): 3762/1645 vs 2724/1295 MB/s (1.38×/1.27×); 200 B
+  1.41×/1.47×; 64 B 2.06×/1.68×.
+- Known gap: AES-CM/HMAC-SHA1 at 1200 B is still ~0.68× of libsrtp on hosts
+  without SHA-NI (Coffee Lake); browsers/libwebrtc negotiate AES-GCM.
+
+No breaking API changes.
+
 ## 0.6.5 — 2026-11-19
 
 Idle `PeerConnection` teardown is deterministic.

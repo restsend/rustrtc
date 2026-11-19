@@ -1783,6 +1783,65 @@ a=fingerprint:sha-256 AA:BB:CC:EE\r\n";
         );
     }
 
+    #[test]
+    fn video_h265_constructor_emits_rtpmap_without_fmtp() {
+        use crate::config::{MediaCapabilities, VideoCapability};
+
+        let caps = MediaCapabilities {
+            audio: vec![],
+            video: vec![VideoCapability::h265()],
+            application: None,
+            image: vec![],
+        };
+
+        let mut section = MediaSection::new(MediaKind::Video, "0");
+        section.apply_config(&make_config(caps));
+
+        let rtpmap = section
+            .attributes
+            .iter()
+            .find(|a| a.key == "rtpmap")
+            .expect("H265 capability should produce a=rtpmap");
+        assert!(
+            rtpmap.value.as_deref().unwrap_or("").contains("H265/90000"),
+            "rtpmap must advertise H265/90000, got {:?}",
+            rtpmap.value
+        );
+        assert!(
+            section.attributes.iter().all(|a| a.key != "fmtp"),
+            "H265 default capability has no fmtp parameters"
+        );
+    }
+
+    #[test]
+    fn video_h265_param_sets_emit_sprop_fmtp() {
+        use crate::config::{MediaCapabilities, VideoCapability};
+
+        let caps = MediaCapabilities {
+            audio: vec![],
+            video: vec![VideoCapability::h265_with_param_sets(
+                &[0x40, 0x01],
+                &[0x42, 0x01],
+                &[0x44, 0x01],
+            )],
+            application: None,
+            image: vec![],
+        };
+
+        let mut section = MediaSection::new(MediaKind::Video, "0");
+        section.apply_config(&make_config(caps));
+
+        let fmtp = section
+            .attributes
+            .iter()
+            .find(|a| a.key == "fmtp")
+            .expect("param sets should produce a=fmtp");
+        let v = fmtp.value.as_deref().unwrap_or("");
+        assert!(v.contains("sprop-vps=QAE="), "vps base64, got {v}");
+        assert!(v.contains("sprop-sps=QgE="), "sps base64, got {v}");
+        assert!(v.contains("sprop-pps=RAE="), "pps base64, got {v}");
+    }
+
     // ── rtcp-fb passthrough ─────────────────────────────────────────────────
 
     #[test]

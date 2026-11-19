@@ -138,6 +138,12 @@ const RTO_BETA: f64 = 0.25;
 // SCTP Constants
 const SCTP_COMMON_HEADER_SIZE: usize = 12;
 const CHUNK_HEADER_SIZE: usize = 4;
+/// Messages up to this size are flushed inline by `send_data_raw` instead of
+/// waiting for the run-loop wake-up (control messages, echoes, pings).
+const INLINE_TRANSMIT_MAX: usize = 256;
+/// Only an isolated send (nothing else sent within this window) takes the
+/// inline path, so a pipelined burst keeps the batched run-loop transmit.
+const INLINE_TRANSMIT_IDLE: core::time::Duration = core::time::Duration::from_millis(1);
 const MAX_SCTP_PACKET_SIZE: usize = 1200;
 const DEFAULT_MAX_PAYLOAD_SIZE: usize = 1172; // 1200 - 12 (common) - 16 (data header)
 const DUP_THRESH: u8 = 3;
@@ -446,8 +452,13 @@ struct SctpInner {
     // common loopback case, where one SACK can ack an entire window).
     window_limited: AtomicBool,
 
-    // Outgoing Packet Queue to prevent deadlocks
-    outgoing_packet_tx: mpsc::UnboundedSender<Bytes>,
+    // Serializes transmit passes: the run loop and the inline fast path in
+    // `send_data_raw` must never interleave TSN assignment / packet sends.
+    transmit_lock: crate::platform::sync::AsyncMutex<()>,
+
+    // Last `send_data_raw` attempt, for the isolated-message fast path: a
+    // burst (sends closer together than INLINE_TRANSMIT_IDLE) keeps batching.
+    last_send_at: Mutex<Option<Instant>>,
 
     // Last SACK receive time (for RTO timeout error count handling)
     last_sack_time: Mutex<Option<Instant>>,
@@ -840,8 +851,6 @@ impl SctpTransport {
         Arc<Self>,
         impl core::future::Future<Output = ()> + Send + 'static,
     ) {
-        let (outgoing_packet_tx, mut outgoing_packet_rx) = mpsc::unbounded_channel::<Bytes>();
-
         let inner = Arc::new(SctpInner {
             dtls_transport: dtls_transport.clone(),
             state: Arc::new(Mutex::new(SctpState::New)),
@@ -898,6 +907,8 @@ impl SctpTransport {
             outbound_queue: Mutex::new(VecDeque::new()),
             queued_bytes: AtomicUsize::new(0),
             window_limited: AtomicBool::new(false),
+            transmit_lock: crate::platform::sync::AsyncMutex::new(()),
+            last_send_at: Mutex::new(None),
             last_sack_time: Mutex::new(None),
             t1_chunk: Mutex::new(None),
             t1_failures: AtomicU32::new(0),
@@ -924,7 +935,6 @@ impl SctpTransport {
             stats_heartbeats_sent: AtomicU64::new(0),
             stats_created_time: Instant::now(),
             close_reason: Mutex::new(None),
-            outgoing_packet_tx,
         });
 
         let close_tx = Arc::new(Notify::new());
@@ -936,30 +946,18 @@ impl SctpTransport {
         });
 
         let inner_clone = inner.clone();
-        let dtls_transport_clone = dtls_transport.clone();
         let runner = async move {
             let close_rx_2 = close_rx.clone();
             let run_loop_fut = inner_clone.run_loop(close_rx, incoming_data_rx);
-            let pump_fut = async {
-                while let Some(packet) = outgoing_packet_rx.recv().await {
-                    if let Err(e) = dtls_transport_clone.send(packet).await {
-                        trace!("SCTP Failed to send outgoing DTLS packet: {}", e);
-                        // DTLS not in Connected state: the session is gone,
-                        // stop pumping. Type-matched, not Display text.
-                        if matches!(e, RtcError::InvalidState(_)) {
-                            break;
-                        }
-                    }
-                }
-            };
             let close_fut = close_rx_2.notified();
             let mut arm0 = core::pin::pin!(run_loop_fut);
-            let mut arm1 = core::pin::pin!(pump_fut);
-            let mut arm2 = core::pin::pin!(close_fut);
-            match crate::platform::select::select3(&mut arm0, &mut arm1, &mut arm2).await {
-                crate::platform::select::Which3::A(_) => {}
-                crate::platform::select::Which3::B(_) => {}
-                crate::platform::select::Which3::C(_) => {}
+            let mut arm1 = core::pin::pin!(close_fut);
+            // SCTP packets are handed to DTLS inline (see
+            // `send_packet_with_tag`): a pump task would add one wake-up to
+            // every datagram on the latency-critical send path.
+            match crate::platform::select::select2(&mut arm0, &mut arm1).await {
+                crate::platform::select::Either::A(_) => {}
+                crate::platform::select::Either::B(_) => {}
             }
         };
 
@@ -3273,11 +3271,12 @@ impl SctpInner {
             .fetch_add(packet_size as u64, Ordering::Relaxed);
         self.stats_packets_sent.fetch_add(1, Ordering::Relaxed);
 
-        if self.outgoing_packet_tx.send(buf.freeze()).is_err() {
-            debug!("Failed to send SCTP packet to transport: channel closed");
-            *self.close_reason.lock() = Some("TRANSPORT_CLOSED".into());
-            self.set_state(SctpState::Closed);
-            return Err(RtcError::Internal("Transport channel closed".to_string()));
+        // Send inline: one less task wake-up per SCTP packet. UDP sends are
+        // non-blocking in practice. Transport failures are non-fatal to the
+        // association (the previous out-of-line pump logged them and stopped
+        // pumping), so they are logged and dropped here as well.
+        if let Err(e) = self.dtls_transport.send(buf.freeze()).await {
+            debug!("Failed to send SCTP packet to transport: {}", e);
         }
         Ok(())
     }
@@ -3392,44 +3391,72 @@ impl SctpInner {
 
         // Create a single Bytes from the input and use .slice() to avoid per-fragment copies
         let data_bytes = Bytes::copy_from_slice(data);
-        let mut offset = 0;
-        let mut queue = self.outbound_queue.lock();
+        {
+            let mut offset = 0;
+            let mut queue = self.outbound_queue.lock();
 
-        while offset < total_len {
-            let remaining = total_len - offset;
-            let chunk_payload_size = core::cmp::min(remaining, max_payload_size);
+            while offset < total_len {
+                let remaining = total_len - offset;
+                let chunk_payload_size = core::cmp::min(remaining, max_payload_size);
 
-            let mut flags = flags_base;
-            if offset == 0 {
-                flags |= 0x02; // B=1
+                let mut flags = flags_base;
+                if offset == 0 {
+                    flags |= 0x02; // B=1
+                }
+                if offset + chunk_payload_size >= total_len {
+                    flags |= 0x01; // E=1
+                }
+
+                let payload = data_bytes.slice(offset..offset + chunk_payload_size);
+                let chunk = OutboundChunk {
+                    stream_id: channel_id,
+                    ppid,
+                    payload,
+                    flags,
+                    ssn,
+                    max_retransmits,
+                    expiry,
+                };
+                queue.push_back(chunk);
+
+                offset += chunk_payload_size;
             }
-            if offset + chunk_payload_size >= total_len {
-                flags |= 0x01; // E=1
-            }
-
-            let payload = data_bytes.slice(offset..offset + chunk_payload_size);
-            let chunk = OutboundChunk {
-                stream_id: channel_id,
-                ppid,
-                payload,
-                flags,
-                ssn,
-                max_retransmits,
-                expiry,
-            };
-            queue.push_back(chunk);
-
-            offset += chunk_payload_size;
         }
 
-        // Trigger run_loop to transmit
-        drop(queue);
+        // Trigger the run loop, and for an isolated small message flush
+        // inline: the extra scheduler wake would otherwise sit on the latency
+        // path of every control message / echo. A pipelined burst (queue
+        // length > 1) keeps the batched run-loop path so message rate does
+        // not regress; bulk payloads never take the fast path.
         self.timer_notify.notify_one();
+        let now = Instant::now();
+        let idle = {
+            let mut last = self.last_send_at.lock();
+            let idle = last.is_none_or(|t| now.duration_since(t) >= INLINE_TRANSMIT_IDLE);
+            *last = Some(now);
+            idle
+        };
+        let isolated_small = total_len <= INLINE_TRANSMIT_MAX
+            && idle
+            && self.outbound_queue.lock().len() == 1;
+        if isolated_small
+            && let Err(e) = self.transmit().await
+        {
+            debug!("Inline transmit failed: {}", e);
+        }
 
         Ok(())
     }
 
+    /// Serializes transmit passes. `send_data_raw` takes the same lock on its
+    /// small-message fast path, so only one caller ever assigns TSNs or hands
+    /// packets to DTLS at a time.
     async fn transmit(&self) -> Result<()> {
+        let _guard = self.transmit_lock.lock().await;
+        self.transmit_inner().await
+    }
+
+    async fn transmit_inner(&self) -> Result<()> {
         let mut chunks_to_send = Vec::new();
 
         if self.sack_needed.swap(false, Ordering::Acquire) {

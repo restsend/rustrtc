@@ -1,6 +1,6 @@
 [package]
 name = "rustrtc"
-version = "0.6.5"
+version = "0.6.6"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 repository = "https://github.com/restsend/rustrtc"
@@ -35,6 +35,7 @@ sha2 = "0.11.0"
 md5 = { package = "md-5", version = "0.11.0" }
 p256 = { version = "0.13.2", optional = true, default-features = false, features = ["alloc", "ecdh", "ecdsa", "pkcs8"] }
 aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc"] }
+ring = { version = "0.17.14", optional = true }
 futures = { version = "0.3.32", default-features = false, features = ["alloc"] }
 crc32fast = { version = "1.5.0", default-features = false }
 base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
@@ -86,7 +87,9 @@ socket2 = "0.6"
 tower-http = { version = "0.6", features = ["fs"] }
 
 [features]
-default = ["std"]
+# `srtp-ring` (ring AES-GCM/HMAC asm) is the fast default; drop it with
+# `default-features = false, features = ["std"]` for the pure-Rust backend.
+default = ["std", "srtp-ring"]
 # Host std support; the no_std build (WP2) currently exposes the RTP/SRTP/RTX
 # data plane only — more modules graduate as their platform seams land.
 std = [
@@ -104,6 +107,10 @@ std = [
     "bytes/serde",
 ]
 simulator = []
+# AES-GCM through ring (OpenSSL-class asm). Part of the default feature set;
+# no_std (and `--no-default-features --features std`) keeps the RustCrypto
+# backend.
+srtp-ring = ["dep:ring"]
 t38 = []
 t38-interop = []
 # Self-implemented DTLS transport (transports/dtls). Crypto goes through the

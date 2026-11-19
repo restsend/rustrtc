@@ -15,8 +15,8 @@ pub mod track;
 pub mod twcc_feedback;
 
 pub use depacketizer::{
-    Depacketizer, H264Depacketizer, PassThroughDepacketizer, Vp9Depacketizer, Vp9Descriptor,
-    parse_vp9_descriptor,
+    Depacketizer, H264Depacketizer, H265Depacketizer, PassThroughDepacketizer, Vp9Depacketizer,
+    Vp9Descriptor, parse_vp9_descriptor,
 };
 pub use error::{MediaError, MediaResult};
 pub use frame::{AudioFrame, MediaKind, MediaSample, VideoFrame, VideoPixelFormat};
@@ -24,8 +24,8 @@ pub use frame::{AudioFrame, MediaKind, MediaSample, VideoFrame, VideoPixelFormat
 pub use jitter_buffer::{JitterBuffer, JitterBufferStats, Playout, PlayoutConfig};
 #[cfg(feature = "std")]
 pub use packetizer::{
-    H264Fragments, H264Packetizer, H264Payloader, Packetizer, Payloader, SimplePayloader,
-    Vp8Payloader, Vp9Payloader,
+    H264Fragments, H264Packetizer, H264Payloader, H265Fragments, H265Packetizer, H265Payloader,
+    Packetizer, Payloader, SimplePayloader, Vp8Payloader, Vp9Payloader,
 };
 #[cfg(feature = "std")]
 pub use pipeline::{

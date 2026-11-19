@@ -787,3 +787,338 @@ mod tests {
         );
     }
 }
+
+/// H.265 / HEVC Depacketizer (RFC 7798).
+///
+/// Handles Single NAL Unit, AP (type 48) and FU (type 49). DONL is not
+/// expected on the wire (`sprop-max-don-diff=0`, the WebRTC default); AP
+/// entries are therefore plain `2-byte length || NAL` records.
+pub struct H265Depacketizer {
+    fu_buffer: Vec<u8>,
+    last_seq: Option<u16>,
+    current_timestamp: u32,
+    drop_count: Arc<AtomicU64>,
+}
+
+impl Default for H265Depacketizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl H265Depacketizer {
+    pub fn new() -> Self {
+        Self {
+            fu_buffer: Vec::new(),
+            last_seq: None,
+            current_timestamp: 0,
+            drop_count: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Returns a shared reference to the atomic drop counter.
+    pub fn drop_counter(&self) -> Arc<AtomicU64> {
+        self.drop_count.clone()
+    }
+}
+
+impl Depacketizer for H265Depacketizer {
+    fn drop_count(&self) -> u64 {
+        self.drop_count.load(Ordering::Relaxed)
+    }
+
+    fn push(
+        &mut self,
+        packet: RtpPacket,
+        clock_rate: u32,
+        addr: SocketAddr,
+        kind: MediaKind,
+    ) -> MediaResult<Vec<MediaSample>> {
+        if kind == MediaKind::Audio {
+            return Ok(vec![MediaSample::from_rtp_packet(
+                packet, kind, clock_rate, addr,
+            )]);
+        }
+
+        let raw_packet = packet.clone();
+        let payload = packet.payload;
+        if payload.len() < 2 {
+            // Keep-alive / padding: pass through untouched.
+            return Ok(vec![MediaSample::from_rtp_packet(
+                raw_packet, kind, clock_rate, addr,
+            )]);
+        }
+
+        let hdr0 = payload[0];
+        let hdr1 = payload[1];
+        let nal_type = (hdr0 >> 1) & 0x3F;
+        let mut samples = Vec::new();
+
+        let create_video_sample = |data: Bytes, timestamp: u32, is_last: bool, pkt: &RtpPacket| {
+            MediaSample::Video(VideoFrame {
+                rtp_timestamp: timestamp,
+                width: 0,
+                height: 0,
+                format: VideoPixelFormat::Unspecified,
+                rotation_deg: 0,
+                is_last_packet: is_last,
+                data,
+                header_extension: pkt.header.extension.clone(),
+                csrcs: pkt.header.csrcs.clone(),
+                sequence_number: Some(pkt.header.sequence_number),
+                payload_type: Some(pkt.header.payload_type),
+                source_addr: Some(addr),
+                raw_packet: Some(pkt.clone()),
+            })
+        };
+
+        match nal_type {
+            // AP (Aggregation Packet, type 48): 2-byte PayloadHdr, then
+            // `2-byte length || NAL` records.
+            48 => {
+                let len = payload.len();
+                let marker = raw_packet.header.marker;
+                let mut offset = 2;
+                while offset + 2 <= len {
+                    let nal_len =
+                        u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+                    offset += 2;
+                    if offset + nal_len > len {
+                        tracing::warn!("H265 AP NAL length exceeds packet size");
+                        self.drop_count.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                    let nal_data = payload.slice(offset..offset + nal_len);
+                    offset += nal_len;
+                    let is_last = offset == len && marker;
+                    samples.push(create_video_sample(
+                        nal_data,
+                        raw_packet.header.timestamp,
+                        is_last,
+                        &raw_packet,
+                    ));
+                }
+            }
+            // FU (Fragmentation Unit, type 49): PayloadHdr(2) | FU header(1)
+            // | fragment.
+            49 => {
+                if payload.len() < 3 {
+                    return Ok(vec![]);
+                }
+                let fu = payload[2];
+                let s_bit = (fu & 0x80) != 0;
+                let e_bit = (fu & 0x40) != 0;
+                let original_nal_type = fu & 0x3F;
+
+                if s_bit {
+                    self.fu_buffer.clear();
+                    // Rebuild the NAL header: F + LayerId from the PayloadHdr,
+                    // Type from the FU header.
+                    self.fu_buffer
+                        .push((hdr0 & 0x81) | (original_nal_type << 1));
+                    self.fu_buffer.push(hdr1);
+                    self.fu_buffer.extend_from_slice(&payload[3..]);
+                    self.current_timestamp = raw_packet.header.timestamp;
+                    self.last_seq = Some(raw_packet.header.sequence_number);
+                } else {
+                    let Some(last_seq) = self.last_seq else {
+                        return Ok(vec![]); // missing start
+                    };
+                    if raw_packet.header.sequence_number != last_seq.wrapping_add(1) {
+                        tracing::warn!(
+                            "H265 FU sequence mismatch: expected {}, got {}",
+                            last_seq.wrapping_add(1),
+                            raw_packet.header.sequence_number
+                        );
+                        self.drop_count.fetch_add(1, Ordering::Relaxed);
+                        self.fu_buffer.clear();
+                        self.last_seq = None;
+                        return Ok(vec![]);
+                    }
+                    if raw_packet.header.timestamp != self.current_timestamp {
+                        tracing::warn!("H265 FU timestamp mismatch inside frame");
+                        self.drop_count.fetch_add(1, Ordering::Relaxed);
+                        self.fu_buffer.clear();
+                        self.last_seq = None;
+                        return Ok(vec![]);
+                    }
+                    self.fu_buffer.extend_from_slice(&payload[3..]);
+                    self.last_seq = Some(raw_packet.header.sequence_number);
+
+                    if e_bit {
+                        let data = Bytes::from(self.fu_buffer.clone());
+                        samples.push(create_video_sample(
+                            data,
+                            self.current_timestamp,
+                            raw_packet.header.marker,
+                            &raw_packet,
+                        ));
+                        self.fu_buffer.clear();
+                        self.last_seq = None;
+                    }
+                }
+            }
+            // Single NAL unit (types 0..=47) and anything else: pass through
+            // with the 2-byte NAL header intact.
+            _ => {
+                samples.push(create_video_sample(
+                    payload,
+                    raw_packet.header.timestamp,
+                    raw_packet.header.marker,
+                    &raw_packet,
+                ));
+            }
+        }
+
+        Ok(samples)
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod h265_depacketizer_tests {
+    use super::*;
+    use crate::media::Payloader;
+    use crate::media::packetizer::H265Payloader;
+    use crate::rtp::RtpHeader;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn addr() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4000)
+    }
+
+    fn packet(payload: Vec<u8>, seq: u16, ts: u32, marker: bool) -> RtpPacket {
+        let mut header = RtpHeader::new(96, seq, ts, 0x1234_5678);
+        header.marker = marker;
+        RtpPacket::new(header, payload)
+    }
+
+    fn nal(nal_type: u8, len: usize) -> Vec<u8> {
+        let mut v = vec![0u8; len];
+        v[0] = (nal_type & 0x3F) << 1;
+        v[1] = 0x01;
+        for (i, b) in v.iter_mut().enumerate().skip(2) {
+            *b = (i % 251) as u8;
+        }
+        v
+    }
+
+    fn video_data(sample: &MediaSample) -> (Bytes, bool) {
+        match sample {
+            MediaSample::Video(f) => (f.data.clone(), f.is_last_packet),
+            _ => panic!("expected a video sample"),
+        }
+    }
+
+    #[test]
+    fn h265_fu_roundtrip() {
+        let original = nal(19, 3000);
+        let payloads = H265Payloader.payload(1200, Bytes::from(original.clone()));
+        assert!(payloads.len() > 1);
+        let mut depacketizer = H265Depacketizer::new();
+        let mut out = Vec::new();
+        let last = payloads.len() - 1;
+        for (i, p) in payloads.iter().enumerate() {
+            let samples = depacketizer
+                .push(
+                    packet(p.to_vec(), 100 + i as u16, 9000, i == last),
+                    90000,
+                    addr(),
+                    MediaKind::Video,
+                )
+                .unwrap();
+            out.extend(samples);
+        }
+        assert_eq!(out.len(), 1, "one NAL after reassembly");
+        let (data, is_last) = video_data(&out[0]);
+        assert_eq!(&data[..], &original[..]);
+        assert!(is_last, "marker on the last FU packet");
+    }
+
+    #[test]
+    fn h265_single_nal_passthrough() {
+        let original = nal(32, 100); // VPS
+        let mut depacketizer = H265Depacketizer::new();
+        let samples = depacketizer
+            .push(
+                packet(original.clone(), 1, 1000, true),
+                90000,
+                addr(),
+                MediaKind::Video,
+            )
+            .unwrap();
+        assert_eq!(samples.len(), 1);
+        let (data, is_last) = video_data(&samples[0]);
+        assert_eq!(&data[..], &original[..]);
+        assert!(is_last);
+    }
+
+    #[test]
+    fn h265_ap_splits_into_nal_units() {
+        let a = nal(32, 20); // VPS
+        let b = nal(33, 30); // SPS
+        let mut payload = vec![(48u8 << 1), 0x01];
+        payload.extend_from_slice(&(a.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&a);
+        payload.extend_from_slice(&(b.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&b);
+
+        let mut depacketizer = H265Depacketizer::new();
+        let samples = depacketizer
+            .push(
+                packet(payload, 7, 5000, true),
+                90000,
+                addr(),
+                MediaKind::Video,
+            )
+            .unwrap();
+        assert_eq!(samples.len(), 2);
+        let (d0, l0) = video_data(&samples[0]);
+        let (d1, l1) = video_data(&samples[1]);
+        assert_eq!(&d0[..], &a[..]);
+        assert!(!l0, "not the last NAL of the packet");
+        assert_eq!(&d1[..], &b[..]);
+        assert!(l1, "last NAL carries the marker");
+    }
+
+    #[test]
+    fn h265_fu_gap_drops_frame() {
+        let original = nal(19, 3000);
+        let payloads = H265Payloader.payload(1200, Bytes::from(original));
+        assert!(payloads.len() >= 3);
+        let mut depacketizer = H265Depacketizer::new();
+        let _ = depacketizer
+            .push(
+                packet(payloads[0].to_vec(), 10, 9000, false),
+                90000,
+                addr(),
+                MediaKind::Video,
+            )
+            .unwrap();
+        // Skip the second fragment, deliver the last.
+        let last = payloads.len() - 1;
+        let samples = depacketizer
+            .push(
+                packet(payloads[last].to_vec(), 10 + last as u16, 9000, true),
+                90000,
+                addr(),
+                MediaKind::Video,
+            )
+            .unwrap();
+        assert!(samples.is_empty(), "a gap must not emit a corrupted NAL");
+        assert_eq!(depacketizer.drop_count(), 1);
+    }
+
+    #[test]
+    fn h265_audio_is_passed_through() {
+        let mut depacketizer = H265Depacketizer::new();
+        let samples = depacketizer
+            .push(
+                packet(vec![1, 2, 3], 1, 0, false),
+                48000,
+                addr(),
+                MediaKind::Audio,
+            )
+            .unwrap();
+        assert_eq!(samples.len(), 1);
+    }
+}

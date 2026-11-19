@@ -622,3 +622,232 @@ impl H264Fragments {
             .collect()
     }
 }
+
+// ── H.265 / HEVC (RFC 7798) ───────────────────────────────────────────────
+// Single NAL below MTU, FU (type 49) above. AP/PACI are not produced.
+
+const H265_FU_TYPE: u8 = 49;
+const H265_MTU: usize = 1200;
+
+/// 90000 / 25 fps timestamp step.
+pub const H265_TS_PER_FRAME: u32 = 3600;
+
+/// FU fragmentation into RTP payloads at the given MTU (RFC 7798 §4.4.3).
+///
+/// The 2-byte NAL header is preserved in every fragment's PayloadHdr with the
+/// Type field set to 49; the FU header carries S/E plus the original NAL type.
+/// No DONL is emitted (`sprop-max-don-diff=0`, the WebRTC default).
+pub struct H265Payloader;
+
+impl Payloader for H265Payloader {
+    fn payload(&self, mtu: usize, data: Bytes) -> Vec<Bytes> {
+        if data.len() < 2 {
+            return Vec::new();
+        }
+        if data.len() <= mtu {
+            return vec![data];
+        }
+        let nal_type = (data[0] >> 1) & 0x3F;
+        let payload_hdr0 = (data[0] & 0x81) | (H265_FU_TYPE << 1);
+        let payload_hdr1 = data[1];
+        let max_frag = mtu.saturating_sub(3).max(1);
+        let mut fragments = Vec::new();
+        let mut offset = 2; // skip the 2-byte NAL header
+        while offset < data.len() {
+            let remaining = data.len() - offset;
+            let frag_size = remaining.min(max_frag);
+            let is_start = offset == 2;
+            let is_end = offset + frag_size >= data.len();
+            let mut fu = nal_type;
+            if is_start {
+                fu |= 0x80;
+            }
+            if is_end {
+                fu |= 0x40;
+            }
+            let mut fragment = Vec::with_capacity(3 + frag_size);
+            fragment.push(payload_hdr0);
+            fragment.push(payload_hdr1);
+            fragment.push(fu);
+            fragment.extend_from_slice(&data[offset..offset + frag_size]);
+            fragments.push(Bytes::from(fragment));
+            offset += frag_size;
+        }
+        fragments
+    }
+}
+
+/// Tracks the 90 kHz RTP clock; NALs (Annex-B or raw) → fragment lists.
+pub struct H265Packetizer {
+    timestamp: u32,
+}
+
+impl Default for H265Packetizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl H265Packetizer {
+    pub fn new() -> Self {
+        Self { timestamp: 0 }
+    }
+
+    pub fn timestamp(&self) -> u32 {
+        self.timestamp
+    }
+
+    pub fn advance(&mut self) {
+        self.timestamp = self.timestamp.wrapping_add(H265_TS_PER_FRAME);
+    }
+
+    pub fn packetize_from_raw(&self, nal_data: &[u8], ts: u32) -> H265Fragments {
+        if nal_data.len() < 2 {
+            return H265Fragments::empty();
+        }
+        let payloads = H265Payloader.payload(H265_MTU, Bytes::copy_from_slice(nal_data));
+        H265Fragments {
+            data: payloads.into_iter().map(|b| b.to_vec()).collect(),
+            timestamp: ts,
+        }
+    }
+
+    /// Packetize one Annex-B NAL (3/4-byte start code stripped if present).
+    pub fn packetize(&self, nal: &[u8]) -> H265Fragments {
+        let start_code =
+            if nal.len() > 4 && nal[0] == 0 && nal[1] == 0 && nal[2] == 0 && nal[3] == 1 {
+                4
+            } else if nal.len() > 3 && nal[0] == 0 && nal[1] == 0 && nal[2] == 1 {
+                3
+            } else {
+                0
+            };
+        self.packetize_from_raw(&nal[start_code..], self.timestamp)
+    }
+}
+
+/// One access unit's RTP payloads sharing one timestamp (last = marker).
+pub struct H265Fragments {
+    data: Vec<Vec<u8>>,
+    timestamp: u32,
+}
+
+impl H265Fragments {
+    fn empty() -> Self {
+        Self {
+            data: Vec::new(),
+            timestamp: 0,
+        }
+    }
+
+    /// Fragment payloads, in transmission order.
+    pub fn payloads(&self) -> &[Vec<u8>] {
+        &self.data
+    }
+
+    /// Build from raw fragment payloads sharing one timestamp.
+    pub fn from_payloads(data: Vec<Vec<u8>>, timestamp: u32) -> Self {
+        Self { data, timestamp }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn into_frames(self, width: u16, height: u16) -> Vec<VideoFrame> {
+        let count = self.data.len();
+        let ts = self.timestamp;
+        self.data
+            .into_iter()
+            .enumerate()
+            .map(|(i, data)| VideoFrame {
+                data: Bytes::from(data),
+                width,
+                height,
+                format: VideoPixelFormat::Unspecified,
+                is_last_packet: i + 1 == count,
+                rtp_timestamp: ts,
+                ..Default::default()
+            })
+            .collect()
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod h265_tests {
+    use super::*;
+
+    fn nal(nal_type: u8, len: usize) -> Vec<u8> {
+        let mut v = vec![0u8; len];
+        // F=0, Type=nal_type, LayerId=0, TID=1
+        v[0] = (nal_type & 0x3F) << 1;
+        v[1] = 0x01;
+        for (i, b) in v.iter_mut().enumerate().skip(2) {
+            *b = (i % 251) as u8;
+        }
+        v
+    }
+
+    #[test]
+    fn h265_small_nal_is_single_packet() {
+        let data = Bytes::from(nal(32, 100)); // VPS
+        let payloads = H265Payloader.payload(1200, data.clone());
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0], data);
+    }
+
+    #[test]
+    fn h265_large_nal_uses_fu() {
+        let original = nal(19, 4000); // IDR_W_RADL
+        let payloads = H265Payloader.payload(1200, Bytes::from(original.clone()));
+        assert!(payloads.len() > 1, "must fragment 4000B at MTU 1200");
+        let last = payloads.len() - 1;
+        let mut rebuilt = Vec::new();
+        for (i, p) in payloads.iter().enumerate() {
+            assert_eq!((p[0] >> 1) & 0x3F, 49, "FU type");
+            assert_eq!(p[0] & 0x81, original[0] & 0x81, "F + LayerId high bit");
+            assert_eq!(p[1], original[1], "LayerId low bits + TID");
+            let fu = p[2];
+            assert_eq!(fu & 0x3F, 19, "original NAL type in FU header");
+            assert_eq!(fu & 0x80 != 0, i == 0, "S bit only on the first");
+            assert_eq!(fu & 0x40 != 0, i == last, "E bit only on the last");
+            if i == 0 {
+                rebuilt.push((p[0] & 0x81) | ((fu & 0x3F) << 1));
+                rebuilt.push(p[1]);
+            }
+            rebuilt.extend_from_slice(&p[3..]);
+            assert!(p.len() <= 1200, "fragment must fit the MTU");
+        }
+        assert_eq!(rebuilt, original, "reassembled NAL must be byte-identical");
+    }
+
+    #[test]
+    fn h265_start_code_is_stripped() {
+        let mut annex_b = vec![0, 0, 0, 1];
+        annex_b.extend_from_slice(&nal(32, 50));
+        let packetizer = H265Packetizer::new();
+        let frags = packetizer.packetize(&annex_b);
+        assert_eq!(frags.len(), 1);
+        assert_eq!(frags.payloads()[0][0] & 0xFE, (32 << 1) as u8 & 0xFE);
+    }
+
+    #[test]
+    fn h265_timestamp_advances() {
+        let mut p = H265Packetizer::new();
+        assert_eq!(p.timestamp(), 0);
+        let f0 = p.packetize_from_raw(&nal(32, 10), p.timestamp());
+        assert_eq!(f0.payloads().len(), 1);
+        p.advance();
+        assert_eq!(p.timestamp(), H265_TS_PER_FRAME);
+    }
+
+    #[test]
+    fn h265_empty_input() {
+        assert!(H265Payloader.payload(1200, Bytes::new()).is_empty());
+        assert!(H265Packetizer::new().packetize(&[]).is_empty());
+    }
+}

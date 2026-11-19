@@ -12,7 +12,7 @@ A high-performance, full-stack real-time communication library — **WebRTC, RTP
 - **Unified `PeerConnection` API** — one interface for every transport combination (any `Connectivity` × any `Keying`, plus T.38). No fragmented APIs.
 - **WebRTC compliant** — interoperable with Chrome/WebRTC and pion; offer/answer, renegotiation, rollback, and standard SDP attributes.
 - **ICE restart** — `restart_ice()` for network migration / re-INVITE flows, with automatic detection of remote-initiated restarts (RFC 8445 §9).
-- **Complete media pipeline** — packetizer/depacketizer (VP8, VP9, H264, Opus, G.711/G.722/G.729), jitter buffer, NACK/RTX, FIR/PLI, TWCC, and REMB for audio and video.
+- **Complete media pipeline** — packetizer/depacketizer (VP8, VP9, H264, H265/HEVC, Opus, G.711/G.722/G.729), jitter buffer, NACK/RTX, FIR/PLI, TWCC, and REMB for audio and video.
 - **Bandwidth estimation (GCC)** — generates TWCC receiver feedback, stamps transport-wide sequence numbers on outbound RTP, and exposes a live `target_bitrate` estimate for encoder adaptation (`RtpSender::subscribe_target_bitrate`).
 - **Full ICE** — STUN, TURN (UDP + TCP), ICE Lite, ICE TCP (RFC 6544), single-port UDP mux for SFU/WHEP deployments, and **mDNS candidate obfuscation** (`enable_mdns`).
 - **NAT traversal & deployment** — RTP latching, UPnP IGD port mapping, and firewall-friendly port ranges (`rtp_start_port`/`rtp_end_port`).
@@ -131,6 +131,28 @@ The no_std wall clock is a logical clock (`platform::time::advance_ms` /
 `Instant::elapsed()` matter to you. The DTLS certificate is flash-provisioned
 DER (`Certificate::from_pkcs8_der`) — there is no certificate generation
 without `std`.
+
+## Performance vs libwebrtc (standalone C++, 0.6.6)
+
+Same host, same topology; **standalone libwebrtc M150** (C++ SDK, no Chrome),
+with data channels (SCTP over DTLS) and SRTP measured separately. Median of
+3–5 runs, pinned cores.
+
+| Path | Metric | libwebrtc | rustrtc |
+|---|---|---:|---:|
+| SCTP | RTT p50 / p99 | 452 / 830 µs | **326–376 / 419–462 µs** |
+| SCTP | 64 KB throughput | 59 MB/s | **157–164 MB/s** |
+| SCTP | 1 KB message rate | 28.6k msg/s | **140k msg/s** |
+| SCTP | setup (offer → DC open) | 126–131 ms | **5–15 ms** |
+| SCTP | PSS at 1 connection | 13–18 MB | **9–10 MB** |
+| SRTP | AES-GCM protect / roundtrip (1200 B) | 2724 / 1295 MB/s* | **3762 / 1645 MB/s** |
+| SRTP | AES-GCM protect (200 B / 64 B) | 755 / 287 MB/s* | **1066 / 591 MB/s** |
+
+\* libsrtp 2.6.0 + OpenSSL 3.5 — the SRTP engine libwebrtc vendors.
+
+Full methodology, single-core tables, end-to-end SRTP latency/loss, the
+AES-CM/SHA-1 caveat and reproduction steps:
+**[PERFORMANCE-VS-LIBWEBRTC.md](PERFORMANCE-VS-LIBWEBRTC.md)**.
 
 ## Benchmark (rustrtc vs webrtc-rs & pion) in 0.5.0
 
@@ -315,7 +337,7 @@ Every latch commit and re-latch is observable:
 Note: persistence-based latching is accident-robustness (stale NAT bindings, port reuse, stray packets), not a security boundary — keep SDP/confidential signaling as the outer defense.
 
 ### Media Capabilities
-- **`media_capabilities`** — Configure audio/video/image (T.38) codecs and SCTP port via `MediaCapabilities`. Video presets: `VideoCapability::default()` (VP8), `VideoCapability::vp9()` / `vp9_with_rtx(pt)` (RFC 9628), `VideoCapability::h264()`.
+- **`media_capabilities`** — Configure audio/video/image (T.38) codecs and SCTP port via `MediaCapabilities`. Video presets: `VideoCapability::default()` (VP8), `VideoCapability::vp9()` / `vp9_with_rtx(pt)` (RFC 9628), `VideoCapability::h264()`, `VideoCapability::h265()` / `h265_with_param_sets(vps, sps, pps)` (RFC 7798, with optional `sprop-*` fmtp).
 - **`ssrc_start`** — Starting SSRC value for local tracks (later tracks count up from it). Random by default per RFC 3550 §8.1; pin it only if your deployment needs deterministic SSRCs. Note: two configs from the same constructor therefore never compare equal via `PartialEq`.
 - **`depacketizer_strategy`** — Pluggable per-kind depacketizer (e.g. `Vp9Depacketizer` for RFC 9628 VP9 reassembly).
 

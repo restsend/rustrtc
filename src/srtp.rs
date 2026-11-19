@@ -5,10 +5,6 @@ use crate::{
     rtp::{RtpHeader, RtpPacket},
 };
 use aes::Aes128;
-use aes_gcm::{
-    Aes128Gcm, Nonce,
-    aead::{AeadInOut, KeyInit},
-};
 use alloc::collections::btree_map::Entry;
 use bytes::BytesMut;
 use core::fmt;
@@ -17,7 +13,110 @@ use hmac::{Hmac, Mac};
 use sha1::Sha1;
 
 type Aes128Ctr = ctr::Ctr128BE<Aes128>;
+/// Raw HMAC-SHA1, used by the RFC 3711 wire-format tests.
 type HmacSha1 = Hmac<Sha1>;
+
+/// Per-packet SRTP auth MAC. The RustCrypto HMAC keeps the key schedule in a
+/// cloneable prototype; `sha1` 0.11 already reaches SHA-NI/SHA-EXT on x86.
+#[derive(Clone)]
+pub(crate) struct AuthHmac(HmacSha1);
+
+impl AuthHmac {
+    fn new_from_slice(key: &[u8]) -> Option<Self> {
+        <HmacSha1 as hmac::digest::KeyInit>::new_from_slice(key)
+            .ok()
+            .map(Self)
+    }
+
+    fn sign(&self, parts: &[&[u8]]) -> [u8; 20] {
+        let mut mac = self.0.clone();
+        for part in parts {
+            mac.update(part);
+        }
+        let out = mac.finalize().into_bytes();
+        let mut tag = [0u8; 20];
+        tag.copy_from_slice(&out[..20]);
+        tag
+    }
+}
+
+/// AES-128-GCM backend. `ring` mirrors libwebrtc's OpenSSL/BoringSSL-class
+/// asm (≈2× the RustCrypto `aes-gcm` crate on x86_64); the crate backend stays
+/// for `no_std`.
+mod gcm {
+    #[cfg(not(feature = "srtp-ring"))]
+    pub struct Gcm(aes_gcm::Aes128Gcm);
+
+    #[cfg(not(feature = "srtp-ring"))]
+    impl Gcm {
+        pub fn new(key: &[u8]) -> Option<Self> {
+            use aes_gcm::KeyInit;
+            aes_gcm::Aes128Gcm::new_from_slice(key).ok().map(Self)
+        }
+
+        /// Encrypt `buf` in place, returning the 16-byte tag.
+        pub fn seal(&self, nonce: [u8; 12], aad: &[u8], buf: &mut [u8]) -> Option<[u8; 16]> {
+            use aes_gcm::aead::AeadInOut;
+            let tag = self
+                .0
+                .encrypt_inout_detached(&aes_gcm::Nonce::from(nonce), aad, buf.into())
+                .ok()?;
+            let mut out = [0u8; 16];
+            out.copy_from_slice(&tag);
+            Some(out)
+        }
+
+        /// Decrypt `ciphertext || tag` in place. Returns false on auth failure.
+        pub fn open(&self, nonce: [u8; 12], aad: &[u8], buf: &mut [u8]) -> bool {
+            use aes_gcm::aead::AeadInOut;
+            if buf.len() < 16 {
+                return false;
+            }
+            let (body, tag) = buf.split_at_mut(buf.len() - 16);
+            let Ok(tag) = aes_gcm::Tag::try_from(&tag[..]) else {
+                return false;
+            };
+            self.0
+                .decrypt_inout_detached(&aes_gcm::Nonce::from(nonce), aad, body.into(), &tag)
+                .is_ok()
+        }
+    }
+
+    #[cfg(feature = "srtp-ring")]
+    pub struct Gcm(ring::aead::LessSafeKey);
+
+    #[cfg(feature = "srtp-ring")]
+    impl Gcm {
+        pub fn new(key: &[u8]) -> Option<Self> {
+            let unbound = ring::aead::UnboundKey::new(&ring::aead::AES_128_GCM, key).ok()?;
+            Some(Self(ring::aead::LessSafeKey::new(unbound)))
+        }
+
+        pub fn seal(&self, nonce: [u8; 12], aad: &[u8], buf: &mut [u8]) -> Option<[u8; 16]> {
+            let tag = self
+                .0
+                .seal_in_place_separate_tag(
+                    ring::aead::Nonce::assume_unique_for_key(nonce),
+                    ring::aead::Aad::from(aad),
+                    buf,
+                )
+                .ok()?;
+            let mut out = [0u8; 16];
+            out.copy_from_slice(tag.as_ref());
+            Some(out)
+        }
+
+        pub fn open(&self, nonce: [u8; 12], aad: &[u8], buf: &mut [u8]) -> bool {
+            self.0
+                .open_in_place(
+                    ring::aead::Nonce::assume_unique_for_key(nonce),
+                    ring::aead::Aad::from(aad),
+                    buf,
+                )
+                .is_ok()
+        }
+    }
+}
 
 /// Maximum HMAC-SHA1 digest length (used for fixed-size auth-tag buffers).
 const SHA1_LEN: usize = 20;
@@ -361,7 +460,11 @@ impl SrtpSession {
         // A fallback retry needs the original bytes restored first (the GCM
         // branch mutates the packet before verifying the tag). Snapshot only
         // when a retry is actually possible — never on the steady-state path.
-        let original = if fallback.is_some() { packet.clone() } else { Vec::new() };
+        let original = if fallback.is_some() {
+            packet.clone()
+        } else {
+            Vec::new()
+        };
 
         match ctx.unprotect_rtcp_with_mki(packet, first) {
             Ok(()) => {
@@ -369,7 +472,9 @@ impl SrtpSession {
                 Ok(())
             }
             Err(e) => {
-                let Some(mki_len) = fallback else { return Err(e) };
+                let Some(mki_len) = fallback else {
+                    return Err(e);
+                };
                 *packet = original;
                 ctx.unprotect_rtcp_with_mki(packet, mki_len)?;
                 self.rtcp_rx_mki_active = Some(mki_len > 0);
@@ -422,10 +527,10 @@ pub struct SrtpContext {
     /// per-packet IV, which is a cheap clone of the round keys, not a re-key).
     rtp_aes_key: Aes128,
     rtcp_aes_key: Aes128,
-    rtp_gcm_cipher: Option<Aes128Gcm>,
-    rtcp_gcm_cipher: Option<Aes128Gcm>,
-    rtp_auth_prototype: Option<HmacSha1>,
-    rtcp_auth_prototype: Option<HmacSha1>,
+    rtp_gcm_cipher: Option<Arc<gcm::Gcm>>,
+    rtcp_gcm_cipher: Option<Arc<gcm::Gcm>>,
+    rtp_auth_prototype: Option<AuthHmac>,
+    rtcp_auth_prototype: Option<AuthHmac>,
     direction: SrtpDirection,
     rollover_counter: u32,
     last_sequence: Option<u16>,
@@ -549,27 +654,25 @@ impl SrtpContext {
         let rtcp_aes_key = <Aes128 as ctr::cipher::KeyInit>::new(&rtcp_key_bytes.into());
 
         let rtp_gcm_cipher = if let SrtpProfile::AeadAes128Gcm = profile {
-            Some(
-                Aes128Gcm::new_from_slice(&rtp_keys.cipher_key)
-                    .map_err(|_| SrtpError::UnsupportedProfile)?,
-            )
+            Some(Arc::new(
+                gcm::Gcm::new(&rtp_keys.cipher_key).ok_or(SrtpError::UnsupportedProfile)?,
+            ))
         } else {
             None
         };
 
         let rtcp_gcm_cipher = if let SrtpProfile::AeadAes128Gcm = profile {
-            Some(
-                Aes128Gcm::new_from_slice(&rtcp_keys.cipher_key)
-                    .map_err(|_| SrtpError::UnsupportedProfile)?,
-            )
+            Some(Arc::new(
+                gcm::Gcm::new(&rtcp_keys.cipher_key).ok_or(SrtpError::UnsupportedProfile)?,
+            ))
         } else {
             None
         };
 
         let rtp_auth_prototype = if !rtp_keys.auth_key.is_empty() {
             Some(
-                <HmacSha1 as hmac::digest::KeyInit>::new_from_slice(&rtp_keys.auth_key)
-                    .map_err(|_| SrtpError::UnsupportedProfile)?,
+                AuthHmac::new_from_slice(&rtp_keys.auth_key)
+                    .ok_or(SrtpError::UnsupportedProfile)?,
             )
         } else {
             None
@@ -577,8 +680,8 @@ impl SrtpContext {
 
         let rtcp_auth_prototype = if !rtcp_keys.auth_key.is_empty() {
             Some(
-                <HmacSha1 as hmac::digest::KeyInit>::new_from_slice(&rtcp_keys.auth_key)
-                    .map_err(|_| SrtpError::UnsupportedProfile)?,
+                AuthHmac::new_from_slice(&rtcp_keys.auth_key)
+                    .ok_or(SrtpError::UnsupportedProfile)?,
             )
         } else {
             None
@@ -699,13 +802,9 @@ impl SrtpContext {
             let tag_len = self._profile.tag_len();
             packet.resize(8 + payload_len + tag_len + 4, 0);
             let tag = cipher
-                .encrypt_inout_detached(
-                    &Nonce::from(nonce),
-                    &aad,
-                    (&mut packet[8..8 + payload_len]).into(),
-                )
-                .map_err(|_| SrtpError::AuthenticationFailed)?;
-            packet[8 + payload_len..8 + payload_len + tag_len].copy_from_slice(tag.as_ref());
+                .seal(nonce, &aad, &mut packet[8..8 + payload_len])
+                .ok_or(SrtpError::AuthenticationFailed)?;
+            packet[8 + payload_len..8 + payload_len + tag_len].copy_from_slice(&tag);
             let index_pos = 8 + payload_len + tag_len;
             packet[index_pos..index_pos + 4].copy_from_slice(&index_with_e.to_be_bytes());
             if let Some((value, _)) = self.mki.tx.as_ref() {
@@ -781,27 +880,13 @@ impl SrtpContext {
             aad[8..12].copy_from_slice(&index_with_e.to_be_bytes());
 
             let ciphertext_len = index_start - 8 - tag_len;
-            let tag: aes_gcm::Tag = packet[8 + ciphertext_len..8 + ciphertext_len + tag_len]
-                .try_into()
-                .map_err(|_| SrtpError::Internal("invalid GCM tag length".to_string()))?;
 
-            // Decrypt in place: move Ciphertext to the front of the buffer
-            // (tag stripped — it is passed separately and verified first),
-            // drop the trailing Index/[MKI] bytes, then hand the Vec to the
-            // AEAD API. Avoids the old per-packet plaintext allocation.
-            let mut header = [0u8; 8];
-            header.copy_from_slice(&packet[..8]);
-            packet.copy_within(8..8 + ciphertext_len, 0);
-            packet.truncate(ciphertext_len);
-            cipher
-                .decrypt_inout_detached(&Nonce::from(nonce), &aad, packet.as_mut_slice().into(), &tag)
-                .map_err(|_| SrtpError::AuthenticationFailed)?;
-
-            // Reconstruct packet: Header || Plaintext
-            let plaintext_len = packet.len();
-            packet.resize(8 + plaintext_len, 0);
-            packet.copy_within(0..plaintext_len, 8);
-            packet[..8].copy_from_slice(&header);
+            // Ciphertext || Tag are contiguous after the 8-byte RTCP header;
+            // open in place and then drop the tag/index/[MKI] tail.
+            if !cipher.open(nonce, &aad, &mut packet[8..8 + ciphertext_len + tag_len]) {
+                return Err(SrtpError::AuthenticationFailed);
+            }
+            packet.truncate(8 + ciphertext_len);
 
             self.rtcp_replay.commit(index as u64);
             if index > self.rtcp_index {
@@ -895,13 +980,12 @@ impl SrtpContext {
     /// cached HMAC prototype to avoid re-padding the key (and a `Vec` alloc) on
     /// every RTCP packet.
     fn auth_tag_rtcp_into(&self, data: &[u8], out: &mut [u8; SHA1_LEN]) -> SrtpResult<()> {
-        let mut mac = self
+        let tag = self
             .rtcp_auth_prototype
             .as_ref()
             .ok_or(SrtpError::UnsupportedProfile)?
-            .clone();
-        mac.update(data);
-        out.copy_from_slice(&mac.finalize().into_bytes());
+            .sign(&[data]);
+        out.copy_from_slice(&tag);
         Ok(())
     }
 
@@ -951,8 +1035,8 @@ impl SrtpContext {
             let (body, trailer) = protected_body.split_at_mut(body_len);
             let (tag_output, mki_output) = trailer.split_at_mut(tag_len);
             let tag = cipher
-                .encrypt_inout_detached(&Nonce::from(nonce), header, body.into())
-                .map_err(|_| SrtpError::AuthenticationFailed)?;
+                .seal(nonce, header, body)
+                .ok_or(SrtpError::AuthenticationFailed)?;
             if let Some((value, _)) = self.mki.tx.as_ref() {
                 mki_output.copy_from_slice(&value[..mki_len]);
             }
@@ -967,14 +1051,11 @@ impl SrtpContext {
 
             // The authentication tag covers the RTP header, the payload and
             // the ROC — NOT the MKI (RFC 3711 §4.2: the MKI is a trailer).
-            let mut mac = self
+            let result = self
                 .rtp_auth_prototype
                 .as_ref()
                 .ok_or(SrtpError::UnsupportedProfile)?
-                .clone();
-            mac.update(&output[..body_end]);
-            mac.update(&roc.to_be_bytes());
-            let result = mac.finalize().into_bytes();
+                .sign(&[&output[..body_end], &roc.to_be_bytes()]);
             if let Some((value, _)) = self.mki.tx.as_ref() {
                 output[body_end..body_end + mki_len].copy_from_slice(&value[..mki_len]);
             }
@@ -1015,7 +1096,9 @@ impl SrtpContext {
                 Ok(unprotected)
             }
             Err(e) => {
-                let Some(mki_len) = fallback else { return Err(e) };
+                let Some(mki_len) = fallback else {
+                    return Err(e);
+                };
                 packet.body = original_body;
                 let unprotected = self.unprotect_with_mki(&mut packet, mki_len)?;
                 self.rx_mki_active = Some(mki_len > 0);
@@ -1057,31 +1140,29 @@ impl SrtpContext {
                 .rtp_gcm_cipher
                 .as_ref()
                 .ok_or(SrtpError::UnsupportedProfile)?;
-            // RFC 7714: header || ciphertext || tag || [MKI].
+            // RFC 7714: header || ciphertext || tag || [MKI]. The tag sits
+            // right after the ciphertext, so the AEAD backend can open the
+            // `ciphertext || tag` slice in place (no copy, both backends).
             let split = packet.body.len() - tag_len - mki_len;
-            let tag: aes_gcm::Tag = packet.body[split..split + tag_len]
-                .try_into()
-                .map_err(|_| SrtpError::Internal("invalid GCM tag length".to_string()))?;
+            if !cipher.open(
+                nonce,
+                &self.auth_scratch,
+                &mut packet.body[..split + tag_len],
+            ) {
+                return Err(SrtpError::AuthenticationFailed);
+            }
             packet.body.truncate(split);
-            cipher
-                .decrypt_inout_detached(
-                    &Nonce::from(nonce),
-                    &self.auth_scratch,
-                    (&mut packet.body[..]).into(),
-                    &tag,
-                )
-                .map_err(|_| SrtpError::AuthenticationFailed)?;
         } else {
             // Layout: header || payload(+padding) || [MKI] || tag. The sender
             // computed the tag over header+payload+ROC only, so the MKI must
             // be excluded from the MAC input here.
             let split = packet.body.len() - tag_len - mki_len;
             if let Some(proto) = self.rtp_auth_prototype.as_ref() {
-                let mut mac = proto.clone();
-                mac.update(&self.auth_scratch);
-                mac.update(&packet.body[..split]);
-                mac.update(&roc.to_be_bytes());
-                let result = mac.finalize().into_bytes();
+                let result = proto.sign(&[
+                    &self.auth_scratch,
+                    &packet.body[..split],
+                    &roc.to_be_bytes(),
+                ]);
                 if !constant_time_eq(&packet.body[split + mki_len..], &result[..tag_len]) {
                     return Err(SrtpError::AuthenticationFailed);
                 }

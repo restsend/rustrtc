@@ -360,6 +360,45 @@ impl VideoCapability {
         }
     }
 
+    /// H.265/HEVC (RFC 7798), payload type 99, NACK/PLI/FIR feedback.
+    pub fn h265() -> Self {
+        Self {
+            payload_type: 99,
+            codec_name: "H265".to_string(),
+            clock_rate: 90000,
+            fmtp: None,
+            rtcp_fbs: vec![
+                "nack".to_string(),
+                "nack pli".to_string(),
+                "ccm fir".to_string(),
+            ],
+            rtx_payload_type: None,
+        }
+    }
+
+    /// H.265 with out-of-band parameter sets (`sprop-vps/sps/pps`, RFC 7798
+    /// §7.1), base64 encoded into `a=fmtp`.
+    pub fn h265_with_param_sets(vps: &[u8], sps: &[u8], pps: &[u8]) -> Self {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let mut cap = Self::h265();
+        cap.fmtp = Some(alloc::format!(
+            "sprop-vps={};sprop-sps={};sprop-pps={}",
+            b64.encode(vps),
+            b64.encode(sps),
+            b64.encode(pps)
+        ));
+        cap
+    }
+
+    /// H.265 with RTX enabled.
+    pub fn h265_with_rtx(rtx_payload_type: u8) -> Self {
+        Self {
+            rtx_payload_type: Some(rtx_payload_type),
+            ..Self::h265()
+        }
+    }
+
     /// VP8 with RTX enabled (common browser interop profile).
     pub fn vp8_with_rtx(rtx_payload_type: u8) -> Self {
         Self {
