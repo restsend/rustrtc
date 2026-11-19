@@ -1184,6 +1184,26 @@ impl PeerConnection {
         }
     }
 
+    /// Clear only the rewrite bridges of this PeerConnection that relay into
+    /// `destination`'s transports, leaving a bridge re-pointed elsewhere
+    /// alone.
+    pub fn clear_rtp_rewrite_bridge_into(&self, destination: &PeerConnection) {
+        let targets = destination.rtp_transports();
+        if targets.is_empty() {
+            return;
+        }
+        for transport in self.rtp_transports() {
+            transport.clear_bridge_rewrite_into(&targets);
+        }
+    }
+
+    fn rtp_transports(&self) -> Vec<Arc<crate::transports::rtp::RtpTransport>> {
+        let mut transports: Vec<Arc<crate::transports::rtp::RtpTransport>> =
+            self.inner.rtp_transport.lock().iter().cloned().collect();
+        transports.extend(self.inner.rtp_media_transports.lock().values().cloned());
+        transports
+    }
+
     /// Register a plaintext [`RtpObserver`] on this PeerConnection's
     /// transports. The observer fires on clear RTP for BOTH directions
     /// (inbound post-SRTP-unprotect, outbound pre-SRTP-protect / pre-relay-push)
@@ -1248,9 +1268,11 @@ impl PeerConnection {
     ///
     /// This is the escape hatch for out-of-band packets that do not fit the
     /// sample-track path — most importantly RFC 4733 telephone-event (DTMF)
-    /// packets, which use a separate payload type from the audio codec (the
-    /// `RtpSender` always stamps the audio codec's PT, so DTMF cannot ride the
-    /// sample track).
+    /// packets. Samples can also carry DTMF with their own payload type and
+    /// packet identity through `RtpSender`.
+    ///
+    /// This method does not map sequence numbers or timestamps. Callers sharing
+    /// a sender SSRC must map the packet through that sender's timeline first.
     ///
     /// The packet is sent on the audio sender's transport when available (so it
     /// egresses on the same 5-tuple as media), falling back to the primary RTP
@@ -2242,7 +2264,7 @@ impl PeerConnection {
                     }
                     let extmap = Self::extract_extmap(section);
                     let _ = t.update_extmap(extmap);
-                    let direction: TransceiverDirection = section.direction.into();
+                        let direction: TransceiverDirection = section.direction.into();
                     t.set_remote_direction(direction);
 
                     if let Some(ssrc_val) = ssrc
@@ -2392,7 +2414,8 @@ impl PeerConnection {
                         let new_params =
                             Self::pick_sender_codec_params(section, &payload_map, &cur);
                         if let Some(np) = new_params
-                            && np.payload_type != cur.payload_type
+                            && (np.payload_type != cur.payload_type
+                                || np.clock_rate != cur.clock_rate)
                         {
                             debug!(
                                 "Syncing sender PT for mid={} (answer): {} -> {} (clock_rate={})",
@@ -3646,10 +3669,12 @@ impl PeerConnection {
         }
 
         let inner_weak = Arc::downgrade(&self.inner);
-        let mut role_rx = self.inner.dtls_role.subscribe();
-        let mut state_rx = ice_transport.subscribe_state();
+        let role_rx = self.inner.dtls_role.subscribe();
+        let state_rx = ice_transport.subscribe_state();
         let pair_rx = ice_transport.subscribe_selected_pair();
         async move {
+            #[cfg(feature = "std")]
+            let (mut role_rx, mut state_rx) = (role_rx, state_rx);
             let is_client = loop {
                 if let Some(is_client) = *role_rx.borrow_and_update() {
                     break is_client;
@@ -4445,7 +4470,7 @@ impl PeerConnection {
                     let cur = sender.params();
                     let new_params = Self::pick_sender_codec_params(section, &payload_map, &cur);
                     if let Some(np) = new_params
-                        && np.payload_type != cur.payload_type
+                        && (np.payload_type != cur.payload_type || np.clock_rate != cur.clock_rate)
                     {
                         debug!(
                             "Syncing sender PT for mid={}: {} -> {} (clock_rate={})",
@@ -7441,11 +7466,10 @@ pub struct RtpSender {
     cname: Arc<str>,
     rtcp_tx: broadcast::Sender<RtcpPacket>,
     stop_tx: Arc<Notify>,
-    next_sequence_number: Arc<AtomicU16>,
-    packets_sent: Arc<AtomicU32>,
-    octets_sent: Arc<AtomicU32>,
-    last_rtp_timestamp: Arc<AtomicU32>,
-    sampling_timestamp_high_water: Arc<Mutex<Option<u32>>>,
+    send_stats: Arc<crate::transports::rtp::RtpSendStats>,
+    /// Outgoing sequence/timestamp space of this SSRC, shared with any
+    /// rewrite bridge relaying onto it (see [`crate::rtp_timeline`]).
+    timeline: Arc<crate::rtp_timeline::OutboundTimeline>,
     interceptors: Vec<Arc<dyn RtpSenderInterceptor + Send + Sync>>,
     /// sdes:mid extension to inject: (extension header ID, mid value).
     /// Set automatically by update_extmap() when negotiation contains sdes:mid.
@@ -7593,6 +7617,12 @@ impl RtpSender {
             Arc::<str>::from(cname_override.unwrap_or_else(|| format!("rustrtc-cname-{ssrc}")));
         let (rtcp_tx, _) = broadcast::channel(100);
         let (transport_change_tx, _) = watch::channel(0);
+        let timeline = crate::rtp_timeline::OutboundTimeline::new(
+            ssrc,
+            params.clock_rate,
+            random_u32() as u16,
+            random_u32(),
+        );
 
         Self {
             track,
@@ -7604,11 +7634,8 @@ impl RtpSender {
             cname,
             rtcp_tx,
             stop_tx: Arc::new(Notify::new()),
-            next_sequence_number: Arc::new(AtomicU16::new(random_u32() as u16)),
-            packets_sent: Arc::new(AtomicU32::new(0)),
-            octets_sent: Arc::new(AtomicU32::new(0)),
-            last_rtp_timestamp: Arc::new(AtomicU32::new(0)),
-            sampling_timestamp_high_water: Arc::new(Mutex::new(None)),
+            send_stats: Arc::new(crate::transports::rtp::RtpSendStats::default()),
+            timeline,
             interceptors,
             sdes_mid: Arc::new(Mutex::new(None)),
             transport_cc_ext_id: Arc::new(Mutex::new(None)),
@@ -7656,48 +7683,28 @@ impl RtpSender {
         })
     }
 
-    /// Next sequence number the paced send loop will put on the wire.
+    /// Sequence number the next packet on this SSRC will carry.
     pub fn next_sequence_number(&self) -> u16 {
-        self.next_sequence_number.load(Ordering::SeqCst)
+        self.timeline.next_sequence_number()
     }
 
-    /// RTP timestamp of the last packet this sender (or an external writer
-    /// via [`Self::note_external_packet`]) put on the wire.
-    pub fn last_rtp_timestamp(&self) -> u32 {
-        self.last_rtp_timestamp.load(Ordering::Relaxed)
+    /// The outgoing timeline of this sender's SSRC. Hand it to a rewrite
+    /// bridge (`bridge_rewrite_rules_with_timelines`) so relayed packets and
+    /// this sender's own samples share one sequence/timestamp space. The
+    /// caller keeps the two from writing at the same time.
+    pub fn timeline(&self) -> Arc<crate::rtp_timeline::OutboundTimeline> {
+        self.timeline.clone()
     }
 
-    /// Newest observed egress sampling timestamp in wrapping serial-number
-    /// order, or `None` before the first observation. External writers use
-    /// their existing observation boundary; paced sends update after success.
-    /// Comparisons assume forward advances smaller than half the RTP cycle.
-    pub fn rtp_timestamp_high_water(&self) -> Option<u32> {
-        *self.sampling_timestamp_high_water.lock()
-    }
-
-    fn advance_sampling_timestamp(high_water: &Mutex<Option<u32>>, timestamp: u32) {
-        let mut high_water = high_water.lock();
-        if high_water.is_none_or(|previous| timestamp.wrapping_sub(previous) < 0x8000_0000) {
-            *high_water = Some(timestamp);
-        }
-    }
-
-    /// Packets counted for RTCP SR (paced send + [`Self::note_external_packet`]).
+    /// Packets successfully submitted to the transport on this SSRC,
+    /// including paced audio, relayed RTP and raw DTMF.
     pub fn packets_sent(&self) -> u32 {
-        self.packets_sent.load(Ordering::Relaxed)
+        self.send_stats.snapshot().0
     }
 
-    /// Record a packet that left on this SSRC outside the paced send loop
-    /// (typically the RTP rewrite bridge). Keeps RTCP Sender Reports and the
-    /// next paced sequence/timestamp coherent when IVR and fast-path share
-    /// the SDP/`a=ssrc` stream.
-    pub fn note_external_packet(&self, sequence_number: u16, timestamp: u32, payload_len: u32) {
-        self.next_sequence_number
-            .store(sequence_number.wrapping_add(1), Ordering::SeqCst);
-        self.last_rtp_timestamp.store(timestamp, Ordering::Relaxed);
-        Self::advance_sampling_timestamp(&self.sampling_timestamp_high_water, timestamp);
-        self.packets_sent.fetch_add(1, Ordering::Relaxed);
-        self.octets_sent.fetch_add(payload_len, Ordering::Relaxed);
+    /// RTP payload octets successfully submitted on this SSRC.
+    pub fn octets_sent(&self) -> u32 {
+        self.send_stats.snapshot().1
     }
 
     pub fn cname(&self) -> &str {
@@ -7746,6 +7753,9 @@ impl RtpSender {
     }
 
     pub fn set_params(&self, params: RtpCodecParameters) {
+        // Relayed packets map through the timeline too, so its clock follows
+        // the negotiated codec even when the paced loop never runs.
+        self.timeline.set_clock_rate(params.clock_rate);
         *self.params.lock() = params;
     }
 
@@ -7806,6 +7816,7 @@ impl RtpSender {
             .wrapping_add(1);
         let _ = self.transport_change_tx.send(generation);
 
+        transport.register_send_stats(self.ssrc, &self.send_stats);
         *self.transport.lock() = Some(transport.clone());
 
         // Wake any previous send-loop task so it (and the Arc<RtpTransport> +
@@ -7826,11 +7837,8 @@ impl RtpSender {
         let stop_rx = self.stop_tx.clone();
         let transport_change_rx = self.transport_change_tx.subscribe();
         let transport_generation = self.transport_generation.clone();
-        let next_seq = self.next_sequence_number.clone();
-        let packets_sent = self.packets_sent.clone();
-        let octets_sent = self.octets_sent.clone();
-        let last_rtp_timestamp = self.last_rtp_timestamp.clone();
-        let sampling_timestamp_high_water = self.sampling_timestamp_high_water.clone();
+        let send_stats = self.send_stats.clone();
+        let timeline = self.timeline.clone();
         let interceptors = self.interceptors.clone();
         let sdes_mid = self.sdes_mid.clone();
         let transport_cc_ext_id = self.transport_cc_ext_id.clone();
@@ -7842,11 +7850,7 @@ impl RtpSender {
         let pc_span = self.pc_span.clone();
         let rt_handle = self.runtime_handle.clone();
         crate::spawn_rtc(rt_handle.as_ref(), pc_span, async move {
-            #[allow(unused_assignments)]
-            let mut sequence_number = 0u16;
             let mut logged_first_sample = false;
-            let mut last_source_ts: Option<u32> = None;
-            let mut timestamp_offset = random_u32(); // Start with random offset
             // Delay the first SR so the initial RTP burst is not immediately followed by RTCP
             // on the same 5-tuple, which can confuse consumers that are expecting RTP first.
             let mut rtcp_interval = crate::platform::task::interval_after(
@@ -7885,13 +7889,12 @@ impl RtpSender {
                         if !rtcp_enabled.load(Ordering::Relaxed) {
                             continue;
                         }
-                        let packet_count = packets_sent.load(Ordering::Relaxed);
+                        // All send paths account at the transport success boundary.
+                        let (packet_count, octet_count) = send_stats.snapshot();
                         if packet_count == 0 {
                             continue;
                         }
-
-                        let octet_count = octets_sent.load(Ordering::Relaxed);
-                        let rtp_timestamp = last_rtp_timestamp.load(Ordering::Relaxed);
+                        let rtp_timestamp = timeline.timestamp();
                         let mut report_blocks = Vec::new();
                         for interceptor in &*interceptors {
                             report_blocks.extend(interceptor.reception_report_blocks());
@@ -7944,11 +7947,7 @@ impl RtpSender {
                         }
                         match res {
                             Ok(_) if !send_enabled.load(Ordering::Relaxed) => {}
-                            Ok(mut sample) => {
-                                // Reload from the shared counter: rewrite/IVR handoff
-                                // updates it via note_external_packet / adopt while this
-                                // loop may have been blocked on track.recv().
-                                sequence_number = next_seq.load(Ordering::SeqCst);
+                            Ok(sample) => {
                                 if !logged_first_sample {
                                     logged_first_sample = true;
                                     trace!(
@@ -7956,83 +7955,23 @@ impl RtpSender {
                                         ssrc, track_id
                                     );
                                 }
-                                let payload_type = {
+                                let (payload_type, out_clock) = {
                                     let p = params_lock.lock();
-                                    p.payload_type
+                                    (p.payload_type, p.clock_rate)
                                 };
-
-                                // Check if application provided sequence_number (indicates app wants control)
-                                let app_controlled = match &sample {
-                                    crate::media::MediaSample::Audio(f) => {
-                                        f.sequence_number.is_some()
+                                let peer_clock = match &sample {
+                                    crate::media::MediaSample::Audio(f)
+                                        if f.raw_packet.is_none() =>
+                                    {
+                                        None
                                     }
-                                    crate::media::MediaSample::Video(f) => {
-                                        f.sequence_number.is_some()
-                                    }
+                                    crate::media::MediaSample::Audio(f) => Some(f.clock_rate),
+                                    crate::media::MediaSample::Video(_) => Some(out_clock),
                                 };
-
-                                // Always rewrite sequence numbers to ensure continuity on the wire
-                                match &mut sample {
-                                    crate::media::MediaSample::Audio(f) => f.sequence_number = None,
-                                    crate::media::MediaSample::Video(f) => f.sequence_number = None,
-                                }
-
-                                let mut packet = sample.into_rtp_packet(
-                                    ssrc,
-                                    payload_type,
-                                    &mut sequence_number,
-                                );
-
-                                // Update the shared next_sequence_number
-                                next_seq.store(sequence_number, Ordering::SeqCst);
-
-                                if !app_controlled {
-                                    // Application doesn't control seq/ts, use rustrtc's logic
-                                    // Timestamp rewriting
-                                    let src_ts = packet.header.timestamp;
-                                    if let Some(last_src) = last_source_ts {
-                                        let delta = src_ts.wrapping_sub(last_src);
-                                        // Check if src_ts is newer (delta < 2^31)
-                                        if delta < 0x80000000 {
-                                            // If delta is very large (e.g. > 10 seconds), assume source switch/reset
-                                            // 10 seconds * 90000 = 900,000.
-                                            if delta > 900_000 {
-                                                // Discontinuity detected.
-                                                // We want the new timestamp to continue from where we left off.
-                                                // But we don't track last_out_ts explicitly here, we rely on offset.
-                                                // last_out_ts was (last_src + old_offset).
-                                                // new_out_ts should be (last_out_ts + small_delta).
-                                                // Let's assume small_delta = 3000 (1/30s at 90khz) or just 1 to be safe.
-                                                // new_out_ts = last_src + old_offset + 3000.
-                                                // new_out_ts = src_ts + new_offset.
-                                                // => new_offset = last_src + old_offset + 3000 - src_ts.
-                                                timestamp_offset = last_src
-                                                    .wrapping_add(timestamp_offset)
-                                                    .wrapping_add(3000)
-                                                    .wrapping_sub(src_ts);
-                                            }
-                                            last_source_ts = Some(src_ts);
-                                        }
-                                        // If src_ts is older (delta >= 2^31), it's an out-of-order packet.
-                                        // We use the existing offset and do NOT update last_source_ts.
-                                    } else {
-                                        // First packet, establish offset
-                                        // We want out_ts = src_ts + offset.
-                                        // We initialized offset to random.
-                                        // So out_ts will be random. Correct.
-                                        last_source_ts = Some(src_ts);
-                                    }
-
-                                    packet.header.timestamp = src_ts.wrapping_add(timestamp_offset);
-
-                                    // Sequence number was already stamped by
-                                    // into_rtp_packet (which advanced the local
-                                    // counter and persisted it into next_seq at
-                                    // line ~6501). Re-stamping here with
-                                    // fetch_add consumed a SECOND number per
-                                    // packet: wire seq advanced +2 per packet,
-                                    // so RFC 3550 receivers computed a constant
-                                    // phantom ~50% loss. Do not touch it again.
+                                let mut packet = sample.into_rtp_packet(payload_type);
+                                match peer_clock {
+                                    None => timeline.write_frame(&mut packet),
+                                    Some(clock) => timeline.write_peer(&mut packet, clock),
                                 }
 
                                 let dst_addr = transport.remote_addr();
@@ -8054,11 +7993,9 @@ impl RtpSender {
                                     let seq = transport_cc_seq.fetch_add(1, Ordering::SeqCst);
                                     let _ = packet.header.set_extension(tcc_id, &seq.to_be_bytes());
                                 }
-                                let payload_len = packet.payload.len() as u32;
-                                let packet_timestamp = packet.header.timestamp;
 
                                 if let Err(e) = transport.send_rtp(packet).await {
-                                    let n = packets_sent.load(Ordering::Relaxed);
+                                    let n = send_stats.snapshot().0;
                                     if n < 5 {
                                         warn!(
                                             "RtpSender: failed to send RTP (ssrc={}): {}",
@@ -8068,19 +8005,13 @@ impl RtpSender {
                                         trace!("Failed to send RTP: {}", e);
                                     }
                                 } else {
-                                    let n = packets_sent.fetch_add(1, Ordering::Relaxed) + 1;
+                                    let n = send_stats.snapshot().0;
                                     if n == 1 {
                                         trace!(
                                             "RtpSender: first RTP packet sent on wire ssrc={} track_id={}",
                                             ssrc, track_id
                                         );
                                     }
-                                    octets_sent.fetch_add(payload_len, Ordering::Relaxed);
-                                    last_rtp_timestamp.store(packet_timestamp, Ordering::Relaxed);
-                                    Self::advance_sampling_timestamp(
-                                        &sampling_timestamp_high_water,
-                                        packet_timestamp,
-                                    );
                                 }
                             }
                             Err(crate::media::error::MediaError::Lagged) => {
@@ -9591,7 +9522,7 @@ mod tests {
             };
             if direct {
                 pc.bridge_rtp_with_rewrite_to_self(RtpRewriteBridgeParams {
-                    fixed_out_ssrc: Some(sender.ssrc()),
+                    out_ssrc: sender.ssrc(),
                     ..Default::default()
                 })
                 .unwrap();
@@ -11319,6 +11250,7 @@ a=sendrecv\r\n";
         );
         // RtpTransport::send (a pre-built datagram) reads the SSRC from bytes 8..12.
         let raw = RtpPacket::new(RtpHeader::new(96, 1, 0, 1234), vec![1]);
+        #[allow(deprecated)]
         let sent = transport.send(&raw.marshal().unwrap()).await;
         assert!(matches!(sent, Ok(0)), "sent a held stream: {sent:?}");
 
@@ -11332,40 +11264,6 @@ a=sendrecv\r\n";
             1,
             "retransmission after resume"
         );
-    }
-
-    #[tokio::test]
-    async fn test_sender_sampling_high_water_preserves_wire_last_and_counters() {
-        let (_, track, _) = sample_track(crate::media::MediaKind::Audio, 8);
-        let sender = RtpSender::new(
-            track,
-            10000,
-            "clock-boundary".into(),
-            RtpCodecParameters {
-                payload_type: 0,
-                name: "PCMU".into(),
-                clock_rate: 8000,
-                channels: 1,
-            },
-            Vec::new(),
-        );
-        assert_eq!(sender.rtp_timestamp_high_water(), None);
-        let timestamps = [u32::MAX - 159, 0, u32::MAX - 319, 160];
-        let expected_high_water = [u32::MAX - 159, 0, 0, 160];
-        for (index, (&timestamp, &expected)) in
-            timestamps.iter().zip(&expected_high_water).enumerate()
-        {
-            let sequence = 65534u16.wrapping_add(index as u16);
-            sender.note_external_packet(sequence, timestamp, 160);
-            assert_eq!(sender.last_rtp_timestamp(), timestamp);
-            assert_eq!(sender.rtp_timestamp_high_water(), Some(expected));
-            assert_eq!(sender.next_sequence_number(), sequence.wrapping_add(1));
-            assert_eq!(sender.packets_sent(), index as u32 + 1);
-            assert_eq!(
-                sender.octets_sent.load(Ordering::Relaxed),
-                (index as u32 + 1) * 160
-            );
-        }
     }
 
     #[tokio::test]

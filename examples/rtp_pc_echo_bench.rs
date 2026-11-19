@@ -255,13 +255,16 @@ async fn process_offer(
     if bridge_mode {
         pc.wait_for_rtp_transport_ready(Duration::from_secs(2))
             .await?;
+        let out_ssrc = pc
+            .get_transceivers()
+            .into_iter()
+            .find_map(|t| t.sender())
+            .map(|s| s.ssrc())
+            .unwrap_or(10_000);
         pc.bridge_rtp_with_rewrite_to_self(RtpRewriteBridgeParams {
-            ssrc_offset: 10_000,
-            fixed_out_ssrc: None,
+            out_ssrc,
             payload_type: Some(0),
             dtmf_payload_type: None,
-            initial_sequence_number: None,
-            initial_timestamp_offset: None,
             strip_extensions: false,
         })?;
     }

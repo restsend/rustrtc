@@ -100,6 +100,7 @@ async fn test_rtp_mode_no_default_extensions() -> Result<()> {
         // Send a few frames
         for i in 0..5 {
             let frame = VideoFrame {
+                sequence_number: Some(i as u16),
                 rtp_timestamp: i * 3000,
                 data: bytes::Bytes::from(vec![0u8; 100]),
                 is_last_packet: true,

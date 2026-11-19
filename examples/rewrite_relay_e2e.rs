@@ -245,14 +245,10 @@ async fn handle_offer(
                     dst,
                     rustrtc::RtpRewriteBridgeOptions {
                         strip_extensions: true,
-                        initial_sequence_number: Some(1000),
-                        initial_timestamp_offset: None,
-                        initial_output_timestamp: None,
                     },
                     vec![rustrtc::RtpRewriteRule {
                         match_payload_type: None,
-                        fixed_out_ssrc: Some(10_000),
-                        ssrc_offset: 0,
+                        out_ssrc: 10_000,
                         out_payload_type: None,
                         sdes_mid_extension_id: None,
                         sdes_mid: None,

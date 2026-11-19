@@ -87,6 +87,7 @@ async fn gcc_loop_runs_over_loopback() -> Result<()> {
         let mut seq = 0u32;
         loop {
             let frame = rustrtc::media::VideoFrame {
+                sequence_number: Some(seq as u16),
                 rtp_timestamp: seq.wrapping_mul(3000),
                 data: bytes::Bytes::from(vec![0u8; 200]),
                 is_last_packet: true,

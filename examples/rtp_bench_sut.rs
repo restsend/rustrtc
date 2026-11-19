@@ -90,12 +90,16 @@ async fn start_forwarding(pc: PeerConnection, pt: u8, echo_addr: SocketAddr) {
                         if count % 100 == 0 {
                             info!("SUT received {} packets for track {} from PC", count, ssrc);
                         }
-                        let data = match sample {
-                            rustrtc::media::MediaSample::Video(frame) => frame.data,
-                            rustrtc::media::MediaSample::Audio(frame) => frame.data,
+                        // Echo complete RTP packets so the return path keeps
+                        // source loss, ordering and timestamp identity.
+                        let packet = match sample {
+                            rustrtc::media::MediaSample::Video(frame) => frame.raw_packet,
+                            rustrtc::media::MediaSample::Audio(frame) => frame.raw_packet,
                         };
-                        if !data.is_empty() {
-                            let _ = echo_socket_clone.send_to(&data, echo_addr).await;
+                        if let Some(packet) = packet {
+                            if let Ok(data) = packet.marshal() {
+                                let _ = echo_socket_clone.send_to(&data, echo_addr).await;
+                            }
                         }
                     }
                     Err(e) => {
@@ -122,21 +126,16 @@ async fn start_forwarding(pc: PeerConnection, pt: u8, echo_addr: SocketAddr) {
                                 count, ssrc
                             );
                         }
-                        let sample = if pt == 0 {
-                            rustrtc::media::MediaSample::Audio(rustrtc::media::AudioFrame {
-                                data: buf[..size].to_vec().into(),
-                                rtp_timestamp: 0,
-                                payload_type: Some(pt),
-                                ..Default::default()
-                            })
-                        } else {
-                            rustrtc::media::MediaSample::Video(rustrtc::media::VideoFrame {
-                                data: buf[..size].to_vec().into(),
-                                rtp_timestamp: 0,
-                                payload_type: Some(pt),
-                                ..Default::default()
-                            })
+                        let packet = match rustrtc::rtp::RtpPacket::parse(&buf[..size]) {
+                            Ok(packet) => packet,
+                            Err(e) => {
+                                warn!("Invalid echoed RTP packet for {}: {}", ssrc, e);
+                                continue;
+                            }
                         };
+                        let sample = rustrtc::media::MediaSample::from_rtp_packet(
+                            packet, kind, clock_rate, echo_addr,
+                        );
                         if let Err(e) = sample_source_clone.send(sample) {
                             warn!("Sample source for {} error: {}", ssrc, e);
                             break;

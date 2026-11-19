@@ -71,6 +71,7 @@ async fn test_remote_addr_and_raw_packet() -> Result<()> {
         // Send enough packets to ensure reception
         for _ in 0..100 {
             let frame = VideoFrame {
+                sequence_number: Some(seq as u16),
                 rtp_timestamp: seq * 3000,
                 data: bytes::Bytes::from(vec![seq as u8; 100]), // Use seq as data to verify
                 is_last_packet: true,

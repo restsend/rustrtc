@@ -5389,12 +5389,9 @@ async fn rewrite_bridge_relays_rtp_to_turn_leg() -> Result<()> {
     src.bridge_rewrite_to(
         dst.clone(),
         RtpRewriteBridgeParams {
-            ssrc_offset: 0,
-            fixed_out_ssrc: Some(0x1234_5678),
+            out_ssrc: 0x1234_5678,
             payload_type: Some(8),
             dtmf_payload_type: None,
-            initial_sequence_number: Some(100),
-            initial_timestamp_offset: None,
             strip_extensions: false,
         },
     );

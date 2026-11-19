@@ -168,6 +168,7 @@ fn two_no_std_pcs_run_full_webrtc_over_the_seams() {
         Box::new(async move {
             for seq in 0..40u8 {
                 let frame = VideoFrame {
+                    sequence_number: Some(u16::from(seq)),
                     rtp_timestamp: seq as u32 * 3000,
                     data: bytes::Bytes::from(vec![seq; 100]),
                     is_last_packet: true,

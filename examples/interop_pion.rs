@@ -379,13 +379,20 @@ async fn run_client(addr_str: &str) {
     transceiver.set_sender(Some(sender.clone()));
 
     tokio::spawn(async move {
+        let mut seq = 0u16;
+        let mut timestamp = 0u32;
         loop {
             sleep(Duration::from_millis(33)).await;
             let frame = VideoFrame {
+                sequence_number: Some(seq),
+                rtp_timestamp: timestamp,
+                is_last_packet: true,
                 data: bytes::Bytes::from_static(&[0u8; 100]),
                 ..Default::default()
             };
             let _ = source.send_video(frame);
+            seq = seq.wrapping_add(1);
+            timestamp = timestamp.wrapping_add(2_970); // 33 ms at 90 kHz
         }
     });
 

@@ -156,7 +156,7 @@ async fn relay(out_mode: (Connectivity, Keying), sink_direction: Direction) -> R
     relay_in.bridge_rtp_with_rewrite_to(
         &out,
         RtpRewriteBridgeParams {
-            fixed_out_ssrc: Some(out_ssrc),
+            out_ssrc,
             ..Default::default()
         },
     )?;

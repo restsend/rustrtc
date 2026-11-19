@@ -19,6 +19,7 @@ pub struct Packetizer {
     mtu: usize,
     payloader: Box<dyn Payloader>,
     pending: VecDeque<MediaSample>,
+    next_seq: u16,
 }
 
 impl Packetizer {
@@ -28,6 +29,7 @@ impl Packetizer {
             mtu,
             payloader,
             pending: VecDeque::new(),
+            next_seq: 0,
         }
     }
 
@@ -39,6 +41,11 @@ impl Packetizer {
                 for (i, payload) in payloads.into_iter().enumerate() {
                     let mut f = frame.clone();
                     f.data = payload;
+                    // Repacketization produces a fresh RTP packet stream rather
+                    // than reusing any upstream packet identity.
+                    f.raw_packet = None;
+                    f.sequence_number = Some(self.next_seq);
+                    self.next_seq = self.next_seq.wrapping_add(1);
                     f.is_last_packet = i == count - 1;
                     self.pending.push_back(MediaSample::Video(f));
                 }
@@ -148,15 +155,11 @@ impl Payloader for Vp9Payloader {
         // Max payload size excluding the descriptor (1 octet + 2-octet PID).
         let max_payload_size = mtu.saturating_sub(3).max(1);
 
-        // Advance the Picture ID once per frame (15 bits, wraps at 0x7fff).
+        // Advance once per frame and keep the low 15 bits for the wire.
         let pid = self
             .picture_id
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |v| Some((v + 1) & 0x7fff),
-            )
-            .unwrap_or(0);
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            & 0x7fff;
 
         let mut offset = 0;
         let total = data.len();
@@ -289,8 +292,10 @@ mod vp9_tests {
     }
 
     #[test]
-    fn vp9_picture_id_advances_per_frame() {
-        let p = Vp9Payloader::new();
+    fn vp9_picture_id_wraps_after_15_bits() {
+        let p = Vp9Payloader {
+            picture_id: std::sync::atomic::AtomicU16::new(0x7fff),
+        };
         let pid1 = parse_vp9_descriptor(&p.payload(1200, Bytes::from(vec![1u8; 10]))[0])
             .unwrap()
             .picture_id
@@ -299,7 +304,8 @@ mod vp9_tests {
             .unwrap()
             .picture_id
             .unwrap();
-        assert_eq!(pid2, (pid1 + 1) & 0x7fff);
+        assert_eq!(pid1, 0x7fff);
+        assert_eq!(pid2, 0);
     }
 
     #[test]
@@ -466,6 +472,29 @@ mod vp9_tests {
         assert!(p.packetize(&[]).is_empty());
         assert_eq!(p.packetize(&[0, 0, 1]).len(), 1);
     }
+
+    #[test]
+    fn h264_access_unit_numbers_all_fragments_and_marks_last() {
+        let mut p = H264Packetizer::new();
+        let sps = vec![0x67, 0x42, 0x00, 0x1F];
+        let pps = vec![0x68, 0xCE, 0x3C, 0x80];
+        let mut idr = vec![0x65u8];
+        idr.extend(std::iter::repeat(0xAB).take(2600));
+        let frames = p
+            .packetize_access_unit([sps.as_slice(), pps.as_slice(), idr.as_slice()], p.timestamp())
+            .into_frames(640, 360);
+        assert_eq!(frames.len(), 5);
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(f.sequence_number, Some(i as u16));
+            assert_eq!(f.rtp_timestamp, 0);
+            assert_eq!(f.is_last_packet, i + 1 == frames.len());
+        }
+        p.advance();
+        let next = p.packetize(&[0x41, 1, 2]).into_frames(640, 360);
+        assert_eq!(next[0].sequence_number, Some(5));
+        assert_eq!(next[0].rtp_timestamp, H264_TS_PER_FRAME);
+        assert!(next[0].is_last_packet);
+    }
 }
 
 // ── H.264 (RFC 6184) ──────────────────────────────────────────────────────
@@ -523,9 +552,10 @@ impl Payloader for H264Payloader {
     }
 }
 
-/// Tracks the 90 kHz RTP clock; NALs (Annex-B or raw) → fragment lists.
+/// Tracks the 90 kHz RTP clock and sequence space; NALs (Annex-B or raw) → fragment lists.
 pub struct H264Packetizer {
     timestamp: u32,
+    next_seq: std::sync::atomic::AtomicU16,
 }
 
 impl Default for H264Packetizer {
@@ -536,7 +566,10 @@ impl Default for H264Packetizer {
 
 impl H264Packetizer {
     pub fn new() -> Self {
-        Self { timestamp: 0 }
+        Self {
+            timestamp: 0,
+            next_seq: std::sync::atomic::AtomicU16::new(0),
+        }
     }
 
     pub fn timestamp(&self) -> u32 {
@@ -548,13 +581,32 @@ impl H264Packetizer {
     }
 
     pub fn packetize_from_raw(&self, nal_data: &[u8], ts: u32) -> H264Fragments {
-        if nal_data.is_empty() {
-            return H264Fragments::empty();
+        self.packetize_access_unit([nal_data], ts)
+    }
+
+    /// Packetize all raw NALs of one access unit (e.g. SPS + PPS + IDR) into a
+    /// single contiguous sequence run sharing `ts`, with RTP marker on the final
+    /// fragment only.
+    pub fn packetize_access_unit<I, B>(&self, nals: I, ts: u32) -> H264Fragments
+    where
+        I: IntoIterator<Item = B>,
+        B: AsRef<[u8]>,
+    {
+        let mut data = Vec::new();
+        for nal in nals {
+            let nal_data = nal.as_ref();
+            if !nal_data.is_empty() {
+                let payloads = H264Payloader.payload(H264_MTU, Bytes::copy_from_slice(nal_data));
+                data.extend(payloads.into_iter().map(|b| b.to_vec()));
+            }
         }
-        let payloads = H264Payloader.payload(H264_MTU, Bytes::copy_from_slice(nal_data));
+        let start_seq = self
+            .next_seq
+            .fetch_add(data.len() as u16, std::sync::atomic::Ordering::Relaxed);
         H264Fragments {
-            data: payloads.into_iter().map(|b| b.to_vec()).collect(),
+            data,
             timestamp: ts,
+            start_seq,
         }
     }
 
@@ -576,24 +628,13 @@ impl H264Packetizer {
 pub struct H264Fragments {
     data: Vec<Vec<u8>>,
     timestamp: u32,
+    start_seq: u16,
 }
 
 impl H264Fragments {
-    fn empty() -> Self {
-        Self {
-            data: Vec::new(),
-            timestamp: 0,
-        }
-    }
-
     /// Fragment payloads, in transmission order.
     pub fn payloads(&self) -> &[Vec<u8>] {
         &self.data
-    }
-
-    /// Build from raw fragment payloads sharing one timestamp.
-    pub fn from_payloads(data: Vec<Vec<u8>>, timestamp: u32) -> Self {
-        Self { data, timestamp }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -607,6 +648,7 @@ impl H264Fragments {
     pub fn into_frames(self, width: u16, height: u16) -> Vec<VideoFrame> {
         let count = self.data.len();
         let ts = self.timestamp;
+        let start_seq = self.start_seq;
         self.data
             .into_iter()
             .enumerate()
@@ -617,6 +659,7 @@ impl H264Fragments {
                 format: VideoPixelFormat::Unspecified,
                 is_last_packet: i + 1 == count,
                 rtp_timestamp: ts,
+                sequence_number: Some(start_seq.wrapping_add(i as u16)),
                 ..Default::default()
             })
             .collect()
@@ -677,9 +720,10 @@ impl Payloader for H265Payloader {
     }
 }
 
-/// Tracks the 90 kHz RTP clock; NALs (Annex-B or raw) → fragment lists.
+/// Tracks the 90 kHz RTP clock and sequence space; NALs (Annex-B or raw) → fragment lists.
 pub struct H265Packetizer {
     timestamp: u32,
+    next_seq: std::sync::atomic::AtomicU16,
 }
 
 impl Default for H265Packetizer {
@@ -690,7 +734,10 @@ impl Default for H265Packetizer {
 
 impl H265Packetizer {
     pub fn new() -> Self {
-        Self { timestamp: 0 }
+        Self {
+            timestamp: 0,
+            next_seq: std::sync::atomic::AtomicU16::new(0),
+        }
     }
 
     pub fn timestamp(&self) -> u32 {
@@ -702,13 +749,32 @@ impl H265Packetizer {
     }
 
     pub fn packetize_from_raw(&self, nal_data: &[u8], ts: u32) -> H265Fragments {
-        if nal_data.len() < 2 {
-            return H265Fragments::empty();
+        self.packetize_access_unit([nal_data], ts)
+    }
+
+    /// Packetize all raw NALs of one access unit (e.g. VPS + SPS + PPS + IDR)
+    /// into a single contiguous sequence run sharing `ts`, with RTP marker on
+    /// the final fragment only.
+    pub fn packetize_access_unit<I, B>(&self, nals: I, ts: u32) -> H265Fragments
+    where
+        I: IntoIterator<Item = B>,
+        B: AsRef<[u8]>,
+    {
+        let mut data = Vec::new();
+        for nal in nals {
+            let nal_data = nal.as_ref();
+            if nal_data.len() >= 2 {
+                let payloads = H265Payloader.payload(H265_MTU, Bytes::copy_from_slice(nal_data));
+                data.extend(payloads.into_iter().map(|b| b.to_vec()));
+            }
         }
-        let payloads = H265Payloader.payload(H265_MTU, Bytes::copy_from_slice(nal_data));
+        let start_seq = self
+            .next_seq
+            .fetch_add(data.len() as u16, std::sync::atomic::Ordering::Relaxed);
         H265Fragments {
-            data: payloads.into_iter().map(|b| b.to_vec()).collect(),
+            data,
             timestamp: ts,
+            start_seq,
         }
     }
 
@@ -730,16 +796,10 @@ impl H265Packetizer {
 pub struct H265Fragments {
     data: Vec<Vec<u8>>,
     timestamp: u32,
+    start_seq: u16,
 }
 
 impl H265Fragments {
-    fn empty() -> Self {
-        Self {
-            data: Vec::new(),
-            timestamp: 0,
-        }
-    }
-
     /// Fragment payloads, in transmission order.
     pub fn payloads(&self) -> &[Vec<u8>] {
         &self.data
@@ -747,7 +807,11 @@ impl H265Fragments {
 
     /// Build from raw fragment payloads sharing one timestamp.
     pub fn from_payloads(data: Vec<Vec<u8>>, timestamp: u32) -> Self {
-        Self { data, timestamp }
+        Self {
+            data,
+            timestamp,
+            start_seq: 0,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -761,6 +825,7 @@ impl H265Fragments {
     pub fn into_frames(self, width: u16, height: u16) -> Vec<VideoFrame> {
         let count = self.data.len();
         let ts = self.timestamp;
+        let start_seq = self.start_seq;
         self.data
             .into_iter()
             .enumerate()
@@ -771,6 +836,7 @@ impl H265Fragments {
                 format: VideoPixelFormat::Unspecified,
                 is_last_packet: i + 1 == count,
                 rtp_timestamp: ts,
+                sequence_number: Some(start_seq.wrapping_add(i as u16)),
                 ..Default::default()
             })
             .collect()
@@ -849,5 +915,33 @@ mod h265_tests {
     fn h265_empty_input() {
         assert!(H265Payloader.payload(1200, Bytes::new()).is_empty());
         assert!(H265Packetizer::new().packetize(&[]).is_empty());
+    }
+
+    #[test]
+    fn h265_access_unit_assigns_contiguous_sequence_numbers() {
+        let mut p = H265Packetizer::new();
+        let vps = nal(32, 24);
+        let sps = nal(33, 30);
+        let pps = nal(34, 10);
+        let idr = nal(19, 2500); // 3 FU fragments at MTU 1200
+
+        let frames = p
+            .packetize_access_unit(
+                [vps.as_slice(), sps.as_slice(), pps.as_slice(), idr.as_slice()],
+                p.timestamp(),
+            )
+            .into_frames(640, 480);
+        assert_eq!(frames.len(), 6);
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(f.sequence_number, Some(i as u16));
+            assert_eq!(f.rtp_timestamp, 0);
+            assert_eq!(f.is_last_packet, i + 1 == frames.len());
+        }
+
+        p.advance();
+        let next = p.packetize_from_raw(&nal(1, 100), p.timestamp()).into_frames(640, 480);
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].sequence_number, Some(6));
+        assert_eq!(next[0].rtp_timestamp, H265_TS_PER_FRAME);
     }
 }

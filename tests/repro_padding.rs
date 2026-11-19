@@ -120,6 +120,7 @@ async fn test_padding_packet_drop() -> Result<()> {
     // Packet 1: Valid
     println!("Sending P1");
     let f1 = VideoFrame {
+        sequence_number: Some(0),
         rtp_timestamp: 1000,
         data: Bytes::from(vec![0x90, 0x80, 0x01]),
         ..Default::default()
@@ -130,6 +131,7 @@ async fn test_padding_packet_drop() -> Result<()> {
     // Packet 2: Empty (Padding)
     println!("Sending P2");
     let f2 = VideoFrame {
+        sequence_number: Some(1),
         rtp_timestamp: 1000,
         data: Bytes::new(), // Empty
         ..Default::default()
@@ -140,6 +142,7 @@ async fn test_padding_packet_drop() -> Result<()> {
     // Packet 3: Valid
     println!("Sending P3");
     let f3 = VideoFrame {
+        sequence_number: Some(2),
         rtp_timestamp: 4000,
         data: Bytes::from(vec![0x90, 0x80, 0x01]), // valid
         is_last_packet: true,

@@ -39,6 +39,9 @@ pub struct AudioFrame {
     #[cfg_attr(feature = "std", serde(skip))]
     pub source_addr: Option<SocketAddr>,
     #[cfg_attr(feature = "std", serde(skip))]
+    /// Packet identity for forwarding through the outbound timeline. Keep it
+    /// for relayed packets (including relayed telephone-event); leave `None`
+    /// for generated/transcoded audio frames paced at `ptime`.
     pub raw_packet: Option<RtpPacket>,
 }
 
@@ -61,6 +64,8 @@ impl Default for AudioFrame {
 #[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VideoFrame {
+    /// Source RTP timestamp (both relayed packets and locally captured/packetized
+    /// video streams). Mapped onto the sender's SSRC via `OutboundTimeline::write_peer`.
     pub rtp_timestamp: u32,
     pub width: u16,
     pub height: u16,
@@ -75,6 +80,8 @@ pub struct VideoFrame {
     #[cfg_attr(feature = "std", serde(skip))]
     pub source_addr: Option<SocketAddr>,
     #[cfg_attr(feature = "std", serde(skip))]
+    /// Original RTP identity for peer packet mapping. Locally packetized
+    /// video leaves this unset and carries the packetizer's sequence number.
     pub raw_packet: Option<RtpPacket>,
 }
 
@@ -113,38 +120,41 @@ impl MediaSample {
         }
     }
 
-    pub fn into_rtp_packet(
-        self,
-        ssrc: u32,
-        default_payload_type: u8,
-        sequence_number: &mut u16,
-    ) -> RtpPacket {
-        let (payload, marker, rtp_timestamp, csrcs, frame_seq, frame_pt, extension) = match self {
-            MediaSample::Audio(f) => (
-                f.data,
-                f.marker,
-                f.rtp_timestamp,
-                Vec::new(),
-                f.sequence_number,
-                f.payload_type,
-                f.header_extension,
+    /// Pack this sample into an `RtpPacket` carrying its source `(ssrc, seq, ts)`
+    /// for `OutboundTimeline` (`write_peer` maps them; `write_frame` overwrites them).
+    pub(crate) fn into_rtp_packet(self, default_payload_type: u8) -> RtpPacket {
+        let (payload, marker, rtp_timestamp, csrcs, frame_seq, frame_pt, extension, raw) =
+            match self {
+                MediaSample::Audio(f) => (
+                    f.data,
+                    f.marker,
+                    f.rtp_timestamp,
+                    Vec::new(),
+                    f.sequence_number,
+                    f.payload_type,
+                    f.header_extension,
+                    f.raw_packet,
+                ),
+                MediaSample::Video(f) => (
+                    f.data,
+                    f.is_last_packet,
+                    f.rtp_timestamp,
+                    f.csrcs,
+                    f.sequence_number,
+                    f.payload_type,
+                    f.header_extension,
+                    f.raw_packet,
+                ),
+            };
+
+        let (seq, ssrc) = match raw.as_ref() {
+            Some(pkt) => (
+                frame_seq.unwrap_or(pkt.header.sequence_number),
+                pkt.header.ssrc,
             ),
-            MediaSample::Video(f) => (
-                f.data,
-                f.is_last_packet,
-                f.rtp_timestamp,
-                f.csrcs,
-                f.sequence_number,
-                f.payload_type,
-                f.header_extension,
-            ),
+            // `0` marks a local source (`peer_source_ssrc()` ignores `0`).
+            None => (frame_seq.unwrap_or_default(), 0),
         };
-
-        let seq = frame_seq.unwrap_or(*sequence_number);
-        if frame_seq.is_none() {
-            *sequence_number = sequence_number.wrapping_add(1);
-        }
-
         let pt = frame_pt.unwrap_or(default_payload_type);
         let mut header = RtpHeader::new(pt, seq, rtp_timestamp, ssrc);
         header.marker = marker;

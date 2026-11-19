@@ -70,6 +70,7 @@ async fn test_media_flow_and_pli() -> Result<()> {
         let mut seq = 0;
         loop {
             let frame = VideoFrame {
+                sequence_number: Some(seq as u16),
                 rtp_timestamp: seq * 3000,
                 data: bytes::Bytes::from(vec![0u8; 100]),
                 is_last_packet: true,

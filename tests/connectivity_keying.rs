@@ -79,6 +79,7 @@ async fn media_flows(source: SampleStreamSource, transceiver: &Arc<RtpTransceive
         for n in 0u32.. {
             let sample = match kind {
                 MediaKind::Video => MediaSample::Video(VideoFrame {
+                    sequence_number: Some(n as u16),
                     rtp_timestamp: n * 3000,
                     data: Bytes::from(vec![0u8; 100]),
                     is_last_packet: true,

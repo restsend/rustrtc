@@ -36,6 +36,7 @@ pub mod media;
 pub mod peer_connection;
 pub mod platform;
 pub mod rtp;
+pub mod rtp_timeline;
 pub mod rtx;
 pub mod sdp;
 pub mod srtp;

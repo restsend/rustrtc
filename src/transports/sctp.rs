@@ -2149,12 +2149,9 @@ impl SctpInner {
             }
 
             if outcome.flight_reduction > 0 {
-                let reduction = outcome.flight_reduction;
-                let _ = self
-                    .flight_size
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |f| {
-                        Some(f.saturating_sub(reduction))
-                    });
+                self.flight_size.update(Ordering::SeqCst, Ordering::SeqCst, |size| {
+                    size.saturating_sub(outcome.flight_reduction)
+                });
 
                 // Congestion Control: Update cwnd_tx for outbound traffic
                 let cwnd = self.cwnd_tx.load(Ordering::SeqCst);
@@ -3653,12 +3650,9 @@ impl SctpInner {
                     record.needs_retransmit = false;
                     if record.in_flight {
                         record.in_flight = false;
-                        let len = record.payload.len();
-                        let _ = self.flight_size.fetch_update(
-                            Ordering::SeqCst,
-                            Ordering::SeqCst,
-                            |f| Some(f.saturating_sub(len)),
-                        );
+                        self.flight_size.update(Ordering::SeqCst, Ordering::SeqCst, |size| {
+                            size.saturating_sub(record.payload.len())
+                        });
                     }
                 }
             }

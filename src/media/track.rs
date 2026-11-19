@@ -274,6 +274,14 @@ impl SampleStreamSource {
         Ok(())
     }
 
+    /// Discard queued samples when replacing an output source. A packet
+    /// already taken by the consumer remains in flight.
+    pub fn discard_pending(&self) {
+        let _push_guard = self.push_lock.lock();
+        let _pop_guard = self.pop_lock.lock();
+        while self.queue.pop().is_some() {}
+    }
+
     /// Increments the drop count (called by RtpReceiver when depacketizer drops frames).
     pub fn increment_drop_count(&self) {
         self.drop_count.fetch_add(1, Ordering::Relaxed);
