@@ -318,6 +318,19 @@ impl IceConn {
     fn commit_latch(&self, from: SocketAddr, to: SocketAddr, ssrc: u32, switch: u8, reason: &str) {
         if to != from {
             *self.remote_addr.write() = to;
+            // In non-rtcp-mux mode behind NAT, SDP may advertise a private IP
+            // for both RTP and RTCP. Until inbound RTCP teaches the exact RTCP
+            // source address, align the RTCP IP with the latched RTP IP (while
+            // keeping the SDP RTCP port) so early PLI/FIR/NACK is reachable.
+            if !self.rtcp_latched.load(Ordering::Relaxed) {
+                let mut remote_rtcp = self.remote_rtcp_addr.write();
+                if let Some(rtcp) = *remote_rtcp
+                    && rtcp.ip() == from.ip()
+                    && to.ip() != rtcp.ip()
+                {
+                    *remote_rtcp = Some(SocketAddr::new(to.ip(), rtcp.port()));
+                }
+            }
         }
         self.rtp_latched.store(true, Ordering::Relaxed);
         tracing::info!("IceConn: RTP latched to {} ({})", to, reason);
@@ -1464,6 +1477,38 @@ mod tests {
             *conn.remote_rtcp_addr.read(),
             Some(rtcp_src),
             "RTCP should not re-latch after already latched"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rtp_latch_syncs_unlatched_rtcp_ip() {
+        let (_tx, rx) = watch::channel(None);
+        let private_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
+        let public_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+        let conn = IceConn::new(rx, SocketAddr::new(private_ip, 4004), None);
+        conn.enable_latch_on_rtp();
+        conn.set_rtp_receiver(Arc::new(NoopReceiver));
+        conn.set_remote_rtcp_addr(Some(SocketAddr::new(private_ip, 4005)));
+
+        // RTP latches to public IP before any inbound RTCP arrives.
+        let rtp_src = SocketAddr::new(public_ip, 54004);
+        let mut marshal_buf = Vec::new();
+        for seq in 1u16..=3 {
+            let mut pkt = [0x80u8, 0x60, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1];
+            pkt[2..4].copy_from_slice(&seq.to_be_bytes());
+            conn.receive(Bytes::copy_from_slice(&pkt), rtp_src, &mut marshal_buf)
+                .await;
+        }
+
+        assert_eq!(*conn.remote_addr.read(), rtp_src);
+        assert_eq!(
+            *conn.remote_rtcp_addr.read(),
+            Some(SocketAddr::new(public_ip, 4005)),
+            "unlatched RTCP IP should follow latched RTP IP while keeping SDP RTCP port"
+        );
+        assert!(
+            !conn.rtcp_latched.load(Ordering::Relaxed),
+            "RTCP should still allow inbound RTCP packets to refine the NAT RTCP port"
         );
     }
 
