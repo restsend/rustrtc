@@ -63,6 +63,58 @@ async fn connected_pair(
 }
 
 #[tokio::test]
+async fn connected_recv_loops_exit_on_close_and_release_everything() {
+    let (pc1, pc2) = connected_pair((Connectivity::Ice, Keying::Dtls), true).await;
+    let l1 = {
+        let pc = pc1.clone();
+        tokio::spawn(async move { while pc.recv().await.is_some() {} })
+    };
+    let l2 = {
+        let pc = pc2.clone();
+        tokio::spawn(async move { while pc.recv().await.is_some() {} })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    pc1.close();
+    pc2.close();
+    assert!(
+        timeout(Duration::from_secs(2), async {
+            let _ = tokio::join!(l1, l2);
+        })
+        .await
+        .is_ok(),
+        "recv() loops did not exit after closing a connected pair"
+    );
+    drop((pc1, pc2));
+    assert!(
+        wait_no_tasks(3).await,
+        "{} tasks still alive after connected recv loops exited",
+        alive_tasks()
+    );
+}
+
+#[tokio::test]
+async fn recv_loop_exits_on_close_and_releases_the_connection() {
+    // Regression: `while let Some(ev) = pc.recv().await` used to park after
+    // close() (the event channel is never closed), so the task — and the
+    // connection clone it holds — lived forever.
+    let pc = PeerConnection::new(RtcConfiguration::webrtc());
+    let loop_pc = pc.clone();
+    let loop_task = tokio::spawn(async move { while loop_pc.recv().await.is_some() {} });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    pc.close();
+    assert!(
+        timeout(Duration::from_secs(2), loop_task).await.is_ok(),
+        "the recv() loop did not exit after close()"
+    );
+    drop(pc);
+    assert!(
+        wait_no_tasks(3).await,
+        "{} tasks still alive after the recv loop exited",
+        alive_tasks()
+    );
+}
+
+#[tokio::test]
 async fn close_without_held_handles_releases_all_tasks() {
     let (pc1, pc2) = connected_pair((Connectivity::Ice, Keying::Dtls), true).await;
     pc1.close();
@@ -114,8 +166,12 @@ async fn close_releases_all_tasks_while_transceivers_held_rtp_and_srtp() {
             rustrtc::rtp::RtpHeader::new(0, 1, 0, 0x12345678),
             vec![0; 160],
         );
-        pc1.wait_for_rtp_transport_ready(Duration::from_secs(3)).await.unwrap();
-        pc2.wait_for_rtp_transport_ready(Duration::from_secs(3)).await.unwrap();
+        pc1.wait_for_rtp_transport_ready(Duration::from_secs(3))
+            .await
+            .unwrap();
+        pc2.wait_for_rtp_transport_ready(Duration::from_secs(3))
+            .await
+            .unwrap();
         pc1.send_raw_rtp(packet).await.unwrap();
         timeout(Duration::from_secs(3), async {
             while pc2.received_rtp_packets() == 0 {
@@ -135,7 +191,10 @@ async fn close_releases_all_tasks_while_transceivers_held_rtp_and_srtp() {
             ready.wait();
             loop {
                 let current = reading.received_rtp_packets();
-                assert!(current >= previous, "closing must not reset the received packet count");
+                assert!(
+                    current >= previous,
+                    "closing must not reset the received packet count"
+                );
                 previous = current;
                 if done.load(std::sync::atomic::Ordering::Acquire) {
                     return current;

@@ -695,6 +695,39 @@ pub(crate) enum QueuedEvent {
     Track(Weak<RtpTransceiver>),
 }
 
+/// Non-blocking pop of one queued event. `None` means the queue is empty (or
+/// the channel is closed); the caller reports the end through the peer state.
+fn try_pop_queued(rx: &mut mpsc::UnboundedReceiver<QueuedEvent>) -> Option<QueuedEvent> {
+    #[cfg(feature = "std")]
+    {
+        rx.try_recv().ok()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        rx.try_recv().ok().flatten()
+    }
+}
+
+/// Upgrade a queued entry into an application event. Dead `Track` entries
+/// (their transceiver graph is already gone) yield `None` and are skipped by
+/// the caller.
+fn upgrade_queued(queued: QueuedEvent) -> Option<PeerConnectionEvent> {
+    match queued {
+        QueuedEvent::DataChannel(dc) => Some(PeerConnectionEvent::DataChannel(dc)),
+        QueuedEvent::Track(weak) => weak.upgrade().map(PeerConnectionEvent::Track),
+    }
+}
+
+/// Drain queued entries until a live event is produced or the queue is empty.
+fn drain_queued(rx: &mut mpsc::UnboundedReceiver<QueuedEvent>) -> Option<PeerConnectionEvent> {
+    loop {
+        let queued = try_pop_queued(rx)?;
+        if let Some(event) = upgrade_queued(queued) {
+            return Some(event);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct PeerConnection {
     inner: Arc<PeerConnectionInner>,
@@ -3957,22 +3990,59 @@ impl PeerConnection {
         self.inner.close_with_reason(DisconnectReason::LocalClose);
     }
 
+    /// Waits for the next application event: an incoming data channel or a
+    /// negotiated track.
+    ///
+    /// The stream ends when the connection is closed: every event queued
+    /// before the close is still delivered, then `None` is returned, and any
+    /// later call returns `None` immediately. The idiomatic loop therefore
+    /// terminates on its own and releases the `PeerConnection` handle it
+    /// holds:
+    ///
+    /// ```ignore
+    /// while let Some(event) = pc.recv().await {
+    ///     // ...
+    /// }
+    /// ```
+    ///
+    /// The call is cancel-safe (it may be raced in a `select!`): no queued
+    /// event is lost if another branch wins.
     pub async fn recv(&self) -> Option<PeerConnectionEvent> {
         let mut rx = self.inner.event_rx.lock().await;
+        #[allow(unused_mut)]
+        let mut state = self.inner.peer_state.subscribe();
         loop {
-            match rx.recv().await? {
-                QueuedEvent::DataChannel(dc) => {
-                    return Some(PeerConnectionEvent::DataChannel(dc));
-                }
-                QueuedEvent::Track(weak) => {
-                    // Skip events whose transceiver graph was already torn
-                    // down (e.g. a backlog queued before a close the
-                    // application never observed). The Weak payload keeps
-                    // such a backlog from pinning the whole per-call graph.
-                    if let Some(transceiver) = weak.upgrade() {
-                        return Some(PeerConnectionEvent::Track(transceiver));
+            // Deliver the backlog first. `close()` does not drop pending
+            // application events; they are handed out before the stream ends.
+            if let Some(event) = drain_queued(&mut rx) {
+                return Some(event);
+            }
+            if *state.borrow() == PeerConnectionState::Closed {
+                // Queue drained and the connection is closed: the stream is
+                // over. Later calls short-circuit here without waiting.
+                return None;
+            }
+
+            // Wait for either the next event or a peer-state transition. The
+            // state arm makes an in-flight `recv()` wake on `close()` even
+            // though `event_tx` is never dropped (it lives in the inner).
+            let mut recv_pin = core::pin::pin!(rx.recv());
+            let mut state_pin = core::pin::pin!(state.changed());
+            match crate::platform::select::select2(&mut recv_pin, &mut state_pin).await {
+                crate::platform::select::Either::A(queued) => match queued {
+                    Some(queued) => {
+                        if let Some(event) = upgrade_queued(queued) {
+                            return Some(event);
+                        }
+                        // Entry whose track graph was already torn down: keep
+                        // draining whatever is behind it.
                     }
-                }
+                    // All senders are gone (the owner is being torn down).
+                    None => return None,
+                },
+                // Peer state changed (possibly to `Closed`): re-drain and
+                // re-check at the top of the loop.
+                crate::platform::select::Either::B(_) => {}
             }
         }
     }

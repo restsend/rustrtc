@@ -1,8 +1,19 @@
 # Changelog
 
-## 0.6.5 — 2026-11-18
+## 0.6.5 — 2026-11-19
 
 Idle `PeerConnection` teardown is deterministic.
+
+### Changed
+
+- `PeerConnection::recv()` now ends when the connection is closed: events
+  queued before `close()` are still delivered, then `None` is returned, and
+  later calls return `None` immediately. A call that is already blocked wakes
+  on close. This makes `while let Some(event) = pc.recv().await` terminate on
+  its own, so tasks holding a `PeerConnection` handle no longer pin the
+  connection (and its per-call state) forever. `Failed` keeps the stream open
+  so ICE restarts and renegotiation can still be observed. Regression guards:
+  `tests/recv_closed.rs`, `tests/resource_reclaim_test.rs`.
 
 ### Fixed
 
@@ -21,7 +32,8 @@ Idle `PeerConnection` teardown is deterministic.
   loop first polled after `stop()` can no longer miss `Closed` and park
   forever waiting for the next update.
 
-No API-breaking changes.
+No compile-time API changes. `recv()` terminates on close now; see the
+behaviour note above.
 
 ## 0.6.4 — 2026-11-09
 
