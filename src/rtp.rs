@@ -53,6 +53,29 @@ pub struct RtpHeader {
     pub extension: Option<RtpHeaderExtension>,
 }
 
+// Element ID, header offset, and payload range. Zero bytes outside elements
+// are padding in both RFC 8285 profiles.
+fn extension_elements(
+    extension: &RtpHeaderExtension,
+) -> impl Iterator<Item = (u8, usize, core::ops::Range<usize>)> + '_ {
+    let mut offset = 0;
+    core::iter::from_fn(move || {
+        while extension.data.get(offset) == Some(&0) {
+            offset += 1;
+        }
+        let start = offset;
+        let first = *extension.data.get(offset)?;
+        let (id, len, header_len) = match extension.profile {
+            0xBEDE if first >> 4 != 15 => (first >> 4, usize::from(first & 0x0F) + 1, 1),
+            0x1000..=0x100F => (first, usize::from(*extension.data.get(offset + 1)?), 2),
+            _ => return None,
+        };
+        let value_start = offset + header_len;
+        offset = value_start + len;
+        (offset <= extension.data.len()).then_some((id, start, value_start..offset))
+    })
+}
+
 impl RtpHeader {
     pub fn new(payload_type: u8, sequence_number: u16, timestamp: u32, ssrc: u32) -> Self {
         Self {
@@ -126,129 +149,87 @@ impl RtpHeader {
     }
 
     pub fn get_extension(&self, id: u8) -> Option<Bytes> {
-        if let Some(ext) = &self.extension {
-            if ext.profile == 0xBEDE {
-                let mut offset = 0;
-                while offset < ext.data.len() {
-                    let b = ext.data[offset];
-                    if b == 0 {
-                        offset += 1;
-                        continue;
-                    }
-                    let ext_id = b >> 4;
-                    let len = (b & 0x0F) as usize + 1;
-                    offset += 1;
+        let extension = self.extension.as_ref()?;
+        let (_, _, value) = extension_elements(extension)
+            .find(|(ext_id, _, _)| *ext_id == id)?;
+        Some(extension.data.slice(value))
+    }
 
-                    if ext_id == 15 {
-                        break;
-                    }
-
-                    if ext_id == id {
-                        if offset + len <= ext.data.len() {
-                            return Some(ext.data.slice(offset..offset + len));
-                        } else {
-                            return None;
-                        }
-                    }
-                    offset += len;
-                }
-            } else if ext.profile == 0x1000 {
-                let mut offset = 0;
-                while offset < ext.data.len() {
-                    let ext_id = ext.data[offset];
-                    if ext_id == 0 {
-                        offset += 1;
-                        continue;
-                    }
-                    offset += 1;
-
-                    if offset >= ext.data.len() {
-                        break;
-                    }
-                    let len = ext.data[offset] as usize;
-                    offset += 1;
-
-                    if ext_id == id {
-                        if offset + len <= ext.data.len() {
-                            return Some(ext.data.slice(offset..offset + len));
-                        } else {
-                            return None;
-                        }
-                    }
-                    offset += len;
-                }
-            } else {
-                // Unsupported extension profile
+    pub(crate) fn remove_extension(&mut self, id: u8) {
+        let Some(extension) = &mut self.extension else {
+            return;
+        };
+        let mut data = None;
+        for (ext_id, start, value) in extension_elements(extension) {
+            if ext_id == id {
+                data.get_or_insert_with(|| extension.data.to_vec())[start..value.end].fill(0);
             }
         }
-        None
+        if let Some(data) = data {
+            if data.iter().all(|&byte| byte == 0) {
+                self.extension = None;
+            } else {
+                extension.data = Bytes::from(data);
+            }
+        }
     }
 
     pub fn set_extension(&mut self, id: u8, data: &[u8]) -> RtpResult<()> {
-        if id == 0 || id >= 15 {
-            return Err(RtpError::InvalidHeader(
-                "invalid extension id for one-byte header",
-            ));
+        if id == 0 {
+            return Err(RtpError::InvalidHeader("invalid extension id"));
         }
-        if data.len() > 16 || data.is_empty() {
+        if data.len() > u8::MAX as usize {
             return Err(RtpError::InvalidHeader("invalid extension data length"));
         }
+        let mut profile = if id < 15 && (1..=16).contains(&data.len()) {
+            0xBEDE
+        } else {
+            0x1000
+        };
+        if let Some(extension) = &self.extension {
+            match extension.profile {
+                0xBEDE => {}
+                0x1000..=0x100F => profile = extension.profile,
+                _ => {
+                    return Err(RtpError::InvalidHeader(
+                        "unsupported extension profile for modification",
+                    ));
+                }
+            }
+        }
 
-        let mut ext = self
+        let existing_len = self
             .extension
-            .take()
-            .unwrap_or_else(|| RtpHeaderExtension::new(0xBEDE, Vec::new()));
-
-        if ext.profile != 0xBEDE {
-            // For now, we only support modifying 0xBEDE
-            self.extension = Some(ext);
-            return Err(RtpError::InvalidHeader(
-                "unsupported extension profile for modification",
-            ));
-        }
-
-        // Upper bound on the rebuilt block: existing bytes + one new entry + padding.
-        let mut new_data = Vec::with_capacity(ext.data.len() + data.len() + 1 + 4);
-        let mut found = false;
-        let mut offset = 0;
-        let id_header = (id << 4) | ((data.len() - 1) as u8);
-
-        while offset < ext.data.len() {
-            let b = ext.data[offset];
-            if b == 0 {
-                offset += 1;
-                continue;
-            }
-            let ext_id = b >> 4;
-            let len = (b & 0x0F) as usize + 1;
-            offset += 1;
-
-            if ext_id == 15 {
-                break;
-            }
-
-            if ext_id == id {
-                found = true;
-                new_data.push(id_header);
-                new_data.extend_from_slice(data);
+            .as_ref()
+            .map_or(0, |extension| extension.data.len());
+        let mut encoded = Vec::with_capacity(existing_len + data.len() + 5);
+        let mut append = |ext_id: u8, value: &[u8]| {
+            if profile == 0xBEDE {
+                encoded.push((ext_id << 4) | ((value.len() - 1) as u8));
             } else {
-                new_data.push(b);
-                new_data.extend_from_slice(&ext.data[offset..offset + len]);
+                encoded.extend_from_slice(&[ext_id, value.len() as u8]);
             }
-            offset += len;
+            encoded.extend_from_slice(value);
+        };
+
+        let mut replaced = false;
+        if let Some(extension) = &self.extension {
+            for (ext_id, _, value) in extension_elements(extension) {
+                if ext_id == id {
+                    if !replaced {
+                        append(id, data);
+                        replaced = true;
+                    }
+                } else {
+                    append(ext_id, &extension.data[value]);
+                }
+            }
         }
-
-        if !found {
-            new_data.push(id_header);
-            new_data.extend_from_slice(data);
+        if !replaced {
+            append(id, data);
         }
-
-        // Align to 32-bit boundary in a single resize (no per-byte push loop).
-        let aligned = (new_data.len() + 3) & !3;
-        new_data.resize(aligned, 0);
-
-        ext.data = Bytes::from(new_data);
-        self.extension = Some(ext);
+        encoded.resize((encoded.len() + 3) & !3, 0);
+        self.extension = Some(RtpHeaderExtension::new(profile, encoded));
         Ok(())
     }
 

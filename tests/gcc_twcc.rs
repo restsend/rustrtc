@@ -7,9 +7,14 @@
 #![allow(clippy::field_reassign_with_default)]
 use anyhow::Result;
 use rustrtc::MediaKind;
+use rustrtc::config::MediaCapabilities;
 use rustrtc::media::MediaSample;
+use rustrtc::peer_connection::RtpObserver;
+use rustrtc::rtp::RtpPacket;
 use rustrtc::transports::ice::IceGathererState;
 use rustrtc::{PeerConnection, RtcConfiguration, RtpCodecParameters};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -35,22 +40,36 @@ fn video_params() -> RtpCodecParameters {
 async fn gcc_loop_runs_over_loopback() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let pc1 = PeerConnection::new(RtcConfiguration {
+    let mut capabilities = MediaCapabilities::default();
+    capabilities.audio[0].rtcp_fbs.push("transport-cc".into());
+    let config = || RtcConfiguration {
         enable_gcc: true,
+        media_capabilities: Some(capabilities.clone()),
         ..RtcConfiguration::webrtc()
-    });
-    let pc2 = PeerConnection::new(RtcConfiguration {
-        enable_gcc: true,
-        ..RtcConfiguration::webrtc()
-    });
+    };
+    let pc1 = PeerConnection::new(config());
+    let pc2 = PeerConnection::new(config());
 
     // PC1: sender with a live video source.
     let (source, track, _) =
         rustrtc::media::track::sample_track(rustrtc::media::MediaKind::Video, 100);
     let sender = pc1.add_track(track.clone(), video_params())?;
 
-    // PC2: receive-only video.
+    let (audio_source, audio_track, _) =
+        rustrtc::media::track::sample_track(rustrtc::media::MediaKind::Audio, 10);
+    let audio_sender = pc1.add_track(
+        audio_track,
+        RtpCodecParameters {
+            payload_type: 111,
+            name: "opus".into(),
+            clock_rate: 48000,
+            channels: 2,
+        },
+    )?;
+
+    // PC2 receives both streams on the same BUNDLE transport.
     pc2.add_transceiver(MediaKind::Video, rustrtc::TransceiverDirection::RecvOnly);
+    pc2.add_transceiver(MediaKind::Audio, rustrtc::TransceiverDirection::RecvOnly);
 
     // Signal.
     let _ = pc1.create_offer().await?;
@@ -77,14 +96,49 @@ async fn gcc_loop_runs_over_loopback() -> Result<()> {
         .iter()
         .find(|(_, uri)| uri.as_str() == rustrtc::sdp::TRANSPORT_CC_URI)
         .map(|(id, _)| *id);
-    assert!(
-        tcc_id.is_some(),
-        "transport-cc extmap must be negotiated, got {extmap:?}"
+    let tcc_id = tcc_id.expect("transport-cc extmap must be negotiated");
+
+    struct Ingress(tokio::sync::mpsc::UnboundedSender<RtpPacket>);
+    impl RtpObserver for Ingress {
+        fn on_ingress(&self, packet: &RtpPacket, _: SocketAddr) {
+            let _ = self.0.send(packet.clone());
+        }
+    }
+    let (observed, mut packets) = tokio::sync::mpsc::unbounded_channel();
+    pc2.add_observer(Arc::new(Ingress(observed)));
+    let mut sequences: Vec<u16> = Vec::new();
+    for (index, ssrc) in [audio_sender.ssrc(), sender.ssrc(), audio_sender.ssrc()]
+        .into_iter()
+        .enumerate()
+    {
+        if ssrc == audio_sender.ssrc() {
+            audio_source.send_audio(rustrtc::media::AudioFrame {
+                data: bytes::Bytes::from_static(&[0xf8, 0xff, 0xfe]),
+                ..Default::default()
+            })?;
+        } else {
+            source.send_video(rustrtc::media::VideoFrame {
+                sequence_number: Some(index as u16),
+                rtp_timestamp: 3000,
+                data: bytes::Bytes::from_static(&[0xaa]),
+                is_last_packet: true,
+                ..Default::default()
+            })?;
+        }
+        let packet = timeout(Duration::from_secs(2), packets.recv()).await?.unwrap();
+        assert_eq!(packet.header.ssrc, ssrc);
+        let extension = packet.header.get_extension(tcc_id).expect("TWCC extension");
+        sequences.push(u16::from_be_bytes(extension.as_ref().try_into()?));
+    }
+    assert_eq!(
+        sequences,
+        [sequences[0], sequences[0].wrapping_add(1), sequences[0].wrapping_add(2)],
     );
+    drop(packets);
 
     // Pump frames.
     let send_task = tokio::spawn(async move {
-        let mut seq = 0u32;
+        let mut seq = 2u32;
         loop {
             let frame = rustrtc::media::VideoFrame {
                 sequence_number: Some(seq as u16),
@@ -131,7 +185,7 @@ async fn gcc_loop_runs_over_loopback() -> Result<()> {
     let rx = sender
         .subscribe_target_bitrate()
         .expect("estimator must be installed");
-    assert_eq!(*rx.borrow(), bitrate);
+    assert_eq!(*rx.borrow(), audio_sender.target_bitrate().unwrap());
     Ok(())
 }
 

@@ -7,13 +7,12 @@
 //! packets arrived and with what inter-arrival deltas.
 //!
 //! [`TwccFeedbackGenerator`] observes inbound RTP packets on the receive path
-//! (as an [`RtpReceiverInterceptor`]) and, on a 100 ms cadence, encodes and
+//! and, on a 100 ms cadence, encodes and
 //! sends the feedback report. Status encoding uses 2-bit-symbol status vector
 //! chunks with 1-byte (250 µs units) or 2-byte (250 µs units) recv deltas —
 //! the subset Chrome and pion emit in practice.
 
 use crate::prelude::*;
-use alloc::collections::{BTreeMap, VecDeque};
 use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering};
 use crate::platform::atomic64::AtomicU64;
 use crate::platform::time::Instant;
@@ -25,8 +24,6 @@ use crate::transports::rtp::RtpTransport;
 
 /// How often pending feedback is flushed.
 const FLUSH_INTERVAL: core::time::Duration = core::time::Duration::from_millis(100);
-/// Flush early (burst tolerance) when this many packets are pending.
-const EARLY_FLUSH_PACKETS: usize = 200;
 /// Hard cap on statuses in one feedback packet (MTU safety: ~500 packets).
 const MAX_STATUSES_PER_REPORT: usize = 480;
 
@@ -34,10 +31,10 @@ const MAX_STATUSES_PER_REPORT: usize = 480;
 enum DeltaSize {
     /// Packet not received.
     Lost,
-    /// Fits in 1 byte (250 µs units, signed 8-bit).
-    Small(i64),
+    /// Fits in 1 byte (250 µs units, unsigned 8-bit).
+    Small(u8),
     /// Fits in 2 bytes (250 µs units, signed 16-bit).
-    Large(i64),
+    Large(i16),
 }
 
 struct PendingRecord {
@@ -45,10 +42,13 @@ struct PendingRecord {
     arrival_us: u64,
 }
 
-/// Generates TWCC feedback for one receiver (one RTP stream direction).
-///
-/// Sequence numbers are tracked per remote media SSRC; each flush emits one
-/// feedback packet per SSRC with pending records.
+#[derive(Default)]
+struct PendingFeedback {
+    media_ssrc: u32,
+    records: Vec<PendingRecord>,
+}
+
+/// Generates TWCC feedback for a transport's incoming RTP sequence space.
 pub struct TwccFeedbackGenerator {
     /// Negotiated extmap id of the transport-cc header extension (0 = unknown;
     /// packets are ignored until negotiation populates this).
@@ -59,8 +59,8 @@ pub struct TwccFeedbackGenerator {
     feedback_seq: AtomicU16,
     /// Reference clock for arrival-time deltas.
     clock: Instant,
-    /// Per-SSRC pending (seq, arrival_us) records, in arrival order.
-    pending: Mutex<BTreeMap<u32, VecDeque<PendingRecord>>>,
+    /// BUNDLE interleaves audio, video and RTX in a single sequence space.
+    pending: Mutex<PendingFeedback>,
     /// Diagnostics.
     pub packets_observed: AtomicU64,
     pub feedback_sent: AtomicU64,
@@ -79,7 +79,7 @@ impl TwccFeedbackGenerator {
             feedback_ssrc: AtomicU32::new(0),
             feedback_seq: AtomicU16::new(rand_u16()),
             clock: Instant::now(),
-            pending: Mutex::new(BTreeMap::new()),
+            pending: Mutex::new(PendingFeedback::default()),
             packets_observed: AtomicU64::new(0),
             feedback_sent: AtomicU64::new(0),
         }
@@ -114,7 +114,7 @@ impl TwccFeedbackGenerator {
         Some(u16::from_be_bytes([data[0], data[1]]))
     }
 
-    /// Record an observed packet (called from the interceptor hot path).
+    /// Record an observed RTP packet before any rewriting.
     pub fn observe(&self, packet: &RtpPacket) {
         let Some(seq) = self.extract_tcc_seq(packet) else {
             return;
@@ -122,45 +122,42 @@ impl TwccFeedbackGenerator {
         self.packets_observed.fetch_add(1, Ordering::Relaxed);
         let arrival_us = self.clock.elapsed().as_micros() as u64;
         let mut pending = self.pending.lock();
-        let queue = pending.entry(packet.header.ssrc).or_default();
-        // Drop exact duplicates (retransmissions carry a new tcc seq in
-        // practice; an identical seq is a bug-suppression no-op).
-        if queue.back().map(|r| r.seq) == Some(seq) {
-            return;
+        pending.media_ssrc = packet.header.ssrc;
+        if pending.records.last().is_none_or(|record| record.seq != seq) {
+            pending.records.push(PendingRecord { seq, arrival_us });
         }
-        queue.push_back(PendingRecord { seq, arrival_us });
-    }
-
-    fn pending_count(&self) -> usize {
-        self.pending.lock().values().map(|q| q.len()).sum()
     }
 
     /// Build and send feedback for all pending records. Returns the number of
     /// RTCP feedback packets sent.
     pub async fn flush(&self, transport: &RtpTransport) -> usize {
-        let mut sent = 0;
-        let records: Vec<(u32, VecDeque<PendingRecord>)> = {
-            let mut pending = self.pending.lock();
-            core::mem::take(&mut *pending).into_iter().collect()
+        let PendingFeedback { media_ssrc, mut records } =
+            core::mem::take(&mut *self.pending.lock());
+        let Some(anchor) = records.first().map(|record| record.seq) else {
+            return 0;
         };
+        // Sort around the first arrival so reordering (including across a
+        // sequence-number wrap) does not look like loss.
+        records.sort_by_key(|record| (record.seq.wrapping_sub(anchor) as i16, record.arrival_us));
+        records.dedup_by_key(|record| record.seq);
+
+        let mut sent = 0;
         let feedback_ssrc = self.feedback_ssrc.load(Ordering::SeqCst);
-        for (media_ssrc, queue) in records {
-            // Encode in slices so a burst cannot exceed the MTU.
-            let owned: Vec<PendingRecord> = queue.into_iter().collect();
-            for chunk in owned.chunks(MAX_STATUSES_PER_REPORT) {
-                match self.build_feedback(media_ssrc, feedback_ssrc, chunk) {
-                    Some(feedback) => {
-                        if transport
-                            .send_rtcp(&[RtcpPacket::TransportWideCc(feedback)])
-                            .await
-                            .is_ok()
-                        {
-                            sent += 1;
-                            self.feedback_sent.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    None => continue,
-                }
+        let mut remaining = records.as_slice();
+        while let Some(first) = remaining.first() {
+            let count = remaining.partition_point(|record| {
+                usize::from(record.seq.wrapping_sub(first.seq)) < MAX_STATUSES_PER_REPORT
+            });
+            let (window, rest) = remaining.split_at(count);
+            remaining = rest;
+            if let Some(feedback) = self.build_feedback(media_ssrc, feedback_ssrc, window)
+                && transport
+                    .send_rtcp(&[RtcpPacket::TransportWideCc(feedback)])
+                    .await
+                    .is_ok()
+            {
+                sent += 1;
+                self.feedback_sent.fetch_add(1, Ordering::Relaxed);
             }
         }
         sent
@@ -178,39 +175,27 @@ impl TwccFeedbackGenerator {
         }
 
         let base_seq = records[0].seq;
-        let first_arrival = records[0].arrival_us;
-
-        // Map wrapped seq → position; drop records outside the window.
-        let mut statuses: Vec<DeltaSize> = Vec::with_capacity(records.len());
-        let mut deltas_us: Vec<Option<i64>> = Vec::with_capacity(records.len());
+        let reference_time = records[0].arrival_us / 64_000;
+        let mut previous_arrival = (reference_time * 64_000) as i64;
+        let mut statuses = Vec::with_capacity(records.len());
         let mut expected = base_seq;
-        // Recv deltas are INTER-PACKET (RFC 3611-style): arrival[i] −
-        // arrival[i−1]; the first packet's delta is 0 (its absolute arrival
-        // is carried by `reference_time`).
-        let mut prev_arrival = first_arrival;
-        for r in records {
-            let offset = r.seq.wrapping_sub(expected);
-            if offset == 0 {
-                // In order: emit directly.
-            } else if offset < 1000 {
-                // Gap before this record: mark the missing seqs as not received.
-                for _ in 0..offset {
-                    statuses.push(DeltaSize::Lost);
-                    deltas_us.push(None);
-                }
-            } else {
-                // Stale duplicate from before the window start: skip.
-                continue;
-            }
-            let delta_us = r.arrival_us.saturating_sub(prev_arrival) as i64;
-            prev_arrival = r.arrival_us;
-            statuses.push(delta_size(delta_us));
-            deltas_us.push(Some(delta_us));
-            expected = r.seq.wrapping_add(1);
-        }
-        if statuses.len() > MAX_STATUSES_PER_REPORT {
-            statuses.truncate(MAX_STATUSES_PER_REPORT);
-            deltas_us.truncate(MAX_STATUSES_PER_REPORT);
+        for record in records {
+            let missing = usize::from(record.seq.wrapping_sub(expected));
+            statuses.extend(core::iter::repeat_n(DeltaSize::Lost, missing));
+
+            // The first delta starts at the 64 ms reference time, and the
+            // rest start at the previous encoded arrival to avoid roundoff
+            // accumulating. Sequence-sorted records can need negative deltas.
+            let delta_us = record.arrival_us as i64 - previous_arrival;
+            let units = (delta_us + delta_us.signum() * 125) / 250;
+            let units = units.clamp(i64::from(i16::MIN), i64::from(i16::MAX));
+            let delta = match u8::try_from(units) {
+                Ok(small) => DeltaSize::Small(small),
+                Err(_) => DeltaSize::Large(units as i16),
+            };
+            statuses.push(delta);
+            previous_arrival += units * 250;
+            expected = record.seq.wrapping_add(1);
         }
         let packet_status_count = statuses.len() as u16;
 
@@ -252,17 +237,11 @@ impl TwccFeedbackGenerator {
             }
         }
         // Recv deltas in the same order as the statuses.
-        for (s, d) in statuses.iter().zip(deltas_us.iter()) {
-            match (s, d) {
-                (DeltaSize::Lost, _) | (_, None) => {}
-                (DeltaSize::Small(_), Some(us)) => {
-                    let units = (*us / 250) as u8;
-                    payload.push(units);
-                }
-                (DeltaSize::Large(_), Some(us)) => {
-                    let units = (*us / 250) as i16;
-                    payload.extend_from_slice(&units.to_be_bytes());
-                }
+        for status in statuses {
+            match status {
+                DeltaSize::Lost => {}
+                DeltaSize::Small(units) => payload.push(units),
+                DeltaSize::Large(units) => payload.extend_from_slice(&units.to_be_bytes()),
             }
         }
 
@@ -273,35 +252,32 @@ impl TwccFeedbackGenerator {
             base_sequence: base_seq,
             packet_status_count,
             // Reference time: 24-bit, 64 ms units, from our clock epoch.
-            reference_time_64ms: (first_arrival / 64_000) as u32 & 0x00FF_FFFF,
+            reference_time_64ms: reference_time as u32 & 0x00FF_FFFF,
             feedback_packet_count: (seq & 0xff) as u8,
             payload,
         })
     }
 
-    /// Periodic flush loop; spawn per receiver transport. The loop holds the
-    /// transport weakly and returns once every other `Arc` to it is dropped.
-    pub async fn run_flush_loop(
-        self: Arc<Self>,
-        transport: Arc<RtpTransport>,
-    ) {
+    /// Periodically flush an explicitly configured receiver's feedback.
+    pub async fn run_flush_loop(self: Arc<Self>, transport: Arc<RtpTransport>) {
         let weak_transport = Arc::downgrade(&transport);
         drop(transport);
-        let mut ticker =
-            crate::platform::task::interval_after(FLUSH_INTERVAL, FLUSH_INTERVAL);
+        Self::run_transport_flush_loop(Arc::downgrade(&self), weak_transport).await;
+    }
+
+    /// Exit when a transport is dropped or its negotiated feedback changes.
+    pub(crate) async fn run_transport_flush_loop(
+        feedback: Weak<Self>,
+        transport: Weak<RtpTransport>,
+    ) {
+        let mut ticker = crate::platform::task::interval_after(FLUSH_INTERVAL, FLUSH_INTERVAL);
         ticker.set_missed_tick_behavior(crate::platform::task::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            if self.pending_count() >= EARLY_FLUSH_PACKETS {
-                // The tick handles bursts well enough; this branch just keeps
-                // the constant honest about intent.
-            }
-            let Some(transport) = weak_transport.upgrade() else {
+            let (Some(feedback), Some(transport)) = (feedback.upgrade(), transport.upgrade()) else {
                 return;
             };
-            if self.flush(&transport).await == 0 {
-                continue;
-            }
+            feedback.flush(&transport).await;
         }
     }
 }
@@ -312,19 +288,6 @@ fn symbol_bits(s: &DeltaSize) -> u16 {
         DeltaSize::Lost => 0b00,
         DeltaSize::Small(_) => 0b01,
         DeltaSize::Large(_) => 0b10,
-    }
-}
-
-fn delta_size(delta_us: i64) -> DeltaSize {
-    let units = delta_us / 250;
-    if (0..=255).contains(&units) {
-        DeltaSize::Small(delta_us)
-    } else if (-32768..=32767).contains(&units) {
-        DeltaSize::Large(delta_us)
-    } else {
-        // Beyond the 2-byte range: clamp; real flows never hit this and
-        // receivers tolerate the wrap.
-        DeltaSize::Large(delta_us.clamp(-8_190_000, 8_191_750))
     }
 }
 
@@ -359,8 +322,7 @@ mod tests {
         generator.set_ext_id(5);
         generator.set_feedback_ssrc(0x1234_5678);
 
-        // 15 packets arriving 40 ms apart (inter-packet delta 40_000 µs →
-        // 160 units → 2-byte large deltas).
+        // 15 packets arriving 40 ms apart use 1-byte deltas (160 units).
         let mut records = Vec::new();
         let t0 = 1_000_000u64;
         for i in 0..15u16 {
@@ -375,12 +337,10 @@ mod tests {
         assert_eq!(fb.media_ssrc, 0xAA_BB_CC_DD);
         assert_eq!(fb.base_sequence, 100);
         assert_eq!(fb.packet_status_count, 15);
-        // 15 identical Large statuses → 1 run-length chunk + 15 × 2-byte
-        // deltas (the first delta is 0 but still encoded as large/2 bytes? no:
-        // 0 µs → 0 units → small/1 byte).
-        // 15 identical Small statuses (40 ms = 160 units fits the unsigned
-        // 1-byte delta) → 1 run-length chunk + 15 × 1-byte deltas.
         assert_eq!(fb.payload.len(), 2 + 15);
+        let decoded = crate::rtp::decode_twcc_feedback(&fb);
+        assert_eq!(fb.reference_time_64ms, 15);
+        assert_eq!(decoded[0], (100, Some(40_000)));
     }
 
     #[test]
@@ -433,6 +393,6 @@ mod tests {
         let mut header = RtpHeader::new(96, 1, 9000, 42);
         header.set_extension(3, &[1, 2, 3, 4]).unwrap();
         generator.observe(&RtpPacket::new(header, vec![0u8; 10]));
-        assert_eq!(generator.pending_count(), 0);
+        assert!(generator.pending.lock().records.is_empty());
     }
 }

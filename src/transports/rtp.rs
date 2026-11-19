@@ -1,4 +1,7 @@
 use crate::errors::{RtcError, RtcResult};
+use crate::media::gcc::GccBandwidthEstimator;
+use crate::media::twcc_feedback::TwccFeedbackGenerator;
+use crate::sdp::MediaKind;
 use crate::peer_connection::{RtpObserver, RtpReceiver};
 use crate::platform::atomic64::AtomicU64;
 use crate::platform::sync::{Mutex, RwLock, mpsc};
@@ -11,9 +14,8 @@ use crate::transports::ice::conn::IceConn;
 use alloc::collections::VecDeque;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use core::cell::RefCell;
 use core::net::SocketAddr;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use tracing::{debug, trace};
 
 /// Successful transport submissions for one sender SSRC, shared by paced,
@@ -84,13 +86,8 @@ pub struct RtpRewriteBridgeParams {
 
 /// A single payload-type-scoped rewrite rule for the RTP rewrite bridge.
 ///
-/// The bridge rewrites every forwarded packet using the most specific match:
-/// a rule whose `match_payload_type` equals the packet's payload type wins;
-/// otherwise the single rule with `match_payload_type: None` acts as the
-/// catch-all. Audio-only relays install one catch-all rule; video relays add
-/// one rule per m-line payload type so audio, video and DTMF each get their own
-/// destination SSRC / payload type (the legacy single-param bridge rewrote
-/// every packet — audio AND video — to one SSRC/PT, which corrupted video).
+/// An exact payload-type match takes precedence over the catch-all
+/// (`match_payload_type: None`).
 #[derive(Debug, Clone)]
 pub struct RtpRewriteRule {
     /// When `Some(pt)`, only packets carrying this payload type are rewritten.
@@ -170,79 +167,54 @@ struct RewriteBridge {
     /// which would otherwise be an unbreakable Arc cycle. Upgraded per
     /// packet; a dead destination uninstalls the bridge.
     target: Weak<RtpTransport>,
-    video_target: Option<Weak<RtpTransport>>,
-    video_payload_types: BTreeSet<u8>,
     options: RtpRewriteBridgeOptions,
     rules: Vec<RtpRewriteRule>,
     /// Outgoing timeline per destination SSRC: the ones handed in by the
     /// caller (shared with that SSRC's sender), plus ones created on first
     /// use for any other rewritten SSRC. Every rewritten packet is mapped
     /// through one as a peer packet (see [`crate::rtp_timeline`]).
-    timelines: RefCell<BTreeMap<u32, Arc<OutboundTimeline>>>,
+    timelines: BTreeMap<u32, Arc<OutboundTimeline>>,
 }
 
 impl RewriteBridge {
     fn new(
         target: Arc<RtpTransport>,
-        video_target: Option<Arc<RtpTransport>>,
-        video_payload_types: BTreeSet<u8>,
         options: RtpRewriteBridgeOptions,
         rules: Vec<RtpRewriteRule>,
         timelines: Vec<Arc<OutboundTimeline>>,
     ) -> Self {
         Self {
             target: Arc::downgrade(&target),
-            video_target: video_target.as_ref().map(Arc::downgrade),
-            video_payload_types,
             options,
             rules,
-            timelines: RefCell::new(timelines.into_iter().map(|t| (t.ssrc(), t)).collect()),
+            timelines: timelines.into_iter().map(|t| (t.ssrc(), t)).collect(),
         }
     }
 
     /// Pick the most specific rule for a payload type: an exact-PT match wins,
-    /// otherwise the catch-all (match_payload_type: None), otherwise none.
-    fn rule_for(&self, raw_pt: u8) -> Option<RtpRewriteRule> {
+    /// otherwise the catch-all (`match_payload_type: None`).
+    fn rule_for(&self, raw_pt: u8) -> Option<&RtpRewriteRule> {
         self.rules
             .iter()
             .find(|r| r.match_payload_type == Some(raw_pt))
-            .cloned()
-            .or_else(|| {
-                self.rules
-                    .iter()
-                    .find(|r| r.match_payload_type.is_none())
-                    .cloned()
-            })
+            .or_else(|| self.rules.iter().find(|r| r.match_payload_type.is_none()))
     }
 
-    /// Select the destination from the packet's original negotiated payload
-    /// type. This runs before any payload-type rewrite. `None` = destination
-    /// transport freed (peer PeerConnection closed) — the caller uninstalls
-    /// the bridge and drops the packet.
-    fn target_for(&self, raw_pt: u8) -> Option<Arc<RtpTransport>> {
-        if self.video_payload_types.contains(&raw_pt)
-            && let Some(video_target) = self.video_target.as_ref().and_then(|w| w.upgrade())
-        {
-            return Some(video_target);
-        }
-        self.target.upgrade()
-    }
-
-    /// Rewrite `packet` for the destination.
-    fn rewrite_packet(&self, packet: &mut RtpPacket) {
+    /// Rewrite `packet` for the destination. Returns `false` if no rule matched
+    /// `packet.header.payload_type` (unmatched packets are dropped).
+    fn rewrite_packet(&mut self, packet: &mut RtpPacket) -> bool {
+        let Some(rule) = self.rule_for(packet.header.payload_type).cloned() else {
+            return false;
+        };
         // Strip extension headers (WebRTC → RTP) before any marshaling so the
         // RTP peer doesn't see WebRTC-specific extensions it can't parse.
         if self.options.strip_extensions {
             packet.header.extension = None;
         }
 
-        let raw_pt = packet.header.payload_type;
-        let rule = self.rule_for(raw_pt);
-        // No matching rule: pass the SSRC through untouched.
-        let out_ssrc = rule.as_ref().map_or(packet.header.ssrc, |r| r.out_ssrc);
+        let out_ssrc = rule.out_ssrc;
         let timeline = self
             .timelines
-            .borrow_mut()
             .entry(out_ssrc)
             .or_insert_with(|| {
                 // No sender shares this SSRC: start where the source is.
@@ -255,20 +227,17 @@ impl RewriteBridge {
             })
             .clone();
         timeline.write_peer(packet, timeline.clock_rate());
-        if let Some(r) = &rule
-            && let Some(payload_type) = r.out_payload_type
-        {
+        if let Some(payload_type) = rule.out_payload_type {
             packet.header.payload_type = payload_type;
         }
 
         // Source extensions may have been stripped above. The destination's
         // negotiated MID is independent of those source extensions: bundled
         // SIP peers (e.g. Linphone), as well as WebRTC peers, need it to demux.
-        if let Some(r) = &rule
-            && let (Some(ext_id), Some(mid)) = (r.sdes_mid_extension_id, &r.sdes_mid)
-        {
+        if let (Some(ext_id), Some(mid)) = (rule.sdes_mid_extension_id, &rule.sdes_mid) {
             let _ = packet.header.set_extension(ext_id, mid.as_bytes());
         }
+        true
     }
 }
 
@@ -409,6 +378,12 @@ impl ListenerRegistry {
     }
 }
 
+#[derive(Default)]
+struct TwccSend {
+    extensions: BTreeMap<(u32, u8), u8>,
+    estimator: Option<Arc<GccBandwidthEstimator>>,
+}
+
 pub struct RtpTransport {
     transport: Arc<IceConn>,
     srtp_session: Mutex<Option<Arc<Mutex<SrtpSession>>>>,
@@ -417,7 +392,12 @@ pub struct RtpTransport {
     rid_extension_id: AtomicU8,
     sdes_mid_extension_id: AtomicU8,
     abs_send_time_extension_id: AtomicU8,
-    rewrite_bridge: Mutex<Option<Box<RewriteBridge>>>,
+    twcc_feedback: RwLock<Option<Arc<TwccFeedbackGenerator>>>,
+    has_twcc_feedback: AtomicBool,
+    twcc_send: RwLock<TwccSend>,
+    has_twcc_send: AtomicBool,
+    twcc_sequence: AtomicU16,
+    rewrite_bridges: Mutex<Vec<(Option<MediaKind>, RewriteBridge)>>,
     has_bridge: AtomicBool,
     srtp_required: bool,
     has_sent_first_packet: AtomicBool,
@@ -485,7 +465,12 @@ impl RtpTransport {
             rid_extension_id: AtomicU8::new(EXT_ID_NONE),
             sdes_mid_extension_id: AtomicU8::new(EXT_ID_NONE),
             abs_send_time_extension_id: AtomicU8::new(EXT_ID_NONE),
-            rewrite_bridge: Mutex::new(None),
+            twcc_feedback: RwLock::new(None),
+            has_twcc_feedback: AtomicBool::new(false),
+            twcc_send: RwLock::new(TwccSend::default()),
+            has_twcc_send: AtomicBool::new(false),
+            twcc_sequence: AtomicU16::new(crate::transports::ice::stun::random_u32() as u16),
+            rewrite_bridges: Mutex::new(Vec::new()),
             has_bridge: AtomicBool::new(false),
             srtp_required,
             has_sent_first_packet: AtomicBool::new(false),
@@ -684,6 +669,76 @@ impl RtpTransport {
             .store(encode_ext_id(id), Ordering::Relaxed);
     }
 
+    pub(crate) fn configure_twcc_feedback(
+        self: &Arc<Self>,
+        ext_id: Option<u8>,
+        sender_ssrc: u32,
+        runtime_handle: Option<&crate::config::RuntimeHandle>,
+        span: tracing::Span,
+    ) {
+        let mut feedback = self.twcc_feedback.write();
+        let Some(id) = ext_id else {
+            self.has_twcc_feedback.store(false, Ordering::Release);
+            *feedback = None;
+            return;
+        };
+        if let Some(existing) = feedback.as_ref()
+            && existing.ext_id() == id
+        {
+            existing.set_feedback_ssrc(sender_ssrc);
+            return;
+        }
+        let generator = Arc::new(TwccFeedbackGenerator::new());
+        generator.set_ext_id(id);
+        generator.set_feedback_ssrc(sender_ssrc);
+        let weak_transport = Arc::downgrade(self);
+        let weak_generator = Arc::downgrade(&generator);
+        *feedback = Some(generator);
+        self.has_twcc_feedback.store(true, Ordering::Release);
+        drop(feedback);
+
+        crate::spawn_rtc(runtime_handle, span, async move {
+            TwccFeedbackGenerator::run_transport_flush_loop(weak_generator, weak_transport).await;
+        });
+    }
+
+    pub(crate) fn configure_twcc_send(&self, extensions: BTreeMap<(u32, u8), u8>) {
+        let mut send = self.twcc_send.write();
+        if !extensions.is_empty() && send.estimator.is_none() {
+            send.estimator = Some(Arc::new(GccBandwidthEstimator::new()));
+        }
+        send.extensions = extensions;
+        self.has_twcc_send
+            .store(!send.extensions.is_empty(), Ordering::Release);
+    }
+
+    pub(crate) fn twcc_estimator(&self) -> Option<Arc<GccBandwidthEstimator>> {
+        if !self.has_twcc_send.load(Ordering::Acquire) {
+            return None;
+        }
+        let send = self.twcc_send.read();
+        if send.extensions.is_empty() {
+            return None;
+        }
+        send.estimator.clone()
+    }
+
+    fn twcc_send_extension(&self, ssrc: u32, payload_type: u8) -> Option<u8> {
+        if !self.has_twcc_send.load(Ordering::Acquire) {
+            return None;
+        }
+        self.twcc_send.read().extensions.get(&(ssrc, payload_type)).copied()
+    }
+
+    fn stamp_twcc(&self, packet: &mut RtpPacket) {
+        if let Some(id) = self.twcc_send_extension(packet.header.ssrc, packet.header.payload_type) {
+            let sequence = self.twcc_sequence.fetch_add(1, Ordering::Relaxed);
+            if let Err(error) = packet.header.set_extension(id, &sequence.to_be_bytes()) {
+                trace!(%error, "Could not write transport-cc RTP extension");
+            }
+        }
+    }
+
     /// Returns the remote peer's socket address (the nominated ICE candidate
     /// or the configured RTP destination).
     pub fn remote_addr(&self) -> SocketAddr {
@@ -701,6 +756,20 @@ impl RtpTransport {
         *listener = Some(tx);
     }
 
+    fn install_rewrite_bridge(
+        &self,
+        media_kind: Option<MediaKind>,
+        bridge: RewriteBridge,
+    ) {
+        let mut bridges = self.rewrite_bridges.lock();
+        if let Some((_, existing)) = bridges.iter_mut().find(|(kind, _)| *kind == media_kind) {
+            *existing = bridge;
+        } else {
+            bridges.push((media_kind, bridge));
+        }
+        self.has_bridge.store(true, Ordering::Release);
+    }
+
     pub fn bridge_rewrite_to(&self, dst: Arc<RtpTransport>, params: RtpRewriteBridgeParams) {
         let options = RtpRewriteBridgeOptions {
             strip_extensions: params.strip_extensions,
@@ -715,79 +784,63 @@ impl RtpTransport {
         options: RtpRewriteBridgeOptions,
         rules: Vec<RtpRewriteRule>,
     ) {
-        self.bridge_rewrite_rules_to_with_video(dst, None, BTreeSet::new(), options, rules);
+        self.bridge_rewrite_rules_with_timelines(dst, options, rules, Vec::new());
     }
 
-    /// Install a payload-type-aware rewrite bridge with an optional video
-    /// destination. `video_payload_types` are the source transport's original
-    /// negotiated video PTs; target selection happens before PT rewriting.
-    ///
-    /// This is only needed when a bundled source carries audio and video on
-    /// one transport while the destination uses separate transports.
-    pub fn bridge_rewrite_rules_to_with_video(
-        &self,
-        dst: Arc<RtpTransport>,
-        video_dst: Option<Arc<RtpTransport>>,
-        video_payload_types: BTreeSet<u8>,
-        options: RtpRewriteBridgeOptions,
-        rules: Vec<RtpRewriteRule>,
-    ) {
-        self.bridge_rewrite_rules_with_timelines(
-            dst,
-            video_dst,
-            video_payload_types,
-            options,
-            rules,
-            Vec::new(),
-        );
-    }
-
-    /// Like [`Self::bridge_rewrite_rules_to_with_video`], but packets
-    /// rewritten onto the SSRC of one of `timelines` continue that shared
-    /// outbound timeline (typically the destination sender's, so relayed and
-    /// sent packets share one sequence/timestamp space). Other rewritten
-    /// SSRCs get a timeline of their own.
+    /// Like [`Self::bridge_rewrite_rules_to`], but packets rewritten onto the
+    /// SSRC of one of `timelines` continue that shared outbound timeline
+    /// (typically the destination sender's, so relayed and sent packets share
+    /// one sequence/timestamp space). Other rewritten SSRCs get a timeline of
+    /// their own.
     pub fn bridge_rewrite_rules_with_timelines(
         &self,
         dst: Arc<RtpTransport>,
-        video_dst: Option<Arc<RtpTransport>>,
-        video_payload_types: BTreeSet<u8>,
         options: RtpRewriteBridgeOptions,
         rules: Vec<RtpRewriteRule>,
         timelines: Vec<Arc<OutboundTimeline>>,
     ) {
-        *self.rewrite_bridge.lock() = Some(Box::new(RewriteBridge::new(
-            dst,
-            video_dst,
-            video_payload_types,
-            options,
-            rules,
-            timelines,
-        )));
-        self.has_bridge.store(true, Ordering::Release);
+        self.install_rewrite_bridge(None, RewriteBridge::new(dst, options, rules, timelines));
+    }
+
+    /// Install a per-media-kind rewrite bridge route on this transport.
+    ///
+    /// Ingress packets demuxed to a receiver of `media_kind` are rewritten by
+    /// `rules` (matched purely by PT) and forwarded to `dst`. Packets of
+    /// `media_kind` that match no rule in `rules` are dropped.
+    pub fn bridge_media_rewrite_rules(
+        &self,
+        media_kind: MediaKind,
+        dst: Arc<RtpTransport>,
+        options: RtpRewriteBridgeOptions,
+        rules: Vec<RtpRewriteRule>,
+        timelines: Vec<Arc<OutboundTimeline>>,
+    ) {
+        self.install_rewrite_bridge(
+            Some(media_kind),
+            RewriteBridge::new(dst, options, rules, timelines),
+        );
     }
 
     pub fn clear_bridge_rewrite(&self) {
-        *self.rewrite_bridge.lock() = None;
+        self.rewrite_bridges.lock().clear();
         self.has_bridge.store(false, Ordering::Release);
     }
 
-    /// Clear the rewrite bridge only if it relays into one of `targets`
-    /// (its audio or optional video target). Returns whether it was cleared.
+    /// Clear only the rewrite bridge routes that relay into one of `targets`.
+    /// Returns whether any route was cleared.
     pub fn clear_bridge_rewrite_into(&self, targets: &[Arc<RtpTransport>]) -> bool {
-        let mut bridge = self.rewrite_bridge.lock();
-        let relays_into = bridge.as_ref().is_some_and(|b| {
-            targets.iter().any(|t| {
-                let target = Arc::downgrade(t);
-                Weak::ptr_eq(&b.target, &target)
-                    || b.video_target.as_ref().is_some_and(|v| Weak::ptr_eq(v, &target))
-            })
+        let mut bridges = self.rewrite_bridges.lock();
+        let before = bridges.len();
+        bridges.retain(|(_, b)| {
+            !targets
+                .iter()
+                .any(|t| Weak::ptr_eq(&b.target, &Arc::downgrade(t)))
         });
-        if relays_into {
-            *bridge = None;
+        let cleared = bridges.len() < before;
+        if bridges.is_empty() {
             self.has_bridge.store(false, Ordering::Release);
         }
-        relays_into
+        cleared
     }
 
     /// Register a plaintext [`RtpObserver`] that fires on clear RTP for BOTH
@@ -903,11 +956,8 @@ impl RtpTransport {
         self.send_prepared_rtp(packet, None).await
     }
 
-    /// Zero-allocation variant of [`send_rtp`]: SRTP-protects the packet into
-    /// `output` (caller-owned, sized `srtp.protected_rtp_len(&packet)`) and
-    /// sends it. This is the primitive for frame-scoped batch senders: fill
-    /// one buffer per RTP packet (e.g. slots backing a `sendmmsg` iovec
-    /// array), call once per slot, never touch the allocator on the hot path.
+    /// SRTP-protects the packet into a caller-owned buffer and sends it.
+    /// Allow room for any transport-added RTP header extensions.
     ///
     /// Returns `Ok(0)` without sending while the direction stops this SSRC.
     pub async fn send_rtp_into(&self, packet: RtpPacket, output: &mut [u8]) -> RtcResult<usize> {
@@ -940,6 +990,7 @@ impl RtpTransport {
         if !self.rtp_send_allowed_for(packet.header.ssrc) {
             return Ok(0);
         }
+        self.stamp_twcc(&mut packet);
         // Egress observation: fire on the plaintext packet BEFORE SRTP protect
         // so observers (stats/recording/sipflow) see clear RTP. Zero cost
         // (single Acquire load) when no observer is registered.
@@ -979,12 +1030,13 @@ impl RtpTransport {
             let len = srtp.protected_rtp_len(&packet);
             match output {
                 Some(out) => {
-                    if out.len() != len {
+                    let available = out.len();
+                    let Some(out) = out.get_mut(..len) else {
                         return Err(RtcError::InvalidState(format!(
                             "send_rtp_into: buffer size mismatch, need {len} bytes, got {}",
-                            out.len()
+                            available
                         )));
-                    }
+                    };
                     srtp.protect_rtp(&packet, out).inspect_err(|_| {
                         self.srtp_protect_failures.fetch_add(1, Ordering::Relaxed);
                     })?;
@@ -1095,39 +1147,53 @@ impl RtpTransport {
         &self,
         mut packet: RtpPacket,
         marshal_buf: &mut Vec<u8>,
+        media_kind: Option<MediaKind>,
     ) -> Option<RtpPacket> {
         if !self.has_bridge.load(Ordering::Acquire) {
             return Some(packet);
         }
         let _packet_len = packet.encoded_len();
-        // Select the destination from the original PT and rewrite under the
-        // bridge lock, then release it before SRTP protection and sending.
         let target = {
-            let mut guard = self.rewrite_bridge.lock();
-            let target = guard
-                .as_mut()
-                .and_then(|bridge| bridge.target_for(packet.header.payload_type));
-            match target {
-                Some(target) => {
-                    guard.as_mut().unwrap().rewrite_packet(&mut packet);
-                    target
-                }
-                None if guard.is_some() => {
-                    // Destination transport freed (its PeerConnection closed):
-                    // the bridge can never forward again. Uninstall it instead
-                    // of keeping the rewrite state alive, and drop the packet.
-                    *guard = None;
-                    drop(guard);
-                    self.has_bridge.store(false, Ordering::Release);
-                    return None;
-                }
-                None => return Some(packet), // no bridge installed
+            let mut bridges = self.rewrite_bridges.lock();
+            if bridges.is_empty() {
+                return Some(packet);
             }
+            let Some(index) = media_kind
+                .and_then(|kind| bridges.iter().position(|(k, _)| *k == Some(kind)))
+                .or_else(|| bridges.iter().position(|(k, _)| k.is_none()))
+                .or_else(|| (media_kind.is_none() && bridges.len() == 1).then_some(0))
+            else {
+                // Per-media routes are installed, but this packet could not be
+                // uniquely demuxed to a bridged stream (e.g. overlapping PT
+                // without MID/SSRC): drop it instead of guessing.
+                return None;
+            };
+            let (_, bridge) = &mut bridges[index];
+            let Some(target) = bridge.target.upgrade() else {
+                // The destination has closed. Uninstall its route and drop.
+                bridges.remove(index);
+                if bridges.is_empty() {
+                    self.has_bridge.store(false, Ordering::Release);
+                }
+                return None;
+            };
+            if !bridge.options.strip_extensions
+                && self.has_twcc_feedback.load(Ordering::Acquire)
+                && let Some(feedback) = self.twcc_feedback.read().as_ref()
+            {
+                packet.header.remove_extension(feedback.ext_id());
+            }
+            if !bridge.rewrite_packet(&mut packet) {
+                return None;
+            }
+            target
         };
         if !target.rtp_send_allowed_for(packet.header.ssrc) {
             // Relayed, but the destination stream may not send: drop.
             return None;
         }
+
+        target.stamp_twcc(&mut packet);
 
         // Fire the destination's egress observer on the plaintext packet
         // (symmetric with the pre-protect hook in send_rtp).
@@ -1385,6 +1451,14 @@ impl RtpTransport {
         // the counter advances for both relayed and depacketized packets.
         self.received_rtp_packets.fetch_add(1, Ordering::Relaxed);
 
+        // Browser audio, video and RTX share one transport sequence space.
+        // Observe it before relay, demux or RTX unwrapping.
+        if self.has_twcc_feedback.load(Ordering::Acquire)
+            && let Some(feedback) = self.twcc_feedback.read().as_ref()
+        {
+            feedback.observe(&rtp_packet);
+        }
+
         // Ingress observation: fire on the plaintext packet BEFORE the
         // relay fast-path early-return, so observers (stats/DTMF/recording)
         // see every inbound packet regardless of forwarding mode. Zero cost
@@ -1402,7 +1476,7 @@ impl RtpTransport {
         let rid_bytes = rid_id.and_then(|id| rtp_packet.header.get_extension(id));
         let mid_bytes = mid_id.and_then(|id| rtp_packet.header.get_extension(id));
 
-        let (listener, receiver) = {
+        let (listener, receiver, media_kind) = {
             let mut listeners = self.listeners.lock();
             let mut selected = None;
             let mut bind_ssrc = false;
@@ -1451,7 +1525,11 @@ impl RtpTransport {
                     .and_then(|route| route.receiver.as_ref())
                     .and_then(Weak::upgrade)
             });
-            (selected, receiver)
+            let media_kind = receiver.as_ref().map(|receiver| match receiver.media_kind() {
+                crate::media::MediaKind::Audio => MediaKind::Audio,
+                crate::media::MediaKind::Video => MediaKind::Video,
+            });
+            (selected, receiver, media_kind)
         };
 
         // Account on the original SSRC before either forwarding or depacketization.
@@ -1461,7 +1539,7 @@ impl RtpTransport {
         {
             trace!(%error, "Failed to send reception report");
         }
-        let Some(rtp_packet) = self.try_bridge_rewrite_rtp(rtp_packet, marshal_buf) else {
+        let Some(rtp_packet) = self.try_bridge_rewrite_rtp(rtp_packet, marshal_buf, media_kind) else {
             return;
         };
 
@@ -1491,19 +1569,24 @@ mod tests {
     #[test]
     fn rewrite_strips_source_extensions_but_stamps_negotiated_mid() {
         for strip_extensions in [false, true] {
-            let bridge = RewriteBridge {
+            let mut bridge = RewriteBridge {
                 target: Weak::new(),
-                video_target: None,
-                video_payload_types: BTreeSet::new(),
                 options: RtpRewriteBridgeOptions { strip_extensions, ..Default::default() },
-                rules: [(9, "0"), (102, "1")].into_iter().map(|(pt, mid)| RtpRewriteRule {
+                rules: [
+                    (9, Some("0")),
+                    (102, Some("1")),
+                    (8, None),
+                ]
+                .into_iter()
+                .map(|(pt, mid)| RtpRewriteRule {
                     match_payload_type: Some(pt),
                     out_ssrc: pt as u32,
                     out_payload_type: None,
-                    sdes_mid_extension_id: Some(4),
-                    sdes_mid: Some(mid.to_string()),
-                }).collect(),
-                timelines: RefCell::new(BTreeMap::new()),
+                    sdes_mid_extension_id: mid.map(|_| 4),
+                    sdes_mid: mid.map(str::to_string),
+                })
+                .collect(),
+                timelines: BTreeMap::new(),
             };
             for (pt, mid) in [(9, "0"), (102, "1")] {
                 let mut packet = RtpPacket::new(
@@ -1511,14 +1594,14 @@ mod tests {
                 );
                 packet.header.set_extension(1, b"source").unwrap();
                 packet.header.set_extension(4, b"wrong").unwrap();
-                bridge.rewrite_packet(&mut packet);
+                assert!(bridge.rewrite_packet(&mut packet));
                 assert_eq!(packet.header.get_extension(4).unwrap().as_ref(), mid.as_bytes());
                 assert_eq!(packet.header.get_extension(1).is_none(), strip_extensions);
             }
             // A peer without a negotiated MID still receives no extensions.
             let mut packet = RtpPacket::new(crate::rtp::RtpHeader::new(8, 1, 160, 8), vec![1u8]);
             packet.header.set_extension(1, b"source").unwrap();
-            bridge.rewrite_packet(&mut packet);
+            assert!(bridge.rewrite_packet(&mut packet));
             assert_eq!(packet.header.extension.is_none(), strip_extensions);
         }
     }
@@ -1561,18 +1644,18 @@ mod tests {
 
         let (_source_tx, source_rx) = watch::channel(None);
         let source = RtpTransport::new(IceConn::new(source_rx, remote.local_addr().unwrap(), None), false);
-        source.bridge_rewrite_rules_with_timelines(target.clone(), None, Default::default(), Default::default(),
+        source.bridge_rewrite_rules_with_timelines(target.clone(), Default::default(),
             vec![RtpRewriteRule { out_ssrc: 777, match_payload_type: None, out_payload_type: None, sdes_mid_extension_id: None, sdes_mid: None }], vec![timeline.clone()]);
         let incoming = RtpPacket::new(crate::rtp::RtpHeader::new(0, 30, 9000, 42), vec![1; 80]);
         let mut buf = Vec::new();
         // A failed relay submission must not count even though mapping ran.
         socket_tx.send(None).unwrap();
-        source.try_bridge_rewrite_rtp(incoming.clone(), &mut buf);
+        source.try_bridge_rewrite_rtp(incoming.clone(), &mut buf, None);
         assert_eq!(stats.snapshot(), (2, 164));
         assert!(target.send_rtp(event.clone()).await.is_err());
         assert_eq!(stats.snapshot(), (2, 164));
         socket_tx.send(Some(IceSocketWrapper::Udp(socket))).unwrap();
-        source.try_bridge_rewrite_rtp(incoming, &mut buf);
+        source.try_bridge_rewrite_rtp(incoming, &mut buf, None);
         assert_eq!(stats.snapshot(), (3, 244), "relay counted exactly once");
         assert_eq!(other_stats.snapshot(), (0, 0), "BUNDLE SSRCs stay independent");
 
@@ -1968,8 +2051,8 @@ mod tests {
             },
         );
 
-        let mut guard = src_transport.rewrite_bridge.lock();
-        let bridge = guard.as_mut().expect("rewrite bridge should be configured");
+        let mut guard = src_transport.rewrite_bridges.lock();
+        let bridge = &mut guard[0].1;
 
         let mut packet = RtpPacket::new(crate::rtp::RtpHeader::new(0, 7, 1111, 100), vec![1u8; 32]);
         bridge.rewrite_packet(&mut packet);
@@ -2024,8 +2107,8 @@ mod tests {
             }],
         );
 
-        let mut guard = src_transport.rewrite_bridge.lock();
-        let bridge = guard.as_mut().expect("rewrite bridge");
+        let mut guard = src_transport.rewrite_bridges.lock();
+        let bridge = &mut guard[0].1;
 
         let mut emitted: Vec<(u16, u32, bool)> = Vec::new();
         let mut feed = |src_ssrc: u32, src_seq: u16, src_ts: u32, marker: bool| {
@@ -2153,8 +2236,8 @@ mod tests {
             }],
         );
 
-        let mut guard = src_transport.rewrite_bridge.lock();
-        let bridge = guard.as_mut().expect("rewrite bridge");
+        let mut guard = src_transport.rewrite_bridges.lock();
+        let bridge = &mut guard[0].1;
 
         let mut emitted: Vec<(u16, u32)> = Vec::new();
         let mut feed = |src_ssrc: u32, src_seq: u16, src_ts: u32| {
@@ -2250,8 +2333,6 @@ mod tests {
 
             src_transport.bridge_rewrite_rules_with_timelines(
                 dst_transport,
-                None,
-                Default::default(),
                 RtpRewriteBridgeOptions::default(),
                 vec![RtpRewriteRule {
                     match_payload_type: None,
@@ -2267,8 +2348,8 @@ mod tests {
                     output_seed.wrapping_sub(160),
                 )],
             );
-            let mut guard = src_transport.rewrite_bridge.lock();
-            let bridge = guard.as_mut().unwrap();
+            let mut guard = src_transport.rewrite_bridges.lock();
+            let bridge = &mut guard[0].1;
             let mut emitted = Vec::new();
             for &(seq, timestamp) in &source_packets {
                 let header = crate::rtp::RtpHeader::new(8, seq, timestamp, 0x1234);
@@ -2358,10 +2439,8 @@ mod tests {
 
         let audio_ssrc = 0x0A0A_0A0A;
         let video_ssrc = 0x0B0B_0B0B;
-        src_transport.bridge_rewrite_rules_to_with_video(
+        src_transport.bridge_rewrite_rules_to(
             dst_transport.clone(),
-            None,
-            [98u8].into_iter().collect(),
             RtpRewriteBridgeOptions {
                 strip_extensions: false,
             },
@@ -2383,8 +2462,8 @@ mod tests {
             ],
         );
 
-        let mut guard = src_transport.rewrite_bridge.lock();
-        let bridge = guard.as_mut().expect("rewrite bridge");
+        let mut guard = src_transport.rewrite_bridges.lock();
+        let bridge = &mut guard[0].1;
 
         let mut audio_out: Vec<(u16, u32)> = Vec::new();
         let mut video_out: Vec<(u16, u32)> = Vec::new();
@@ -2469,8 +2548,8 @@ mod tests {
             },
         );
 
-        let mut guard = src_transport.rewrite_bridge.lock();
-        let bridge = guard.as_mut().expect("rewrite bridge should be configured");
+        let mut guard = src_transport.rewrite_bridges.lock();
+        let bridge = &mut guard[0].1;
 
         // Audio packet (PT 100) → rewritten to audio dst PT 96.
         let mut audio = RtpPacket::new(
@@ -2548,22 +2627,30 @@ mod tests {
                 sdes_mid: None,
             },
         ];
-        src_transport.bridge_rewrite_rules_to_with_video(
+        src_transport.bridge_media_rewrite_rules(
+            MediaKind::Audio,
             dst_transport.clone(),
-            Some(video_dst_transport.clone()),
-            BTreeSet::from([98, 99]),
             Default::default(),
-            rules,
+            rules[..2].to_vec(),
+            Vec::new(),
+        );
+        src_transport.bridge_media_rewrite_rules(
+            MediaKind::Video,
+            video_dst_transport.clone(),
+            Default::default(),
+            rules[2..].to_vec(),
+            Vec::new(),
         );
 
-        let mut guard = src_transport.rewrite_bridge.lock();
-        let bridge = guard.as_mut().expect("rewrite bridge should be configured");
+        let mut guard = src_transport.rewrite_bridges.lock();
+        let audio_idx = guard.iter().position(|(k, _)| *k == Some(MediaKind::Audio)).unwrap();
+        let video_idx = guard.iter().position(|(k, _)| *k == Some(MediaKind::Video)).unwrap();
 
         // Audio packet (PT 97) → audio SSRC + PT 96.
         let mut audio =
             RtpPacket::new(crate::rtp::RtpHeader::new(97, 7, 1111, 1111), vec![1u8; 32]);
-        let audio_target = bridge.target_for(audio.header.payload_type).unwrap();
-        bridge.rewrite_packet(&mut audio);
+        let audio_target = guard[audio_idx].1.target.upgrade().unwrap();
+        assert!(guard[audio_idx].1.rewrite_packet(&mut audio));
         assert!(Arc::ptr_eq(&audio_target, &dst_transport));
         assert_eq!(audio.header.ssrc, audio_ssrc);
         assert_eq!(audio.header.payload_type, 96);
@@ -2573,8 +2660,8 @@ mod tests {
             crate::rtp::RtpHeader::new(101, 7, 1111, 1111),
             vec![1u8; 32],
         );
-        let dtmf_target = bridge.target_for(dtmf.header.payload_type).unwrap();
-        bridge.rewrite_packet(&mut dtmf);
+        let dtmf_target = guard[audio_idx].1.target.upgrade().unwrap();
+        assert!(guard[audio_idx].1.rewrite_packet(&mut dtmf));
         assert!(Arc::ptr_eq(&dtmf_target, &dst_transport));
         assert_eq!(dtmf.header.ssrc, audio_ssrc);
         assert_eq!(dtmf.header.payload_type, 110);
@@ -2582,16 +2669,16 @@ mod tests {
         // Video packet (PT 98) → video SSRC + PT 102.
         let mut video =
             RtpPacket::new(crate::rtp::RtpHeader::new(98, 7, 2222, 2222), vec![1u8; 32]);
-        let video_target = bridge.target_for(video.header.payload_type).unwrap();
-        bridge.rewrite_packet(&mut video);
+        let video_target = guard[video_idx].1.target.upgrade().unwrap();
+        assert!(guard[video_idx].1.rewrite_packet(&mut video));
         assert!(Arc::ptr_eq(&video_target, &video_dst_transport));
         assert_eq!(video.header.ssrc, video_ssrc);
         assert_eq!(video.header.payload_type, 102);
 
         // RTX packet (PT 99, distinct source SSRC) → video SSRC + PT 103.
         let mut rtx = RtpPacket::new(crate::rtp::RtpHeader::new(99, 7, 3333, 3333), vec![1u8; 32]);
-        let rtx_target = bridge.target_for(rtx.header.payload_type).unwrap();
-        bridge.rewrite_packet(&mut rtx);
+        let rtx_target = guard[video_idx].1.target.upgrade().unwrap();
+        assert!(guard[video_idx].1.rewrite_packet(&mut rtx));
         assert!(Arc::ptr_eq(&rtx_target, &video_dst_transport));
         assert_eq!(rtx.header.ssrc, video_ssrc);
         assert_eq!(rtx.header.payload_type, 103);
@@ -2601,8 +2688,8 @@ mod tests {
         // marker (end of frame).
         let mut video2 =
             RtpPacket::new(crate::rtp::RtpHeader::new(98, 8, 2382, 2222), vec![1u8; 32]);
-        let video2_target = bridge.target_for(video2.header.payload_type).unwrap();
-        bridge.rewrite_packet(&mut video2);
+        let video2_target = guard[video_idx].1.target.upgrade().unwrap();
+        assert!(guard[video_idx].1.rewrite_packet(&mut video2));
         assert!(Arc::ptr_eq(&video2_target, &video_dst_transport));
         assert_eq!(
             video2.header.sequence_number,
@@ -2613,7 +2700,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rewrite_rules_unmatched_packet_passes_ssrc_through() {
+    async fn test_rewrite_rules_unmatched_packet_is_dropped() {
         use crate::transports::ice::IceSocketWrapper;
         use tokio::net::UdpSocket;
         use tokio::sync::watch;
@@ -2628,7 +2715,7 @@ mod tests {
         let dst_conn = IceConn::new(dst_rx, "127.0.0.1:9".parse().unwrap(), None);
         let dst_transport = Arc::new(RtpTransport::new(dst_conn, false));
 
-        // Only a video rule: no catch-all. Audio-ish PT 97 must pass through.
+        // Only a video rule: no catch-all. Unmatched PT 97 must be dropped.
         let rules = vec![RtpRewriteRule {
             match_payload_type: Some(98),
             out_ssrc: 222,
@@ -2638,20 +2725,18 @@ mod tests {
         }];
         src_transport.bridge_rewrite_rules_to(dst_transport.clone(), Default::default(), rules);
 
-        let mut guard = src_transport.rewrite_bridge.lock();
-        let bridge = guard.as_mut().expect("rewrite bridge should be configured");
+        let mut guard = src_transport.rewrite_bridges.lock();
+        let bridge = &mut guard[0].1;
 
         let mut video =
             RtpPacket::new(crate::rtp::RtpHeader::new(98, 7, 2222, 2222), vec![1u8; 32]);
-        bridge.rewrite_packet(&mut video);
+        assert!(bridge.rewrite_packet(&mut video));
         assert_eq!(video.header.ssrc, 222);
         assert_eq!(video.header.payload_type, 102);
 
         let mut unmatched =
             RtpPacket::new(crate::rtp::RtpHeader::new(97, 7, 1111, 1111), vec![1u8; 32]);
-        bridge.rewrite_packet(&mut unmatched);
-        assert_eq!(unmatched.header.ssrc, 1111);
-        assert_eq!(unmatched.header.payload_type, 97);
+        assert!(!bridge.rewrite_packet(&mut unmatched));
         drop(guard);
     }
 
@@ -2683,8 +2768,8 @@ mod tests {
             },
         );
 
-        let mut guard = src_transport.rewrite_bridge.lock();
-        let bridge = guard.as_mut().expect("rewrite bridge should be configured");
+        let mut guard = src_transport.rewrite_bridges.lock();
+        let bridge = &mut guard[0].1;
 
         let mut audio = RtpPacket::new(
             crate::rtp::RtpHeader::new(100, 7, 1111, 1111),
@@ -3201,9 +3286,302 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn bundled_fast_relay_reports_twcc_across_audio_video_and_rtx() {
+        use crate::rtp::decode_twcc_feedback;
+        use crate::transports::ice::IceSocketWrapper;
+        use tokio::{net::UdpSocket, sync::watch, time::timeout};
+
+        let browser = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let browser_addr = browser.local_addr().unwrap();
+        let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (_socket_tx, socket_rx) = watch::channel(Some(IceSocketWrapper::Udp(local)));
+        let source = Arc::new(RtpTransport::new(IceConn::new(socket_rx, browser_addr, None), false));
+        source.configure_twcc_feedback(Some(5), 1234, None, tracing::Span::none());
+
+        let destination = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (_destination_tx, destination_rx) = watch::channel(Some(IceSocketWrapper::Udp(local)));
+        let target = Arc::new(RtpTransport::new(
+            IceConn::new(destination_rx, destination.local_addr().unwrap(), None),
+            false,
+        ));
+        target.configure_twcc_send(BTreeMap::from([((1234, 0), 17), ((5678, 111), 17)]));
+        source.bridge_rewrite_rules_with_timelines(
+            target.clone(),
+            RtpRewriteBridgeOptions { strip_extensions: false },
+            audio_rules(1234),
+            Vec::new(),
+        );
+        let local_packet = RtpPacket::new(crate::rtp::RtpHeader::new(111, 77, 0, 5678), vec![1]);
+        target.send_rtp(local_packet).await.unwrap();
+
+        for (transport_seq, pt, ssrc) in [
+            (u16::MAX, 96, 10),
+            (1, 111, 20),
+            (0, 97, 30),
+            (2, 96, 10),
+        ] {
+            let mut packet = RtpPacket::new(
+                crate::rtp::RtpHeader::new(pt, 42, 10_000, ssrc),
+                vec![0xaa],
+            );
+            packet.header.set_extension(5, &transport_seq.to_be_bytes()).unwrap();
+            packet.header.set_extension(3, b"other").unwrap();
+            source.feed_packet(Bytes::from(packet.marshal().unwrap()), browser_addr).await;
+        }
+
+        let mut previous: Option<u16> = None;
+        for index in 0..5 {
+            let mut buf = [0; 1500];
+            let n = timeout(core::time::Duration::from_secs(1), destination.recv(&mut buf))
+                .await.unwrap().unwrap();
+            let packet = RtpPacket::parse(&buf[..n]).unwrap();
+            assert_eq!(packet.header.ssrc, if index == 0 { 5678 } else { 1234 });
+            assert!(packet.header.get_extension(5).is_none());
+            if index != 0 {
+                assert_eq!(packet.header.get_extension(3).unwrap().as_ref(), b"other");
+            }
+            let extension = packet.header.get_extension(17).unwrap();
+            let sequence = u16::from_be_bytes(extension.as_ref().try_into().unwrap());
+            if let Some(previous) = previous {
+                assert_eq!(sequence, previous.wrapping_add(1));
+            }
+            previous = Some(sequence);
+        }
+
+        let mut report = [0; 1500];
+        let n = timeout(core::time::Duration::from_secs(1), browser.recv(&mut report))
+            .await
+            .expect("the relay sends periodic TWCC feedback")
+            .unwrap();
+        let packets = parse_rtcp_packets(&report[..n], None).unwrap();
+        let [RtcpPacket::TransportWideCc(feedback)] = &packets[..] else {
+            panic!("expected one transport-wide report, got {packets:?}");
+        };
+        assert_eq!(feedback.sender_ssrc, 1234);
+        let entries = decode_twcc_feedback(feedback);
+        assert_eq!(
+            entries.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+            [u16::MAX, 0, 1, 2]
+        );
+        assert!(entries.iter().all(|(_, delta)| delta.is_some()));
+    }
+
+    #[tokio::test]
+    async fn bundled_reinvite_drops_unaccepted_payload_type_from_audio_route() {
+        use crate::config::{AudioCapability, MediaCapabilities, VideoCapability};
+        use crate::sdp::MediaKind;
+        use crate::transports::ice::IceSocketWrapper;
+        use crate::{PeerConnection, RtcConfiguration, SdpType, SessionDescription, TransceiverDirection};
+        use tokio::{net::UdpSocket, sync::watch, time::timeout};
+
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_port = peer.local_addr().unwrap().port();
+        let mut config = RtcConfiguration::sip();
+        config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
+        config.media_capabilities = Some(MediaCapabilities {
+            audio: vec![AudioCapability::opus()],
+            video: vec![VideoCapability::h264()],
+            application: None,
+            image: vec![],
+        });
+        let pc = PeerConnection::new(config);
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
+
+        let initial_offer = format!("v=0\r\n\
+            o=- 1 1 IN IP4 127.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            c=IN IP4 127.0.0.1\r\n\
+            a=group:BUNDLE as\r\n\
+            m=audio {peer_port} RTP/AVP 111\r\n\
+            a=mid:as\r\n\
+            a=rtcp-mux\r\n\
+            a=rtpmap:111 opus/48000/2\r\n\
+            m=video 0 RTP/AVP 0\r\n\
+            a=mid:vs\r\n\
+            a=inactive\r\n");
+        pc.set_remote_description(SessionDescription::parse(SdpType::Offer, &initial_offer).unwrap())
+            .await
+            .unwrap();
+        pc.set_local_description(pc.create_answer().await.unwrap()).unwrap();
+        pc.wait_for_rtp_transport_ready(core::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        let reinvite = initial_offer
+            .replace("o=- 1 1", "o=- 1 2")
+            .replace("a=group:BUNDLE as\r\n", "a=group:BUNDLE as vs\r\n")
+            .replace("RTP/AVP 111\r\n", "RTP/AVP 111 96\r\na=rtpmap:96 iLBC/8000\r\n")
+            .replace("m=video 0 RTP/AVP 0\r\n", "m=video 0 RTP/AVP 96\r\n")
+            .replace("a=inactive\r\n", "a=rtcp-mux\r\na=bundle-only\r\n\
+                a=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=1;profile-level-id=42e01f\r\n");
+        pc.set_remote_description(SessionDescription::parse(SdpType::Offer, &reinvite).unwrap())
+            .await
+            .unwrap();
+        let answer = pc.create_answer().await.unwrap();
+        assert_eq!(answer.media_sections[0].formats, ["111"]);
+        assert_eq!(answer.media_sections[1].formats, ["96"]);
+        let source_port = answer.media_sections[0].port;
+        pc.set_local_description(answer).unwrap();
+
+        let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (_socket_tx, socket_rx) = watch::channel(Some(IceSocketWrapper::Udp(relay_socket)));
+        let target = Arc::new(RtpTransport::new(
+            IceConn::new(socket_rx, sink.local_addr().unwrap(), None),
+            false,
+        ));
+        let source = pc.rtp_transport_for_test().unwrap();
+        assert_eq!(source.local_addr().port(), source_port);
+        source.bridge_media_rewrite_rules(
+            MediaKind::Audio,
+            target.clone(),
+            RtpRewriteBridgeOptions { strip_extensions: true },
+            vec![RtpRewriteRule {
+                match_payload_type: None,
+                out_ssrc: 1111,
+                out_payload_type: Some(111),
+                sdes_mid_extension_id: None,
+                sdes_mid: None,
+            }],
+            Vec::new(),
+        );
+        source.bridge_media_rewrite_rules(
+            MediaKind::Video,
+            target.clone(),
+            RtpRewriteBridgeOptions { strip_extensions: true },
+            vec![RtpRewriteRule {
+                match_payload_type: Some(96),
+                out_ssrc: 2222,
+                out_payload_type: Some(97),
+                sdes_mid_extension_id: None,
+                sdes_mid: None,
+            }],
+            Vec::new(),
+        );
+
+        let nal = [0x65, 0x01, 0x02];
+        let packet = RtpPacket::new(crate::rtp::RtpHeader::new(96, 1, 9000, 6789), nal.to_vec());
+        peer.send_to(&packet.marshal().unwrap(), ("127.0.0.1", source_port))
+            .await
+            .unwrap();
+        let mut forwarded = [0; 1500];
+        let n = timeout(core::time::Duration::from_secs(1), sink.recv(&mut forwarded))
+            .await
+            .expect("the first video packet must be relayed without MID or learned SSRC")
+            .unwrap();
+        let packet = RtpPacket::parse(&forwarded[..n]).unwrap();
+        assert_eq!(packet.header.payload_type, 97);
+        assert_eq!(packet.header.ssrc, 2222);
+        assert_eq!(packet.payload.as_ref(), &nal);
+        pc.close();
+    }
+
+    #[tokio::test]
+    async fn bundled_relay_distinguishes_reused_pt_by_mid_and_learned_ssrc() {
+        #[derive(Default)]
+        struct CapturedRtp(Mutex<Vec<RtpPacket>>);
+
+        impl RtpObserver for CapturedRtp {
+            fn on_ingress(&self, _: &RtpPacket, _: SocketAddr) {}
+
+            fn on_egress(&self, packet: &RtpPacket, _: SocketAddr) {
+                self.0.lock().push(packet.clone());
+            }
+        }
+
+        let source = loopback_transport();
+        let audio_target = Arc::new(loopback_transport());
+        let video_target = Arc::new(loopback_transport());
+        let audio_packets = Arc::new(CapturedRtp::default());
+        let video_packets = Arc::new(CapturedRtp::default());
+        audio_target.add_observer(audio_packets.clone());
+        video_target.add_observer(video_packets.clone());
+
+        let audio = Arc::new(RtpReceiver::new(crate::sdp::MediaKind::Audio, 0, Vec::new()));
+        let video = Arc::new(RtpReceiver::new(crate::sdp::MediaKind::Video, 0, Vec::new()));
+        source.set_sdes_mid_extension_id(Some(1));
+        let (audio_tx, _audio_rx) = mpsc::channel(8);
+        let (video_tx, _video_rx) = mpsc::channel(8);
+        for (mid, receiver, tx, pts) in [
+            ("as", &audio, audio_tx, vec![96]),
+            ("vs", &video, video_tx, vec![96, 98]),
+        ] {
+            source.register_mid_listener(mid.into(), tx.clone());
+            source.register_payload_list_listener(pts, tx.clone());
+            source.register_reception_stats(tx, Arc::downgrade(receiver));
+        }
+
+        source.bridge_media_rewrite_rules(
+            MediaKind::Audio,
+            audio_target.clone(),
+            RtpRewriteBridgeOptions { strip_extensions: true },
+            vec![RtpRewriteRule {
+                match_payload_type: None,
+                out_ssrc: 1111,
+                out_payload_type: Some(111),
+                sdes_mid_extension_id: Some(4),
+                sdes_mid: Some("0".into()),
+            }],
+            vec![OutboundTimeline::new(1111, 48_000, 0, 0)],
+        );
+        source.bridge_media_rewrite_rules(
+            MediaKind::Video,
+            video_target.clone(),
+            RtpRewriteBridgeOptions { strip_extensions: true },
+            vec![RtpRewriteRule {
+                match_payload_type: Some(96),
+                out_ssrc: 2222,
+                out_payload_type: Some(97),
+                sdes_mid_extension_id: Some(4),
+                sdes_mid: Some("1".into()),
+            }],
+            vec![OutboundTimeline::new(2222, 90_000, 0, 0)],
+        );
+
+        let addr = "127.0.0.1:5000".parse().unwrap();
+        // The unlabeled first packet is ambiguous. MID then binds independent
+        // audio and video SSRCs, and subsequent packets can omit the extension.
+        // Video PT 98 has no compatible target rule and must not be relayed.
+        for (pt, ssrc, seq, ts, mid, data) in [
+            (96, 99, 1, 0, None, vec![0xff]),
+            (96, 10, 1, 48_000, Some("as"), vec![1]),
+            (96, 20, 1, 90_000, Some("vs"), vec![2]),
+            (98, 20, 50, 91_000, None, vec![0xff]),
+            (96, 10, 2, 48_960, None, vec![3]),
+            (96, 20, 2, 93_000, None, vec![4]),
+        ] {
+            let mut packet = RtpPacket::new(crate::rtp::RtpHeader::new(pt, seq, ts, ssrc), data);
+            if let Some(mid) = mid {
+                packet.header.set_extension(1, mid.as_bytes()).unwrap();
+            }
+            source.feed_packet(Bytes::from(packet.marshal().unwrap()), addr).await;
+        }
+
+        for (captured, ssrc, payload_type, mid, values, timestamp_step) in [
+            (&audio_packets, 1111, 111, b"0", [1, 3], 960),
+            (&video_packets, 2222, 97, b"1", [2, 4], 3000),
+        ] {
+            let packets = captured.0.lock();
+            assert_eq!(packets.len(), 2);
+            for (packet, value) in packets.iter().zip(values) {
+                assert_eq!(packet.header.ssrc, ssrc);
+                assert_eq!(packet.header.payload_type, payload_type);
+                assert_eq!(packet.header.get_extension(4).unwrap().as_ref(), mid);
+                assert!(packet.header.get_extension(1).is_none());
+                assert_eq!(packet.payload.as_ref(), &[value]);
+            }
+            assert_eq!(packets[1].header.sequence_number.wrapping_sub(packets[0].header.sequence_number), 1);
+            assert_eq!(packets[1].header.timestamp.wrapping_sub(packets[0].header.timestamp), timestamp_step);
+        }
+    }
+
     fn relay(transport: &RtpTransport, pt: u8, seq: u16, ts: u32, ssrc: u32) -> RtpPacket {
-        let mut guard = transport.rewrite_bridge.lock();
-        let bridge = guard.as_mut().expect("bridge installed");
+        let mut guard = transport.rewrite_bridges.lock();
+        let bridge = &mut guard[0].1;
         let mut packet = RtpPacket::new(
             crate::rtp::RtpHeader::new(pt, seq, ts, ssrc),
             vec![0x55; 160],
@@ -3234,8 +3612,6 @@ mod tests {
 
         from_b.bridge_rewrite_rules_with_timelines(
             dst.clone(),
-            None,
-            BTreeSet::new(),
             RtpRewriteBridgeOptions::default(),
             audio_rules(0xA1),
             vec![timeline.clone()],
@@ -3277,8 +3653,6 @@ mod tests {
         // Transfer: C is relayed into the same SSRC.
         from_c.bridge_rewrite_rules_with_timelines(
             dst.clone(),
-            None,
-            BTreeSet::new(),
             RtpRewriteBridgeOptions::default(),
             audio_rules(0xA1),
             vec![timeline.clone()],
@@ -3311,8 +3685,6 @@ mod tests {
         });
         src.bridge_rewrite_rules_with_timelines(
             Arc::new(loopback_transport()),
-            None,
-            BTreeSet::new(),
             RtpRewriteBridgeOptions::default(),
             rules,
             vec![timeline],
@@ -3322,4 +3694,50 @@ mod tests {
         let video = relay(&src, 97, 7, 0, 0xB);
         assert_eq!((video.header.ssrc, video.header.sequence_number), (0xF1, 7));
     }
+
+    #[tokio::test]
+    async fn single_per_media_video_route_drops_unmatched_packets() {
+        #[derive(Default)]
+        struct CapturedPayloadTypes(Mutex<Vec<u8>>);
+
+        impl RtpObserver for CapturedPayloadTypes {
+            fn on_ingress(&self, _: &RtpPacket, _: SocketAddr) {}
+
+            fn on_egress(&self, packet: &RtpPacket, _: SocketAddr) {
+                self.0.lock().push(packet.header.payload_type);
+            }
+        }
+
+        let source = loopback_transport();
+        let target = Arc::new(loopback_transport());
+        let captured = Arc::new(CapturedPayloadTypes::default());
+        target.add_observer(captured.clone());
+        source.bridge_media_rewrite_rules(
+            MediaKind::Video,
+            target.clone(),
+            RtpRewriteBridgeOptions::default(),
+            vec![RtpRewriteRule {
+                match_payload_type: Some(96),
+                out_ssrc: 0xF1,
+                out_payload_type: Some(97),
+                sdes_mid_extension_id: None,
+                sdes_mid: None,
+            }],
+            Vec::new(),
+        );
+
+        let mut buffer = Vec::new();
+        for (sequence, payload_type, kind) in [
+            (1, 96, MediaKind::Video),
+            (2, 98, MediaKind::Video),
+            (3, 96, MediaKind::Audio),
+        ] {
+            let header = crate::rtp::RtpHeader::new(payload_type, sequence, 9000, 0x10);
+            let packet = RtpPacket::new(header, vec![1]);
+            assert!(source.try_bridge_rewrite_rtp(packet, &mut buffer, Some(kind)).is_none());
+        }
+
+        assert_eq!(&*captured.0.lock(), &[97]);
+    }
+
 }

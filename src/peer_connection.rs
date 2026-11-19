@@ -1421,9 +1421,6 @@ impl PeerConnection {
         if nack_enabled {
             builder = builder.nack();
         }
-        if self.inner.config.enable_gcc && self.inner.config.webrtc_extensions {
-            builder = builder.twcc_feedback(Arc::new(TwccFeedbackGenerator::new()));
-        }
         let receiver = builder.build();
         if direction.sends() {
             let rand_val = random_u32();
@@ -1529,11 +1526,7 @@ impl PeerConnection {
 
         if nack_enabled {
             builder = builder.nack(self.inner.config.nack_buffer_size);
-            if self.inner.config.enable_gcc {
-                // GCC bandwidth estimator replaces the log-only REMB handler:
-                // it consumes TWCC feedback and publishes target_bitrate.
-                builder = builder.interceptor(Arc::new(GccBandwidthEstimator::new()));
-            } else {
+            if !self.inner.config.enable_gcc {
                 builder = builder.bitrate_controller();
             }
         }
@@ -1570,6 +1563,12 @@ impl PeerConnection {
         transceiver.set_sender(Some(sender.clone()));
         if let Some(transport) = transport {
             self.attach_rtp_transport_to_transceiver(&transceiver, transport);
+            if self.signaling_state() == SignalingState::Stable
+                && let (Some(local), Some(remote)) =
+                    (self.local_description(), self.remote_description())
+            {
+                self.sync_transport_twcc(&local, &remote);
+            }
         }
         Ok(sender)
     }
@@ -1788,8 +1787,155 @@ impl PeerConnection {
                 && matches!(ours.direction, Direction::SendRecv | Direction::SendOnly)
                 && matches!(theirs.direction, Direction::SendRecv | Direction::RecvOnly);
             transceiver.set_send_permitted(permitted);
+            if let Some(receiver) = transceiver.receiver() {
+                // Receive on the PTs in our answer. Rejecting a format must
+                // remove its PT from that m-line's BUNDLE demux candidates.
+                let answer_payloads = matches!(local.sdp_type, SdpType::Answer | SdpType::Pranswer)
+                    .then(|| {
+                        if rejected {
+                            Vec::new()
+                        } else {
+                            ours.formats.iter().filter_map(|format| format.parse().ok()).collect()
+                        }
+                    });
+                receiver.set_local_answer_payloads(answer_payloads);
+            }
         }
         self.sync_transport_send_gates();
+        self.sync_transport_twcc(&local, &remote);
+    }
+
+    fn sync_transport_twcc(&self, local: &SessionDescription, remote: &SessionDescription) {
+        if !(self.config().enable_gcc && self.config().webrtc_extensions) {
+            return;
+        }
+
+        #[derive(Default)]
+        struct TransportTwcc {
+            send: BTreeMap<(u32, u8), u8>,
+            receive: Option<(u8, u32)>,
+        }
+
+        let primary = self.inner.rtp_transport.lock().clone();
+        let media = self.inner.rtp_media_transports.lock().clone();
+        let mut settings: Vec<(&Arc<RtpTransport>, TransportTwcc)> = Vec::new();
+        for transport in primary.iter().chain(media.values()) {
+            if !settings.iter().any(|(existing, _)| Arc::ptr_eq(existing, transport)) {
+                settings.push((transport, TransportTwcc::default()));
+            }
+        }
+        for (transceiver, remote_idx) in self.matched_rtp_media_sections(remote) {
+            let Some(transport) = media.get(&transceiver.id()).or(primary.as_ref()) else {
+                continue;
+            };
+            let Some((_, setting)) = settings.iter_mut().find(|(t, _)| Arc::ptr_eq(t, transport))
+            else {
+                continue;
+            };
+            let Some(ours) = local.media_sections.get(remote_idx) else { continue };
+            let theirs = &remote.media_sections[remote_idx];
+            if local.is_media_rejected(ours) || remote.is_media_rejected(theirs) {
+                continue;
+            }
+
+            let (Some((local_id, local_ext_direction)), Some((remote_id, remote_ext_direction))) =
+                (Self::twcc_extmap(ours), Self::twcc_extmap(theirs))
+            else {
+                continue;
+            };
+            if local_id != remote_id {
+                continue;
+            }
+
+            // The extension alone does not negotiate transport feedback.
+            let has_feedback = |section: &MediaSection, pt: &str| {
+                section.attributes.iter().any(|attr| {
+                    if attr.key != "rtcp-fb" {
+                        return false;
+                    }
+                    let mut fields = attr.value.as_deref().unwrap_or_default().split_whitespace();
+                    matches!(fields.next(), Some(format) if format == pt || format == "*")
+                        && fields.next() == Some("transport-cc")
+                })
+            };
+            let payloads: Vec<u8> = theirs
+                .formats
+                .iter()
+                .filter(|pt| {
+                    ours.formats.contains(pt) && has_feedback(ours, pt) && has_feedback(theirs, pt)
+                })
+                .filter_map(|pt| pt.parse().ok())
+                .collect();
+            if payloads.is_empty() {
+                continue;
+            }
+
+            let sends = |direction| matches!(direction, Direction::SendRecv | Direction::SendOnly);
+            let receives = |direction| matches!(direction, Direction::SendRecv | Direction::RecvOnly);
+            if sends(ours.direction)
+                && receives(theirs.direction)
+                && sends(local_ext_direction)
+                && receives(remote_ext_direction)
+            {
+                if let Some(ssrc) = transceiver.sender_ssrc() {
+                    setting.send.extend(payloads.iter().map(|&pt| ((ssrc, pt), local_id)));
+                }
+                if let Some(ssrc) = transceiver.sender_rtx_ssrc()
+                    && let Some(pt) = *transceiver.sender_rtx_payload_type.lock()
+                {
+                    // Repair packets participate in the same feedback as their primary.
+                    let local_apt = crate::rtx::extract_rtx_apt_map_from_attrs(&ours.attributes);
+                    let remote_apt = crate::rtx::extract_rtx_apt_map_from_attrs(&theirs.attributes);
+                    if let Some(primary) = local_apt.get(&pt)
+                        && remote_apt.get(&pt) == Some(primary)
+                        && (payloads.contains(primary) || payloads.contains(&pt))
+                    {
+                        setting.send.insert((ssrc, pt), local_id);
+                    }
+                }
+            }
+            if receives(ours.direction)
+                && sends(theirs.direction)
+                && receives(local_ext_direction)
+                && sends(remote_ext_direction)
+            {
+                setting.receive.get_or_insert((local_id, transceiver.sender_ssrc().unwrap_or(0)));
+            }
+        }
+
+        for (transport, setting) in settings {
+            transport.configure_twcc_send(setting.send);
+            let (id, sender_ssrc) = setting.receive.map_or((None, 0), |(id, ssrc)| (Some(id), ssrc));
+            transport.configure_twcc_feedback(
+                id,
+                sender_ssrc,
+                self.config().runtime_handle.as_ref(),
+                self.inner.pc_span.clone(),
+            );
+        }
+    }
+
+    fn twcc_extmap(section: &MediaSection) -> Option<(u8, Direction)> {
+        section.attributes.iter().find_map(|attr| {
+            if attr.key != "extmap" {
+                return None;
+            }
+            let mut fields = attr.value.as_deref()?.split_whitespace();
+            let id = fields.next()?;
+            let (id, direction) = id.split_once('/').unwrap_or((id, "sendrecv"));
+            if fields.next()? != crate::sdp::TRANSPORT_CC_URI {
+                return None;
+            }
+            let id = id.parse::<u8>().ok().filter(|id| *id != 0)?;
+            let direction = match direction {
+                "sendrecv" => Direction::SendRecv,
+                "sendonly" => Direction::SendOnly,
+                "recvonly" => Direction::RecvOnly,
+                "inactive" => Direction::Inactive,
+                _ => return None,
+            };
+            Some((id, direction))
+        })
     }
 
     /// Gate the egress paths that bypass the RtpSender (send_raw_rtp, the
@@ -2299,9 +2445,6 @@ impl PeerConnection {
                     } else {
                         debug!("NACK: disabled for new receiver mid={}", mid);
                     }
-                    if self.inner.config.enable_gcc && self.inner.config.webrtc_extensions {
-                        builder = builder.twcc_feedback(Arc::new(TwccFeedbackGenerator::new()));
-                    }
                     let receiver = builder.build();
                     if let Some(rtx) = rtx_ssrc {
                         receiver.set_rtx_ssrc(rtx);
@@ -2683,6 +2826,14 @@ impl PeerConnection {
                 );
                 self.attach_rtp_transport_to_transceiver(t, selected_transport);
             }
+        }
+        let local = self.inner.local_description.lock().clone();
+        let remote = self.inner.remote_description.lock().clone();
+        if let (Some(local), Some(remote)) = (local, remote)
+            && (matches!(local.sdp_type, SdpType::Answer | SdpType::Pranswer)
+                || matches!(remote.sdp_type, SdpType::Answer | SdpType::Pranswer))
+        {
+            self.sync_transport_twcc(&local, &remote);
         }
         loops.push(Box::pin(Self::create_rtcp_loop(
             rtp_transport.clone(),
@@ -3816,6 +3967,11 @@ impl PeerConnection {
                         _ => trace!("RTCP Loop: Got packet {:?}", packet),
                     }
 
+                    if let RtcpPacket::TransportWideCc(feedback) = &packet
+                        && let Some(estimator) = rtp_transport.twcc_estimator()
+                    {
+                        estimator.on_twcc_feedback(feedback);
+                    }
                     stats_collector.process_rtcp(&packet);
                     let Some(inner) = inner_weak.upgrade() else {
                         return;
@@ -6425,7 +6581,22 @@ impl PeerConnectionInner {
         // Add transport-cc extmap (TWCC sequence numbers + feedback) when the
         // GCC loop is enabled. Answers echo the remote id; offers claim one.
         if self.config.enable_gcc && self.config.webrtc_extensions {
-            let mut transport_cc_id = bundled_extmap_id(crate::sdp::TRANSPORT_CC_URI);
+            let mut transport_cc_id = remote_section
+                .and_then(PeerConnection::twcc_extmap)
+                .map(|(id, direction)| {
+                    let qualifier = match (sdp_type, direction) {
+                        (SdpType::Answer, Direction::SendOnly) => "/recvonly",
+                        (SdpType::Answer, Direction::RecvOnly) => "/sendonly",
+                        (SdpType::Answer, Direction::Inactive) => "/inactive",
+                        _ => "",
+                    };
+                    format!("{id}{qualifier}")
+                })
+                .or_else(|| {
+                    bundle_tag_section
+                        .and_then(PeerConnection::twcc_extmap)
+                        .map(|(id, _)| id.to_string())
+                });
             if sdp_type == SdpType::Offer && transport_cc_id.is_none() {
                 transport_cc_id = Some(Self::claim_free_extmap_id(&mut used_extmap_ids, 5));
             }
@@ -7371,15 +7542,11 @@ impl RtpTransceiver {
             }
         }
 
-        *payload_map = new_map.clone();
+        *payload_map = new_map;
+        drop(payload_map);
 
-        // Update PT listeners in transport for fallback routing
-        if let Some(receiver) = self.receiver()
-            && let Some(transport_weak) = self.rtp_transport.lock().clone()
-            && let Some(transport) = transport_weak.upgrade()
-            && let Some(tx) = receiver.packet_tx()
-        {
-            transport.register_payload_list_listener(new_map.keys().copied().collect(), tx.clone());
+        if let Some(receiver) = self.receiver() {
+            receiver.refresh_payload_listener(false);
         }
 
         Ok(())
@@ -7431,13 +7598,6 @@ impl RtpTransceiver {
             if let (Some(id), Some(mid)) = (sdes_mid_id, mid_value) {
                 sender_arc.set_sdes_mid(id, Arc::from(mid.as_str()));
             }
-            // Propagate the transport-cc extension id to the sender so it
-            // stamps outgoing packets (GCC loop).
-            let tcc_id = extmap
-                .iter()
-                .find(|(_, uri)| uri.as_str() == crate::sdp::TRANSPORT_CC_URI)
-                .map(|(id, _)| *id);
-            sender_arc.set_transport_cc_ext_id(tcc_id);
         } else {
             // Sender not yet created — defer sdes:mid so set_sender() can apply it.
             let mid_value = self.mid.lock().clone();
@@ -7494,10 +7654,6 @@ pub struct RtpSender {
     /// sdes:mid extension to inject: (extension header ID, mid value).
     /// Set automatically by update_extmap() when negotiation contains sdes:mid.
     sdes_mid: Arc<Mutex<Option<(u8, Arc<str>)>>>,
-    /// transport-cc extension id to inject with a per-packet sequence number
-    /// (GCC loop). `None` = not negotiated / disabled.
-    transport_cc_ext_id: Arc<Mutex<Option<u8>>>,
-    transport_cc_seq: Arc<AtomicU16>,
     transport_generation: Arc<AtomicU64>,
     transport_change_tx: watch::Sender<u64>,
     /// Whether the negotiated direction lets this sender transmit RTP.
@@ -7658,8 +7814,6 @@ impl RtpSender {
             timeline,
             interceptors,
             sdes_mid: Arc::new(Mutex::new(None)),
-            transport_cc_ext_id: Arc::new(Mutex::new(None)),
-            transport_cc_seq: Arc::new(AtomicU16::new(random_u32() as u16)),
             transport_generation: Arc::new(AtomicU64::new(0)),
             transport_change_tx,
             send_enabled: Arc::new(AtomicBool::new(true)),
@@ -7683,24 +7837,21 @@ impl RtpSender {
         self.ssrc
     }
 
-    /// Current GCC target bitrate estimate (bps), when the GCC loop is
-    /// enabled AND a TWCC-feedback-producing peer is connected. Returns
-    /// `None` when no estimator is installed.
+    /// Current GCC target bitrate (bps) for the attached transport.
+    /// Standalone senders can also supply an estimator as an interceptor.
     pub fn target_bitrate(&self) -> Option<u64> {
-        self.interceptors
-            .iter()
-            .find_map(|i| i.clone().as_gcc_stats().map(|g| g.target_bitrate()))
+        self.gcc_estimator().map(|estimator| estimator.target_bitrate())
     }
 
-    /// Subscribe to GCC target-bitrate changes (bps). Returns `None` when no
-    /// estimator is installed. Applications driving an encoder should spawn a
-    /// task on this receiver and adapt the encoder bitrate.
+    /// Subscribe to bitrate changes (bps) on the current transport's estimator.
     pub fn subscribe_target_bitrate(&self) -> Option<watch::Receiver<u64>> {
-        self.interceptors.iter().find_map(|i| {
-            i.clone()
-                .as_gcc_stats()
-                .map(|g| g.subscribe_target_bitrate())
-        })
+        self.gcc_estimator().map(|estimator| estimator.subscribe_target_bitrate())
+    }
+
+    fn gcc_estimator(&self) -> Option<Arc<GccBandwidthEstimator>> {
+        self.transport()
+            .and_then(|transport| transport.twcc_estimator())
+            .or_else(|| self.interceptors.iter().find_map(|i| i.clone().as_gcc_stats()))
     }
 
     /// Sequence number the next packet on this SSRC will carry.
@@ -7747,13 +7898,6 @@ impl RtpSender {
 
     pub fn set_sdes_mid(&self, ext_id: u8, mid: Arc<str>) {
         *self.sdes_mid.lock() = Some((ext_id, mid));
-    }
-
-    /// Set the negotiated transport-cc extension id; outgoing packets get a
-    /// monotonically increasing transport-wide sequence number stamped into
-    /// it (GCC loop). `None` disables stamping.
-    pub fn set_transport_cc_ext_id(&self, ext_id: Option<u8>) {
-        *self.transport_cc_ext_id.lock() = ext_id;
     }
 
     pub fn sdes_mid(&self) -> Option<(u8, Arc<str>)> {
@@ -7861,8 +8005,6 @@ impl RtpSender {
         let timeline = self.timeline.clone();
         let interceptors = self.interceptors.clone();
         let sdes_mid = self.sdes_mid.clone();
-        let transport_cc_ext_id = self.transport_cc_ext_id.clone();
-        let transport_cc_seq = self.transport_cc_seq.clone();
         let send_enabled = self.send_enabled.clone();
         let rtcp_enabled = self.rtcp_enabled.clone();
         let mut rtcp_rx = self.rtcp_tx.subscribe();
@@ -8007,13 +8149,6 @@ impl RtpSender {
                                     let _ = packet.header.set_extension(id, mid.as_bytes());
                                 }
 
-                                // Auto-inject the transport-cc sequence number
-                                // extension when negotiated (GCC loop).
-                                if let Some(tcc_id) = *transport_cc_ext_id.lock() {
-                                    let seq = transport_cc_seq.fetch_add(1, Ordering::SeqCst);
-                                    let _ = packet.header.set_extension(tcc_id, &seq.to_be_bytes());
-                                }
-
                                 if let Err(e) = transport.send_rtp(packet).await {
                                     let n = send_stats.snapshot().0;
                                     if n < 5 {
@@ -8101,6 +8236,8 @@ pub struct RtpReceiver {
     ssrc: Mutex<u32>,
     params: Mutex<RtpCodecParameters>,
     payload_map: Arc<RwLock<BTreeMap<u8, RtpCodecParameters>>>,
+    /// Receive PTs from the local answer, independent of the peer's codec map.
+    local_answer_payloads: Mutex<Option<Vec<u8>>>,
     transport: Mutex<Option<Arc<RtpTransport>>>,
     packet_tx: Mutex<Option<mpsc::Sender<(crate::rtp::RtpPacket, core::net::SocketAddr)>>>,
     rtcp_feedback_ssrc: Mutex<Option<u32>>,
@@ -8250,6 +8387,7 @@ impl RtpReceiverBuilder {
             ssrc: Mutex::new(self.ssrc),
             params: Mutex::new(params),
             payload_map: self.payload_map,
+            local_answer_payloads: Mutex::new(None),
             transport: Mutex::new(None),
             packet_tx: Mutex::new(None),
             rtcp_feedback_ssrc: Mutex::new(None),
@@ -8323,6 +8461,7 @@ impl RtpReceiver {
             ssrc: Mutex::new(ssrc),
             params: Mutex::new(params),
             payload_map: Arc::new(RwLock::new(BTreeMap::new())),
+            local_answer_payloads: Mutex::new(None),
             transport: Mutex::new(None),
             packet_tx: Mutex::new(None),
             rtcp_feedback_ssrc: Mutex::new(None),
@@ -8382,6 +8521,10 @@ impl RtpReceiver {
 
     pub fn track(&self) -> Arc<SampleStreamTrack> {
         self.track.clone()
+    }
+
+    pub(crate) fn media_kind(&self) -> crate::media::MediaKind {
+        self.track.kind()
     }
 
     pub fn nack_handler(&self) -> Option<Arc<dyn NackStats>> {
@@ -8512,30 +8655,51 @@ impl RtpReceiver {
         if apt_map.is_empty() {
             return;
         }
-        let all_pts: Vec<u8> = {
-            let default_pt = self.params.lock().payload_type;
-            let mut pts = vec![default_pt];
-            for pt in self.payload_map.read().keys().copied() {
-                if !pts.contains(&pt) {
-                    pts.push(pt);
-                }
-            }
-            for pt in apt_map.keys().copied() {
-                if !pts.contains(&pt) {
-                    pts.push(pt);
-                }
-            }
-            pts
-        };
         *self.rtx_apt.lock() = apt_map;
+        self.refresh_payload_listener(true);
+    }
 
-        let transport = self.transport.lock().clone();
-        let packet_tx = self.packet_tx.lock().clone();
-        if let Some(transport) = transport
-            && let Some(tx) = packet_tx
+    fn set_local_answer_payloads(&self, payloads: Option<Vec<u8>>) {
         {
-            // register_payload_list_listener replaces the PT list — pass the full set.
-            transport.register_payload_list_listener(all_pts, tx);
+            let mut current = self.local_answer_payloads.lock();
+            if *current == payloads {
+                return;
+            }
+            *current = payloads;
+        }
+        self.refresh_payload_listener(false);
+    }
+
+    fn payload_listener_types(&self, include_default: bool) -> Vec<u8> {
+        if let Some(payloads) = self.local_answer_payloads.lock().as_ref() {
+            return payloads.clone();
+        }
+
+        let mut payloads = Vec::new();
+        if include_default {
+            payloads.push(self.params.lock().payload_type);
+        }
+        for pt in self.payload_map.read().keys().copied() {
+            if !payloads.contains(&pt) {
+                payloads.push(pt);
+            }
+        }
+        for pt in self.rtx_apt.lock().keys().copied() {
+            if !payloads.contains(&pt) {
+                payloads.push(pt);
+            }
+        }
+        payloads
+    }
+
+    fn refresh_payload_listener(&self, include_default: bool) {
+        let transport = self.transport.lock().clone();
+        let packet_tx = self.packet_tx.lock();
+        if let Some(transport) = transport
+            && let Some(tx) = packet_tx.as_ref()
+        {
+            let payloads = self.payload_listener_types(include_default);
+            transport.register_payload_list_listener(payloads, tx.clone());
         }
     }
 
@@ -8655,21 +8819,15 @@ impl RtpReceiver {
             transport.set_sdes_mid_extension_id(sdes_mid_id);
         }
 
-        // Register the negotiated payload types when available, keeping the
-        // default PT as a fallback before negotiation completes.
-        let default_pt = self.params.lock().payload_type;
-        let mut payload_types = vec![default_pt];
-        for pt in self.payload_map.read().keys().copied() {
-            if !payload_types.contains(&pt) {
-                payload_types.push(pt);
-            }
-        }
-        for pt in self.rtx_apt.lock().keys().copied() {
-            if !payload_types.contains(&pt) {
-                payload_types.push(pt);
-            }
-        }
-        transport.register_payload_list_listener(payload_types.clone(), tx.clone());
+        // Publish the current list and channel together so an answer that
+        // commits during transport setup always updates the new listener.
+        let payload_types = {
+            let mut packet_tx = self.packet_tx.lock();
+            let payload_types = self.payload_listener_types(true);
+            transport.register_payload_list_listener(payload_types.clone(), tx.clone());
+            *packet_tx = Some(tx.clone());
+            payload_types
+        };
         transport.register_reception_stats(tx.clone(), Arc::downgrade(self));
         if let Some(rtx_ssrc) = *self.rtx_ssrc.lock() {
             transport.register_listener_sync(rtx_ssrc, tx.clone());
@@ -8682,13 +8840,10 @@ impl RtpReceiver {
                 transceiver_mid = ?route_transceiver.as_ref().and_then(|t| t.mid()),
                 receiver_kind = ?self.track.kind(),
                 receiver_ssrc = ssrc,
-                default_pt,
                 payload_types = ?payload_types,
                 "RTP receiver registered on transport"
             )
         });
-
-        *self.packet_tx.lock() = Some(tx);
 
         initial_tracks.push(ReceiverCommand::AddTrack {
             rid: None,
@@ -14922,8 +15077,6 @@ a=sendrecv\r\n"
         let transport = sender.transport().unwrap();
         transport.bridge_rewrite_rules_with_timelines(
             transport.clone(),
-            None,
-            [96].into_iter().collect(),
             RtpRewriteBridgeOptions { strip_extensions: true },
             vec![
                 RtpRewriteRule::catch_all(RtpRewriteBridgeParams {
