@@ -284,6 +284,9 @@ impl Default for BufferStats {
 enum IceCommand {
     StartGathering,
     RunChecks,
+    /// Wake the runner so it observes the terminal [`IceTransportState::Closed`]
+    /// set by [`IceTransport::stop`] and returns.
+    Shutdown,
 }
 
 #[derive(Debug, Clone)]
@@ -648,6 +651,7 @@ impl IceTransportRunner {
                 GatherArm::Cmd(cmd) => {
                     trace!("Runner received command: {:?}", cmd);
                     match cmd {
+                        IceCommand::Shutdown => break,
                         IceCommand::StartGathering => {
                             let inner = self.inner.clone();
                             gathering_future = Box::pin(async move {
@@ -2067,6 +2071,16 @@ impl IceTransport {
         }
 
         let _ = self.inner.set_state(IceTransportState::Closed);
+        // Explicitly wake the runner. `run` drives its arms through a custom
+        // `poll_fn` that rebuilds the sub-futures on every poll, so the waker
+        // registered by `watch::Receiver::changed()` is dropped when it returns
+        // `Pending`: a bare `set_state(Closed)` does not reliably wake a parked
+        // runner (an idle connection that is closed before it carries any
+        // traffic would keep its runner task, and therefore the whole
+        // `IceTransportInner`, until the next 1 s keepalive tick). The command
+        // channel's waker lives on the receiver side, so this send always
+        // wakes it.
+        let _ = self.inner.cmd_tx.send(IceCommand::Shutdown);
         {
             // Serialize the teardown with selection commits: without the
             // lock a concurrent commit could interleave and leave a selected

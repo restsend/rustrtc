@@ -4755,6 +4755,17 @@ async fn run_gathering_loop(
     #[allow(unused_mut)]
     let mut ice_state_rx = ice_transport.subscribe_state();
     let mut cand_rx = ice_transport.subscribe_candidates();
+    // A PeerConnection can be closed before this loop is first polled
+    // (`stop()` flips the state to Closed). `changed()` only reports updates
+    // that happen *after* subscription, so without this guard the loop would
+    // park forever and pin the ICE transport.
+    if matches!(
+        *ice_state_rx.borrow(),
+        crate::transports::ice::IceTransportState::Closed
+            | crate::transports::ice::IceTransportState::Failed
+    ) {
+        return;
+    }
     loop {
         let state = *rx.borrow_and_update();
         if state == crate::transports::ice::IceGathererState::Complete

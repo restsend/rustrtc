@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.6.5 — 2026-11-18
+
+Idle `PeerConnection` teardown is deterministic.
+
+### Fixed
+
+- **ICE runner release on close.** `IceTransportRunner::run` drives its arms
+  through a hand-rolled `poll_fn` that rebuilds — and therefore drops — its
+  sub-futures on every poll, so the waker registered by
+  `watch::Receiver::changed()` does not survive a `Pending`. `stop()` only
+  flipped the state to `Closed`, so a runner closed before it carried any
+  traffic stayed parked until the next 1 s keepalive tick, keeping the whole
+  `IceTransportInner` (≈20 KB plus its sockets) alive per closed connection;
+  sustained connection churn accumulated them. `stop()` now also sends
+  `IceCommand::Shutdown` over the command channel, whose waker is owned by the
+  receiver, so the runner returns immediately. Regression guard:
+  `transports::ice::tests::stop_wakes_the_runner_promptly`.
+- `run_gathering_loop` checks for a terminal ICE state when it starts, so a
+  loop first polled after `stop()` can no longer miss `Closed` and park
+  forever waiting for the next update.
+
+No API-breaking changes.
+
 ## 0.6.4 — 2026-11-09
 
 no_std GCC/TWCC congestion control + an injectable hardware clock.

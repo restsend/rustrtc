@@ -33,6 +33,25 @@ fn parse_turn_uri() {
 }
 
 #[tokio::test]
+async fn stop_wakes_the_runner_promptly() {
+    // Regression: the runner parks inside a hand-rolled `poll_fn` that
+    // rebuilds (and drops) its sub-futures on every poll, so the waker
+    // registered by `watch::Receiver::changed()` does not survive. A bare
+    // `set_state(Closed)` therefore did not wake it: the task (and the whole
+    // `IceTransportInner`, ~20 KB) stayed parked until the next 1 s keepalive
+    // tick. With connection churn, closed transports accumulated.
+    let (transport, runner) = IceTransport::new(RtcConfiguration::webrtc());
+    let handle = tokio::spawn(runner);
+    // Let the runner enter the parked state.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    transport.stop();
+    assert!(
+        timeout(Duration::from_millis(500), handle).await.is_ok(),
+        "ICE runner did not return within 500 ms of stop()"
+    );
+}
+
+#[tokio::test]
 async fn builder_starts_gathering() {
     let (transport, runner) = IceTransportBuilder::new(RtcConfiguration::webrtc()).build();
     tokio::spawn(runner);
