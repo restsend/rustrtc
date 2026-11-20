@@ -556,8 +556,16 @@ pub fn parse_rtcp_packets(raw: &[u8], addr: Option<SocketAddr>) -> RtpResult<Vec
             )?)),
             RTCP_SDES => packets.push(RtcpPacket::SourceDescription(parse_sdes(fmt, body)?)),
             RTCP_BYE => packets.push(RtcpPacket::Goodbye(parse_goodbye(fmt, body)?)),
-            RTCP_RTPFB => packets.push(parse_rtcp_rtpfb(fmt, body)?),
-            RTCP_PSFB => packets.push(parse_rtcp_psfb(fmt, body)?),
+            RTCP_RTPFB => {
+                if let Some(fb) = parse_rtcp_rtpfb(fmt, body)? {
+                    packets.push(fb);
+                }
+            }
+            RTCP_PSFB => {
+                if let Some(fb) = parse_rtcp_psfb(fmt, body)? {
+                    packets.push(fb);
+                }
+            }
             RTCP_XR => {
                 // XR (Extended Report, RFC 3611) — valid but not parsed; skip silently
             }
@@ -787,20 +795,37 @@ fn parse_report_block(bytes: &[u8]) -> ReportBlock {
     }
 }
 
-fn parse_rtcp_rtpfb(fmt: u8, body: &[u8]) -> RtpResult<RtcpPacket> {
+fn parse_rtcp_rtpfb(fmt: u8, body: &[u8]) -> RtpResult<Option<RtcpPacket>> {
     match fmt {
-        RTCP_RTPFB_NACK => Ok(RtcpPacket::GenericNack(parse_nack_body(body)?)),
-        RTCP_RTPFB_TWCC => Ok(RtcpPacket::TransportWideCc(parse_twcc_body(body)?)),
-        _ => Err(RtpError::InvalidRtcp("unsupported RTP feedback format")),
+        RTCP_RTPFB_NACK => Ok(Some(RtcpPacket::GenericNack(parse_nack_body(body)?))),
+        RTCP_RTPFB_TWCC => Ok(Some(RtcpPacket::TransportWideCc(parse_twcc_body(body)?))),
+        _ => {
+            debug!("skipping unsupported RTCP RTPFB format: {}", fmt);
+            Ok(None)
+        }
     }
 }
 
-fn parse_rtcp_psfb(fmt: u8, body: &[u8]) -> RtpResult<RtcpPacket> {
+fn parse_rtcp_psfb(fmt: u8, body: &[u8]) -> RtpResult<Option<RtcpPacket>> {
     match fmt {
-        RTCP_PSFB_PLI => Ok(RtcpPacket::PictureLossIndication(parse_psfb_common(body)?)),
-        RTCP_PSFB_FIR => Ok(RtcpPacket::FullIntraRequest(parse_fir_body(body)?)),
-        RTCP_PSFB_APP => Ok(RtcpPacket::RemoteBitrateEstimate(parse_remb_body(body)?)),
-        _ => Err(RtpError::InvalidRtcp("unsupported payload feedback format")),
+        RTCP_PSFB_PLI => Ok(Some(RtcpPacket::PictureLossIndication(parse_psfb_common(
+            body,
+        )?))),
+        RTCP_PSFB_FIR => Ok(Some(RtcpPacket::FullIntraRequest(parse_fir_body(body)?))),
+        RTCP_PSFB_APP => {
+            if body.len() >= 12 && &body[8..12] == b"REMB" {
+                Ok(Some(RtcpPacket::RemoteBitrateEstimate(parse_remb_body(
+                    body,
+                )?)))
+            } else {
+                debug!("skipping non-REMB RTCP PSFB APP feedback");
+                Ok(None)
+            }
+        }
+        _ => {
+            debug!("skipping unsupported RTCP PSFB format: {}", fmt);
+            Ok(None)
+        }
     }
 }
 
@@ -1392,5 +1417,36 @@ mod tests {
         let t2 = t + std::time::Duration::from_secs(1);
         let abs2 = calculate_abs_send_time(t2);
         assert_eq!(abs2, 0x40000); // 1 << 18
+    }
+
+    #[test]
+    fn parse_rtcp_skips_unsupported_feedback_formats_in_compound_packet() {
+        let rr = RtcpPacket::ReceiverReport(ReceiverReport {
+            sender_ssrc: 0x1122_3344,
+            report_blocks: vec![],
+        });
+        let pli = RtcpPacket::PictureLossIndication(PictureLossIndication {
+            sender_ssrc: 0x1122_3344,
+            media_ssrc: 0x5566_7788,
+        });
+        let fir = RtcpPacket::FullIntraRequest(FullIntraRequest {
+            sender_ssrc: 0x1122_3344,
+            requests: vec![FirRequest {
+                ssrc: 0x5566_7788,
+                sequence_number: 7,
+            }],
+        });
+
+        let mut raw = marshal_rtcp_packets(&[rr.clone()]).unwrap();
+        // TMMBR (PT=205, FMT=3, RFC 5104 §4.2.1): 16-byte FCI payload (4 words).
+        write_rtcp_packet(&mut raw, 3, RTCP_RTPFB, vec![0u8; 16]);
+        // SLI (PT=206, FMT=2, RFC 4585 §6.3.2): 12-byte FCI payload (3 words).
+        write_rtcp_packet(&mut raw, 2, RTCP_PSFB, vec![0u8; 12]);
+        // Non-REMB AFB (PT=206, FMT=15, RFC 4585 §6.4): 16-byte payload.
+        write_rtcp_packet(&mut raw, RTCP_PSFB_APP, RTCP_PSFB, vec![0u8; 16]);
+        raw.extend_from_slice(&marshal_rtcp_packets(&[pli.clone(), fir.clone()]).unwrap());
+
+        let parsed = parse_rtcp_packets(&raw, None).unwrap();
+        assert_eq!(parsed, vec![rr, pli, fir]);
     }
 }

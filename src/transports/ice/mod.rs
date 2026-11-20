@@ -749,7 +749,7 @@ impl IceTransportRunner {
 
     #[cfg(feature = "std")]
     async fn run_udp_read_loop(socket: Arc<UdpSocket>, inner: Arc<IceTransportInner>) {
-        let mut buf = [0u8; 1500];
+        let mut buf = vec![0u8; 16_384];
         let mut marshal_buf = Vec::with_capacity(1500);
         let mut state_rx = inner.state.subscribe();
         let sender = IceSocketWrapper::Udp(socket.clone());
@@ -823,7 +823,7 @@ impl IceTransportRunner {
         socket: Arc<dyn crate::platform::net::UdpSocket>,
         inner: Arc<IceTransportInner>,
     ) {
-        let mut buf = vec![0u8; 1500];
+        let mut buf = vec![0u8; 16_384];
         let mut marshal_buf = Vec::with_capacity(1500);
         let sender = IceSocketWrapper::Platform(socket.clone());
         loop {
@@ -910,7 +910,7 @@ impl IceTransportRunner {
         relayed_addr: SocketAddr,
         inner: Arc<IceTransportInner>,
     ) {
-        let mut buf = [0u8; 1500];
+        let mut buf = vec![0u8; 16_384];
         let mut marshal_buf = Vec::with_capacity(1500);
         #[allow(unused_mut)]
         let mut state_rx = inner.state.subscribe();
