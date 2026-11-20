@@ -227,6 +227,32 @@ impl OutboundTimeline {
             .collect()
     }
 
+    /// Map a repair's original sequence and timestamp through the active video
+    /// run. RTX uses the same clock as its primary. The repair does not move
+    /// the primary timeline or establish a new anchor.
+    pub(crate) fn translate_rtx(
+        &self,
+        source_ssrc: Option<u32>,
+        repair_ssrc: u32,
+        original_sequence: u16,
+        timestamp: u32,
+    ) -> Option<(u16, u32)> {
+        let state = self.state.lock();
+        let anchor = state.anchor?;
+        if anchor.ssrc == 0
+            || anchor.ssrc == repair_ssrc
+            || source_ssrc.is_some_and(|ssrc| ssrc != anchor.ssrc)
+        {
+            return None;
+        }
+        let sequence = original_sequence.wrapping_add(anchor.seq_offset);
+        let timestamp = anchor.out_ts.wrapping_add(timestamp.wrapping_sub(anchor.in_ts));
+        let timestamp_step = timestamp.wrapping_sub(state.cur_ts) as i32;
+        (state.cur_seq.wrapping_sub(sequence) <= anchor.nack_span
+            && timestamp_step.unsigned_abs() <= state.ticks(MAX_TS_STEP))
+            .then_some((sequence, timestamp))
+    }
+
     /// RTP timestamp for an RTCP Sender Report at "now".
     pub fn timestamp(&self) -> u32 {
         let state = self.state.lock();

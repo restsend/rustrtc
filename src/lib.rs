@@ -93,7 +93,7 @@ pub use transports::ice::{
     MAX_LEASE_DURATION, MIN_LEASE_DURATION, TcpType, UpnpPortMapper,
 };
 #[cfg(feature = "std")]
-pub use transports::rtp::{RtpRewriteBridgeOptions, RtpRewriteBridgeParams, RtpRewriteRule};
+pub use transports::rtp::{RtpRewriteBridgeOptions, RtpRewriteBridgeParams, RtpRewriteRule, RtpRtxRewrite};
 pub use transports::sctp::{
     DataChannel, DataChannelConfig, DataChannelEvent, DataChannelState, SctpLinkStats,
 };

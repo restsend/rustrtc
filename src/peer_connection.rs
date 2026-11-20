@@ -346,7 +346,7 @@ pub struct DefaultRtpSenderNackHandler {
     /// Written under `rtx_config`'s mutex in `set_rtx`, read lock-free in
     /// `on_packet_sent` so the send hot path never acquires the mutex.
     rtx_ssrc_fast: AtomicU32,
-    rtx_seq: AtomicU16,
+    rtx_seq: Arc<AtomicU16>,
     rtx_sent_count: AtomicU64,
 }
 
@@ -384,7 +384,7 @@ impl DefaultRtpSenderNackHandler {
             retransmit_suppressed_count: AtomicU64::new(0),
             rtx_config: Mutex::new(None),
             rtx_ssrc_fast: AtomicU32::new(0),
-            rtx_seq: AtomicU16::new(random_u32() as u16),
+            rtx_seq: Arc::new(AtomicU16::new(random_u32() as u16)),
             rtx_sent_count: AtomicU64::new(0),
         }
     }
@@ -735,6 +735,9 @@ pub struct PeerConnection {
 
 struct PeerConnectionInner {
     config: RtcConfiguration,
+    /// Dynamic video capabilities installed after construction (e.g. when a
+    /// mid-call re-INVITE adds video to an originally audio-only peer).
+    video_capabilities_override: Mutex<Option<Vec<crate::config::VideoCapability>>>,
     signaling_state: watch::Sender<SignalingState>,
     _signaling_state_rx: watch::Receiver<SignalingState>,
     peer_state: watch::Sender<PeerConnectionState>,
@@ -982,6 +985,7 @@ impl PeerConnection {
 
         let inner = PeerConnectionInner {
             config,
+            video_capabilities_override: Mutex::new(None),
             signaling_state: signaling_state_tx,
             _signaling_state_rx: signaling_state_rx,
             peer_state: peer_state_tx,
@@ -1095,6 +1099,13 @@ impl PeerConnection {
 
     pub fn config(&self) -> &RtcConfiguration {
         &self.inner.config
+    }
+
+    /// Update the video capabilities used for subsequent `add_track` /
+    /// `add_transceiver` NACK setup and SDP offer/answer generation (e.g. when
+    /// a mid-call re-INVITE adds video to an originally audio-only peer).
+    pub fn set_video_capabilities(&self, caps: Vec<crate::config::VideoCapability>) {
+        *self.inner.video_capabilities_override.lock() = Some(caps);
     }
 
     /// Returns the sink for RTP source-change notifications, creating the
@@ -1402,23 +1413,7 @@ impl PeerConnection {
             builder = builder.interceptor(i.clone());
         }
 
-        let nack_enabled = if let Some(caps) = &self.inner.config.media_capabilities {
-            match kind {
-                MediaKind::Audio => caps.audio.iter().any(|c| rtcp_fb_enables_nack(&c.rtcp_fbs)),
-                MediaKind::Video => caps.video.iter().any(|c| rtcp_fb_enables_nack(&c.rtcp_fbs)),
-                MediaKind::Application => false,
-                MediaKind::Image => false,
-            }
-        } else {
-            match kind {
-                MediaKind::Audio => rtcp_fb_enables_nack(&AudioCapability::default().rtcp_fbs),
-                MediaKind::Video => rtcp_fb_enables_nack(&VideoCapability::default().rtcp_fbs),
-                MediaKind::Application => false,
-                MediaKind::Image => false,
-            }
-        };
-
-        if nack_enabled {
+        if self.inner.nack_enabled_for_kind(kind) {
             builder = builder.nack();
         }
         let receiver = builder.build();
@@ -1508,23 +1503,7 @@ impl PeerConnection {
             builder = builder.cname(cname.clone());
         }
 
-        let nack_enabled = if let Some(caps) = &self.inner.config.media_capabilities {
-            match kind {
-                MediaKind::Audio => caps.audio.iter().any(|c| rtcp_fb_enables_nack(&c.rtcp_fbs)),
-                MediaKind::Video => caps.video.iter().any(|c| rtcp_fb_enables_nack(&c.rtcp_fbs)),
-                MediaKind::Application => false,
-                MediaKind::Image => false,
-            }
-        } else {
-            match kind {
-                MediaKind::Audio => rtcp_fb_enables_nack(&AudioCapability::default().rtcp_fbs),
-                MediaKind::Video => rtcp_fb_enables_nack(&VideoCapability::default().rtcp_fbs),
-                MediaKind::Application => false,
-                MediaKind::Image => false,
-            }
-        };
-
-        if nack_enabled {
+        if self.inner.nack_enabled_for_kind(kind) {
             builder = builder.nack(self.inner.config.nack_buffer_size);
             if !self.inner.config.enable_gcc {
                 builder = builder.bitrate_controller();
@@ -1787,7 +1766,37 @@ impl PeerConnection {
                 && matches!(ours.direction, Direction::SendRecv | Direction::SendOnly)
                 && matches!(theirs.direction, Direction::SendRecv | Direction::RecvOnly);
             transceiver.set_send_permitted(permitted);
-            if let Some(receiver) = transceiver.receiver() {
+            let receiver = transceiver.receiver();
+            if transceiver.kind() == MediaKind::Video {
+                let mut apt = ours.video_rtx_apt_map();
+                let remote_apt = theirs.video_rtx_apt_map();
+                apt.retain(|pt, primary| !rejected && remote_apt.get(pt) == Some(primary));
+
+                let sender = transceiver.sender();
+                let rtx = transceiver.sender_rtx_ssrc().filter(|_| permitted).and_then(|rtx_ssrc| {
+                    let rtx_payload_type = sender
+                        .iter()
+                        .map(|sender| sender.params().payload_type)
+                        .chain(ours.formats.iter().filter_map(|format| format.parse().ok()))
+                        .find_map(|primary| crate::rtx::rtx_pt_for_primary(&apt, primary))?;
+                    Some(crate::rtx::RtxSenderConfig { rtx_ssrc, rtx_payload_type })
+                });
+                let rtx_pt = rtx.map(|config| config.rtx_payload_type);
+                let previous_rtx_pt = core::mem::replace(
+                    &mut *transceiver.sender_rtx_payload_type.lock(),
+                    rtx_pt,
+                );
+                if (rtx.is_some() || previous_rtx_pt.is_some())
+                    && let Some(sender) = sender
+                {
+                    sender.set_rtx(rtx);
+                }
+                if let Some(receiver) = &receiver {
+                    receiver.set_rtx_apt_map(apt);
+                }
+                *transceiver.remote_fid_ssrcs.lock() = (!rejected).then(|| theirs.fid_ssrcs()).flatten();
+            }
+            if let Some(receiver) = receiver {
                 // Receive on the PTs in our answer. Rejecting a format must
                 // remove its PT from that m-line's BUNDLE demux candidates.
                 let answer_payloads = matches!(local.sdp_type, SdpType::Answer | SdpType::Pranswer)
@@ -1880,17 +1889,15 @@ impl PeerConnection {
                 if let Some(ssrc) = transceiver.sender_ssrc() {
                     setting.send.extend(payloads.iter().map(|&pt| ((ssrc, pt), local_id)));
                 }
-                if let Some(ssrc) = transceiver.sender_rtx_ssrc()
-                    && let Some(pt) = *transceiver.sender_rtx_payload_type.lock()
-                {
+                if let Some(ssrc) = transceiver.sender_rtx_ssrc() {
                     // Repair packets participate in the same feedback as their primary.
-                    let local_apt = crate::rtx::extract_rtx_apt_map_from_attrs(&ours.attributes);
-                    let remote_apt = crate::rtx::extract_rtx_apt_map_from_attrs(&theirs.attributes);
-                    if let Some(primary) = local_apt.get(&pt)
-                        && remote_apt.get(&pt) == Some(primary)
-                        && (payloads.contains(primary) || payloads.contains(&pt))
-                    {
-                        setting.send.insert((ssrc, pt), local_id);
+                    let remote_apt = theirs.video_rtx_apt_map();
+                    for (pt, primary) in ours.video_rtx_apt_map() {
+                        if remote_apt.get(&pt) == Some(&primary)
+                            && (payloads.contains(&primary) || payloads.contains(&pt))
+                        {
+                            setting.send.insert((ssrc, pt), local_id);
+                        }
                     }
                 }
             }
@@ -2280,28 +2287,15 @@ impl PeerConnection {
                 let mut rids = Vec::new();
                 let mut rid_ext_id = None;
                 let mut abs_send_time_ext_id = None;
-                let mut fid_group = None;
-                let mut rtx_ssrc = None;
-                let rtx_apt = crate::rtx::extract_rtx_apt_map_from_attrs(&section.attributes);
-
-                // First pass: check for ssrc-group FID
-                for attr in &section.attributes {
-                    if attr.key == "ssrc-group"
-                        && let Some(val) = &attr.value
-                        && val.starts_with("FID")
-                    {
-                        // Format: FID <primary> <rtx>
-                        let parts: Vec<&str> = val.split_whitespace().collect();
-                        if parts.len() >= 3
-                            && let Ok(primary) = parts[1].parse::<u32>()
-                        {
-                            fid_group = Some(primary);
-                            if let Ok(rtx) = parts[2].parse::<u32>() {
-                                rtx_ssrc = Some(rtx);
-                            }
-                        }
-                    }
-                }
+                let rtx_apt = if section.kind == MediaKind::Video {
+                    section.video_rtx_apt_map()
+                } else {
+                    crate::rtx::extract_rtx_apt_map_from_attrs(&section.attributes)
+                };
+                let (fid_group, rtx_ssrc) = match section.fid_ssrcs() {
+                    Some((primary, rtx)) => (Some(primary), Some(rtx)),
+                    None => (None, None),
+                };
 
                 for attr in &section.attributes {
                     if attr.key == "ssrc" {
@@ -2417,27 +2411,7 @@ impl PeerConnection {
                         .runtime_handle(self.inner.config.runtime_handle.clone())
                         .reception_stats(self.inner.stats_collector.clone());
 
-                    let nack_enabled = if let Some(caps) = &self.inner.config.media_capabilities {
-                        match kind {
-                            MediaKind::Audio => {
-                                caps.audio.iter().any(|c| rtcp_fb_enables_nack(&c.rtcp_fbs))
-                            }
-                            MediaKind::Video => {
-                                caps.video.iter().any(|c| rtcp_fb_enables_nack(&c.rtcp_fbs))
-                            }
-                            _ => false,
-                        }
-                    } else {
-                        match kind {
-                            MediaKind::Audio => {
-                                rtcp_fb_enables_nack(&AudioCapability::default().rtcp_fbs)
-                            }
-                            MediaKind::Video => {
-                                rtcp_fb_enables_nack(&VideoCapability::default().rtcp_fbs)
-                            }
-                            _ => false,
-                        }
-                    };
+                    let nack_enabled = self.inner.nack_enabled_for_kind(kind);
 
                     if nack_enabled {
                         debug!("NACK: enabled for new receiver mid={}", mid);
@@ -5489,6 +5463,26 @@ fn is_ice_failed_or_closed(state: crate::transports::ice::IceTransportState) -> 
 }
 
 impl PeerConnectionInner {
+    fn nack_enabled_for_kind(&self, kind: MediaKind) -> bool {
+        if kind == MediaKind::Video
+            && let Some(caps) = self.video_capabilities_override.lock().as_ref()
+        {
+            return caps.iter().any(|c| rtcp_fb_enables_nack(&c.rtcp_fbs));
+        }
+        if let Some(caps) = &self.config.media_capabilities {
+            match kind {
+                MediaKind::Audio => caps.audio.iter().any(|c| rtcp_fb_enables_nack(&c.rtcp_fbs)),
+                MediaKind::Video => caps.video.iter().any(|c| rtcp_fb_enables_nack(&c.rtcp_fbs)),
+                MediaKind::Application | MediaKind::Image => false,
+            }
+        } else {
+            match kind {
+                MediaKind::Audio => rtcp_fb_enables_nack(&AudioCapability::default().rtcp_fbs),
+                MediaKind::Video => rtcp_fb_enables_nack(&VideoCapability::default().rtcp_fbs),
+                MediaKind::Application | MediaKind::Image => false,
+            }
+        }
+    }
     /// Track a spawned task so it can be aborted on close. Only meant for
     /// fire-and-forget tasks whose lifetime should be bounded by the connection.
     #[cfg(feature = "std")]
@@ -6477,6 +6471,12 @@ impl PeerConnectionInner {
         previous_bundle_tag: Option<&str>,
     ) {
         section.apply_config(&self.config);
+        if kind == MediaKind::Video
+            && let Some(caps) = self.video_capabilities_override.lock().clone()
+            && !caps.is_empty()
+        {
+            section.apply_video_capabilities(&caps);
+        }
         let remote = self.remote_description.lock();
         let remote_section = remote.as_ref().and_then(|sdp| sdp.media_sections.get(media_index));
         if sdp_type == SdpType::Answer && let Some(offered) = remote_section {
@@ -6739,7 +6739,7 @@ impl PeerConnectionInner {
     /// Echo remote-offered RTX payload types into a local answer when the
     /// associated primary PT is present in the answer media section.
     fn merge_remote_rtx_into_answer(section: &mut MediaSection, remote_section: &MediaSection) {
-        let apt_map = crate::rtx::extract_rtx_apt_map_from_attrs(&remote_section.attributes);
+        let apt_map = remote_section.video_rtx_apt_map();
         if apt_map.is_empty() {
             return;
         }
@@ -7286,6 +7286,7 @@ pub struct RtpTransceiver {
     sender_ssrc: Mutex<Option<u32>>,
     sender_rtx_ssrc: Mutex<Option<u32>>,
     sender_rtx_payload_type: Mutex<Option<u8>>,
+    remote_fid_ssrcs: Mutex<Option<(u32, u32)>>,
     sender_stream_id: Mutex<Option<String>>,
     sender_track_id: Mutex<Option<String>>,
     payload_map: Arc<RwLock<BTreeMap<u8, RtpCodecParameters>>>,
@@ -7316,6 +7317,7 @@ impl RtpTransceiver {
             sender_ssrc: Mutex::new(None),
             sender_rtx_ssrc: Mutex::new(None),
             sender_rtx_payload_type: Mutex::new(None),
+            remote_fid_ssrcs: Mutex::new(None),
             sender_stream_id: Mutex::new(None),
             sender_track_id: Mutex::new(None),
             payload_map: Arc::new(RwLock::new(BTreeMap::new())),
@@ -7346,6 +7348,12 @@ impl RtpTransceiver {
 
     pub fn sender_rtx_ssrc(&self) -> Option<u32> {
         *self.sender_rtx_ssrc.lock()
+    }
+
+    /// Negotiated remote `(primary_ssrc, rtx_ssrc)` from `a=ssrc-group:FID`,
+    /// updated on every completed offer/answer exchange.
+    pub fn remote_fid_ssrcs(&self) -> Option<(u32, u32)> {
+        *self.remote_fid_ssrcs.lock()
     }
 
     pub fn sender_stream_id(&self) -> Option<String> {
@@ -7650,6 +7658,9 @@ pub struct RtpSender {
     /// Outgoing sequence/timestamp space of this SSRC, shared with any
     /// rewrite bridge relaying onto it (see [`crate::rtp_timeline`]).
     timeline: Arc<crate::rtp_timeline::OutboundTimeline>,
+    /// Independent RFC 4588 RTX sequence space for this sender, shared with
+    /// the NACK handler (when attached) and any rewrite bridge relaying RTX.
+    rtx_seq: Arc<AtomicU16>,
     interceptors: Vec<Arc<dyn RtpSenderInterceptor + Send + Sync>>,
     /// sdes:mid extension to inject: (extension header ID, mid value).
     /// Set automatically by update_extmap() when negotiation contains sdes:mid.
@@ -7800,6 +7811,16 @@ impl RtpSender {
             random_u32(),
         );
 
+        let rtx_seq = interceptors
+            .iter()
+            .find_map(|interceptor| {
+                interceptor
+                    .clone()
+                    .as_sender_nack_handler()
+                    .map(|handler| handler.rtx_seq.clone())
+            })
+            .unwrap_or_else(|| Arc::new(AtomicU16::new(random_u32() as u16)));
+
         Self {
             track,
             transport: Mutex::new(None),
@@ -7812,6 +7833,7 @@ impl RtpSender {
             stop_tx: Arc::new(Notify::new()),
             send_stats: Arc::new(crate::transports::rtp::RtpSendStats::default()),
             timeline,
+            rtx_seq,
             interceptors,
             sdes_mid: Arc::new(Mutex::new(None)),
             transport_generation: Arc::new(AtomicU64::new(0)),
@@ -7934,6 +7956,11 @@ impl RtpSender {
             }
         }
         None
+    }
+
+    /// Share this sender's RTX sequence space with a transport relay.
+    pub fn rtx_sequence_counter(&self) -> Arc<AtomicU16> {
+        self.rtx_seq.clone()
     }
 
     /// Configure RFC 4588 RTX retransmission on the sender NACK interceptor.
@@ -8652,9 +8679,6 @@ impl RtpReceiver {
     /// Store RTX→primary payload-type associations from SDP `apt=` and register
     /// the RTX payload types on the transport so retransmissions are demuxed.
     pub fn set_rtx_apt_map(&self, apt_map: alloc::collections::BTreeMap<u8, u8>) {
-        if apt_map.is_empty() {
-            return;
-        }
         *self.rtx_apt.lock() = apt_map;
         self.refresh_payload_listener(true);
     }
@@ -10639,6 +10663,196 @@ a=ssrc-group:FID 12345 67890\r\n";
         assert!(sender.nack_handler().is_some());
         let t = &pc.get_transceivers()[0];
         assert!(t.sender_rtx_ssrc().is_some());
+    }
+
+    #[tokio::test]
+    async fn an_answer_omitting_rtx_disables_the_offered_repair_sender() {
+        use crate::config::{MediaCapabilities, VideoCapability};
+
+        let mut config = RtcConfiguration::sip();
+        config.media_capabilities = Some(MediaCapabilities {
+            audio: vec![],
+            video: vec![VideoCapability::vp8_with_rtx(97)],
+            application: None,
+            image: vec![],
+        });
+        let offerer = PeerConnection::new(config.clone());
+        let answerer = PeerConnection::new(config);
+        let (_source, track, _) =
+            crate::media::track::sample_track(crate::media::frame::MediaKind::Video, 8);
+        let sender = offerer
+            .add_track(track, RtpCodecParameters {
+                payload_type: 96,
+                name: "VP8".into(),
+                clock_rate: 90_000,
+                channels: 0,
+            })
+            .unwrap();
+
+        let offer = offerer.create_offer().await.unwrap();
+        let transceiver = &offerer.get_transceivers()[0];
+        assert_eq!(*transceiver.sender_rtx_payload_type.lock(), Some(97));
+        let sequence = sender.rtx_sequence_counter();
+        offerer.set_local_description(offer.clone()).unwrap();
+        answerer.set_remote_description(offer).await.unwrap();
+        let mut answer = answerer.create_answer().await.unwrap();
+        strip_rtx_from_section(&mut answer.media_sections[0]);
+        offerer.set_remote_description(answer).await.unwrap();
+
+        assert!(transceiver.sender_rtx_payload_type.lock().is_none());
+        let handler = sender
+            .interceptors()
+            .iter()
+            .find_map(|interceptor| interceptor.clone().as_sender_nack_handler())
+            .unwrap();
+        assert!(handler.rtx_config().is_none());
+        assert!(Arc::ptr_eq(&sequence, &sender.rtx_sequence_counter()));
+    }
+
+    #[tokio::test]
+    async fn set_video_capabilities_enables_rtx_and_fid_on_added_video_offer() {
+        use crate::config::{AudioCapability, MediaCapabilities, VideoCapability};
+
+        let mut config = RtcConfiguration::sip();
+        config.media_capabilities = Some(MediaCapabilities {
+            audio: vec![AudioCapability::pcmu()],
+            video: vec![],
+            application: None,
+            image: vec![],
+        });
+        let pc = PeerConnection::new(config);
+        let (_audio_src, audio_track, _) =
+            crate::media::track::sample_track(crate::media::frame::MediaKind::Audio, 8);
+        pc.add_track(
+            audio_track,
+            RtpCodecParameters {
+                payload_type: 0,
+                name: "PCMU".into(),
+                clock_rate: 8_000,
+                channels: 1,
+            },
+        )
+        .unwrap();
+
+        // Simulate mid-call re-INVITE adding video with RTX to an originally audio-only PC.
+        let mut h264 = VideoCapability::h264();
+        h264.payload_type = 102;
+        h264.rtx_payload_type = Some(103);
+        h264.rtcp_fbs = vec!["nack".into(), "nack pli".into()];
+        pc.set_video_capabilities(vec![h264]);
+
+        let (_video_src, video_track, _) =
+            crate::media::track::sample_track(crate::media::frame::MediaKind::Video, 8);
+        let sender = pc
+            .add_track(
+                video_track,
+                RtpCodecParameters {
+                    payload_type: 102,
+                    name: "H264".into(),
+                    clock_rate: 90_000,
+                    channels: 0,
+                },
+            )
+            .unwrap();
+        let _ = sender.rtx_sequence_counter();
+
+        let offer = pc.create_offer().await.unwrap();
+        let video_section = offer
+            .media_sections
+            .iter()
+            .find(|s| s.kind == MediaKind::Video)
+            .expect("video m-line");
+        assert_eq!(video_section.video_rtx_apt_map().get(&103), Some(&102));
+        let (primary_ssrc, rtx_ssrc) = video_section.fid_ssrcs().expect("FID group");
+        assert_eq!(primary_ssrc, sender.ssrc());
+        let video_transceiver = pc
+            .get_transceivers()
+            .into_iter()
+            .find(|t| t.kind() == MediaKind::Video)
+            .unwrap();
+        assert_eq!(video_transceiver.sender_rtx_ssrc(), Some(rtx_ssrc));
+    }
+
+    #[tokio::test]
+    async fn set_video_capabilities_enables_rtx_and_fid_on_added_video_answer() {
+        use crate::config::{AudioCapability, MediaCapabilities, VideoCapability};
+
+        let mut config = RtcConfiguration::sip();
+        config.media_capabilities = Some(MediaCapabilities {
+            audio: vec![AudioCapability::pcmu()],
+            video: vec![],
+            application: None,
+            image: vec![],
+        });
+        let pc = PeerConnection::new(config);
+        let (_audio_src, audio_track, _) =
+            crate::media::track::sample_track(crate::media::frame::MediaKind::Audio, 8);
+        pc.add_track(
+            audio_track,
+            RtpCodecParameters {
+                payload_type: 0,
+                name: "PCMU".into(),
+                clock_rate: 8_000,
+                channels: 1,
+            },
+        )
+        .unwrap();
+
+        let mut h264 = VideoCapability::h264();
+        h264.payload_type = 102;
+        h264.rtx_payload_type = Some(103);
+        h264.rtcp_fbs = vec!["nack".into(), "nack pli".into()];
+        pc.set_video_capabilities(vec![h264]);
+
+        let reinvite_offer = "v=0\r\n\
+o=- 1 2 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+c=IN IP4 127.0.0.1\r\n\
+t=0 0\r\n\
+m=audio 5000 RTP/AVP 0\r\n\
+a=sendrecv\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+m=video 5002 RTP/AVP 102 103\r\n\
+a=sendrecv\r\n\
+a=rtpmap:102 H264/90000\r\n\
+a=rtpmap:103 rtx/90000\r\n\
+a=fmtp:103 apt=102\r\n\
+a=ssrc-group:FID 1111 2222\r\n\
+a=ssrc:1111 cname:remote\r\n\
+a=ssrc:2222 cname:remote\r\n";
+        let offer = SessionDescription::parse(SdpType::Offer, reinvite_offer).unwrap();
+        pc.set_remote_description(offer).await.unwrap();
+
+        let (_video_src, video_track, _) =
+            crate::media::track::sample_track(crate::media::frame::MediaKind::Video, 8);
+        let sender = pc
+            .add_track(
+                video_track,
+                RtpCodecParameters {
+                    payload_type: 102,
+                    name: "H264".into(),
+                    clock_rate: 90_000,
+                    channels: 0,
+                },
+            )
+            .unwrap();
+        let _ = sender.rtx_sequence_counter();
+
+        let answer = pc.create_answer().await.unwrap();
+        let video_section = answer
+            .media_sections
+            .iter()
+            .find(|s| s.kind == MediaKind::Video)
+            .expect("video m-line");
+        assert_eq!(video_section.video_rtx_apt_map().get(&103), Some(&102));
+        let (primary_ssrc, rtx_ssrc) = video_section.fid_ssrcs().expect("FID group");
+        assert_eq!(primary_ssrc, sender.ssrc());
+        let video_transceiver = pc
+            .get_transceivers()
+            .into_iter()
+            .find(|t| t.kind() == MediaKind::Video)
+            .unwrap();
+        assert_eq!(video_transceiver.sender_rtx_ssrc(), Some(rtx_ssrc));
     }
 
     #[tokio::test]
@@ -15089,6 +15303,7 @@ a=sendrecv\r\n"
                     out_ssrc: sender.ssrc(),
                     sdes_mid_extension_id: Some(mid_id),
                     sdes_mid: Some(mid.to_string()),
+                    rtx: None,
                 },
             ],
             Vec::new(),

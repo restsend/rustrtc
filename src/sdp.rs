@@ -889,6 +889,85 @@ impl MediaSection {
         None
     }
 
+    /// RFC 4588 repair-to-primary payload types accepted by this video m-line.
+    /// Both formats must be listed and their explicit RTP clocks must agree.
+    pub fn video_rtx_apt_map(&self) -> crate::rtx::RtxAptMap {
+        if self.kind != MediaKind::Video {
+            return crate::rtx::RtxAptMap::new();
+        }
+        let formats: BTreeMap<u8, (&str, u32)> = self.attributes.iter().filter_map(|attr| {
+            if attr.key != "rtpmap" {
+                return None;
+            }
+            let mut parts = attr.value.as_deref()?.split_whitespace();
+            let format = parts.next()?;
+            if !self.formats.iter().any(|listed| listed == format) {
+                return None;
+            }
+            let (codec, rate) = parts.next()?.split_once('/')?;
+            Some((format.parse().ok()?, (codec, rate.parse().ok()?)))
+        }).collect();
+        let mut map = crate::rtx::extract_rtx_apt_map_from_attrs(&self.attributes);
+        map.retain(|repair, primary| {
+            matches!((formats.get(repair), formats.get(primary)),
+                (Some((repair_codec, repair_rate)), Some((primary_codec, primary_rate)))
+                    if repair_codec.eq_ignore_ascii_case("rtx")
+                        && !primary_codec.eq_ignore_ascii_case("rtx")
+                        && *repair_rate != 0
+                        && repair_rate == primary_rate)
+        });
+        map
+    }
+
+    /// Parse the first valid RFC 5888 `a=ssrc-group:FID <primary> <rtx>` pair
+    /// in this media section (distinct non-zero SSRCs).
+    pub fn fid_ssrcs(&self) -> Option<(u32, u32)> {
+        self.attributes.iter().find_map(|attr| {
+            if attr.key != "ssrc-group" {
+                return None;
+            }
+            let mut fields = attr.value.as_deref()?.split_whitespace();
+            if fields.next()? != "FID" {
+                return None;
+            }
+            let primary = fields.next()?.parse::<u32>().ok()?;
+            let rtx = fields.next()?.parse::<u32>().ok()?;
+            (primary != 0 && rtx != 0 && primary != rtx && fields.next().is_none())
+                .then_some((primary, rtx))
+        })
+    }
+
+    /// Remove `a=ssrc-group:FID` lines and the associated repair `a=ssrc:`
+    /// attributes from this media section.
+    pub fn strip_fid_ssrcs(&mut self) {
+        let rtx_ssrcs: alloc::collections::BTreeSet<u32> = self
+            .attributes
+            .iter()
+            .filter_map(|attr| {
+                if attr.key != "ssrc-group" {
+                    return None;
+                }
+                let mut fields = attr.value.as_deref()?.split_whitespace();
+                if fields.next()? != "FID" {
+                    return None;
+                }
+                fields.nth(1)?.parse().ok()
+            })
+            .collect();
+        self.attributes.retain(|attr| {
+            let value = attr.value.as_deref().unwrap_or_default();
+            match attr.key.as_str() {
+                "ssrc-group" => value.split_whitespace().next() != Some("FID"),
+                "ssrc" => !value
+                    .split_whitespace()
+                    .next()
+                    .and_then(|field| field.parse().ok())
+                    .is_some_and(|ssrc| rtx_ssrcs.contains(&ssrc)),
+                _ => true,
+            }
+        });
+    }
+
     pub fn to_video_capabilities(&self) -> Vec<crate::config::VideoCapability> {
         if self.kind != MediaKind::Video {
             return Vec::new();
@@ -998,7 +1077,7 @@ impl MediaSection {
         }
 
         // Attach RTX payload types via fmtp apt= onto the matching primary codec.
-        let apt_map = crate::rtx::extract_rtx_apt_map_from_attrs(&self.attributes);
+        let apt_map = self.video_rtx_apt_map();
         for cap in &mut capabilities {
             if let Some(rtx_pt) = crate::rtx::rtx_pt_for_primary(&apt_map, cap.payload_type) {
                 cap.rtx_payload_type = Some(rtx_pt);
@@ -1162,20 +1241,11 @@ impl MediaSection {
         }
     }
 
-    fn apply_video_config(&mut self, config: &RtcConfiguration) {
-        let default_caps = crate::config::VideoCapability::default();
-        let caps = if let Some(c) = &config.media_capabilities {
-            if c.video.is_empty() {
-                vec![default_caps]
-            } else {
-                c.video.clone()
-            }
-        } else {
-            vec![default_caps]
-        };
-
+    pub(crate) fn apply_video_capabilities(&mut self, caps: &[crate::config::VideoCapability]) {
         self.formats = caps.iter().map(|c| c.payload_type.to_string()).collect();
-        for video in &caps {
+        self.attributes
+            .retain(|attr| !matches!(attr.key.as_str(), "rtpmap" | "fmtp" | "rtcp-fb"));
+        for video in caps {
             self.attributes.push(Attribute::new(
                 "rtpmap",
                 Some(format!(
@@ -1205,6 +1275,21 @@ impl MediaSection {
                 );
             }
         }
+    }
+
+    fn apply_video_config(&mut self, config: &RtcConfiguration) {
+        let default_caps = crate::config::VideoCapability::default();
+        let caps = if let Some(c) = &config.media_capabilities {
+            if c.video.is_empty() {
+                vec![default_caps]
+            } else {
+                c.video.clone()
+            }
+        } else {
+            vec![default_caps]
+        };
+
+        self.apply_video_capabilities(&caps);
     }
 
     fn apply_application_config(&mut self, config: &RtcConfiguration) {
@@ -2029,6 +2114,49 @@ a=fmtp:97 apt=96\r\n";
         assert_eq!(caps.len(), 1);
         assert_eq!(caps[0].payload_type, 96);
         assert_eq!(caps[0].rtx_payload_type, Some(97));
+    }
+
+    #[test]
+    fn video_rtx_requires_listed_repair_and_matching_rtpmap_clock() {
+        let sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=video 5000 RTP/AVP 96 97 98 99\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+a=rtpmap:97 rtx/8000\r\n\
+a=fmtp:97 apt=96\r\n\
+a=rtpmap:98 H264/90000\r\n\
+a=fmtp:98 apt=96\r\n\
+a=fmtp:99 apt=96\r\n\
+a=rtpmap:100 rtx/90000\r\n\
+a=fmtp:100 apt=96\r\n";
+        let desc = SessionDescription::parse(SdpType::Answer, sdp).unwrap();
+        let section = &desc.media_sections[0];
+        assert!(section.video_rtx_apt_map().is_empty());
+        let caps = section.to_video_capabilities();
+        assert!(caps.iter().all(|cap| cap.rtx_payload_type.is_none()));
+    }
+
+    #[test]
+    fn fid_ssrcs_parse_and_strip() {
+        let sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=video 5000 RTP/AVP 96 97\r\n\
+a=ssrc-group:FID 111 222\r\n\
+a=ssrc:111 cname:video\r\n\
+a=ssrc:222 cname:video\r\n";
+        let mut desc = SessionDescription::parse(SdpType::Answer, sdp).unwrap();
+        let section = &mut desc.media_sections[0];
+        assert_eq!(section.fid_ssrcs(), Some((111, 222)));
+        section.strip_fid_ssrcs();
+        assert_eq!(section.fid_ssrcs(), None);
+        let rendered = desc.to_sdp_string();
+        assert!(rendered.contains("a=ssrc:111 cname:video"));
+        assert!(!rendered.contains("a=ssrc:222"));
+        assert!(!rendered.contains("ssrc-group:FID"));
     }
 
     #[test]

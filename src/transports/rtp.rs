@@ -109,6 +109,19 @@ pub struct RtpRewriteRule {
     /// The destination leg's MID value for this m-line (e.g. "0" for the
     /// audio m-line, "1" for video).
     pub sdes_mid: Option<String>,
+    /// Optional RFC 4588 repair stream associated with this primary PT.
+    pub rtx: Option<RtpRtxRewrite>,
+}
+
+/// Rewrite an accepted RFC 4588 repair stream using its primary rule's
+/// timeline and the destination sender's independent RTX sequence space.
+#[derive(Debug, Clone)]
+pub struct RtpRtxRewrite {
+    pub source_payload_type: u8,
+    /// Negotiated incoming (primary SSRC, RTX SSRC), when signaled via FID.
+    pub source_ssrcs: Option<(u32, u32)>,
+    pub destination: crate::rtx::RtxSenderConfig,
+    pub sequence: Arc<AtomicU16>,
 }
 
 /// Direction-level rewrite bridge options (not payload-type-scoped).
@@ -127,6 +140,7 @@ impl RtpRewriteRule {
             out_payload_type: params.payload_type,
             sdes_mid_extension_id: None,
             sdes_mid: None,
+            rtx: None,
         }
     }
 
@@ -139,6 +153,7 @@ impl RtpRewriteRule {
             out_payload_type: Some(dst_pt),
             sdes_mid_extension_id: None,
             sdes_mid: None,
+            rtx: None,
         }
     }
 
@@ -191,44 +206,81 @@ impl RewriteBridge {
         }
     }
 
-    /// Pick the most specific rule for a payload type: an exact-PT match wins,
-    /// otherwise the catch-all (`match_payload_type: None`).
-    fn rule_for(&self, raw_pt: u8) -> Option<&RtpRewriteRule> {
-        self.rules
+    /// Exact primary and RTX PTs take precedence over the catch-all.
+    fn rule_for(
+        rules: &[RtpRewriteRule],
+        raw_pt: u8,
+    ) -> Option<(&RtpRewriteRule, Option<&RtpRtxRewrite>)> {
+        if let Some(rule) = rules.iter().find(|rule| rule.match_payload_type == Some(raw_pt)) {
+            return Some((rule, None));
+        }
+        rules
             .iter()
-            .find(|r| r.match_payload_type == Some(raw_pt))
-            .or_else(|| self.rules.iter().find(|r| r.match_payload_type.is_none()))
+            .find_map(|rule| {
+                let repair = rule.rtx.as_ref().filter(|rtx| rtx.source_payload_type == raw_pt)?;
+                Some((rule, Some(repair)))
+            })
+            .or_else(|| {
+                rules
+                    .iter()
+                    .find(|rule| rule.match_payload_type.is_none())
+                    .map(|rule| (rule, None))
+            })
     }
 
-    /// Rewrite `packet` for the destination. Returns `false` if no rule matched
-    /// `packet.header.payload_type` (unmatched packets are dropped).
+    /// Rewrite a primary packet or its negotiated repair. Returns false when
+    /// there is no route or the repair falls outside the active primary run.
     fn rewrite_packet(&mut self, packet: &mut RtpPacket) -> bool {
-        let Some(rule) = self.rule_for(packet.header.payload_type).cloned() else {
+        let Some((rule, repair)) = Self::rule_for(&self.rules, packet.header.payload_type) else {
             return false;
         };
-        // Strip extension headers (WebRTC → RTP) before any marshaling so the
-        // RTP peer doesn't see WebRTC-specific extensions it can't parse.
-        if self.options.strip_extensions {
+        // An RTX header belongs to the incoming repair SSRC. Rebuild the
+        // destination MID and TWCC rather than forwarding source extension IDs.
+        if self.options.strip_extensions || repair.is_some() {
             packet.header.extension = None;
         }
 
-        let out_ssrc = rule.out_ssrc;
-        let timeline = self
-            .timelines
-            .entry(out_ssrc)
-            .or_insert_with(|| {
+        if let Some(rtx) = repair {
+            let source_ssrc = match rtx.source_ssrcs {
+                Some((primary, repair_ssrc)) if repair_ssrc == packet.header.ssrc => Some(primary),
+                Some(_) => return false,
+                None => None,
+            };
+            let Some(original_sequence) = crate::rtx::decode_osn(&packet.payload) else {
+                return false;
+            };
+            let Some((sequence, timestamp)) = self.timelines.get(&rule.out_ssrc).and_then(|timeline| {
+                timeline.translate_rtx(
+                    source_ssrc,
+                    packet.header.ssrc,
+                    original_sequence,
+                    packet.header.timestamp,
+                )
+            }) else {
+                return false;
+            };
+            let mut payload = BytesMut::with_capacity(packet.payload.len());
+            payload.extend_from_slice(&crate::rtx::encode_osn(sequence));
+            payload.extend_from_slice(&packet.payload[2..]);
+            packet.payload = payload.freeze();
+            packet.header.ssrc = rtx.destination.rtx_ssrc;
+            packet.header.payload_type = rtx.destination.rtx_payload_type;
+            packet.header.sequence_number = rtx.sequence.fetch_add(1, Ordering::Relaxed);
+            packet.header.timestamp = timestamp;
+        } else {
+            let timeline = self.timelines.entry(rule.out_ssrc).or_insert_with(|| {
                 // No sender shares this SSRC: start where the source is.
                 OutboundTimeline::new(
-                    out_ssrc,
+                    rule.out_ssrc,
                     UNSHARED_CLOCK_RATE,
                     packet.header.sequence_number.wrapping_sub(1),
                     packet.header.timestamp.wrapping_sub(160),
                 )
-            })
-            .clone();
-        timeline.write_peer(packet, timeline.clock_rate());
-        if let Some(payload_type) = rule.out_payload_type {
-            packet.header.payload_type = payload_type;
+            });
+            timeline.write_peer(packet, timeline.clock_rate());
+            if let Some(payload_type) = rule.out_payload_type {
+                packet.header.payload_type = payload_type;
+            }
         }
 
         // Source extensions may have been stripped above. The destination's
@@ -1584,6 +1636,7 @@ mod tests {
                     out_payload_type: None,
                     sdes_mid_extension_id: mid.map(|_| 4),
                     sdes_mid: mid.map(str::to_string),
+                    rtx: None,
                 })
                 .collect(),
                 timelines: BTreeMap::new(),
@@ -1604,6 +1657,80 @@ mod tests {
             assert!(bridge.rewrite_packet(&mut packet));
             assert_eq!(packet.header.extension.is_none(), strip_extensions);
         }
+    }
+
+    #[test]
+    fn rewrite_rtx_uses_the_primary_mapping_and_its_own_sequence_space() {
+        use crate::rtp::RtpHeader;
+
+        let timeline = OutboundTimeline::new(100, 90_000, 4_999, 10_000);
+        let sequence = Arc::new(AtomicU16::new(u16::MAX));
+        let mut bridge = RewriteBridge {
+            target: Weak::new(),
+            options: RtpRewriteBridgeOptions::default(),
+            rules: vec![RtpRewriteRule {
+                match_payload_type: Some(96),
+                out_ssrc: 100,
+                out_payload_type: Some(110),
+                sdes_mid_extension_id: Some(4),
+                sdes_mid: Some("video".into()),
+                rtx: Some(RtpRtxRewrite {
+                    source_payload_type: 97,
+                    source_ssrcs: Some((9, 10)),
+                    destination: crate::rtx::RtxSenderConfig {
+                        rtx_ssrc: 101,
+                        rtx_payload_type: 111,
+                    },
+                    sequence: sequence.clone(),
+                }),
+            }],
+            timelines: [(100, timeline.clone())].into(),
+        };
+        let mut first = RtpPacket::new(RtpHeader::new(96, u16::MAX - 1, 30_000, 9), vec![1]);
+        let mut later = RtpPacket::new(RtpHeader::new(96, 0, 36_000, 9), vec![2]);
+        assert!(bridge.rewrite_packet(&mut first));
+        assert!(bridge.rewrite_packet(&mut later));
+        assert_eq!(first.header.sequence_number, 5_000);
+        assert_eq!(later.header.sequence_number, 5_002);
+
+        let mut repair = RtpPacket::new(
+            RtpHeader::new(97, 300, 33_000, 10),
+            vec![0xff, 0xff, 0x1a, 0x2b],
+        );
+        repair.header.marker = true;
+        repair.header.set_extension(1, b"source").unwrap();
+
+        let mut wrong_source = repair.clone();
+        wrong_source.header.ssrc = 11;
+        assert!(!bridge.rewrite_packet(&mut wrong_source));
+        let mut outside_run = repair.clone();
+        outside_run.payload = Bytes::from_static(&[0, 1, 0x1a, 0x2b]);
+        assert!(!bridge.rewrite_packet(&mut outside_run));
+        let mut malformed = repair.clone();
+        malformed.payload = Bytes::from_static(&[0xff]);
+        assert!(!bridge.rewrite_packet(&mut malformed));
+        assert_eq!(sequence.load(Ordering::Relaxed), u16::MAX);
+
+        let mut repeated = repair.clone();
+        assert!(bridge.rewrite_packet(&mut repair));
+        assert!(bridge.rewrite_packet(&mut repeated));
+        assert_eq!(repair.header.ssrc, 101);
+        assert_eq!(repair.header.payload_type, 111);
+        assert_eq!(repair.header.sequence_number, u16::MAX);
+        assert_eq!(repeated.header.sequence_number, 0);
+        assert_eq!(repair.header.timestamp, later.header.timestamp.wrapping_sub(3_000));
+        assert!(repair.header.marker);
+        assert_eq!(repair.header.get_extension(4).unwrap().as_ref(), b"video");
+        assert!(repair.header.get_extension(1).is_none());
+        assert_eq!(&repair.payload[..2], &5_001u16.to_be_bytes());
+        assert_eq!(&repair.payload[2..], &[0x1a, 0x2b]);
+        assert_eq!(timeline.next_sequence_number(), 5_003);
+
+        let mut replacement = RtpPacket::new(RtpHeader::new(96, 1, 39_000, 13), vec![3]);
+        assert!(bridge.rewrite_packet(&mut replacement));
+        let mut old_repair = RtpPacket::new(RtpHeader::new(97, 301, 33_000, 10), vec![0xff, 0xff, 4]);
+        assert!(!bridge.rewrite_packet(&mut old_repair));
+        assert_eq!(sequence.load(Ordering::Relaxed), 1);
     }
 
     use super::*;
@@ -1645,7 +1772,7 @@ mod tests {
         let (_source_tx, source_rx) = watch::channel(None);
         let source = RtpTransport::new(IceConn::new(source_rx, remote.local_addr().unwrap(), None), false);
         source.bridge_rewrite_rules_with_timelines(target.clone(), Default::default(),
-            vec![RtpRewriteRule { out_ssrc: 777, match_payload_type: None, out_payload_type: None, sdes_mid_extension_id: None, sdes_mid: None }], vec![timeline.clone()]);
+            vec![RtpRewriteRule { out_ssrc: 777, match_payload_type: None, out_payload_type: None, sdes_mid_extension_id: None, sdes_mid: None, rtx: None }], vec![timeline.clone()]);
         let incoming = RtpPacket::new(crate::rtp::RtpHeader::new(0, 30, 9000, 42), vec![1; 80]);
         let mut buf = Vec::new();
         // A failed relay submission must not count even though mapping ran.
@@ -2104,6 +2231,7 @@ mod tests {
                 out_payload_type: None,
                 sdes_mid_extension_id: None,
                 sdes_mid: None,
+                rtx: None,
             }],
         );
 
@@ -2233,6 +2361,7 @@ mod tests {
                 out_payload_type: None,
                 sdes_mid_extension_id: None,
                 sdes_mid: None,
+                rtx: None,
             }],
         );
 
@@ -2340,6 +2469,7 @@ mod tests {
                     out_payload_type: Some(0),
                     sdes_mid_extension_id: None,
                     sdes_mid: None,
+                    rtx: None,
                 }],
                 vec![OutboundTimeline::new(
                     10000,
@@ -2451,6 +2581,7 @@ mod tests {
                     out_payload_type: None,
                     sdes_mid_extension_id: None,
                     sdes_mid: None,
+                    rtx: None,
                 },
                 RtpRewriteRule {
                     match_payload_type: Some(98),
@@ -2458,6 +2589,7 @@ mod tests {
                     out_payload_type: None,
                     sdes_mid_extension_id: None,
                     sdes_mid: None,
+                    rtx: None,
                 },
             ],
         );
@@ -2601,6 +2733,7 @@ mod tests {
                 out_payload_type: Some(96),
                 sdes_mid_extension_id: None,
                 sdes_mid: None,
+                rtx: None,
             },
             // DTMF PT 101 → 110, still on the audio SSRC.
             RtpRewriteRule {
@@ -2609,6 +2742,7 @@ mod tests {
                 out_payload_type: Some(110),
                 sdes_mid_extension_id: None,
                 sdes_mid: None,
+                rtx: None,
             },
             // Video PT 98 → 102, video SSRC.
             RtpRewriteRule {
@@ -2617,6 +2751,7 @@ mod tests {
                 out_payload_type: Some(102),
                 sdes_mid_extension_id: None,
                 sdes_mid: None,
+                rtx: None,
             },
             // Video RTX PT 99 → 103, same video SSRC (distinct source stream).
             RtpRewriteRule {
@@ -2625,6 +2760,7 @@ mod tests {
                 out_payload_type: Some(103),
                 sdes_mid_extension_id: None,
                 sdes_mid: None,
+                rtx: None,
             },
         ];
         src_transport.bridge_media_rewrite_rules(
@@ -2722,6 +2858,7 @@ mod tests {
             out_payload_type: Some(102),
             sdes_mid_extension_id: None,
             sdes_mid: None,
+            rtx: None,
         }];
         src_transport.bridge_rewrite_rules_to(dst_transport.clone(), Default::default(), rules);
 
@@ -3446,6 +3583,7 @@ mod tests {
                 out_payload_type: Some(111),
                 sdes_mid_extension_id: None,
                 sdes_mid: None,
+                rtx: None,
             }],
             Vec::new(),
         );
@@ -3459,6 +3597,7 @@ mod tests {
                 out_payload_type: Some(97),
                 sdes_mid_extension_id: None,
                 sdes_mid: None,
+                rtx: None,
             }],
             Vec::new(),
         );
@@ -3525,6 +3664,7 @@ mod tests {
                 out_payload_type: Some(111),
                 sdes_mid_extension_id: Some(4),
                 sdes_mid: Some("0".into()),
+                rtx: None,
             }],
             vec![OutboundTimeline::new(1111, 48_000, 0, 0)],
         );
@@ -3538,6 +3678,7 @@ mod tests {
                 out_payload_type: Some(97),
                 sdes_mid_extension_id: Some(4),
                 sdes_mid: Some("1".into()),
+                rtx: None,
             }],
             vec![OutboundTimeline::new(2222, 90_000, 0, 0)],
         );
@@ -3682,6 +3823,7 @@ mod tests {
             out_payload_type: Some(97),
             sdes_mid_extension_id: None,
             sdes_mid: None,
+            rtx: None,
         });
         src.bridge_rewrite_rules_with_timelines(
             Arc::new(loopback_transport()),
@@ -3722,6 +3864,7 @@ mod tests {
                 out_payload_type: Some(97),
                 sdes_mid_extension_id: None,
                 sdes_mid: None,
+                rtx: None,
             }],
             Vec::new(),
         );

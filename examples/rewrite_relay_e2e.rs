@@ -252,6 +252,7 @@ async fn handle_offer(
                         out_payload_type: None,
                         sdes_mid_extension_id: None,
                         sdes_mid: None,
+                        rtx: None,
                     }],
                 );
                 eprintln!("[e2e] rewrite bridge armed");
