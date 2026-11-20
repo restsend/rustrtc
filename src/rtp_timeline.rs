@@ -127,7 +127,11 @@ impl OutboundTimeline {
     /// Map a peer or packetized video RTP packet onto this timeline in place,
     /// scaling timestamp deltas when `in_clock` differs from this timeline's
     /// clock rate.
-    pub fn write_peer(&self, packet: &mut crate::rtp::RtpPacket, in_clock: u32) {
+    ///
+    /// Returns `false` if the packet is a late pre-anchor packet from the
+    /// current SSRC that would map before the start of the active run (caller
+    /// should drop it without re-anchoring).
+    pub fn write_peer(&self, packet: &mut crate::rtp::RtpPacket, in_clock: u32) -> bool {
         let mut state = self.state.lock();
         let out_clock = state.clock_rate;
         let ssrc = packet.header.ssrc;
@@ -152,6 +156,11 @@ impl OutboundTimeline {
             let dseq = out_seq.wrapping_sub(state.cur_seq) as i16;
             let dts = out_ts.wrapping_sub(state.cur_ts) as i32;
             if dseq.unsigned_abs() <= SEQ_REORDER_WINDOW && dts.unsigned_abs() <= max_step {
+                if dseq < 0 && dseq.unsigned_abs() > anchor.nack_span {
+                    // Late packet from before this run's anchor: drop it rather
+                    // than reusing an earlier run's sequence or re-anchoring.
+                    return false;
+                }
                 if dseq > 0 {
                     state.cur_seq = out_seq;
                     anchor.nack_span = (anchor.nack_span + dseq as u16).min(SEQ_REORDER_WINDOW);
@@ -168,7 +177,7 @@ impl OutboundTimeline {
                 packet.header.ssrc = self.ssrc;
                 packet.header.sequence_number = out_seq;
                 packet.header.timestamp = out_ts;
-                return;
+                return true;
             }
         }
 
@@ -185,6 +194,7 @@ impl OutboundTimeline {
         packet.header.ssrc = self.ssrc;
         packet.header.sequence_number = out_seq;
         packet.header.timestamp = out_ts;
+        true
     }
 
     /// Advance generated audio by one `ptime` interval in place, catching up by
@@ -438,5 +448,23 @@ mod tests {
         }
         assert!(t.translate_nack(42, &[65535]).is_empty());
         assert_eq!(t.translate_nack(42, &[latest]), vec![700 + 5000]);
+    }
+
+    #[test]
+    fn reordered_peer_packet_never_reuses_last_playback_sequence() {
+        let t = OutboundTimeline::new(1, 8000, 99, 10000 - 160);
+        // Playback sends seq 100.
+        let (playback_seq, _) = send_frame(&t);
+        assert_eq!(playback_seq, 100);
+        // New relay run starts with in_seq=50 -> out_seq=101 (nack_span=0).
+        let (first_relay_seq, first_ts) = send_peer(&t, 42, 50, 8000);
+        assert_eq!(first_relay_seq, 101);
+        // Late/reordered pre-anchor in_seq=49 is dropped without re-anchoring.
+        let mut late = RtpPacket::new(RtpHeader::new(0, 49, 7840, 42), vec![]);
+        assert!(!t.write_peer(&mut late, t.clock_rate()));
+        // Next in-order packet in_seq=51 continues seamlessly at out_seq=102.
+        let (next_seq, next_ts) = send_peer(&t, 42, 51, 8000);
+        assert_eq!(next_seq, 102);
+        assert_eq!(next_ts, first_ts);
     }
 }

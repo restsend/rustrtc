@@ -8160,7 +8160,11 @@ impl RtpSender {
                                 let mut packet = sample.into_rtp_packet(payload_type);
                                 match peer_clock {
                                     None => timeline.write_frame(&mut packet),
-                                    Some(clock) => timeline.write_peer(&mut packet, clock),
+                                    Some(clock) => {
+                                        if !timeline.write_peer(&mut packet, clock) {
+                                            continue;
+                                        }
+                                    }
                                 }
 
                                 let dst_addr = transport.remote_addr();

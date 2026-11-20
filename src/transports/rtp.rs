@@ -277,7 +277,9 @@ impl RewriteBridge {
                     packet.header.timestamp.wrapping_sub(160),
                 )
             });
-            timeline.write_peer(packet, timeline.clock_rate());
+            if !timeline.write_peer(packet, timeline.clock_rate()) {
+                return false;
+            }
             if let Some(payload_type) = rule.out_payload_type {
                 packet.header.payload_type = payload_type;
             }
