@@ -263,6 +263,13 @@ pub trait RtpObserver: Send + Sync {
     /// emits on the wire.
     fn on_egress(&self, _packet: &RtpPacket, _dst_addr: core::net::SocketAddr) {}
 
+    /// An inbound RTP or SRTP datagram failed header parsing.
+    fn on_ingress_parse_error(&self, _src_addr: core::net::SocketAddr, _protected: bool) {}
+
+    /// The awaited RTP send completed with bytes written. The direct relay
+    /// fast path does not use this callback.
+    fn on_send_complete(&self, _ssrc: u32, _payload_type: u8, _bytes: usize) {}
+
     /// The latched RTP remote source (the egress destination) changed: the
     /// initial latch commit (`switch == 0`) or a competitive re-latch after
     /// e.g. a NAT rebinding (`switch >= 1`).  Rare — at most a handful of
