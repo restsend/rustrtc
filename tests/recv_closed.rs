@@ -7,7 +7,10 @@
 //! (used by the examples) parked forever after `close()` and pinned the whole
 //! `PeerConnectionInner` for as long as the task lived.
 
-use rustrtc::{PeerConnection, PeerConnectionEvent, RtcConfiguration};
+use rustrtc::{
+    MediaKind, PeerConnection, PeerConnectionEvent, PeerConnectionState, RtcConfiguration,
+    TransceiverDirection,
+};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -50,8 +53,25 @@ async fn blocked_recv_wakes_on_close() {
 }
 
 #[tokio::test]
+async fn closed_ice_ends_recv_and_releases_transceivers() {
+    let pc = new_pc();
+    pc.add_transceiver(MediaKind::Audio, TransceiverDirection::RecvOnly);
+    pc.ice_transport().stop();
+
+    assert!(recv_within(&pc, 1000).await.is_none());
+    assert_eq!(
+        *pc.subscribe_peer_state().borrow(),
+        PeerConnectionState::Closed
+    );
+    assert!(pc.get_transceivers().is_empty());
+}
+
+#[tokio::test]
 async fn every_concurrent_waiter_wakes_on_close() {
     let pc = new_pc();
+    // A caller may stop polling a pending future without dropping it.
+    let mut parked = Box::pin(pc.recv());
+    assert!(futures::poll!(&mut parked).is_pending());
     let mut waiters = Vec::new();
     for _ in 0..4 {
         let pc = pc.clone();
@@ -69,6 +89,12 @@ async fn every_concurrent_waiter_wakes_on_close() {
             "waiter {i} returned an event after close()"
         );
     }
+    assert!(
+        timeout(Duration::from_secs(2), parked)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// Events queued before `close()` (an incoming data channel here) are handed

@@ -690,40 +690,78 @@ pub enum PeerConnectionEvent {
 /// → track graph; [`PeerConnection::recv`] upgrades live transceivers and
 /// silently skips dead ones.
 #[derive(Clone)]
-pub(crate) enum QueuedEvent {
+enum QueuedEvent {
     DataChannel(Arc<DataChannel>),
     Track(Weak<RtpTransceiver>),
 }
 
-/// Non-blocking pop of one queued event. `None` means the queue is empty (or
-/// the channel is closed); the caller reports the end through the peer state.
-fn try_pop_queued(rx: &mut mpsc::UnboundedReceiver<QueuedEvent>) -> Option<QueuedEvent> {
-    #[cfg(feature = "std")]
-    {
-        rx.try_recv().ok()
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        rx.try_recv().ok().flatten()
-    }
+#[derive(Default, PartialEq, Eq)]
+enum EventStreamState {
+    #[default]
+    Open,
+    Closing,
+    Closed,
 }
 
-/// Upgrade a queued entry into an application event. Dead `Track` entries
-/// (their transceiver graph is already gone) yield `None` and are skipped by
-/// the caller.
-fn upgrade_queued(queued: QueuedEvent) -> Option<PeerConnectionEvent> {
-    match queued {
-        QueuedEvent::DataChannel(dc) => Some(PeerConnectionEvent::DataChannel(dc)),
-        QueuedEvent::Track(weak) => weak.upgrade().map(PeerConnectionEvent::Track),
-    }
+#[derive(Default)]
+struct EventBacklog {
+    queue: VecDeque<QueuedEvent>,
+    state: EventStreamState,
 }
 
-/// Drain queued entries until a live event is produced or the queue is empty.
-fn drain_queued(rx: &mut mpsc::UnboundedReceiver<QueuedEvent>) -> Option<PeerConnectionEvent> {
-    loop {
-        let queued = try_pop_queued(rx)?;
-        if let Some(event) = upgrade_queued(queued) {
-            return Some(event);
+struct PeerEvents {
+    backlog: Mutex<EventBacklog>,
+    changed: watch::Sender<()>,
+}
+
+impl PeerEvents {
+    fn new() -> Self {
+        let (changed, _) = watch::channel(());
+        Self {
+            backlog: Mutex::new(EventBacklog::default()),
+            changed,
+        }
+    }
+
+    fn push(&self, event: QueuedEvent) {
+        let mut backlog = self.backlog.lock();
+        if backlog.state == EventStreamState::Open {
+            backlog.queue.push_back(event);
+            drop(backlog);
+            let _ = self.changed.send(());
+        }
+    }
+
+    fn begin_close(&self) -> bool {
+        let mut backlog = self.backlog.lock();
+        if backlog.state != EventStreamState::Open {
+            return false;
+        }
+        backlog.state = EventStreamState::Closing;
+        true
+    }
+
+    fn finish_close(&self) {
+        self.backlog.lock().state = EventStreamState::Closed;
+        let _ = self.changed.send(());
+    }
+
+    async fn recv(&self) -> Option<QueuedEvent> {
+        // Check the backlog after subscribing, so a simultaneous push or close
+        // cannot be missed. No caller holds the lock while waiting.
+        #[allow(unused_mut)]
+        let mut changed = self.changed.subscribe();
+        loop {
+            {
+                let mut backlog = self.backlog.lock();
+                if let Some(event) = backlog.queue.pop_front() {
+                    return Some(event);
+                }
+                if backlog.state == EventStreamState::Closed {
+                    return None;
+                }
+            }
+            let _ = changed.changed().await;
         }
     }
 }
@@ -801,8 +839,7 @@ struct PeerConnectionInner {
     sdes_primary_index: Mutex<Option<usize>>,
     sctp_transport: Mutex<Option<Arc<SctpTransport>>>,
     data_channels: Arc<Mutex<Vec<Weak<DataChannel>>>>,
-    event_tx: mpsc::UnboundedSender<QueuedEvent>,
-    event_rx: sync::AsyncMutex<mpsc::UnboundedReceiver<QueuedEvent>>,
+    events: Arc<PeerEvents>,
     /// Lazily-created sink for RTP source-change notifications from the
     /// media `IceConn`s; a forwarder task delivers them to the registered
     /// [`RtpObserver`]s.
@@ -999,7 +1036,6 @@ impl PeerConnection {
 
         let ssrc_generator = AtomicU32::new(config.ssrc_start);
 
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (disconnect_reason_tx, disconnect_reason_rx) = watch::channel(None);
 
         // Root correlation span for all internal tasks of this connection.
@@ -1041,8 +1077,7 @@ impl PeerConnection {
             sdes_primary_index: Mutex::new(None),
             sctp_transport: Mutex::new(None),
             data_channels: Arc::new(Mutex::new(Vec::new())),
-            event_tx,
-            event_rx: sync::AsyncMutex::new(event_rx),
+            events: Arc::new(PeerEvents::new()),
             source_change_tx: Mutex::new(None),
             dtls_role: dtls_role_tx,
             _dtls_role_rx: dtls_role_rx.clone(),
@@ -1416,7 +1451,7 @@ impl PeerConnection {
         if let Some(receiver) = &receiver_arc {
             receiver.set_transport(
                 transport,
-                Some(self.inner.event_tx.clone()),
+                Some(Arc::downgrade(&self.inner.events)),
                 Some(Arc::downgrade(transceiver)),
             );
             if let Some(sender) = &sender_arc {
@@ -2575,7 +2610,9 @@ impl PeerConnection {
                         if let Some(r) = t.receiver.lock().as_ref() {
                             r.track_event_sent.store(true, Ordering::SeqCst);
                         }
-                        let _ = self.inner.event_tx.send(QueuedEvent::Track(Arc::downgrade(&t)));
+                        self.inner
+                            .events
+                            .push(QueuedEvent::Track(Arc::downgrade(&t)));
                     }
                 } else {
                     let kind = section.kind;
@@ -2625,7 +2662,7 @@ impl PeerConnection {
                             t.set_rtp_transport(Arc::downgrade(transport));
                             receiver.set_transport(
                                 transport.clone(),
-                                Some(self.inner.event_tx.clone()),
+                                Some(Arc::downgrade(&self.inner.events)),
                                 Some(Arc::downgrade(&t)),
                             );
                         } else {
@@ -2651,7 +2688,9 @@ impl PeerConnection {
                         if let Some(r) = t.receiver.lock().as_ref() {
                             r.track_event_sent.store(true, Ordering::SeqCst);
                         }
-                        let _ = self.inner.event_tx.send(QueuedEvent::Track(Arc::downgrade(&t)));
+                        self.inner
+                            .events
+                            .push(QueuedEvent::Track(Arc::downgrade(&t)));
                     }
                 }
             }
@@ -2713,10 +2752,9 @@ impl PeerConnection {
                     if let Some(rx) = t.receiver.lock().as_ref() {
                         rx.set_ssrc(ssrc_val);
                         if !rx.track_event_sent.swap(true, Ordering::SeqCst) {
-                            let _ = self
-                                .inner
-                                .event_tx
-                                .send(QueuedEvent::Track(Arc::downgrade(&t)));
+                            self.inner
+                                .events
+                                .push(QueuedEvent::Track(Arc::downgrade(&t)));
                             debug!(
                                 "Answer SDP: Sent Track event for SSRC {} mid={}",
                                 ssrc_val, mid
@@ -2925,7 +2963,7 @@ impl PeerConnection {
                 if let Some(receiver) = &receiver_arc {
                     receiver.set_transport(
                         selected_transport,
-                        Some(self.inner.event_tx.clone()),
+                        Some(Arc::downgrade(&self.inner.events)),
                         Some(Arc::downgrade(t)),
                     );
                 }
@@ -3135,7 +3173,7 @@ impl PeerConnection {
         let dc_listener = async move {
             while let Some(dc) = dc_rx.recv().await {
                 if let Some(inner) = inner_weak_dc.upgrade() {
-                    let _ = inner.event_tx.send(QueuedEvent::DataChannel(dc));
+                    inner.events.push(QueuedEvent::DataChannel(dc));
                 } else {
                     break;
                 }
@@ -4266,8 +4304,8 @@ impl PeerConnection {
     /// negotiated track.
     ///
     /// The stream ends when the connection is closed: every event queued
-    /// before the close is still delivered, then `None` is returned, and any
-    /// later call returns `None` immediately. The idiomatic loop therefore
+    /// before the close is still delivered while its resources are live. The
+    /// stream then returns `None`, including on later calls. The idiomatic loop therefore
     /// terminates on its own and releases the `PeerConnection` handle it
     /// holds:
     ///
@@ -4280,43 +4318,19 @@ impl PeerConnection {
     /// The call is cancel-safe (it may be raced in a `select!`): no queued
     /// event is lost if another branch wins.
     pub async fn recv(&self) -> Option<PeerConnectionEvent> {
-        let mut rx = self.inner.event_rx.lock().await;
-        #[allow(unused_mut)]
-        let mut state = self.inner.peer_state.subscribe();
-        loop {
-            // Deliver the backlog first. `close()` does not drop pending
-            // application events; they are handed out before the stream ends.
-            if let Some(event) = drain_queued(&mut rx) {
-                return Some(event);
-            }
-            if *state.borrow() == PeerConnectionState::Closed {
-                // Queue drained and the connection is closed: the stream is
-                // over. Later calls short-circuit here without waiting.
-                return None;
-            }
-
-            // Wait for either the next event or a peer-state transition. The
-            // state arm makes an in-flight `recv()` wake on `close()` even
-            // though `event_tx` is never dropped (it lives in the inner).
-            let mut recv_pin = core::pin::pin!(rx.recv());
-            let mut state_pin = core::pin::pin!(state.changed());
-            match crate::platform::select::select2(&mut recv_pin, &mut state_pin).await {
-                crate::platform::select::Either::A(queued) => match queued {
-                    Some(queued) => {
-                        if let Some(event) = upgrade_queued(queued) {
-                            return Some(event);
-                        }
-                        // Entry whose track graph was already torn down: keep
-                        // draining whatever is behind it.
+        while let Some(event) = self.inner.events.recv().await {
+            match event {
+                QueuedEvent::DataChannel(channel) => {
+                    return Some(PeerConnectionEvent::DataChannel(channel));
+                }
+                QueuedEvent::Track(track) => {
+                    if let Some(track) = track.upgrade() {
+                        return Some(PeerConnectionEvent::Track(track));
                     }
-                    // All senders are gone (the owner is being torn down).
-                    None => return None,
-                },
-                // Peer state changed (possibly to `Closed`): re-drain and
-                // re-check at the top of the loop.
-                crate::platform::select::Either::B(_) => {}
+                }
             }
         }
+        None
     }
 
     /// Initialize a T.38 fax endpoint for the Image transceiver.
@@ -5315,21 +5329,13 @@ async fn run_transport_loop(
                             false
                         }
                     });
-                    let _ = inner.peer_state.send(PeerConnectionState::Failed);
+                    inner.set_peer_state(PeerConnectionState::Failed);
                 }
                 return;
             }
             crate::transports::ice::IceTransportState::Closed => {
                 if let Some(inner) = inner_weak.upgrade() {
-                    let _ = inner.disconnect_reason.send_if_modified(|cur| {
-                        if cur.is_none() {
-                            *cur = Some(DisconnectReason::IceDisconnected);
-                            true
-                        } else {
-                            false
-                        }
-                    });
-                    let _ = inner.peer_state.send(PeerConnectionState::Closed);
+                    inner.close_with_reason(DisconnectReason::IceDisconnected);
                 }
                 return;
             }
@@ -5439,7 +5445,7 @@ async fn monitor_transport(
                 }
                 match new_state {
                     crate::transports::ice::IceTransportState::Disconnected => {
-                        let _ = inner.peer_state.send(PeerConnectionState::Disconnected);
+                        inner.set_peer_state(PeerConnectionState::Disconnected);
                         let _ = ice_connection_state_tx.send(IceConnectionState::Disconnected);
                         let epoch = disconnect_epoch;
                         let tx = grace_tx.clone();
@@ -5459,7 +5465,7 @@ async fn monitor_transport(
                     crate::transports::ice::IceTransportState::Connected
                     | crate::transports::ice::IceTransportState::Completed => {
                         disconnect_epoch += 1;
-                        let _ = inner.peer_state.send(PeerConnectionState::Connected);
+                        inner.set_peer_state(PeerConnectionState::Connected);
                         let _ = ice_connection_state_tx.send(IceConnectionState::Connected);
                         debug!(
                             "ICE recovered (epoch {}), grace cancelled",
@@ -5489,7 +5495,7 @@ async fn monitor_transport(
                                 false
                             }
                         });
-                        let _ = inner.peer_state.send(PeerConnectionState::Disconnected);
+                        inner.set_peer_state(PeerConnectionState::Disconnected);
                         let _ = ice_connection_state_tx.send(IceConnectionState::Disconnected);
                         return false;
                     }
@@ -5508,7 +5514,7 @@ async fn monitor_transport(
                                 false
                             }
                         });
-                        let _ = inner.peer_state.send(PeerConnectionState::Disconnected);
+                        inner.set_peer_state(PeerConnectionState::Disconnected);
                         let _ = ice_connection_state_tx.send(IceConnectionState::Disconnected);
                         if let Some(sctp) = inner.sctp_transport.lock().as_ref() {
                             sctp.close();
@@ -5575,11 +5581,11 @@ async fn handle_connected_state(
                             false
                         }
                     });
-                    let _ = inner.peer_state.send(PeerConnectionState::Failed);
+                    inner.set_peer_state(PeerConnectionState::Failed);
                     return false;
                 }
                 Ok(rtcp_loop) => {
-                    let _ = inner.peer_state.send(PeerConnectionState::Connected);
+                    inner.set_peer_state(PeerConnectionState::Connected);
 
                     #[cfg(feature = "std")]
                     let dtls_state_rx = {
@@ -6982,8 +6988,18 @@ impl PeerConnectionInner {
         id.to_string()
     }
 
+    fn set_peer_state(&self, next: PeerConnectionState) {
+        let _ = self.peer_state.send_if_modified(|state| {
+            if *state == PeerConnectionState::Closed {
+                return false;
+            }
+            *state = next;
+            true
+        });
+    }
+
     fn close_with_reason(&self, reason: DisconnectReason) {
-        if *self.peer_state.borrow() == PeerConnectionState::Closed {
+        if !self.events.begin_close() {
             return;
         }
 
@@ -7030,7 +7046,7 @@ impl PeerConnectionInner {
         }
 
         let _ = self.signaling_state.send(SignalingState::Closed);
-        let _ = self.peer_state.send(PeerConnectionState::Closed);
+        self.set_peer_state(PeerConnectionState::Closed);
         let _ = self.ice_connection_state.send(IceConnectionState::Closed);
         let _ = self.ice_gathering_state.send(IceGatheringState::Complete);
 
@@ -7158,6 +7174,8 @@ impl PeerConnectionInner {
             self.retired_received_rtp_packets
                 .fetch_add(transport.received_rtp_packets(), Ordering::Relaxed);
         }
+        drop(primary);
+        self.events.finish_close();
     }
 }
 
@@ -8478,7 +8496,7 @@ pub struct RtpReceiver {
     runner_tx: Mutex<Option<mpsc::UnboundedSender<ReceiverCommand>>>,
     interceptors: Vec<Arc<dyn RtpReceiverInterceptor>>,
     reception_stats: Option<Arc<StatsCollector>>,
-    track_ready_event_tx: Mutex<Option<mpsc::UnboundedSender<QueuedEvent>>>,
+    track_ready_events: Mutex<Option<Weak<PeerEvents>>>,
     track_ready_transceiver: Mutex<Option<Weak<RtpTransceiver>>>,
     track_event_sent: AtomicBool,
     /// Lock-free clock-rate cache keyed by payload type. The mapping is static
@@ -8617,7 +8635,7 @@ impl RtpReceiverBuilder {
             runner_tx: Mutex::new(None),
             interceptors: self.interceptors,
             reception_stats: self.reception_stats,
-            track_ready_event_tx: Mutex::new(None),
+            track_ready_events: Mutex::new(None),
             track_ready_transceiver: Mutex::new(None),
             track_event_sent: AtomicBool::new(false),
             clock_rate_cache_pt: AtomicU8::new(u8::MAX),
@@ -8691,7 +8709,7 @@ impl RtpReceiver {
             runner_tx: Mutex::new(None),
             interceptors,
             reception_stats: None,
-            track_ready_event_tx: Mutex::new(None),
+            track_ready_events: Mutex::new(None),
             track_ready_transceiver: Mutex::new(None),
             track_event_sent: AtomicBool::new(false),
             clock_rate_cache_pt: AtomicU8::new(u8::MAX),
@@ -8975,13 +8993,13 @@ impl RtpReceiver {
         }
     }
 
-    /// `event_tx` is the connection's event channel clone; the queued
+    /// `events` is a weak reference to the connection's event backlog; the queued
     /// Track payload is weak (see [`QueuedEvent`]) so a backlog after
     /// close cannot pin the transceiver graph.
-    pub(crate) fn set_transport(
+    fn set_transport(
         self: &Arc<Self>,
         transport: Arc<RtpTransport>,
-        event_tx: Option<mpsc::UnboundedSender<QueuedEvent>>,
+        events: Option<Weak<PeerEvents>>,
         transceiver: Option<Weak<RtpTransceiver>>,
     ) {
         {
@@ -9007,7 +9025,7 @@ impl RtpReceiver {
 
         let route_transceiver = transceiver.clone().and_then(|t| t.upgrade());
         *self.transport.lock() = Some(transport.clone());
-        *self.track_ready_event_tx.lock() = event_tx;
+        *self.track_ready_events.lock() = events;
         *self.track_ready_transceiver.lock() = transceiver;
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -9245,8 +9263,11 @@ impl RtpReceiver {
                                                 if !this
                                                     .track_event_sent
                                                     .swap(true, Ordering::SeqCst)
-                                                    && let Some(ref event_tx) =
-                                                        *this.track_ready_event_tx.lock()
+                                                    && let Some(events) = this
+                                                        .track_ready_events
+                                                        .lock()
+                                                        .as_ref()
+                                                        .and_then(Weak::upgrade)
                                                 {
                                                     let transceiver =
                                                         this.track_ready_transceiver.lock();
@@ -9254,11 +9275,9 @@ impl RtpReceiver {
                                                         .as_ref()
                                                         .and_then(|t| t.upgrade())
                                                     {
-                                                        let _ = event_tx.send(
-                                                            QueuedEvent::Track(Arc::downgrade(
-                                                                &transceiver,
-                                                            )),
-                                                        );
+                                                        events.push(QueuedEvent::Track(
+                                                            Arc::downgrade(&transceiver),
+                                                        ));
                                                         trace!(
                                                             "RTP mode: Sent Track event after SSRC latching complete"
                                                         );
@@ -16684,7 +16703,8 @@ a=rtpmap:8 PCMA/8000\r\n";
             Arc::new(RtpTransport::new(ice_conn, false))
         };
 
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QueuedEvent>();
+        let event_rx = Arc::new(PeerEvents::new());
+        let event_tx = Arc::downgrade(&event_rx);
         let transceiver_weak = Arc::downgrade(&transceiver);
 
         // ── Phase 1: transport A — simulate 183 early media ──────────────
@@ -16818,7 +16838,8 @@ a=rtpmap:8 PCMA/8000\r\n";
             },
         )]));
 
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QueuedEvent>();
+        let event_rx = Arc::new(PeerEvents::new());
+        let event_tx = Arc::downgrade(&event_rx);
         let transceiver_weak = Arc::downgrade(&transceiver);
 
         let (_, socket_rx) =
@@ -16873,7 +16894,7 @@ a=rtpmap:8 PCMA/8000\r\n";
         // No spurious second Track event in the channel
         crate::platform::task::yield_now().await;
         assert!(
-            event_rx.try_recv().is_err(),
+            event_rx.backlog.lock().queue.is_empty(),
             "ptr_eq match: no spurious Track event must be emitted when transport is reused"
         );
     }
@@ -16913,7 +16934,8 @@ a=rtpmap:8 PCMA/8000\r\n";
         // Precondition: starts as false
         assert!(!receiver.track_event_sent.load(Ordering::SeqCst));
 
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QueuedEvent>();
+        let event_rx = Arc::new(PeerEvents::new());
+        let event_tx = Arc::downgrade(&event_rx);
         let transceiver_weak = Arc::downgrade(&transceiver);
 
         let (_, socket_rx) =
@@ -16959,7 +16981,7 @@ a=rtpmap:8 PCMA/8000\r\n";
         // Exactly one — channel is now empty
         crate::platform::task::yield_now().await;
         assert!(
-            event_rx.try_recv().is_err(),
+            event_rx.backlog.lock().queue.is_empty(),
             "only one Track event must be emitted per transport lifetime"
         );
     }
@@ -17006,7 +17028,8 @@ a=rtpmap:8 PCMA/8000\r\n";
             Arc::new(RtpTransport::new(ice_conn, false))
         };
 
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QueuedEvent>();
+        let event_rx = Arc::new(PeerEvents::new());
+        let event_tx = Arc::downgrade(&event_rx);
         let tw = Arc::downgrade(&transceiver);
 
         // Transport A — SSRC = 0xAAAA_1111
