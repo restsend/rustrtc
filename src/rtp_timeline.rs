@@ -132,10 +132,33 @@ impl OutboundTimeline {
     /// current SSRC that would map before the start of the active run (caller
     /// should drop it without re-anchoring).
     pub fn write_peer(&self, packet: &mut crate::rtp::RtpPacket, in_clock: u32) -> bool {
+        self.write_peer_packet(packet, in_clock, Some(packet.header.sequence_number))
+    }
+
+    pub(crate) fn write_unsequenced_video(
+        &self,
+        packet: &mut crate::rtp::RtpPacket,
+        in_clock: u32,
+    ) -> bool {
+        self.write_peer_packet(packet, in_clock, None)
+    }
+
+    fn write_peer_packet(
+        &self,
+        packet: &mut crate::rtp::RtpPacket,
+        in_clock: u32,
+        source_sequence: Option<u16>,
+    ) -> bool {
         let mut state = self.state.lock();
         let out_clock = state.clock_rate;
         let ssrc = packet.header.ssrc;
-        let seq = packet.header.sequence_number;
+        // A locally packetized frame can have a timestamp but no RTP
+        // sequence yet. Continue after the active run's virtual source cursor.
+        let seq = source_sequence.unwrap_or_else(|| {
+            state.anchor.filter(|anchor| anchor.ssrc == ssrc).map_or(0, |anchor| {
+                state.cur_seq.wrapping_sub(anchor.seq_offset).wrapping_add(1)
+            })
+        });
         let ts = packet.header.timestamp;
         let max_step = state.ticks(MAX_TS_STEP);
         if let Some(mut anchor) = state.anchor
