@@ -1286,6 +1286,8 @@ impl PeerConnection {
     ///
     /// This method does not map sequence numbers or timestamps. Callers sharing
     /// a sender SSRC must map the packet through that sender's timeline first.
+    /// Use [`OutboundTimeline::write_control`](crate::rtp_timeline::OutboundTimeline::write_control)
+    /// to keep a locally generated control packet in its own payload clock.
     ///
     /// The packet is sent on the audio sender's transport when available (so it
     /// egresses on the same 5-tuple as media), falling back to the primary RTP
