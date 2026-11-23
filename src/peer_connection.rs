@@ -733,6 +733,33 @@ pub struct PeerConnection {
     inner: Arc<PeerConnectionInner>,
 }
 
+// Only local SDP application is reversible here: no remote answer or transport
+// restart has been applied. This is deliberately not general JSEP rollback.
+enum LocalOfferRollback {
+    Pending(LocalOfferSnapshot),
+    // Remote application may already have changed live media, even if it
+    // fails or is cancelled after signaling has transitioned back to Stable.
+    ApplyingRemote,
+}
+
+struct LocalOfferSnapshot {
+    description: SessionDescription,
+    transceivers: Vec<LocalOfferTransceiverState>,
+}
+
+struct LocalOfferTransceiverState {
+    transceiver: Arc<RtpTransceiver>,
+    mid: Option<String>,
+    mline_index: Option<usize>,
+    direction: TransceiverDirection,
+    desired_direction: TransceiverDirection,
+    implicit_direction: bool,
+    payload_map: BTreeMap<u8, RtpCodecParameters>,
+    extmap: BTreeMap<u8, String>,
+    pending_sdes_mid: Option<(u8, Arc<str>)>,
+    sender_sdes_mid: Option<(u8, Arc<str>)>,
+}
+
 struct PeerConnectionInner {
     config: RtcConfiguration,
     /// Dynamic video capabilities installed after construction (e.g. when a
@@ -747,6 +774,7 @@ struct PeerConnectionInner {
     ice_gathering_state: watch::Sender<IceGatheringState>,
     _ice_gathering_state_rx: watch::Receiver<IceGatheringState>,
     local_description: Mutex<Option<SessionDescription>>,
+    local_offer_rollback: Mutex<Option<LocalOfferRollback>>,
     remote_description: Mutex<Option<SessionDescription>>,
     transceivers: Mutex<Vec<Arc<RtpTransceiver>>>,
     next_mid: AtomicU16,
@@ -995,6 +1023,7 @@ impl PeerConnection {
             ice_gathering_state: ice_gathering_state_tx,
             _ice_gathering_state_rx: ice_gathering_state_rx,
             local_description: Mutex::new(None),
+            local_offer_rollback: Mutex::new(None),
             remote_description: Mutex::new(None),
             transceivers: Mutex::new(Vec::new()),
             next_mid: AtomicU16::new(0),
@@ -1633,7 +1662,146 @@ impl PeerConnection {
             .any(|attr| attr.key == "ice-lite")
     }
 
+    /// Cancel an established session's pending local re-offer, retaining its
+    /// negotiated media and transport. Successfully negotiated Stable is an
+    /// idempotent no-op; incomplete remote application remains an error.
+    ///
+    /// This does not support initial offers, provisional answers, ICE restarts,
+    /// transport/key changes or media topology changes. Callers must serialize
+    /// signaling and correlate answers to their signaling transaction; SDP alone
+    /// cannot distinguish a late answer from an answer to a subsequent offer.
+    /// Set offer directions on the SDP, rather than changing transceivers before
+    /// set_local_description, so the previous preferences can be restored.
+    pub fn rollback_local_offer(&self) -> RtcResult<()> {
+        if matches!(
+            *self.inner.local_offer_rollback.lock(),
+            Some(LocalOfferRollback::ApplyingRemote)
+        ) {
+            return Err(RtcError::InvalidState(
+                "remote description application is incomplete; local-only rollback is unavailable"
+                    .into(),
+            ));
+        }
+        if self.signaling_state() == SignalingState::Stable {
+            return Ok(());
+        }
+        if self.signaling_state() != SignalingState::HaveLocalOffer {
+            return Err(RtcError::InvalidState(
+                "rollback requires a local re-offer".into(),
+            ));
+        }
+        let rollback = match self.inner.local_offer_rollback.lock().take() {
+            Some(LocalOfferRollback::Pending(snapshot)) => snapshot,
+            _ => return Err(RtcError::InvalidState("local offer is not reversible (initial offer, answer applied, or transport/topology change)".into())),
+        };
+        for previous in rollback.transceivers {
+            let t = previous.transceiver;
+            *t.mid.lock() = previous.mid;
+            t.set_mline_index(previous.mline_index);
+            *t.direction.lock() = previous.direction;
+            *t.desired_direction.lock() = previous.desired_direction;
+            t.implicit_direction
+                .store(previous.implicit_direction, Ordering::Relaxed);
+            t.update_payload_map(previous.payload_map)?;
+            t.update_extmap(previous.extmap)?;
+            *t.pending_sdes_mid.lock() = previous.pending_sdes_mid;
+            if let Some(sender) = t.sender() {
+                *sender.sdes_mid.lock() = previous.sender_sdes_mid;
+            }
+        }
+        *self.inner.local_description.lock() = Some(rollback.description);
+        let _ = self.inner.signaling_state.send(SignalingState::Stable);
+        Ok(())
+    }
+
+    fn snapshot_local_offer(&self, offer: &SessionDescription) -> Option<LocalOfferRollback> {
+        let previous = self.local_description()?;
+        let remote = self.remote_description()?;
+        // Transport identity and credentials must remain unchanged. SDES key
+        // changes are included because set_local_description applies them.
+        // ICE capabilities and a proposed RTCP mux/address are not applied by
+        // set_local_description: ICE/RTCP routing changes only when applying
+        // the remote description. They may differ without changing the live
+        // transport (e.g. gathering completed, or offering mux after a non-mux
+        // answer). Restoring the previous SDP restores those local proposals.
+        // An answerer's next offer normally changes setup=active/passive to
+        // actpass. set_local_description does not apply a DTLS role (only the
+        // remote-description path does), so restoring the SDP suffices here.
+        let transport_attributes = |attributes: &[crate::sdp::Attribute]| {
+            attributes
+                .iter()
+                .filter(|a| {
+                    matches!(
+                        a.key.as_str(),
+                        "ice-ufrag"
+                            | "ice-pwd"
+                            | "fingerprint"
+                            | "crypto"
+                            | "group"
+                            | "bundle-only"
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        // 0.6 re-offers use the negotiated BUNDLE tag's port for every
+        // bundled m-line. Our initial offer may still contain separate ports.
+        // This reflects the already negotiated transport, not a port change.
+        let negotiated_bundle = bundle_group(&remote);
+        let bundled_port = negotiated_bundle.first().and_then(|tag| {
+            previous
+                .media_sections
+                .iter()
+                .find(|m| m.mid == *tag)
+                .map(|m| m.port)
+        });
+        if previous.session.connection != offer.session.connection
+            || transport_attributes(&previous.session.attributes)
+                != transport_attributes(&offer.session.attributes)
+            || previous.media_sections.len() != offer.media_sections.len()
+            || !previous
+                .media_sections
+                .iter()
+                .zip(&offer.media_sections)
+                .all(|(a, b)| {
+                    a.kind == b.kind
+                        && a.mid == b.mid
+                        && (a.port == b.port
+                            || (negotiated_bundle.contains(&b.mid.as_str())
+                                && bundled_port == Some(b.port)))
+                        && a.protocol == b.protocol
+                        && a.connection == b.connection
+                        && transport_attributes(&a.attributes)
+                            == transport_attributes(&b.attributes)
+                })
+        {
+            return None;
+        }
+        Some(LocalOfferRollback::Pending(LocalOfferSnapshot {
+            description: previous,
+            transceivers: self
+                .get_transceivers()
+                .into_iter()
+                .map(|t| LocalOfferTransceiverState {
+                    mid: t.mid(),
+                    mline_index: t.mline_index(),
+                    direction: t.direction(),
+                    desired_direction: t.desired_direction(),
+                    implicit_direction: t.implicit_direction.load(Ordering::Relaxed),
+                    payload_map: t.get_payload_map(),
+                    extmap: t.get_extmap(),
+                    pending_sdes_mid: t.pending_sdes_mid.lock().clone(),
+                    sender_sdes_mid: t.sender().and_then(|s| s.sdes_mid()),
+                    transceiver: t.clone(),
+                })
+                .collect(),
+        }))
+    }
+
     pub fn set_local_description(&self, mut desc: SessionDescription) -> RtcResult<()> {
+        if desc.sdp_type == SdpType::Rollback {
+            return self.rollback_local_offer();
+        }
         self.inner.validate_sdp_type(&desc.sdp_type)?;
 
         let previous_local = self.inner.local_description.lock().clone();
@@ -1650,6 +1818,13 @@ impl PeerConnection {
                             "set_local_description(offer) requires stable signaling state".into(),
                         ));
                     }
+                    let mut rollback = self.inner.local_offer_rollback.lock();
+                    if matches!(*rollback, Some(LocalOfferRollback::ApplyingRemote)) {
+                        return Err(RtcError::InvalidState(
+                            "cannot replace an incomplete remote description application with a local offer".into(),
+                        ));
+                    }
+                    *rollback = self.snapshot_local_offer(&desc);
                     let _ = state.send(SignalingState::HaveLocalOffer);
                 }
                 SdpType::Answer => {
@@ -1740,6 +1915,7 @@ impl PeerConnection {
         let applies_answer = matches!(desc.sdp_type, SdpType::Answer | SdpType::Pranswer);
         self.apply_remote_description(desc).await?;
         if applies_answer {
+            self.inner.local_offer_rollback.lock().take();
             self.apply_negotiated_send_directions();
         }
         Ok(())
@@ -2037,6 +2213,17 @@ impl PeerConnection {
             local.as_ref(),
             self.config().connectivity.is_direct() && !self.config().webrtc_extensions,
         )?;
+        if matches!(desc.sdp_type, SdpType::Answer | SdpType::Pranswer) {
+            if self.signaling_state() != SignalingState::HaveLocalOffer {
+                return Err(RtcError::InvalidState(
+                    "remote answer requires local offer".into(),
+                ));
+            }
+            // Validation and slot reconciliation above do not change the active
+            // connection. From here the remote description may modify transport.
+            *self.inner.local_offer_rollback.lock() = Some(LocalOfferRollback::ApplyingRemote);
+        }
+
         let media_parameters_changed = previous_remote.as_ref().is_none_or(|previous| {
             previous.session.connection != desc.session.connection
                 || previous.session.attributes != desc.session.attributes
@@ -13503,6 +13690,379 @@ a=mid:0
                 .address,
             local_addr
         );
+    }
+
+    #[tokio::test]
+    async fn local_reoffer_rollback_rejects_partial_remote_application_even_when_stable() {
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
+        let remote = PeerConnection::new(RtcConfiguration::webrtc());
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        let _ = pc.create_offer().await.unwrap();
+        pc.wait_for_gathering_complete().await;
+        let offer = pc.create_offer().await.unwrap();
+        pc.set_local_description(offer.clone()).unwrap();
+        remote.set_remote_description(offer).await.unwrap();
+        let _ = remote.create_answer().await.unwrap();
+        remote.wait_for_gathering_complete().await;
+        let answer = remote.create_answer().await.unwrap();
+        remote.set_local_description(answer.clone()).unwrap();
+        pc.set_remote_description(answer.clone()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::try_join!(pc.wait_for_connected(), remote.wait_for_connected()).unwrap();
+        })
+        .await
+        .unwrap();
+
+        let retry = pc.create_offer().await.unwrap();
+        pc.set_local_description(retry).unwrap();
+        let mut changed_identity = answer;
+        changed_identity.media_sections[0].direction = Direction::Inactive;
+        let fingerprint = format!("sha-256 {}", vec!["AA"; 32].join(":"));
+        for attribute in changed_identity.session.attributes.iter_mut().chain(
+            changed_identity
+                .media_sections
+                .iter_mut()
+                .flat_map(|section| section.attributes.iter_mut()),
+        ) {
+            if attribute.key == "fingerprint" {
+                attribute.value = Some(fingerprint.clone());
+            }
+        }
+        let err = pc
+            .set_remote_description(changed_identity)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("changing remote DTLS fingerprint"),
+            "{err}"
+        );
+        assert_eq!(pc.signaling_state(), SignalingState::Stable);
+        assert_eq!(
+            pc.get_transceivers()[0].direction(),
+            TransceiverDirection::Inactive
+        );
+        assert!(
+            pc.rollback_local_offer().is_err(),
+            "partial remote application must not report successful rollback"
+        );
+        let next = pc.create_offer().await.unwrap();
+        assert!(
+            pc.set_local_description(next).is_err(),
+            "a fresh offer must not conceal the failed remote application"
+        );
+        pc.close();
+        remote.close();
+    }
+
+    #[tokio::test]
+    async fn local_reoffer_rollback_preserves_baseline_on_remote_validation_failure() {
+        let pc = PeerConnection::new(RtcConfiguration::webrtc());
+        let remote = PeerConnection::new(RtcConfiguration::webrtc());
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        // Match the engine: publish the first offer before gathering completes.
+        let offer = pc.create_offer().await.unwrap();
+        pc.set_local_description(offer).unwrap();
+        pc.wait_for_gathering_complete().await;
+        let offer = pc.local_description().unwrap();
+        assert!(
+            pc.rollback_local_offer().is_err(),
+            "initial offer has no baseline"
+        );
+        remote.set_remote_description(offer).await.unwrap();
+        let answer = remote.create_answer().await.unwrap();
+        remote.set_local_description(answer).unwrap();
+        remote.wait_for_gathering_complete().await;
+        let answer = remote.local_description().unwrap();
+        pc.set_remote_description(answer.clone()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::try_join!(pc.wait_for_connected(), remote.wait_for_connected()).unwrap();
+        })
+        .await
+        .unwrap();
+        // The established answerer changes setup to actpass in its re-offer.
+        // Rollback must keep the actual connected DTLS and SRTP transports.
+        let answerer_baseline = remote.local_description().unwrap();
+        let dtls = remote.inner.dtls_transport.lock().clone().unwrap();
+        let rtp = remote.inner.rtp_transport.lock().clone().unwrap();
+        let role = *remote.inner.dtls_role.borrow();
+        let mut answerer_offer = remote.create_offer().await.unwrap();
+        answerer_offer.media_sections[0].direction = Direction::Inactive;
+        remote.set_local_description(answerer_offer).unwrap();
+        remote.rollback_local_offer().unwrap();
+        assert_eq!(remote.local_description().unwrap(), answerer_baseline);
+        assert_eq!(*remote.inner.dtls_role.borrow(), role);
+        assert!(Arc::ptr_eq(
+            &dtls,
+            &remote.inner.dtls_transport.lock().clone().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &rtp,
+            &remote.inner.rtp_transport.lock().clone().unwrap()
+        ));
+        assert_eq!(
+            *remote.subscribe_peer_state().borrow(),
+            PeerConnectionState::Connected
+        );
+        let baseline = pc.local_description().unwrap();
+        let mut retry = pc.create_offer().await.unwrap();
+        retry.media_sections[0].direction = Direction::Inactive;
+        pc.set_local_description(retry).unwrap();
+        let mut invalid_answer = answer.clone();
+        invalid_answer
+            .session
+            .attributes
+            .retain(|a| a.key != "fingerprint");
+        for section in &mut invalid_answer.media_sections {
+            section.attributes.retain(|a| a.key != "fingerprint");
+        }
+        assert!(pc.set_remote_description(invalid_answer).await.is_err());
+        pc.rollback_local_offer().unwrap();
+        assert_eq!(pc.local_description().unwrap(), baseline);
+        assert_eq!(
+            pc.get_transceivers()[0].desired_direction(),
+            TransceiverDirection::SendRecv
+        );
+        pc.rollback_local_offer().unwrap();
+        assert_eq!(
+            pc.local_description().unwrap(),
+            baseline,
+            "Stable rollback is idempotent"
+        );
+
+        // A provisional answer has applied remote media and is outside this API.
+        let retry = pc.create_offer().await.unwrap();
+        pc.set_local_description(retry).unwrap();
+        let mut provisional = answer.clone();
+        provisional.sdp_type = SdpType::Pranswer;
+        pc.set_remote_description(provisional).await.unwrap();
+        assert!(pc.rollback_local_offer().is_err());
+        pc.set_remote_description(answer).await.unwrap();
+
+        // ICE restart and media topology changes also have no local-only rollback.
+        let mut restart = pc.create_offer().await.unwrap();
+        restart.media_sections[0]
+            .attributes
+            .iter_mut()
+            .find(|a| a.key == "ice-ufrag")
+            .unwrap()
+            .value = Some("restarted".into());
+        pc.set_local_description(restart).unwrap();
+        assert!(pc.rollback_local_offer().is_err());
+        let mut topology_change = remote.create_offer().await.unwrap();
+        topology_change.media_sections[0].mid = "replacement".into();
+        assert!(remote.set_local_description(topology_change).is_err());
+        assert_eq!(remote.signaling_state(), SignalingState::Stable);
+        remote.rollback_local_offer().unwrap();
+        let mut transport_change = remote.create_offer().await.unwrap();
+        transport_change.media_sections[0].port += 2;
+        remote.set_local_description(transport_change).unwrap();
+        assert!(remote.rollback_local_offer().is_err());
+        pc.close();
+        remote.close();
+    }
+
+    #[tokio::test]
+    async fn local_reoffer_rollback_restores_non_mux_answer_after_mux_proposal() {
+        let config = RtcConfiguration::sip();
+        let pc = PeerConnection::new(config);
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rtcp_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rtcp_addr = rtcp_socket.local_addr().unwrap();
+        let mut offer = SessionDescription::parse(SdpType::Offer,
+                "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nc=IN IP4 127.0.0.1\r\nm=audio 8000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\na=sendrecv\r\n").unwrap();
+        offer.media_sections[0].port = socket.local_addr().unwrap().port();
+        offer.media_sections[0]
+            .attributes
+            .push(crate::sdp::Attribute::new(
+                "rtcp",
+                Some(rtcp_addr.port().to_string()),
+            ));
+        pc.set_remote_description(offer).await.unwrap();
+        let answer = pc.create_answer().await.unwrap();
+        pc.set_local_description(answer.clone()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), pc.wait_for_connected())
+            .await
+            .unwrap()
+            .unwrap();
+        let transport = pc.inner.rtp_transport.lock().clone().unwrap();
+        assert!(
+            !answer.media_sections[0]
+                .attributes
+                .iter()
+                .any(|a| a.key == "rtcp-mux")
+        );
+        for sequence in 0..2 {
+            let mut proposal = pc.create_offer().await.unwrap();
+            // Upstream 0.6 keeps the previously refused mux in create_offer.
+            // Propose it explicitly to exercise rollback of a local mux change.
+            proposal.media_sections[0].attributes.push(crate::sdp::Attribute::new("rtcp-mux", None));
+            proposal.media_sections[0].direction = Direction::Inactive;
+            pc.set_local_description(proposal).unwrap();
+            // A local mux proposal must not change the currently negotiated
+            // separate RTCP destination, either before or after rollback.
+            assert_eq!(
+                *transport.ice_conn().remote_rtcp_addr.read(),
+                Some(rtcp_addr)
+            );
+            pc.rollback_local_offer().unwrap();
+            assert_eq!(
+                *transport.ice_conn().remote_rtcp_addr.read(),
+                Some(rtcp_addr)
+            );
+            assert_eq!(pc.local_description().unwrap(), answer);
+            assert_eq!(pc.signaling_state(), SignalingState::Stable);
+            assert!(Arc::ptr_eq(
+                &transport,
+                &pc.inner.rtp_transport.lock().clone().unwrap()
+            ));
+            let packet = RtpPacket {
+                header: crate::rtp::RtpHeader::new(111, sequence, 160, 12345),
+                payload: bytes::Bytes::from_static(&[1, 2, 3]),
+                padding_len: 0,
+            };
+            pc.send_raw_rtp(packet.clone()).await.unwrap();
+            let mut buffer = [0; 1500];
+            let (size, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                socket.recv_from(&mut buffer),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                RtpPacket::parse(&buffer[..size]).unwrap().payload,
+                packet.payload
+            );
+            let report = RtcpPacket::ReceiverReport(crate::rtp::ReceiverReport {
+                sender_ssrc: 12345,
+                report_blocks: vec![],
+            });
+            transport.send_rtcp(&[report]).await.unwrap();
+            let (size, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                rtcp_socket.recv_from(&mut buffer),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(size >= 8, "RTCP must still reach the separate RTCP socket");
+        }
+        pc.close();
+    }
+
+    #[tokio::test]
+    async fn local_reoffer_rollback_restores_negotiated_media_and_allows_retry() {
+        let config = RtcConfiguration::sip();
+        let pc = PeerConnection::new(config);
+        let transceiver = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        let offer = pc.create_offer().await.unwrap();
+        pc.set_local_description(offer).unwrap();
+        let remote = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut answer = SessionDescription::parse(SdpType::Answer,
+            "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nc=IN IP4 127.0.0.1\r\nm=audio 8000 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\na=sendrecv\r\n").unwrap();
+        answer.media_sections[0].port = remote.local_addr().unwrap().port();
+        pc.set_remote_description(answer.clone()).await.unwrap();
+        let established_local = pc.local_description().unwrap();
+        let transport = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(transport) = pc.inner.rtp_transport.lock().clone() {
+                    break transport;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let payloads = transceiver.get_payload_map();
+        let extensions = transceiver.get_extmap();
+        let direction = transceiver.direction();
+        let desired = transceiver.desired_direction();
+        let permitted = transceiver.send_permitted.load(Ordering::Relaxed);
+        assert!(payloads.contains_key(&8));
+
+        for _ in 0..2 {
+            let mut retry = pc.create_offer().await.unwrap();
+            let section = &mut retry.media_sections[0];
+            section.direction = Direction::Inactive;
+            section.formats = vec!["0".into()];
+            section
+                .attributes
+                .retain(|a| !matches!(a.key.as_str(), "rtpmap" | "fmtp" | "extmap"));
+            section.attributes.push(crate::sdp::Attribute::new(
+                "rtpmap",
+                Some("0 PCMU/8000".into()),
+            ));
+            section.attributes.push(crate::sdp::Attribute::new(
+                "extmap",
+                Some(format!("9 {}", crate::sdp::ABS_SEND_TIME_URI)),
+            ));
+            pc.set_local_description(retry).unwrap();
+            assert_eq!(
+                transceiver.desired_direction(),
+                TransceiverDirection::Inactive
+            );
+            assert!(transceiver.get_payload_map().contains_key(&0));
+            // A second pending offer must not overwrite the rollback baseline.
+            let pending = pc.local_description().unwrap();
+            assert!(pc.set_local_description(pending.clone()).is_err());
+            pc.set_local_description(SessionDescription::new(SdpType::Rollback))
+                .unwrap();
+            assert_eq!(pc.signaling_state(), SignalingState::Stable);
+            assert_eq!(pc.local_description().unwrap(), established_local);
+            assert_eq!(pc.remote_description().unwrap(), answer);
+            assert_eq!(transceiver.get_payload_map(), payloads);
+            assert_eq!(transceiver.get_extmap(), extensions);
+            assert_eq!(transceiver.direction(), direction);
+            assert_eq!(transceiver.desired_direction(), desired);
+            assert_eq!(
+                transceiver.send_permitted.load(Ordering::Relaxed),
+                permitted
+            );
+            assert!(Arc::ptr_eq(
+                &transport,
+                &pc.inner.rtp_transport.lock().clone().unwrap()
+            ));
+            assert!(
+                pc.set_remote_description(answer.clone()).await.is_err(),
+                "late answer after rollback"
+            );
+            let packet = RtpPacket {
+                header: crate::rtp::RtpHeader::new(8, 42, 160, 12345),
+                payload: bytes::Bytes::from_static(&[1, 2, 3]),
+                padding_len: 0,
+            };
+            pc.send_raw_rtp(packet.clone()).await.unwrap();
+            let mut buffer = [0; 1500];
+            let (size, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                remote.recv_from(&mut buffer),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let received = RtpPacket::parse(&buffer[..size]).unwrap();
+            assert_eq!(received.header.payload_type, 8);
+            assert_eq!(received.payload, packet.payload);
+        }
+        // A successful retry is the next baseline, never the original session.
+        let mut hold = pc.create_offer().await.unwrap();
+        hold.media_sections[0].direction = Direction::Inactive;
+        pc.set_local_description(hold).unwrap();
+        let mut hold_answer = answer.clone();
+        hold_answer.media_sections[0].direction = Direction::Inactive;
+        pc.set_remote_description(hold_answer).await.unwrap();
+        let held_local = pc.local_description().unwrap();
+        let retry = pc.create_offer().await.unwrap();
+        pc.set_local_description(retry).unwrap();
+        pc.set_local_description(SessionDescription::new(SdpType::Rollback))
+            .unwrap();
+        assert_eq!(pc.local_description().unwrap(), held_local);
+        assert_eq!(
+            transceiver.desired_direction(),
+            TransceiverDirection::Inactive
+        );
+        assert!(!transceiver.send_permitted.load(Ordering::Relaxed));
+        pc.close();
     }
 
     #[tokio::test]
