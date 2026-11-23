@@ -8371,11 +8371,21 @@ impl RtpSender {
                                     crate::media::MediaSample::Audio(f) => Some(f.clock_rate),
                                     crate::media::MediaSample::Video(_) => Some(out_clock),
                                 };
+                                let unsequenced_video = matches!(
+                                    &sample,
+                                    crate::media::MediaSample::Video(frame)
+                                        if frame.sequence_number.is_none() && frame.raw_packet.is_none()
+                                );
                                 let mut packet = sample.into_rtp_packet(payload_type);
                                 match peer_clock {
                                     None => timeline.write_frame(&mut packet),
                                     Some(clock) => {
-                                        if !timeline.write_peer(&mut packet, clock) {
+                                        let mapped = if unsequenced_video {
+                                            timeline.write_unsequenced_video(&mut packet, clock)
+                                        } else {
+                                            timeline.write_peer(&mut packet, clock)
+                                        };
+                                        if !mapped {
                                             continue;
                                         }
                                     }
@@ -12325,6 +12335,52 @@ a=mid:0
             }
             other => panic!("expected audio sample, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn local_video_fragments_get_distinct_rtp_sequences() {
+        use crate::media::{MediaSample, frame::VideoFrame};
+        use crate::transports::ice::IceSocketWrapper;
+
+        let remote = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (_socket, socket_rx) = watch::channel(Some(IceSocketWrapper::Udp(local)));
+        let conn = crate::transports::ice::conn::IceConn::new(
+            socket_rx, remote.local_addr().unwrap(), None,
+        );
+        let transport = Arc::new(RtpTransport::new(conn, false));
+        let (source, track, _) = sample_track(crate::media::frame::MediaKind::Video, 8);
+        let sender = RtpSender::builder(track, 12345)
+            .params(RtpCodecParameters {
+                payload_type: 110,
+                name: "H264".to_string(),
+                clock_rate: 90_000,
+                channels: 0,
+            })
+            .build();
+        sender.set_transport(transport);
+        for (timestamp, last) in [(3_000, false), (3_000, true), (6_000, true)] {
+            source.send(MediaSample::Video(VideoFrame {
+                rtp_timestamp: timestamp,
+                is_last_packet: last,
+                data: bytes::Bytes::from_static(&[0x65, 0x88]),
+                ..Default::default()
+            })).unwrap();
+        }
+
+        let mut packets = Vec::new();
+        let mut buf = [0; 1500];
+        for _ in 0..3 {
+            let n = tokio::time::timeout(Duration::from_secs(1), remote.recv(&mut buf))
+                .await.unwrap().unwrap();
+            packets.push(RtpPacket::parse(&buf[..n]).unwrap());
+        }
+        let first = &packets[0].header;
+        assert_eq!(packets[1].header.sequence_number, first.sequence_number.wrapping_add(1));
+        assert_eq!(packets[2].header.sequence_number, first.sequence_number.wrapping_add(2));
+        assert_eq!(packets[1].header.timestamp, first.timestamp);
+        assert_eq!(packets[2].header.timestamp, first.timestamp.wrapping_add(3_000));
+        assert!(packets.iter().all(|packet| packet.header.payload_type == 110));
     }
 
     // ===== RTP mode ICE-skip verification tests =====
