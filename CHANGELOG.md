@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.6.8 — 2026-11-23
+
+Control-plane refinements: DTMF/control packets ride media sequences without
+stealing playout time, and a local re-offer can be rolled back before the
+answer lands.
+
+### Added
+
+- **Local re-offer rollback** (`PeerConnection::rollback_local_offer`,
+  `set_local_description(rollback)`): cancels a pending local re-offer on an
+  established session and restores the previous SDP and transceiver state.
+  Local-only: refused once a remote answer has begun applying, and not
+  supported for initial offers, ICE restarts or transport/topology changes.
+- **Shared outbound sequence for control packets**
+  (`OutboundTimeline::write_control`): locally generated control packets
+  (e.g. RFC 4733 telephone events) take the next sequence on the media
+  timeline while keeping their own payload-clock timestamp; the next peer
+  frame continues after them.
+- **RTP observer callbacks**: `RtpObserver::on_ingress_parse_error` (inbound
+  RTP/SRTP datagram failed header parsing) and `on_send_complete` (awaited
+  send finished with bytes written). Both have default no-op impls; existing
+  observers are unaffected.
+
+### Fixed
+
+- **JitterBuffer control packets** (`push_control`): negotiated control
+  packets sharing the media SSRC are buffered in sequence order but no
+  longer consume playout duration, skew `last_delivered_timestamp`, or
+  trigger spurious timestamp-discontinuity resets; capacity is enforced on
+  media duration, not packet count.
+- **Peer event stream**: closing the connection no longer blocks concurrent
+  `recv()` waiters on an internal mutex — waiters share the queued backlog
+  and all wake on close; queued events keep weak references so a backlog
+  cannot pin the transceiver graph.
+- **Unsequenced video fragments**: locally packetized video frames without
+  RTP sequence numbers now get distinct, continuous sequence numbers on the
+  outbound timeline instead of failing the peer mapping and being dropped.
+
+No breaking API changes.
+
+## 0.6.7 — 2026-11-20
+
+### Added
+
+- **RFC 4588 RTX relay**: retransmission-stream relay with FID source/RTX
+  stream tracking and dynamic video payload capabilities negotiated after
+  construction.
+
+### Fixed
+
+- Late pre-anchor peer RTP packets on a fresh source are dropped instead of
+  re-anchoring the timeline mid-run.
+- RTCP: unsupported feedback formats are skipped instead of blocking the
+  compound packet; the direct UDP receive buffer is raised.
+- ICE: the unlatched RTCP source IP is synced when RTP latches first behind
+  NAT (asymmetric port rebinding).
+
 ## 0.6.6 — 2026-11-19
 
 H.265/HEVC payloads, faster SRTP, and a leaner SCTP send path.
