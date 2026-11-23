@@ -5869,7 +5869,11 @@ impl PeerConnectionInner {
         let mut have_primary = false;
         let mut kinds_with_transport = Vec::new();
         for section in &offer.media_sections {
-            let bundled = bundle_tag.is_some() && group.contains(&section.mid.as_str());
+            // Group membership, not tag resolution: the offered tag may
+            // itself be rejected (port 0), and remaining members are
+            // bundle-only (wire port 0) yet alive (RFC 9143 §7.3.3) — the
+            // answer must re-select a tag among them (RFC 8843 §8.2.2).
+            let bundled = !section.mid.is_empty() && group.contains(&section.mid.as_str());
             let own = match self.config.bundle_policy {
                 BundlePolicy::MaxCompat | BundlePolicy::Disabled => true,
                 BundlePolicy::Balanced => !kinds_with_transport.contains(&section.kind),

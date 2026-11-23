@@ -37,6 +37,21 @@ answer lands.
 - **Unsequenced video fragments**: locally packetized video frames without
   RTP sequence numbers now get distinct, continuous sequence numbers on the
   outbound timeline instead of failing the peer mapping and being dropped.
+- **BUNDLE tag re-selection**: when the offered BUNDLE tag's m-line is
+  rejected (port 0), the answer re-selects the tag among the remaining
+  bundled members even if they are bundle-only (wire port 0, RFC 9143
+  §7.3.3) — previously the whole group was dropped and no
+  `a=group:BUNDLE` line was emitted.
+- **First nomination follows immediately**: a controlled agent adopts the
+  controlling peer's nominated pair at once even when its own check round
+  already committed a best-effort pair (e.g. a relay pair that raced
+  ahead). Previously the first nomination was downgraded to a deferred
+  verification while the PC reported connected, leaving both sides on
+  different 5-tuples until the verification landed (RFC 8445
+  §7.3.1.5/§8.1.2). Later nominations keep the defer+verify switching
+  protection.
+- The pion interop example now negotiates `transport-cc` rtcp-fb so TWCC
+  feedback (and the GCC estimator it feeds) is actually exercised.
 
 No breaking API changes.
 

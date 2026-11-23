@@ -240,7 +240,18 @@ async fn restart_ice_preserves_direction_intent() {
     assert_eq!(offer.media_sections[0].direction, Direction::SendRecv);
     pc.set_local_description(offer.clone()).unwrap();
 
-    let mut answer = minimal_sdp(SdpType::Answer, "0", Direction::SendRecv);
+    // The answer must mirror the offer's m-line kind (RFC 8829 §5.3.1):
+    // the offer here is a single application (data-channel) section.
+    let mut answer = SessionDescription::new(SdpType::Answer);
+    answer.session = SessionSection::default();
+    let mut application = MediaSection::new(MediaKind::Application, "0");
+    application
+        .attributes
+        .push(Attribute::new("setup", Some("active".to_string())));
+    application
+        .attributes
+        .push(Attribute::new("sctp-port", Some("5000".to_string())));
+    answer.media_sections.push(application);
     answer.session.attributes.push(Attribute::new(
         "fingerprint",
         Some("sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF".to_string()),
@@ -257,12 +268,6 @@ async fn restart_ice_preserves_direction_intent() {
         "ice-pwd",
         Some("answerpwdanswerpwdanswerpwd".to_string()),
     ));
-    answer.media_sections[0]
-        .attributes
-        .push(Attribute::new("setup", Some("active".to_string())));
-    answer.media_sections[0]
-        .attributes
-        .push(Attribute::new("rtcp-mux", None));
     pc.set_remote_description(answer).await.unwrap();
     assert_eq!(pc.signaling_state(), rustrtc::SignalingState::Stable);
 

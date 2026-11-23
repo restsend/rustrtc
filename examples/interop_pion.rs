@@ -309,7 +309,13 @@ async fn run_client(addr_str: &str) {
         payload_type: 96,
         codec_name: "VP8".to_string(),
         clock_rate: 90000,
-        rtcp_fbs: vec!["nack".to_string(), "pli".to_string()],
+        // transport-cc must be negotiated (RFC 8888 rtcp-fb) for the TWCC
+        // sequence stamps pion's feedback relies on to be emitted at all.
+        rtcp_fbs: vec![
+            "nack".to_string(),
+            "pli".to_string(),
+            "transport-cc".to_string(),
+        ],
         ..Default::default()
     }];
     config.media_capabilities = Some(caps);

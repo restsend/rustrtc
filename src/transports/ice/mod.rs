@@ -3965,7 +3965,7 @@ async fn handle_stun_request(
                     // verification of the peer's newer nomination. If the
                     // peer truly reverted to this pair, its next fresh
                     // nomination re-commits it after the pending one.
-                } else if !has_selected {
+                } else if !has_selected || inner.nomination_complete.borrow().is_none() {
                     // A nomination that changes something: make it the most
                     // recent (RFC 8445 §8.1.1). The bump invalidates any
                     // deferred verifier spawned for an older nomination, so
@@ -3974,7 +3974,16 @@ async fn handle_stun_request(
                         .nomination_generation
                         .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
                     // First nomination: follow immediately so call setup is
-                    // never delayed.
+                    // never delayed. "First" means no nomination has been
+                    // processed yet — a best-effort pair committed by the
+                    // local check round (e.g. a relay pair that raced ahead)
+                    // must not downgrade the peer's nomination to a deferred
+                    // verification while the PC already reports connected on
+                    // an inconsistent 5-tuple. A USE-CANDIDATE request is a
+                    // successful connectivity check, so electing its pair
+                    // now is exactly §7.3.1.5/§8.1.2. Later nominations (the
+                    // stream was already nominated) keep the defer+verify
+                    // path-switching protection below.
                     debug!(
                         label = inner.config.label.as_deref().unwrap_or("-"),
                         "Controlled agent following UseCandidate (first nomination): {} -> {}",
