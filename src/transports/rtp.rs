@@ -956,6 +956,22 @@ impl RtpTransport {
         }
     }
 
+    fn fire_ingress_parse_error(&self, src_addr: SocketAddr, protected: bool) {
+        if self.has_observers.load(Ordering::Acquire) {
+            for observer in self.observers.read().iter() {
+                observer.on_ingress_parse_error(src_addr, protected);
+            }
+        }
+    }
+
+    fn fire_send_complete(&self, packet: &RtpPacket, bytes: usize) {
+        if self.has_observers.load(Ordering::Acquire) {
+            for observer in self.observers.read().iter() {
+                observer.on_send_complete(packet.header.ssrc, packet.header.payload_type, bytes);
+            }
+        }
+    }
+
     /// Legacy raw-bytes RTP send path (prefer [`Self::send_rtp`]).
     /// Returns `Ok(0)` without sending while the direction stops this SSRC.
     #[deprecated(note = "legacy raw-bytes API; use send_rtp instead")]
@@ -1128,6 +1144,7 @@ impl RtpTransport {
             Ok(n) => {
                 if n > 0 {
                     self.record_rtp_sent(packet.header.ssrc, packet.payload.len());
+                    self.fire_send_complete(&packet, n);
                 }
                 if is_first {
                     self.transport.mark_first_outbound();
@@ -1476,6 +1493,7 @@ impl RtpTransport {
                         }
                         Err(e) => {
                             trace!("SRTP parse failed: {}", e);
+                            self.fire_ingress_parse_error(addr, true);
                             return;
                         }
                     }
@@ -1493,6 +1511,7 @@ impl RtpTransport {
                         Ok(rtp_packet) => rtp_packet,
                         Err(e) => {
                             trace!("RTP parse failed: {}", e);
+                            self.fire_ingress_parse_error(addr, false);
                             return;
                         }
                     }
@@ -1738,6 +1757,48 @@ mod tests {
     use super::*;
     use crate::transports::ice::conn::IceConn;
     use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn observer_distinguishes_parse_failure_and_completed_send() {
+        use crate::transports::ice::IceSocketWrapper;
+        use tokio::net::UdpSocket;
+        use tokio::sync::watch;
+
+        #[derive(Default)]
+        struct Events {
+            parse_errors: Mutex<Vec<(SocketAddr, bool)>>,
+            sends: Mutex<Vec<(u32, u8, usize)>>,
+        }
+        impl RtpObserver for Events {
+            fn on_ingress_parse_error(&self, src_addr: SocketAddr, protected: bool) {
+                self.parse_errors.lock().push((src_addr, protected));
+            }
+
+            fn on_send_complete(&self, ssrc: u32, pt: u8, bytes: usize) {
+                self.sends.lock().push((ssrc, pt, bytes));
+            }
+        }
+
+        let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = remote.local_addr().unwrap();
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (socket_tx, socket_rx) = watch::channel(Some(IceSocketWrapper::Udp(socket)));
+        let transport = RtpTransport::new(IceConn::new(socket_rx, remote_addr, None), false);
+        let events = Arc::new(Events::default());
+        transport.add_observer(events.clone());
+        let packet = RtpPacket::new(crate::rtp::RtpHeader::new(0, 1, 160, 42), vec![0; 160]);
+        transport.feed_packet(Bytes::from_static(&[0x80, 0]), remote_addr).await;
+        transport.feed_packet(Bytes::from(packet.marshal().unwrap()), remote_addr).await;
+        transport.set_rtp_send_allowed(false);
+        assert_eq!(transport.send_rtp(packet.clone()).await.unwrap(), 0);
+        transport.set_rtp_send_allowed(true);
+        let sent = transport.send_rtp(packet.clone()).await.unwrap();
+        socket_tx.send(None).unwrap();
+        assert!(transport.send_rtp(packet).await.is_err());
+
+        assert_eq!(&*events.parse_errors.lock(), &[(remote_addr, false)]);
+        assert_eq!(&*events.sends.lock(), &[(42, 0, sent)]);
+    }
 
     #[tokio::test]
     async fn send_accounting_is_shared_and_excludes_rejected_packets() {
