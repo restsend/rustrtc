@@ -124,6 +124,18 @@ impl OutboundTimeline {
         self.state.lock().cur_seq.wrapping_add(1)
     }
 
+    /// Assign an outbound sequence number and SSRC to a locally generated
+    /// control packet. Its timestamp stays in the caller's payload clock.
+    /// This ends the current peer mapping so a subsequent peer packet cannot
+    /// reuse the sequence number allocated here.
+    pub fn write_control(&self, packet: &mut crate::rtp::RtpPacket) {
+        let mut state = self.state.lock();
+        state.anchor = None;
+        state.cur_seq = state.cur_seq.wrapping_add(1);
+        packet.header.ssrc = self.ssrc;
+        packet.header.sequence_number = state.cur_seq;
+    }
+
     /// Map a peer or packetized video RTP packet onto this timeline in place,
     /// scaling timestamp deltas when `in_clock` differs from this timeline's
     /// clock rate.
@@ -353,6 +365,30 @@ mod tests {
         assert_eq!(send_peer(&t, 0xC, 8, 283), (1003, ts_c + 160));
         assert_eq!(send_peer(&t, 0xC, 5_000, 443), (1004, ts_c + 320));
         assert_eq!(send_peer(&t, 0xC, 5_001, 999_999), (1005, ts_c + 480));
+    }
+
+    #[test]
+    fn local_control_keeps_its_timestamp_and_shares_the_audio_sequence() {
+        let t = OutboundTimeline::new(99, 48_000, u16::MAX - 2, 50_000);
+        let (_, before) = send_frame(&t);
+        let mut start = crate::rtp::RtpPacket::new(
+            crate::rtp::RtpHeader::new(101, 0, 7_000, 99),
+            vec![5, 10, 0, 0],
+        );
+        let mut end = start.clone();
+        t.write_control(&mut start);
+        let (between, between_ts) = send_frame(&t);
+        t.write_control(&mut end);
+        let (after, after_ts) = send_frame(&t);
+
+        assert_eq!(
+            [start.header.sequence_number, between, end.header.sequence_number, after],
+            [u16::MAX, 0, 1, 2]
+        );
+        assert_eq!(start.header.timestamp, 7_000);
+        assert_eq!(end.header.timestamp, 7_000);
+        assert_eq!(between_ts, before + 960);
+        assert_eq!(after_ts, between_ts + 960);
     }
 
     #[test]
