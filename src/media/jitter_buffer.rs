@@ -100,6 +100,7 @@ const COMFORT_NOISE_PT: u8 = 13;
 struct BufferedSample {
     sample: MediaSample,
     arrival: Instant,
+    control: bool,
 }
 
 pub struct JitterBuffer {
@@ -236,21 +237,26 @@ impl JitterBuffer {
         self.frames(self.min_delay).max(1)
     }
 
-    /// Samples `tick` buffers at most.
+    /// Media samples `tick` buffers at most; control packets have no duration.
     fn max_frames(&self) -> usize {
         (self.max_delay.as_micros() / self.ptime.as_micros().max(1)) as usize
     }
 
     /// Drop the oldest buffered sample (in sequence order, across
     /// wraparound), its slot given up.
-    fn drop_oldest(&mut self) {
+    fn drop_oldest(&mut self) -> bool {
         if let Some(oldest) = self.get_first_seq() {
-            self.samples.remove(&oldest);
+            let media = self
+                .samples
+                .remove(&oldest)
+                .is_some_and(|buffered| !buffered.control);
             self.stats.dropped += 1;
             if self.playing {
                 self.last_delivered_seq = Some(oldest);
             }
+            return media;
         }
+        false
     }
 
     /// Take the sample due on a playout clock: call once per
@@ -269,14 +275,23 @@ impl JitterBuffer {
             self.above_target_ticks = 0;
         }
 
+        // Control packets share sequence ordering, but represent no playout
+        // duration. Keep the hard packet-count capacity in push_inner.
+        let mut media_frames = self
+            .samples
+            .values()
+            .filter(|buffered| !buffered.control)
+            .count();
         let max_frames = self.max_frames().max(self.target_frames() + 1);
-        while self.samples.len() > max_frames {
-            self.drop_oldest();
+        while media_frames > max_frames {
+            if self.drop_oldest() {
+                media_frames -= 1;
+            }
         }
 
         // delay grown by underruns (or a sender clock running fast): once
         // well above target for long, drop a sample to win it back
-        if self.samples.len() > self.target_frames() + 1 {
+        if media_frames > self.target_frames() + 1 {
             self.above_target_ticks += 1;
         } else {
             self.above_target_ticks = 0;
@@ -294,11 +309,15 @@ impl JitterBuffer {
             self.last_delivered_seq = Some(next);
             let comfort_noise = match &buffered.sample {
                 MediaSample::Audio(f) => {
-                    self.last_delivered_timestamp = Some(f.rtp_timestamp);
-                    f.payload_type == Some(COMFORT_NOISE_PT)
+                    if !buffered.control {
+                        self.last_delivered_timestamp = Some(f.rtp_timestamp);
+                    }
+                    !buffered.control && f.payload_type == Some(COMFORT_NOISE_PT)
                 }
                 MediaSample::Video(f) => {
-                    self.last_delivered_timestamp = Some(f.rtp_timestamp);
+                    if !buffered.control {
+                        self.last_delivered_timestamp = Some(f.rtp_timestamp);
+                    }
                     false
                 }
             };
@@ -356,6 +375,19 @@ impl JitterBuffer {
     }
 
     pub fn push(&mut self, sample: MediaSample) {
+        self.push_inner(sample, false);
+    }
+
+    /// Buffer a control packet (e.g. a negotiated telephone event) sharing
+    /// the media SSRC and sequence space, but not its media timestamp clock.
+    /// It is delivered in sequence like a sample, without measuring packet
+    /// time or changing the last delivered media timestamp. The caller owns
+    /// payload-type negotiation and identifies control packets explicitly.
+    pub fn push_control(&mut self, sample: MediaSample) {
+        self.push_inner(sample, true);
+    }
+
+    fn push_inner(&mut self, sample: MediaSample, control: bool) {
         let (seq_opt, timestamp, ssrc, marker, clock_rate) = match &sample {
             MediaSample::Audio(f) => (
                 f.sequence_number,
@@ -381,7 +413,7 @@ impl JitterBuffer {
             return;
         };
         self.stats.received += 1;
-        if let MediaSample::Audio(f) = &sample {
+        if !control && let MediaSample::Audio(f) = &sample {
             self.measure_ptime(seq, timestamp, f.clock_rate);
         }
 
@@ -403,6 +435,7 @@ impl JitterBuffer {
                         BufferedSample {
                             sample,
                             arrival: now,
+                            control,
                         },
                     );
                     return;
@@ -440,6 +473,7 @@ impl JitterBuffer {
                     BufferedSample {
                         sample,
                         arrival: now,
+                        control,
                     },
                 );
                 return;
@@ -447,7 +481,7 @@ impl JitterBuffer {
         }
 
         // Timestamp discontinuity (clock remap on re-INVITE / hold-resume).
-        if let Some(last_ts) = self.last_delivered_timestamp {
+        if !control && let Some(last_ts) = self.last_delivered_timestamp {
             let max_reasonable_jump: u32 = match &sample {
                 MediaSample::Audio(_) => clock_rate.saturating_mul(AUDIO_TS_JUMP_SECS),
                 MediaSample::Video(_) => 90000u32.saturating_mul(VIDEO_TS_JUMP_SECS),
@@ -470,6 +504,7 @@ impl JitterBuffer {
                     BufferedSample {
                         sample,
                         arrival: now,
+                        control,
                     },
                 );
                 return;
@@ -489,6 +524,7 @@ impl JitterBuffer {
                         BufferedSample {
                             sample,
                             arrival: now,
+                            control,
                         },
                     );
                     return;
@@ -521,6 +557,7 @@ impl JitterBuffer {
             BufferedSample {
                 sample,
                 arrival: now,
+                control,
             },
         );
     }
@@ -552,7 +589,9 @@ impl JitterBuffer {
                 MediaSample::Audio(f) => f.rtp_timestamp,
                 MediaSample::Video(f) => f.rtp_timestamp,
             };
-            self.last_delivered_timestamp = Some(timestamp);
+            if !buffered.control {
+                self.last_delivered_timestamp = Some(timestamp);
+            }
 
             Some(buffered.sample)
         } else {
@@ -779,6 +818,68 @@ mod tests {
     }
 
     #[test]
+    fn control_packets_preserve_buffered_media_and_independent_clocks() {
+        for clock_rate in [8000, 48000] {
+            for origin in [100_000u32, u32::MAX - 100] {
+                for clocked in [false, true] {
+                    // Tight latency and rapid adaptive trimming independently
+                    // enforce media duration, not the number of control packets.
+                    let mut jb = JitterBuffer::new(Duration::ZERO, Duration::from_millis(120), 32);
+                    jb.set_playout_config(PlayoutConfig {
+                        trim_after: Duration::from_millis(20),
+                        ..Default::default()
+                    });
+                    let audio = |seq, timestamp| {
+                        let mut sample = make_sample_with_ssrc(seq, 7, timestamp);
+                        if let MediaSample::Audio(f) = &mut sample {
+                            f.clock_rate = clock_rate;
+                        }
+                        sample
+                    };
+                    let take = |jb: &mut JitterBuffer| {
+                        if clocked {
+                            match jb.tick() {
+                                Playout::Sample(sample) => sample,
+                                other => panic!("expected ordered sample, got {other:?}"),
+                            }
+                        } else {
+                            jb.pop().expect("no false sequence gap")
+                        }
+                    };
+                    jb.push(audio(100, origin));
+                    assert_eq!(get_seq(take(&mut jb)), 100);
+                    jb.push(audio(101, origin.wrapping_add(clock_rate / 50)));
+                    for seq in 102..109 {
+                        let mut control = make_sample_with_ssrc(seq, 7, (seq - 102) as u32 * 320);
+                        if let MediaSample::Audio(f) = &mut control {
+                            // A negotiated PT, not a hard-coded telephone-event ID.
+                            f.payload_type = Some(42);
+                            f.marker = true;
+                        }
+                        jb.push_control(control);
+                    }
+                    jb.push(audio(109, origin.wrapping_add(clock_rate / 25)));
+                    assert_eq!(jb.ptime(), Duration::from_millis(20));
+                    for seq in 101..110 {
+                        assert_eq!(
+                            get_seq(take(&mut jb)),
+                            seq,
+                            "speech/control order must be complete"
+                        );
+                    }
+                    assert_eq!(jb.stats().resets, 0);
+                    assert_eq!(jb.stats().lost, 0);
+                    // A real media-clock discontinuity still restarts the
+                    // stream after the intervening control packets.
+                    jb.push(audio(110, origin.wrapping_add(clock_rate * 4)));
+                    assert_eq!(jb.stats().resets, 1);
+                    assert_eq!(get_seq(take(&mut jb)), 110);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_jitter_buffer_ssrc_change_forward_jump() {
         let mut jb = JitterBuffer::new(Duration::from_millis(0), Duration::from_millis(100), 10);
 
@@ -1000,13 +1101,21 @@ mod tests {
 
     #[test]
     fn tick_drops_the_oldest_beyond_max_delay() {
-        let mut jb = playout();
-        for seq in 0..12 {
-            jb.push(make_sample(seq));
+        for with_control in [false, true] {
+            let mut jb = playout();
+            for seq in 0..12 {
+                jb.push(make_sample(seq));
+            }
+            if with_control {
+                for seq in 12..16 {
+                    jb.push_control(make_sample(seq));
+                }
+            }
+            // 200 ms at 20 ms: retain at most 10 media samples, regardless
+            // of control packets. Real excess media still gets discarded.
+            assert_eq!(tick(&mut jb), S(2));
+            assert_eq!(jb.stats().dropped, 2);
         }
-        // 200 ms at 20 ms: 10 samples
-        assert_eq!(tick(&mut jb), S(2));
-        assert_eq!(jb.stats().dropped, 2);
     }
 
     #[test]
