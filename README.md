@@ -132,27 +132,32 @@ The no_std wall clock is a logical clock (`platform::time::advance_ms` /
 DER (`Certificate::from_pkcs8_der`) — there is no certificate generation
 without `std`.
 
-## Performance vs libwebrtc (standalone C++, 0.6.6)
+## Performance (rustrtc vs libwebrtc, pion, webrtc-rs)
 
-Same host, same topology; **standalone libwebrtc M150** (C++ SDK, no Chrome),
-with data channels (SCTP over DTLS) and SRTP measured separately. Median of
-3–5 runs, pinned cores.
+Same host, same scenario: two peers in one process, reliable ordered data
+channel (SCTP over DTLS), loopback, 4 MB window, pinned cores. Medians of
+3–5 runs; the host is noisy, so ratios under ~1.5× are within noise.
 
-| Path | Metric | libwebrtc | rustrtc |
-|---|---|---:|---:|
-| SCTP | RTT p50 / p99 | 452 / 830 µs | **326–376 / 419–462 µs** |
-| SCTP | 64 KB throughput | 59 MB/s | **157–164 MB/s** |
-| SCTP | 1 KB message rate | 28.6k msg/s | **140k msg/s** |
-| SCTP | setup (offer → DC open) | 126–131 ms | **5–15 ms** |
-| SCTP | PSS at 1 connection | 13–18 MB | **9–10 MB** |
-| SRTP | AES-GCM protect / roundtrip (1200 B) | 2724 / 1295 MB/s* | **3762 / 1645 MB/s** |
-| SRTP | AES-GCM protect (200 B / 64 B) | 755 / 287 MB/s* | **1066 / 591 MB/s** |
+| Implementation | RTT p50 / p99 | 64 KiB throughput | 200 B msg rate | Setup | PSS |
+|---|---:|---:|---:|---:|---:|
+| **rustrtc 0.6.6** | **0.34 / 0.44 ms** | **158 MB/s** | **201k msg/s** | 3–15 ms | 9–10 MB |
+| libwebrtc M150 (standalone C++) | 0.45 / 0.83 ms | 59 MB/s | 29k msg/s | 126–131 ms | 13–18 MB |
+| pion 3.3.6 | 0.46 / 0.58 ms | 97 MB/s (62–120) | 102k msg/s (100–329k) | 4–24 ms | 33–41 MB |
+| webrtc-rs 0.17.1 | 0.83 / 1.00 ms | 48 MB/s | 189k msg/s | 4–21 ms | 7–11 MB |
 
-\* libsrtp 2.6.0 + OpenSSL 3.5 — the SRTP engine libwebrtc vendors.
+On a single core rustrtc reaches **137.6–140.2 MB/s** at 64 KiB (libwebrtc
+54.0, pion 10.6, webrtc-rs 17.5) and **383–390k msg/s** at 200 B (libwebrtc
+42k, pion 38k, webrtc-rs 31k).
 
-Full methodology, single-core tables, end-to-end SRTP latency/loss, the
-AES-CM/SHA-1 caveat and reproduction steps:
-**[PERFORMANCE-VS-LIBWEBRTC.md](PERFORMANCE-VS-LIBWEBRTC.md)**.
+- Full matrix, single-core results, methodology, variance and caveats:
+  **[PERFORMANCE-COMPARISON.md](PERFORMANCE-COMPARISON.md)**
+- SRTP (libsrtp, the engine libwebrtc vendors) and end-to-end media numbers:
+  **[PERFORMANCE-VS-LIBWEBRTC.md](PERFORMANCE-VS-LIBWEBRTC.md)**
+
+libpeer and MetaRTC could not be measured in this scenario (DTLS handshake
+failure in a direct pair / no standalone headless data-channel example); the
+reasons and build details are documented in
+[PERFORMANCE-COMPARISON.md](PERFORMANCE-COMPARISON.md#not-measured).
 
 ## Benchmark (rustrtc vs webrtc-rs & pion) in 0.5.0
 
