@@ -132,18 +132,24 @@ The no_std wall clock is a logical clock (`platform::time::advance_ms` /
 DER (`Certificate::from_pkcs8_der`) — there is no certificate generation
 without `std`.
 
-## Performance (rustrtc vs libwebrtc, pion, webrtc-rs)
+## Performance (rustrtc vs libwebrtc, pion, webrtc-rs, libpeer, MetaRTC)
 
-Same host, same scenario: two peers in one process, reliable ordered data
-channel (SCTP over DTLS), loopback, 4 MB window, pinned cores. Medians of
-3–5 runs; the host is noisy, so ratios under ~1.5× are within noise.
+Same host, same scenario: reliable ordered data channel (SCTP over DTLS),
+loopback, 4 MB window, pinned cores. Medians of 3–5 runs; the host is noisy, so
+ratios under ~1.5× are within noise. rustrtc/libwebrtc/pion/webrtc-rs/MetaRTC
+are two peers in one process; **libpeer is one peer per process** (its native
+topology).
 
-| Implementation | RTT p50 / p99 | 64 KiB throughput | 200 B msg rate | Setup | PSS |
-|---|---:|---:|---:|---:|---:|
-| **rustrtc 0.6.8** | **0.34 / 0.44 ms** | **158 MB/s** | **201k msg/s** | 3–15 ms | 9–10 MB |
-| libwebrtc M150 (standalone C++) | 0.45 / 0.83 ms | 59 MB/s | 29k msg/s | 126–131 ms | 13–18 MB |
-| pion 3.3.6 | 0.46 / 0.58 ms | 97 MB/s (62–120) | 102k msg/s (100–329k) | 4–24 ms | 33–41 MB |
-| webrtc-rs 0.17.1 | 0.83 / 1.00 ms | 48 MB/s | 189k msg/s | 4–21 ms | 7–11 MB |
+| Implementation | RTT p50 / p99 | 64 KiB throughput | 1 KiB throughput | 200 B msg rate | Setup | PSS |
+|---|---:|---:|---:|---:|---:|---:|
+| **rustrtc 0.6.8** | **0.34 / 0.44 ms** | **158 MB/s** | **135 MB/s** | **201k msg/s** | 3–15 ms | 9–10 MB |
+| libpeer (usrsctp) | 0.36 / 0.42 ms | 117 MB/s (75–118) | 24 MB/s | 30k msg/s | 77–97 ms | 1.2–8.6 MB¹ |
+| MetaRTC | 0.37 / 0.55 ms | 60 MB/s (54–61) | 47 MB/s | 105k msg/s (69–156k) | 108–131 ms | 5.9–6.9 MB |
+| libwebrtc M150 (standalone C++) | 0.45 / 0.83 ms | 59 MB/s | 28 MB/s | 29k msg/s | 126–131 ms | 13–18 MB |
+| pion 3.3.6 | 0.46 / 0.58 ms | 97 MB/s (62–120) | 109 MB/s (40–114) | 102k msg/s (100–329k) | 4–24 ms | 33–41 MB |
+| webrtc-rs 0.17.1 | 0.83 / 1.00 ms | 48 MB/s | 44 MB/s | 189k msg/s | 4–21 ms | 7–11 MB |
+
+¹ libpeer is two processes; PSS is for the sending process only.
 
 On a single core rustrtc reaches **137.6–140.2 MB/s** at 64 KiB (libwebrtc
 54.0, pion 10.6, webrtc-rs 17.5) and **383–390k msg/s** at 200 B (libwebrtc
@@ -154,10 +160,11 @@ On a single core rustrtc reaches **137.6–140.2 MB/s** at 64 KiB (libwebrtc
 - SRTP (libsrtp, the engine libwebrtc vendors) and end-to-end media numbers:
   **[PERFORMANCE-VS-LIBWEBRTC.md](PERFORMANCE-VS-LIBWEBRTC.md)**
 
-libpeer and MetaRTC could not be measured in this scenario (DTLS handshake
-failure in a direct pair / no standalone headless data-channel example); the
-reasons and build details are documented in
-[PERFORMANCE-COMPARISON.md](PERFORMANCE-COMPARISON.md#not-measured).
+libpeer and MetaRTC required correctness patches to run as a local pair
+(server-side SCTP listen/accept, deferred SCTP start, DTLS thread safety,
+propagated `EAGAIN`); the patches, their symptoms and the exact measurement
+setup are documented in
+[PERFORMANCE-COMPARISON.md](PERFORMANCE-COMPARISON.md#patches-required).
 
 ## Benchmark (rustrtc vs webrtc-rs & pion) in 0.5.0
 
