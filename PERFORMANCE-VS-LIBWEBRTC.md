@@ -1,6 +1,6 @@
 # rustrtc vs libwebrtc — performance comparison
 
-Standalone **libwebrtc (M150, C++ SDK)** against **rustrtc 0.6.6**, same host,
+Standalone **libwebrtc (M150, C++ SDK)** against **rustrtc 0.6.8**, same host,
 same topology. Data channels (SCTP over DTLS) and SRTP are measured
 separately, because they are different data planes: WebRTC data channels run
 SCTP over DTLS (no SRTP), while media runs SRTP.
@@ -27,7 +27,7 @@ see [SRTP](#srtp) for the exact methodology.
 |---|---|
 | CPU | Intel Core i7-9700T @ 2.00 GHz, 8 cores (Coffee Lake, **no SHA-NI**) |
 | OS / kernel | Debian 13, Linux 6.12.101 |
-| rustrtc | 0.6.6, `--release` (fat LTO, 1 CGU) |
+| rustrtc | 0.6.8, `--release` (fat LTO, 1 CGU) |
 | libwebrtc | M150.7871.06, standalone prebuilt C++ SDK (`webrtc-sdk`), no Chrome |
 | SRTP engine | libsrtp 2.6.0 (OpenSSL 3.5 backend), the engine libwebrtc vendors |
 | Topology | two peers in one process, loopback UDP, `taskset` pinned cores |
@@ -44,7 +44,7 @@ the libwebrtc stack itself. This document uses the standalone C++ library.
 
 4 pinned cores, two peers in one process, unidirectional bulk transfer.
 
-| Metric | libwebrtc M150 | rustrtc 0.6.6 |
+| Metric | libwebrtc M150 | rustrtc 0.6.8 |
 |---|---:|---:|
 | Setup, offer → data-channel open | 125.6–131.5 ms | **5.0–14.5 ms** |
 | RTT p50 / p90 / p99 | 445–459 / 523–560 / 779–882 µs | **326–376 / 396–427 / 419–462 µs** |

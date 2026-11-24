@@ -140,7 +140,7 @@ channel (SCTP over DTLS), loopback, 4 MB window, pinned cores. Medians of
 
 | Implementation | RTT p50 / p99 | 64 KiB throughput | 200 B msg rate | Setup | PSS |
 |---|---:|---:|---:|---:|---:|
-| **rustrtc 0.6.6** | **0.34 / 0.44 ms** | **158 MB/s** | **201k msg/s** | 3–15 ms | 9–10 MB |
+| **rustrtc 0.6.8** | **0.34 / 0.44 ms** | **158 MB/s** | **201k msg/s** | 3–15 ms | 9–10 MB |
 | libwebrtc M150 (standalone C++) | 0.45 / 0.83 ms | 59 MB/s | 29k msg/s | 126–131 ms | 13–18 MB |
 | pion 3.3.6 | 0.46 / 0.58 ms | 97 MB/s (62–120) | 102k msg/s (100–329k) | 4–24 ms | 33–41 MB |
 | webrtc-rs 0.17.1 | 0.83 / 1.00 ms | 48 MB/s | 189k msg/s | 4–21 ms | 7–11 MB |
