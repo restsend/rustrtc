@@ -630,6 +630,14 @@ async fn test_dtls_close_during_handshake_exits_task() -> Result<()> {
         result.is_ok(),
         "DTLS task did NOT exit within 3s after close() — notify_one race?"
     );
+    // The runner must publish a terminal state before it returns. Otherwise
+    // `start_dtls` waits on the state watch forever after the runner's
+    // JoinHandle completes, parking the whole transport loop.
+    assert!(
+        matches!(dtls.get_state(), DtlsState::Closed),
+        "expected DtlsState::Closed after close() during handshake, got {}",
+        dtls.get_state()
+    );
 
     Ok(())
 }

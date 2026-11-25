@@ -2053,6 +2053,13 @@ impl DtlsInner {
                             let _ = self.conn.send(&buf).await;
                         }
                     }
+                    // Terminal state: the handshake runner is about to return.
+                    // Without this, a close during the handshake left the state
+                    // at `Handshaking`; `run_transport_loop` only waits for a
+                    // watch change after the runner task completes and would
+                    // therefore park forever on the detached transport.
+                    *self.state.lock() = DtlsState::Closed;
+                    let _ = self.state_tx.send(DtlsState::Closed);
                     return Ok(());
                 }
                 // Handshake timeout — abort if the peer never responds.
@@ -2076,6 +2083,8 @@ impl DtlsInner {
                 crate::platform::select::Which4::D(packet) => {
                     let Some(packet) = packet else {
                         debug!("DTLS handshake feeder closed — exiting loop");
+                        *self.state.lock() = DtlsState::Closed;
+                        let _ = self.state_tx.send(DtlsState::Closed);
                         return Ok(());
                     };
                     if let Err(e) = self

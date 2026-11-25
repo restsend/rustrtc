@@ -171,6 +171,38 @@ impl Drop for LoopsGuard {
 #[cfg(not(feature = "std"))]
 struct LoopsGuard;
 
+/// Aborts its task on drop. Used for the DTLS handshake runner while
+/// `start_dtls` is still awaiting it: dropping a bare `JoinHandle` only
+/// detaches the task, so aborting the parent transport loop mid-handshake
+/// used to leave the runner (and the DTLS/ICE Arcs it holds) behind.
+#[cfg(feature = "std")]
+struct AbortOnDropTask(Option<tokio::task::JoinHandle<()>>);
+#[cfg(feature = "std")]
+impl AbortOnDropTask {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self(Some(handle))
+    }
+
+    fn handle(&mut self) -> &mut tokio::task::JoinHandle<()> {
+        self.0.as_mut().expect("DTLS runner handle already disarmed")
+    }
+
+    /// Keep the task running after this guard is dropped. Used once the
+    /// handshake completes: the DTLS runner becomes the connected transport's
+    /// packet pump and must outlive `start_dtls`.
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+#[cfg(feature = "std")]
+impl Drop for AbortOnDropTask {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
 /// NACK / retransmission / RTCP-feedback hook for the SENDER side.
 ///
 /// **Not for general packet observation.** This fires per-sender on the
@@ -1092,16 +1124,7 @@ impl PeerConnection {
             ssrc_generator,
             disconnect_reason: disconnect_reason_tx,
             _disconnect_reason_rx: disconnect_reason_rx,
-            tasks: Mutex::new({
-                #[cfg(feature = "std")]
-                {
-                    Vec::new()
-                }
-                #[cfg(not(feature = "std"))]
-                {
-                    ()
-                }
-            }),
+            tasks: Mutex::new(Default::default()),
             pc_span,
         };
         let pc = Self {
@@ -1141,27 +1164,38 @@ impl PeerConnection {
             let ice_transport_gathering = ice_transport.clone();
             let ice_gathering_state_tx = pc.inner.ice_gathering_state.clone();
             let inner_weak_gathering = inner_weak.clone();
+
+            // Spawn each loop as its own tracked task instead of detaching it
+            // from a single tracked parent: aborting the parent would not reach
+            // its children, leaving whichever loop is parked in a transport
+            // start wait holding `IceTransportInner` after close/Drop.
             let h = crate::spawn_rtc(
                 pc.inner.config.runtime_handle.as_ref(),
                 pc.inner.pc_span.clone(),
-                async move {
-                    let gathering_loop = run_gathering_loop(
-                        ice_transport_gathering,
-                        ice_gathering_state_tx,
-                        inner_weak_gathering,
-                    );
+                run_gathering_loop(
+                    ice_transport_gathering,
+                    ice_gathering_state_tx,
+                    inner_weak_gathering,
+                ),
+            );
+            pc.inner.track_task(h);
 
-                    let transport_loop = run_transport_loop(
-                        ice_transport,
-                        ice_connection_state_tx,
-                        dtls_role_rx,
-                        inner_weak,
-                    );
+            let h = crate::spawn_rtc(
+                pc.inner.config.runtime_handle.as_ref(),
+                pc.inner.pc_span.clone(),
+                run_transport_loop(
+                    ice_transport,
+                    ice_connection_state_tx,
+                    dtls_role_rx,
+                    inner_weak,
+                ),
+            );
+            pc.inner.track_task(h);
 
-                    crate::platform::task::spawn(gathering_loop);
-                    crate::platform::task::spawn(transport_loop);
-                    crate::platform::task::spawn(ice_runner);
-                },
+            let h = crate::spawn_rtc(
+                pc.inner.config.runtime_handle.as_ref(),
+                pc.inner.pc_span.clone(),
+                ice_runner,
             );
             pc.inner.track_task(h);
         }
@@ -3102,9 +3136,17 @@ impl PeerConnection {
 
         // Start the handshake loop before flushing buffered packets so inbound
         // DTLS records are not dropped on the try_send race.
-        // std: spawn_rtc returns a JoinHandle the select arm polls; no_std:
-        // the runner parks in the injected executor (the state watch
+        // std: spawn_rtc returns a JoinHandle the select arm polls, owned by a
+        // drop guard so aborting this transport loop also stops the runner;
+        // no_std: the runner parks in the injected executor (the state watch
         // carries the outcome), so there is no handle to poll.
+        #[cfg(feature = "std")]
+        let mut dtls_runner_task = AbortOnDropTask::new(crate::spawn_rtc(
+            self.inner.config.runtime_handle.as_ref(),
+            self.inner.pc_span.clone(),
+            dtls_runner,
+        ));
+        #[cfg(not(feature = "std"))]
         #[cfg_attr(not(feature = "std"), allow(unused_mut, unused_variables))]
         let mut dtls_runner_task = crate::spawn_rtc(
             self.inner.config.runtime_handle.as_ref(),
@@ -3201,6 +3243,8 @@ impl PeerConnection {
             match state {
                 dtls::DtlsState::Connected(_, profile_opt) => {
                     self.setup_srtp(&dtls_clone, is_client, profile_opt, &rtp_transport_clone);
+                    #[cfg(feature = "std")]
+                    dtls_runner_task.disarm();
                     return Ok(Some((dtls_clone, vec![sctp_runner, dc_listener])));
                 }
                 dtls::DtlsState::Failed => {
@@ -3215,15 +3259,15 @@ impl PeerConnection {
             }
 
             // The runner task has finished but the watch state wasn't
-            // Connected/Failed/Closed yet (the handshake can return Ok after
-            // setting Closed, or exit via feeder/close without a final state).
-            // Wait for a state transition instead of re-polling the completed
-            // JoinHandle, which would panic.
+            // Connected/Failed/Closed yet. The handshake future sets its final
+            // state synchronously before returning, so a non-terminal state
+            // here can never change again. Waiting for `changed()` would park
+            // this transport loop forever (the detached DTLS runner used to do
+            // exactly that when `close()` won the handshake race).
             if dtls_runner_done {
-                if state_rx.changed().await.is_err() {
-                    break;
-                }
-                continue;
+                return Err(RtcError::Internal(
+                    "DTLS runner exited without a terminal state".into(),
+                ));
             }
 
             // On std spawn_rtc returns a polled JoinHandle arm; on no_std
@@ -3239,7 +3283,7 @@ impl PeerConnection {
                     let mut arm_state = core::pin::pin!(state_rx.changed());
                     let mut arm_pair = core::pin::pin!(pair_rx.changed());
                     select5(
-                        &mut dtls_runner_task,
+                        dtls_runner_task.handle(),
                         &mut sctp_runner,
                         &mut dc_listener,
                         &mut arm_state,
@@ -7188,6 +7232,14 @@ impl PeerConnectionInner {
                 .fetch_add(transport.received_rtp_packets(), Ordering::Relaxed);
         }
         drop(primary);
+        // The cooperative signals above (SCTP/DTLS close, ICE Closed +
+        // Shutdown) are enough for an idle runner, but a monitor parked in a
+        // transport-start wait (DTLS role/handshake, SDES attributes) or one
+        // that missed the watch wake may not observe them again. Abort the
+        // tracked tasks now so `IceTransportInner` is released even while the
+        // application keeps this handle after close().
+        #[cfg(feature = "std")]
+        self.abort_tracked_tasks();
         self.events.finish_close();
     }
 }
