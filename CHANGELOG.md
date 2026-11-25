@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.6.9 — 2026-11-25
+
+Peer teardown now cancels the long-lived ICE/DTLS loops instead of relying on
+their own timeouts, fixing connections that survived `close()`/drop and kept
+their ICE state alive.
+
+### Fixed
+
+- **PeerConnection teardown**: gathering, transport and ICE-runner loops are
+  tracked and aborted by `close()` and `Drop`, including a transport loop
+  parked in `start_transport`.
+- **DTLS close during handshake**: publishes `DtlsState::Closed` before the
+  runner exits, and `start_dtls` fails fast instead of waiting forever for a
+  terminal state; the runner is aborted if the transport start is cancelled
+  but kept alive after a successful handshake.
+- **Late ICE check rounds**: `Closed` is terminal, so a connectivity-check or
+  nomination round that outlives `stop()` can no longer publish `Connected`,
+  commit a pair, or signal nomination.
+
+No breaking API changes.
+
 ## 0.6.8 — 2026-11-23
 
 Control-plane refinements: DTMF/control packets ride media sequences without
