@@ -2405,6 +2405,10 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
                 checking.remove(&key);
             }
 
+            if inner.is_closed() {
+                return None;
+            }
+
             match res {
                 Ok(_) => Some(IceCandidatePair::new(local, remote)),
                 Err(e) => {
@@ -2515,6 +2519,10 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         }
     }
 
+    if inner.is_closed() {
+        return;
+    }
+
     if successful_pairs.is_empty() {
         // Don't transition to Failed — trickle ICE candidates may arrive
         // later via add_remote_candidate and trigger new connectivity checks.
@@ -2564,6 +2572,9 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         let pair = &successful_pairs[0];
         {
             let _selection = inner.selection_lock.lock();
+            if inner.is_closed() {
+                return;
+            }
             if inner.nomination_complete.borrow().is_some() {
                 debug!(
                     label = inner.config.label.as_deref().unwrap_or("-"),
@@ -2625,7 +2636,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
             {
                 crate::platform::task::sleep(core::time::Duration::from_millis(20)).await;
             }
-            if inner.nomination_complete.borrow().is_none() {
+            if inner.nomination_complete.borrow().is_none() && !inner.is_closed() {
                 debug!(
                     label = inner.config.label.as_deref().unwrap_or("-"),
                     "Nomination did not arrive in time; keeping best-effort selected pair"
@@ -2727,6 +2738,9 @@ async fn nominate_best_pair(
     round_generation: u64,
     successful_pairs: &mut Vec<IceCandidatePair>,
 ) {
+    if inner.is_closed() {
+        return;
+    }
     // Sort by priority: host > srflx > relay.  P2P first, relay last.
     successful_pairs.sort_by_key(|p| core::cmp::Reverse(p.priority(IceRole::Controlling)));
 
@@ -2853,7 +2867,7 @@ fn maybe_upgrade_on_success(inner: &Arc<IceTransportInner>, pair: &IceCandidateP
         span,
         async move {
             let _guard = inner.nomination_lock.lock().await;
-            if *inner.nomination_complete.borrow() != Some(true) {
+            if inner.is_closed() || *inner.nomination_complete.borrow() != Some(true) {
                 return;
             }
             if inner
@@ -2886,7 +2900,11 @@ fn maybe_upgrade_on_success(inner: &Arc<IceTransportInner>, pair: &IceCandidateP
                 Ok(_) => {
                     let committed = {
                         let _selection = inner.selection_lock.lock();
-                        commit_selected_pair(&inner, &pair, None)
+                        if inner.is_closed() {
+                            false
+                        } else {
+                            commit_selected_pair(&inner, &pair, None)
+                        }
                     };
                     if committed {
                         info!(
@@ -2930,6 +2948,9 @@ fn complete_controlling_nomination(
     let nominated = nominated_pair.is_some();
 
     let _selection = inner.selection_lock.lock();
+    if inner.is_closed() {
+        return false;
+    }
     // Re-check under the selection lock: a concurrent round may have
     // completed its nomination while this round was still running its
     // checks. A *successful* concurrent nomination is authoritative — keep
@@ -3053,6 +3074,9 @@ fn upgrade_candidate_pairs(
 /// the generation counter. Returns `true` when the selected pair was
 /// upgraded.
 async fn try_upgrade_nominated_path(inner: Arc<IceTransportInner>) -> bool {
+    if inner.is_closed() {
+        return false;
+    }
     // Only a successfully nominated controlling agent upgrades.
     if *inner.nomination_complete.borrow() != Some(true) {
         return false;
@@ -3132,7 +3156,11 @@ async fn try_upgrade_nominated_path(inner: Arc<IceTransportInner>) -> bool {
             Ok(_) => {
                 let committed = {
                     let _selection = inner.selection_lock.lock();
-                    commit_selected_pair(&inner, &pair, None)
+                    if inner.is_closed() {
+                        false
+                    } else {
+                        commit_selected_pair(&inner, &pair, None)
+                    }
                 };
                 if committed {
                     info!(
@@ -4658,7 +4686,16 @@ fn store_ice_state(state: &watch::Sender<IceTransportState>, new: IceTransportSt
 }
 
 impl IceTransportInner {
+    fn is_closed(&self) -> bool {
+        matches!(*self.state.borrow(), IceTransportState::Closed)
+    }
+
     fn set_state(&self, new: IceTransportState) {
+        // Closed is terminal: a check/nomination round that outlived stop()
+        // must not resurrect the transport.
+        if new != IceTransportState::Closed && self.is_closed() {
+            return;
+        }
         store_ice_state(&self.state, new);
     }
 }
@@ -4682,6 +4719,19 @@ mod state_tests {
         );
         store_ice_state(&tx, IceTransportState::Disconnected);
         assert!(rx.has_changed().unwrap());
+    }
+
+    /// Closed is terminal. A connectivity-check round that outlived `stop()`
+    /// must not resurrect the transport by publishing `Connected` later.
+    #[tokio::test]
+    async fn closed_is_terminal_for_late_check_rounds() {
+        let (ice, runner) = super::IceTransport::new(crate::RtcConfiguration::webrtc());
+        drop(runner);
+        ice.force_state_for_test(IceTransportState::Closed);
+        ice.force_state_for_test(IceTransportState::Connected);
+        assert_eq!(ice.state(), IceTransportState::Closed);
+        ice.force_state_for_test(IceTransportState::Closed);
+        assert_eq!(ice.state(), IceTransportState::Closed);
     }
 }
 
