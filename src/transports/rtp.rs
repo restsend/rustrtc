@@ -1192,8 +1192,10 @@ impl RtpTransport {
 
     /// Synchronous best-effort RTCP send for the close path, where we must NOT
     /// spawn or await (tokio runtime may be tearing down). Marshals,
-    /// SRTP-protects if a session exists, then `try_send`s — drops the packet
-    /// if the socket buffer is full. Never panics.
+    /// SRTP-protects if a session exists, then `try_send`s on the RTCP
+    /// socket and address (the RTP ones with rtcp-mux), like
+    /// [`Self::send_rtcp`] — drops the packet if the socket buffer is full.
+    /// Never panics.
     pub fn send_rtcp_sync(&self, packets: &[RtcpPacket]) {
         let Ok(mut raw) = marshal_rtcp_packets(packets) else {
             return;
@@ -1211,7 +1213,7 @@ impl RtpTransport {
                 return;
             }
         }
-        let _ = self.ice_conn().try_send(&raw);
+        let _ = self.ice_conn().try_send_rtcp(&raw);
     }
 
     fn try_bridge_rewrite_rtp(

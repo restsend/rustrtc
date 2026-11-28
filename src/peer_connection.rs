@@ -7112,6 +7112,13 @@ impl PeerConnectionInner {
         // shared `RtpTransport` (plus each receiver's receive loop and TWCC
         // flush loop) can be freed even while the application still holds a
         // transceiver or receiver-track handle.
+        //
+        // First note each sender's SSRC, CNAME and transport, for the RTCP
+        // BYE below: detach drops the transport.
+        let byes: Vec<(u32, String, Option<Arc<RtpTransport>>)> = (self.transceivers.lock().iter())
+            .filter_map(|t| t.sender())
+            .map(|s| (s.ssrc(), s.cname().to_string(), s.transport()))
+            .collect();
         {
             let transceivers = self.transceivers.lock();
             for t in transceivers.iter() {
@@ -7148,19 +7155,24 @@ impl PeerConnectionInner {
             // Send RTCP BYE — synchronous, best-effort (no spawn/await: the
             // close path may run during runtime teardown where tokio::spawn
             // would panic). The remote times out RTP if BYE is dropped.
-            let transceivers = self.transceivers.lock();
-            let mut ssrcs = Vec::new();
-            for t in transceivers.iter() {
-                if let Some(sender) = t.sender() {
-                    ssrcs.push(sender.ssrc());
-                }
-            }
-            if !ssrcs.is_empty() {
-                let bye = crate::rtp::RtcpPacket::Goodbye(crate::rtp::Goodbye {
-                    sources: ssrcs,
-                    reason: Some("PeerConnection closed".to_string()),
-                });
-                transport.send_rtcp_sync(&[bye]);
+            // One compound packet per sender, on the sender's transport (its
+            // RTCP port without rtcp-mux): a report first, even an empty
+            // one, and the CNAME, as every compound packet (RFC 3550 §6.1).
+            for (ssrc, cname, sender_transport) in &byes {
+                let transport = sender_transport.as_ref().unwrap_or(transport);
+                transport.send_rtcp_sync(&[
+                    RtcpPacket::ReceiverReport(crate::rtp::ReceiverReport {
+                        sender_ssrc: *ssrc,
+                        report_blocks: Vec::new(),
+                    }),
+                    RtcpPacket::SourceDescription(crate::rtp::SourceDescription::cname(
+                        *ssrc, cname,
+                    )),
+                    RtcpPacket::Goodbye(crate::rtp::Goodbye {
+                        sources: vec![*ssrc],
+                        reason: Some("PeerConnection closed".to_string()),
+                    }),
+                ]);
             }
         }
 
