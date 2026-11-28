@@ -1,7 +1,7 @@
 #![cfg(feature = "std")]
-//! RTCP towards a plain SIP peer without rtcp-mux (a trunk): the BYE goes
-//! to its RTCP port, and every compound packet starts with a report (RFC
-//! 3550 §6.1).
+//! RTCP towards a plain SIP peer without rtcp-mux (a trunk): the reports
+//! and the BYE go to its RTCP port, every compound packet starts with a
+//! report, and a sender sends SRs only (RFC 3550 §6.1, §6.4).
 
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
@@ -9,6 +9,7 @@ use rustrtc::media::frame::{AudioFrame, MediaKind as FrameKind};
 use rustrtc::media::track::sample_track;
 use rustrtc::peer_connection::RtpSender;
 use rustrtc::rtp::{RtcpPacket, is_rtcp, parse_rtcp_packets};
+use rustrtc::transports::rtp::RtpRewriteRule;
 use rustrtc::{PeerConnection, RtcConfiguration, RtpCodecParameters, SdpType, SessionDescription};
 use std::sync::Arc;
 use std::time::Duration;
@@ -159,6 +160,102 @@ async fn talk(
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// A paced sender (transcoding) sends SRs only, every one with the
+/// CNAME, on the peer's RTCP port.
+#[tokio::test]
+async fn sender_sends_only_sender_reports() -> Result<()> {
+    let peer = Peer::new().await;
+    let (pc, source, _) = answer(&peer).await?;
+    let ((reports, _), ()) = tokio::join!(
+        Peer::collect(&peer.rtcp, Duration::from_secs(8)),
+        talk(&peer, Some(&source), Duration::from_secs(8)),
+    );
+    assert!(reports.len() >= 2, "{reports:?}");
+    for r in &reports {
+        assert_eq!(r[0], 200, "a sender's report is an SR: {reports:?}");
+        assert!(r.contains(&202), "with the CNAME: {reports:?}");
+    }
+    pc.close();
+    Ok(())
+}
+
+/// A sender that stops (on hold) is a receiver again after two reports:
+/// RRs, not SRs with a packet count that does not move (RFC 3550 §6.4).
+#[tokio::test]
+async fn stopped_sender_sends_receiver_reports() -> Result<()> {
+    let peer = Peer::new().await;
+    let (pc, source, _) = answer(&peer).await?;
+    talk(&peer, Some(&source), Duration::from_secs(1)).await;
+    // Only the peer sends from now on. Reports go every 3 s: the ones at
+    // 3 s and 6 s are SRs, the next ones RRs.
+    // The SRs: drained here.
+    tokio::join!(
+        Peer::collect(&peer.rtcp, Duration::from_secs(6)),
+        talk(&peer, None, Duration::from_secs(6)),
+    );
+    let ((reports, _), ()) = tokio::join!(
+        Peer::collect(&peer.rtcp, Duration::from_millis(4500)),
+        talk(&peer, None, Duration::from_millis(4500)),
+    );
+    assert!(!reports.is_empty(), "a receiver reports");
+    for r in &reports {
+        assert_eq!(r[0], 201, "not a sender anymore: RRs: {reports:?}");
+        assert!(r.contains(&202), "with the CNAME: {reports:?}");
+    }
+    pc.close();
+    Ok(())
+}
+
+/// A relayed leg (the rewrite bridge sends its RTP, not its paced sender)
+/// is a sender too: SRs, with the packets that the bridge sent.
+#[tokio::test]
+async fn relay_sender_sends_sender_reports() -> Result<()> {
+    let caller = Peer::new().await;
+    let callee = Peer::new().await;
+    let (a, _a_source, _) = answer(&caller).await?;
+    let (b, _b_source, b_sender) = answer(&callee).await?;
+    // What rustpbx-media does: relay onto the callee sender's SSRC, on
+    // its timeline. The transports attach a moment after the negotiation
+    // (rustpbx-media retries the same way).
+    let rule = RtpRewriteRule {
+        match_payload_type: None,
+        out_ssrc: b_sender.ssrc(),
+        out_payload_type: Some(8),
+        sdes_mid_extension_id: None,
+        sdes_mid: None,
+        rtx: None,
+    };
+    let mut tries = 0;
+    let (a_transport, b_transport) = loop {
+        let a_sender = a.get_transceivers()[0].sender().unwrap();
+        if let (Some(at), Some(bt)) = (a_sender.transport(), b_sender.transport()) {
+            break (at, bt);
+        }
+        tries += 1;
+        assert!(tries < 50, "no transports");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    a_transport.bridge_rewrite_rules_with_timelines(
+        b_transport,
+        Default::default(),
+        vec![rule],
+        vec![b_sender.timeline()],
+    );
+    let ((rtcp, rtp), ()) = tokio::join!(
+        Peer::collect(&callee.rtcp, Duration::from_secs(8)),
+        talk(&caller, None, Duration::from_secs(8)),
+    );
+    // The relayed RTP went to the callee's RTP socket, not here.
+    assert_eq!(rtp, 0);
+    assert!(rtcp.len() >= 2, "a relayed leg sends reports: {rtcp:?}");
+    for r in &rtcp {
+        assert_eq!(r[0], 200, "a relayed leg is a sender: SRs: {rtcp:?}");
+    }
+    a.close();
+    b.close();
+    Ok(())
 }
 
 /// At close: one compound RR + SDES + BYE, on the peer's RTCP port, not
