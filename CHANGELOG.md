@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.6.10 — 2026-11-28
+
+RTCP now follows a plain SIP peer without rtcp-mux: reports and the BYE go to
+its RTCP port, every compound packet starts with a report and its CNAME, and a
+sender reports as an SR only while it sends RTP.
+
+### Fixed
+
+- **RTCP BYE routing (no rtcp-mux)**: the close path's best-effort BYE used the
+  RTP socket and address; it now uses the same RTCP socket/address as
+  `send_rtcp` (the RTP ones with rtcp-mux), and is sent per sender as a compound
+  `RR + SDES(CNAME) + BYE` (RFC 3550 §6.1, §11).
+- **Sender reports**: the sender's RTCP loop sends an SR only if it sent RTP
+  since the report before the last, otherwise an RR with its report blocks
+  (RFC 3550 §6.4); stopping (e.g. on hold) no longer keeps sending SRs with an
+  unchanging packet count.
+- **Duplicate RRs**: while a sender's loop reports, or the sender sent RTP
+  within two report intervals, `StatsCollector` no longer emits its own RR, so
+  the peer gets one report per interval instead of an RR and SR back to back.
+
+No breaking API changes.
+
 ## 0.6.9 — 2026-11-25
 
 Peer teardown now cancels the long-lived ICE/DTLS loops instead of relying on
